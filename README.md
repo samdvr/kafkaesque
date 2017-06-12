@@ -19,11 +19,10 @@ Kafkaesque by default produces messages to localhost:3899 as the broker host. If
 ```scala
 import kafkaesque.data.Event
 
+case class Deposit(message: String, topic: String) extends Event
 object Main extends App{
   import Kafkaesque._
-
   override def main(args: Array[String]): Unit = {
-    case class Deposit(message: String, topic: String) extends Event
     Seq(Deposit("Hello From Kafkaesque", "events")).publish
   }
 }

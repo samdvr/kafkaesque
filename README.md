@@ -1,6 +1,6 @@
 # Kafkaesque
 
-A simple kafka producer
+A simple Kafka Producer
 
 ## Usage
 

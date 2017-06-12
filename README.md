@@ -20,7 +20,8 @@ Kafkaesque by default produces messages to ```localhost:3899``` as the broker ho
 import kafkaesque.data.Event
 
 case class DepositCompleted(message: String, topic: String) extends Event
-object Main extends App{
+
+object Main extends App {
   import Kafkaesque._
   override def main(args: Array[String]): Unit = {
     Seq(DepositCompleted("Hello From Kafkaesque", "events")).publish

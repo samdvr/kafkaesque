@@ -12,9 +12,9 @@ Then import Kafkaesque._
 Now Seq[Event] will have publish that defaults to localhost:3899
 and invoking it will produce the event.
 
-###Example:
+### Example:
 
-```
+```scala
 import kafkaesque.data.Event
 
 object Main extends App{
@@ -24,10 +24,5 @@ object Main extends App{
     case class Deposit(message: String, topic: String) extends Event
     Seq(Deposit("Hello From Kafkaesque", "events")).publish
   }
-
-
-
 }
-
-
 ```

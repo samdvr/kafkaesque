@@ -1,6 +1,6 @@
 # Kafkaesque
 
-Sample kafka producer
+A simple kafka producer
 
 ## Usage
 
@@ -11,6 +11,9 @@ Then import Kafkaesque._
 
 Now Seq[Event] will have publish that defaults to localhost:3899
 and invoking it will produce the event.
+
+## Configuration
+Kafkaesque by default produces messages to localhost:3899 as the broker host. If you'd like to change this behavior you can define values for kafkaesque.brokers in your application.conf file.
 
 ### Example:
 

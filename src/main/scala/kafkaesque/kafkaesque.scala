@@ -10,7 +10,7 @@ object Kafkaesque {
 
   implicit class Publisher[A](data: A) {
 
-    def publish(topic: String)(implicit encoder: Encoder[A]) = {
+    def publish(topic: String)(implicit encoder: Encoder[A]): Future[RecordMetadata] = {
       producer.send(new ProducerRecord[String, String](topic, data.asJson.noSpaces))
     }
   }

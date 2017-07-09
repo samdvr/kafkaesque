@@ -4,14 +4,14 @@ A simple Kafka Producer
 
 ## Usage
 
-In order to publish an event create a case class
+Let's say we have defined a case class as follows:
 ```Scala
 case class Person(name: String, age: Int)
 ```
 
-Then import Kafkaesque._
+after importing ```Kafkaesque._```
 
-Now any ```Person``` instance will have publish that produces the event.
+Any instance of our case class has publish which produces the event to Kafka
 
 ```Scala
 import Kafkaesque._

@@ -19,7 +19,7 @@ This also works for Seq[Person]
 
 ```Scala
 import Kafkaesque._
-Seq(Person("Sherlock", 43),Person("John", 46)).publish.("SomeTopic")
+Seq(Person("Sherlock", 43),Person("John", 46)).publish("SomeTopic")
 ```
 
 

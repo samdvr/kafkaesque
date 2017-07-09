@@ -4,27 +4,24 @@ A simple Kafka Producer
 
 ## Usage
 
-In order to publish an event create an event extending kafkaesque.data.Event trait which has the following values:
-```topic:String, message: String```
+In order to publish an event create a case class
+```case class Person(name: String, age: Int)```
 
 Then import Kafkaesque._
 
-Now any ```Seq[Event]``` will have publish that produces the event in the Sequence.
+Now any ```Person``` instance will have publish that produces the event.
+
+```Scala
+import Kafkaesque._
+Person("Sherlock", 43).publish
+```
+This also works for Seq[Person]
+
+```Scala
+import Kafkaesque._
+Seq(Person("Sherlock", 43),Person("John", 46)).publish
+```
+
 
 ## Configuration
 Kafkaesque by default produces messages to ```localhost:3899``` as the broker host. If you'd like to change this behavior you can define values for ```kafkaesque.brokers``` in your ```application.conf``` file.
-
-### Example:
-
-```scala
-import kafkaesque.data.Event
-
-case class DepositCompleted(message: String, topic: String) extends Event
-
-object Main extends App {
-  import Kafkaesque._
-  override def main(args: Array[String]): Unit = {
-    Seq(DepositCompleted("Hello From Kafkaesque", "events")).publish
-  }
-}
-```

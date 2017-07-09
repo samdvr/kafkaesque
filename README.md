@@ -13,13 +13,13 @@ Now any ```Person``` instance will have publish that produces the event.
 
 ```Scala
 import Kafkaesque._
-Person("Sherlock", 43).publish
+Person("Sherlock", 43).publish("SomeTopic")
 ```
 This also works for Seq[Person]
 
 ```Scala
 import Kafkaesque._
-Seq(Person("Sherlock", 43),Person("John", 46)).publish
+Seq(Person("Sherlock", 43),Person("John", 46)).publish.("SomeTopic")
 ```
 
 

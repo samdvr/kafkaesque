@@ -5,7 +5,9 @@ A simple Kafka Producer
 ## Usage
 
 In order to publish an event create a case class
-```case class Person(name: String, age: Int)```
+```Scala
+case class Person(name: String, age: Int)
+```
 
 Then import Kafkaesque._
 

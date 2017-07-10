@@ -15,13 +15,13 @@ Any instance of our case class has publish which produces the event to Kafka
 
 ```Scala
 import Kafkaesque._
-Person("Sherlock", 43).publish("SomeTopic")
+Person("Sherlock", 43).publish("some-topic")
 ```
 This also works for Seq[Person]
 
 ```Scala
 import Kafkaesque._
-Seq(Person("Sherlock", 43),Person("John", 46)).publish("SomeTopic")
+Seq(Person("Sherlock", 43), Person("John", 46)).publish("some-topic")
 ```
 
 

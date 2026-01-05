@@ -1,0 +1,106 @@
+# CI/CD Dockerfile for Kafkaesque (Optimized for size)
+# Runs ALL tests: unit, integration, single-node E2E, and cluster E2E
+#
+# Usage:
+#   docker build -f Dockerfile.ci -t kafkaesque-ci .
+#   docker run --rm kafkaesque-ci
+#
+# The build will fail if unit/integration tests fail.
+# Runtime executes both single-node and cluster E2E tests.
+#
+# Image size optimizations:
+# - Multi-stage build with minimal runtime dependencies
+# - Static MUSL binary (no glibc needed at runtime)
+# - Minimal Alpine base (~5MB) with only essential tools
+# - Efficient layer caching for faster rebuilds
+
+# =============================================================================
+# Stage 1: Build and test (Static MUSL build on Alpine)
+# =============================================================================
+FROM rust:1.89-alpine3.20 AS builder
+
+# Install build dependencies (single layer)
+RUN apk add --no-cache \
+    musl-dev \
+    cmake \
+    make \
+    g++ \
+    pkgconfig \
+    openssl-dev \
+    openssl-libs-static \
+    cyrus-sasl-dev \
+    zstd-dev \
+    zstd-static
+
+WORKDIR /app
+
+# Configure Cargo for Alpine (musl)
+# target-applies-to-host = false prevents flags from affecting proc-macros
+RUN mkdir -p .cargo && \
+    echo '[target.x86_64-unknown-linux-musl]' > .cargo/config.toml && \
+    echo 'rustflags = ["-C", "target-feature=+crt-static"]' >> .cargo/config.toml && \
+    echo '[build]' >> .cargo/config.toml && \
+    echo 'target-applies-to-host = false' >> .cargo/config.toml
+
+# Environment variables to force static linking for native C dependencies
+ENV ZSTD_SYS_USE_PKG_CONFIG=0
+ENV OPENSSL_STATIC=1
+ENV PKG_CONFIG_ALL_STATIC=1
+
+# Copy dependency files first for better caching
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy source to pre-build dependencies
+# We explicitly specify --target to ensure cargo distinguishes host vs target
+RUN mkdir -p src examples tests benches && \
+    echo 'fn main() {}' > src/main.rs && \
+    echo 'pub fn dummy() {}' > src/lib.rs && \
+    echo 'fn main() {}' > examples/cluster.rs && \
+    echo 'fn main() {}' > examples/benchmark.rs && \
+    echo 'fn main() {}' > benches/produce_bench.rs && \
+    cargo build --target x86_64-unknown-linux-musl --release --example cluster 2>/dev/null || true && \
+    cargo build --target x86_64-unknown-linux-musl --lib 2>/dev/null || true && \
+    rm -rf src examples tests benches target/x86_64-unknown-linux-musl/release/.fingerprint/kafkaesque-*
+
+# Copy actual source
+COPY src ./src
+COPY examples ./examples
+COPY tests ./tests
+COPY benches ./benches
+
+# Build and test in release mode (optimized)
+# Note: On Alpine, Rust uses musl by default. We just ensure static linking.
+# Explicit --target is important here to utilize the config correctly.
+RUN cargo test --target x86_64-unknown-linux-musl --lib --release && \
+    cargo test --target x86_64-unknown-linux-musl --tests --release && \
+    cargo build --target x86_64-unknown-linux-musl --release --example cluster && \
+    strip target/x86_64-unknown-linux-musl/release/examples/cluster
+
+# =============================================================================
+# Stage 2: E2E test runner (minimal Alpine - ~40MB total)
+# =============================================================================
+FROM alpine:3.20 AS runner
+
+# Install ONLY runtime dependencies for E2E tests
+# Note: kafkacat pulls in librdkafka which needs glibc compatibility
+RUN apk add --no-cache \
+    ca-certificates \
+    netcat-openbsd \
+    kafkacat \
+    bash \
+    && rm -rf /var/cache/apk/*
+
+WORKDIR /app
+
+# Copy statically compiled binary (no runtime dependencies)
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/examples/cluster /app/target/release/examples/cluster
+
+# Copy E2E test scripts
+COPY scripts/run-e2e.sh /app/run-e2e.sh
+RUN chmod +x /app/run-e2e.sh
+
+# Verify binary is executable (don't run --help as it starts the server)
+RUN test -x /app/target/release/examples/cluster && echo "Binary verified"
+
+# Run all E2E tests: single-node AND cluster
+CMD ["/app/run-e2e.sh", "--cluster"]

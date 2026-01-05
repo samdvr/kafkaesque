@@ -1,0 +1,71 @@
+# NetworkPolicy for Kafkaesque - restricts network access to only required ports
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafkaesque
+  namespace: kafkaesque
+  labels:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kafkaesque
+      app.kubernetes.io/component: broker
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Allow Kafka client connections from any pod in the cluster
+    - ports:
+        - protocol: TCP
+          port: 9092
+      from:
+        - namespaceSelector: {}
+
+    # Allow Raft communication between brokers only
+    - ports:
+        - protocol: TCP
+          port: 9093
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafkaesque
+              app.kubernetes.io/component: broker
+
+    # Allow health check access from any pod (for probes and monitoring)
+    - ports:
+        - protocol: TCP
+          port: 8080
+      from:
+        - namespaceSelector: {}
+
+  egress:
+    # Allow DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      to:
+        - namespaceSelector: {}
+
+    # Allow Raft communication between brokers
+    - ports:
+        - protocol: TCP
+          port: 9093
+      to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafkaesque
+              app.kubernetes.io/component: broker
+
+    # Allow connections to object storage (S3/GCS/Azure)
+    # For local storage mode, this can be removed
+    - ports:
+        - protocol: TCP
+          port: 443
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0

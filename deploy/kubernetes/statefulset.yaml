@@ -1,0 +1,137 @@
+# StatefulSet for Kafkaesque brokers
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafkaesque
+  namespace: kafkaesque
+  labels:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+spec:
+  serviceName: kafkaesque-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafkaesque
+      app.kubernetes.io/component: broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafkaesque
+        app.kubernetes.io/component: broker
+    spec:
+      serviceAccountName: kafkaesque
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: kafkaesque
+          image: kafkaesque:latest
+          imagePullPolicy: IfNotPresent
+
+          # Use shell to extract broker ID from hostname (kafkaesque-0 -> 0)
+          command:
+            - /bin/sh
+            - -c
+            - |
+              export BROKER_ID=$(hostname | sed 's/.*-//')
+              exec /app/cluster
+
+          ports:
+            - name: kafka
+              containerPort: 9092
+              protocol: TCP
+            - name: raft
+              containerPort: 9093
+              protocol: TCP
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: kafkaesque-config
+
+          env:
+            # Raft configuration - each broker listens on its own address
+            - name: RAFT_LISTEN_ADDR
+              value: "0.0.0.0:9093"
+            # Raft peers - discovered from headless service
+            # Format: "node_id=host:port,node_id=host:port,..."
+            - name: RAFT_PEERS
+              value: "0=kafkaesque-0.kafkaesque-headless.kafkaesque.svc.cluster.local:9093,1=kafkaesque-1.kafkaesque-headless.kafkaesque.svc.cluster.local:9093,2=kafkaesque-2.kafkaesque-headless.kafkaesque.svc.cluster.local:9093"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+
+          # Health probes
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+
+          volumeMounts:
+            - name: data
+              mountPath: /data/kafkaesque
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: kafkaesque
+          app.kubernetes.io/component: broker
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
+        # Uncomment and set storageClassName for specific storage class
+        # storageClassName: fast-ssd

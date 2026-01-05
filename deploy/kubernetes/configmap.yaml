@@ -1,0 +1,30 @@
+# ConfigMap for Kafkaesque broker configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafkaesque-config
+  namespace: kafkaesque
+  labels:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+data:
+  # Cluster configuration
+  CLUSTER_ID: "kafkaesque-cluster"
+  AUTO_CREATE_TOPICS: "true"
+
+  # Network configuration
+  HOST: "0.0.0.0"
+  PORT: "9092"
+  HEALTH_PORT: "8080"
+
+  # Object store configuration (override for S3/GCS/Azure)
+  OBJECT_STORE_TYPE: "local"
+  DATA_PATH: "/data/kafkaesque"
+
+  # Timing configuration
+  BROKER_HEARTBEAT_TTL_SECS: "30"
+  OWNERSHIP_CACHE_TTL_SECS: "1"
+
+  # Logging
+  RUST_LOG: "info"
+  LOG_FORMAT: "json"

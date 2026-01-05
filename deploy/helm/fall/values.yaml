@@ -1,0 +1,185 @@
+# Default values for Kafkaesque Helm chart
+
+# Replica count for the StatefulSet
+replicaCount: 3
+
+image:
+  repository: kafkaesque
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Service account configuration
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+# Kafkaesque broker configuration
+config:
+  # Cluster configuration
+  clusterId: "kafkaesque-cluster"
+  autoCreateTopics: true
+
+  # Network ports
+  kafkaPort: 9092
+  raftPort: 9093
+  healthPort: 8080
+
+  # Object storage configuration
+  objectStore:
+    # Type: local, s3, gcs, azure
+    type: local
+    # Local storage path (used when type=local)
+    dataPath: /data/kafkaesque
+
+    # S3 configuration (used when type=s3)
+    s3:
+      bucket: ""
+      region: "us-east-1"
+      endpoint: "" # For S3-compatible services like MinIO
+
+    # GCS configuration (used when type=gcs)
+    gcs:
+      bucket: ""
+
+    # Azure configuration (used when type=azure)
+    azure:
+      container: ""
+      account: ""
+
+  # Timing configuration
+  heartbeatTtlSecs: 30
+  ownershipCacheTtlSecs: 1
+
+  # Logging
+  logLevel: "info"
+  logFormat: "json"
+
+# Kubernetes service configuration
+service:
+  type: ClusterIP
+  kafkaPort: 9092
+  healthPort: 8080
+  annotations: {}
+
+# Headless service for StatefulSet discovery
+headlessService:
+  annotations: {}
+
+# Pod configuration
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  capabilities:
+    drop:
+      - ALL
+
+# Resource limits
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+
+# Health probes
+livenessProbe:
+  httpGet:
+    path: /health
+    port: health
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: health
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: health
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 30
+
+# Persistence configuration
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+
+# Node scheduling
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod anti-affinity (recommended for HA)
+podAntiAffinity:
+  enabled: true
+  # "soft" or "hard"
+  type: soft
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# ServiceMonitor for Prometheus Operator
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+
+# NetworkPolicy for pod isolation
+networkPolicy:
+  enabled: true
+  # Allow external ingress (from outside the cluster)
+  allowExternal: false
+  # Namespace selector for ingress (default: allow from all namespaces)
+  ingressNamespaceSelector: {}
+  # Extra egress rules (e.g., for external services)
+  extraEgress: []
+
+# Extra environment variables
+extraEnv: []
+# - name: EXTRA_VAR
+#   value: "value"
+
+# Extra environment variables from secrets/configmaps
+extraEnvFrom: []
+# - secretRef:
+#     name: kafkaesque-s3-credentials
+
+# Termination grace period
+terminationGracePeriodSeconds: 30

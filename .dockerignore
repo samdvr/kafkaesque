@@ -1,0 +1,45 @@
+# Build artifacts
+target/
+*.rlib
+*.rmeta
+
+# Git
+.git/
+.gitignore
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+tarpaulin-report.html
+*.profraw
+*.profdata
+coverage/
+
+# Documentation (built)
+doc/
+
+# Local config
+.env
+.env.local
+*.local.json
+
+# Cargo lock is needed for reproducible builds, don't ignore it
+# Cargo.lock
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# CI artifacts we don't need to copy into container
+*.log

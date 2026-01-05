@@ -1,0 +1,52 @@
+name: Rust
+on:
+  push:
+    branches: [ "main" ]
+    tags:
+      - '*'
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  checks: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: stable
+
+jobs:
+  # Note: static analysis (clippy, fmt) is handled by ci.yml
+
+  build:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Doc tests
+        run: cargo test --doc

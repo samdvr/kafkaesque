@@ -1,0 +1,16 @@
+# PodDisruptionBudget to ensure high availability during maintenance
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafkaesque-pdb
+  namespace: kafkaesque
+  labels:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+spec:
+  # Ensure at least 2 brokers are always available (for 3-node cluster)
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafkaesque
+      app.kubernetes.io/component: broker

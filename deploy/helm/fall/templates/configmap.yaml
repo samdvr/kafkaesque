@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kafkaesque.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kafkaesque.labels" . | nindent 4 }}
+data:
+  CLUSTER_ID: {{ .Values.config.clusterId | quote }}
+  AUTO_CREATE_TOPICS: {{ .Values.config.autoCreateTopics | quote }}
+  HOST: "0.0.0.0"
+  PORT: {{ .Values.config.kafkaPort | quote }}
+  HEALTH_PORT: {{ .Values.config.healthPort | quote }}
+  OBJECT_STORE_TYPE: {{ .Values.config.objectStore.type | quote }}
+  DATA_PATH: {{ .Values.config.objectStore.dataPath | quote }}
+  BROKER_HEARTBEAT_TTL_SECS: {{ .Values.config.heartbeatTtlSecs | quote }}
+  OWNERSHIP_CACHE_TTL_SECS: {{ .Values.config.ownershipCacheTtlSecs | quote }}
+  RUST_LOG: {{ .Values.config.logLevel | quote }}
+  LOG_FORMAT: {{ .Values.config.logFormat | quote }}
+  {{- if eq .Values.config.objectStore.type "s3" }}
+  AWS_S3_BUCKET: {{ .Values.config.objectStore.s3.bucket | quote }}
+  AWS_REGION: {{ .Values.config.objectStore.s3.region | quote }}
+  {{- if .Values.config.objectStore.s3.endpoint }}
+  AWS_ENDPOINT: {{ .Values.config.objectStore.s3.endpoint | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if eq .Values.config.objectStore.type "gcs" }}
+  GCS_BUCKET: {{ .Values.config.objectStore.gcs.bucket | quote }}
+  {{- end }}
+  {{- if eq .Values.config.objectStore.type "azure" }}
+  AZURE_CONTAINER: {{ .Values.config.objectStore.azure.container | quote }}
+  AZURE_STORAGE_ACCOUNT: {{ .Values.config.objectStore.azure.account | quote }}
+  {{- end }}

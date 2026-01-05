@@ -1,0 +1,15 @@
+# Namespace for Kafkaesque deployment
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafkaesque
+  labels:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: messaging
+    # Pod Security Standards - enforce restricted security profile
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

@@ -1,0 +1,69 @@
+# Ultra-minimal Dockerfile for Kafkaesque (Production - Smallest possible)
+# For production deployments without E2E tests
+#
+# Usage:
+#   docker build -f Dockerfile.minimal -t kafkaesque-minimal .
+#   docker run --rm -p 9092:9092 kafkaesque-minimal
+#
+#
+# Note: This skips E2E tests for minimal size. Use Dockerfile.ci for testing.
+
+# =============================================================================
+# Stage 1: Build with static linking
+# =============================================================================
+FROM rust:1.89-alpine3.20 AS builder
+
+RUN apk add --no-cache \
+    musl-dev \
+    cmake \
+    make \
+    g++ \
+    pkgconfig \
+    openssl-dev \
+    openssl-libs-static
+
+WORKDIR /app
+
+# Dependency caching
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src examples && \
+    echo 'fn main() {}' > src/main.rs && \
+    echo 'pub fn dummy() {}' > src/lib.rs && \
+    echo 'fn main() {}' > examples/cluster.rs && \
+    cargo build --release --example cluster 2>/dev/null || true && \
+    rm -rf src examples
+
+# Build release binary
+COPY src ./src
+COPY examples ./examples
+
+ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static -C opt-level=z -C lto=fat -C codegen-units=1"
+RUN cargo build --release --example cluster && \
+    strip --strip-all target/release/examples/cluster
+
+# =============================================================================
+# Stage 2: Minimal runtime (scratch + glibc compatibility)
+# =============================================================================
+FROM alpine:3.20
+
+# Install only glibc compatibility (no other tools)
+# This is needed only if the binary has any glibc dependencies
+# For a pure static musl binary, you could use FROM scratch instead
+RUN apk add --no-cache \
+    ca-certificates \
+    libgcc \
+    && rm -rf /var/cache/apk/* /tmp/* /var/tmp/*
+
+WORKDIR /app
+
+# Copy only the binary
+COPY --from=builder /app/target/release/examples/cluster /app/cluster
+
+# Non-root user for security
+RUN adduser -D -u 1000 kafkaesque && \
+    chown -R kafkaesque:kafkaesque /app
+USER kafkaesque
+
+EXPOSE 9092 9093 8080
+
+ENTRYPOINT ["/app/cluster"]

@@ -299,7 +299,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                     self.data_runtime.spawn(async move {
                         let mut conn = ClientConnection::new_with_rate_limiter(stream, addr, rate_limiter);
                         if let Err(e) = conn.handle_requests(handler).await {
-                            tracing::error!(client_addr = %addr, error = ?e, "Error handling connection");
+                            tracing::warn!(client_addr = %addr, error = ?e, "Error handling connection");
                         }
                         // Decrement active connection count
                         active_connections.fetch_sub(1, Ordering::SeqCst);

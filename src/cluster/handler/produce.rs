@@ -109,7 +109,7 @@ pub(super) async fn handle_produce(
 
                 let topic_name = Arc::clone(&topic_name);
                 let partition_manager = partition_manager.clone();
-                tokio::spawn(async move {
+                handler.data_runtime.spawn(async move {
                     let _permit = permit;
                     let _ = fire_and_forget_produce(
                         &partition_manager,

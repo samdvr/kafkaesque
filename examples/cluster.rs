@@ -47,18 +47,27 @@
 //! - `GET /metrics` - Prometheus metrics
 //!
 //! Set `HEALTH_PORT=0` to disable the health server.
+//!
+//! ## Runtime Configuration
+//!
+//! The broker uses separate tokio runtimes for control plane (Raft, heartbeats)
+//! and data plane (client connections, produce/fetch) to prevent cold reads from
+//! starving Raft heartbeats.
+//!
+//! - `CONTROL_PLANE_THREADS`: Number of control plane threads (default: 2)
+//! - `DATA_PLANE_THREADS`: Number of data plane threads (default: num_cpus)
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use kafkaesque::cluster::{ClusterConfig, SlateDBClusterHandler};
+use kafkaesque::runtime::{BrokerRuntimes, RuntimeConfig};
 use kafkaesque::server::KafkaServer;
 use kafkaesque::server::health::HealthServer;
 use kafkaesque::telemetry::{LogFormat, init_logging};
 use tracing::info;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging with format from LOG_FORMAT env var (default: pretty)
     // Set LOG_FORMAT=json for JSON output suitable for log aggregators
     init_logging(LogFormat::from_env()).map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -66,6 +75,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read configuration from environment
     let config = ClusterConfig::from_env()?;
 
+    // Create runtime configuration from cluster config
+    let runtime_config = RuntimeConfig {
+        control_plane_threads: config.control_plane_threads,
+        data_plane_threads: config.data_plane_threads,
+        ..Default::default()
+    };
+
+    // Create separate runtimes for control plane and data plane
+    let runtimes = BrokerRuntimes::new(runtime_config)?;
+    let handles = runtimes.handles();
+
+    info!(
+        control_plane_threads = handles.control.metrics().num_workers(),
+        data_plane_threads = handles.data.metrics().num_workers(),
+        "Created separate control plane and data plane runtimes"
+    );
+
+    // Run the broker on the control plane runtime
+    runtimes.block_on_control(run_broker(config, handles))
+}
+
+async fn run_broker(
+    config: ClusterConfig,
+    runtime_handles: kafkaesque::runtime::RuntimeHandles,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         broker_id = config.broker_id,
         host = %config.host,
@@ -97,7 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     health_addr = %health_addr,
                     "Health server started"
                 );
-                Some(tokio::spawn(async move {
+                // Health server runs on control plane runtime
+                Some(runtime_handles.control.spawn(async move {
                     let _ = server.run().await;
                 }))
             }
@@ -111,10 +146,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let handler = SlateDBClusterHandler::new(config.clone()).await?;
+    // Create handler with runtime handles for control/data plane separation
+    let handler =
+        SlateDBClusterHandler::with_runtime_handles(config.clone(), runtime_handles.clone())
+            .await?;
 
+    // Create server with data plane runtime for client connections
     let addr = format!("{}:{}", config.host, config.port);
-    let server = KafkaServer::new(&addr, handler).await?;
+    let server = KafkaServer::with_config(
+        &addr,
+        handler,
+        kafkaesque::constants::DEFAULT_MAX_CONNECTIONS_PER_IP,
+        kafkaesque::constants::DEFAULT_MAX_TOTAL_CONNECTIONS,
+        runtime_handles.data.clone(),
+    )
+    .await?;
 
     info!(
         broker_id = config.broker_id,

@@ -68,6 +68,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::net::TcpListener;
+use tokio::runtime::Handle;
 use tokio::sync::{RwLock, broadcast};
 
 use crate::error::{Error, Result};
@@ -93,16 +94,21 @@ pub struct KafkaServer<H: Handler> {
     max_total_connections: usize,
     /// Rate limiter for authentication failures
     auth_rate_limiter: Arc<AuthRateLimiter>,
+    /// Runtime handle for spawning data plane tasks.
+    data_runtime: Handle,
 }
 
 impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
     /// Create a new Kafka server bound to the given address.
+    ///
+    /// Uses the current tokio runtime for spawning connection handlers.
     pub async fn new(addr: &str, handler: H) -> Result<Self> {
         Self::with_config(
             addr,
             handler,
             DEFAULT_MAX_CONNECTIONS_PER_IP,
             DEFAULT_MAX_TOTAL_CONNECTIONS,
+            Handle::current(),
         )
         .await
     }
@@ -114,11 +120,13 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
     /// * `handler` - Request handler implementation
     /// * `max_connections_per_ip` - Maximum connections allowed from a single IP
     /// * `max_total_connections` - Maximum total connections (0 = unlimited)
+    /// * `data_runtime` - Runtime handle for spawning connection handler tasks
     pub async fn with_config(
         addr: &str,
         handler: H,
         max_connections_per_ip: usize,
         max_total_connections: usize,
+        data_runtime: Handle,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .await
@@ -142,6 +150,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
             max_connections_per_ip,
             max_total_connections,
             auth_rate_limiter: Arc::new(AuthRateLimiter::new()),
+            data_runtime,
         })
     }
 
@@ -287,7 +296,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                     // Increment active connection count
                     active_connections.fetch_add(1, Ordering::SeqCst);
 
-                    tokio::spawn(async move {
+                    self.data_runtime.spawn(async move {
                         let mut conn = ClientConnection::new_with_rate_limiter(stream, addr, rate_limiter);
                         if let Err(e) = conn.handle_requests(handler).await {
                             tracing::error!(client_addr = %addr, error = ?e, "Error handling connection");
@@ -345,11 +354,15 @@ pub struct TlsKafkaServer<H: Handler> {
     max_total_connections: usize,
     /// Rate limiter for authentication failures
     auth_rate_limiter: Arc<AuthRateLimiter>,
+    /// Runtime handle for spawning data plane tasks.
+    data_runtime: Handle,
 }
 
 #[cfg(feature = "tls")]
 impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
     /// Create a new TLS-enabled Kafka server bound to the given address.
+    ///
+    /// Uses the current tokio runtime for spawning connection handlers.
     pub async fn new(addr: &str, handler: H, tls_config: TlsConfig) -> Result<Self> {
         Self::with_config(
             addr,
@@ -357,6 +370,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
             tls_config,
             DEFAULT_MAX_CONNECTIONS_PER_IP,
             DEFAULT_MAX_TOTAL_CONNECTIONS,
+            Handle::current(),
         )
         .await
     }
@@ -369,12 +383,14 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
     /// * `tls_config` - TLS configuration
     /// * `max_connections_per_ip` - Maximum connections allowed from a single IP
     /// * `max_total_connections` - Maximum total connections (0 = unlimited)
+    /// * `data_runtime` - Runtime handle for spawning connection handler tasks
     pub async fn with_config(
         addr: &str,
         handler: H,
         tls_config: TlsConfig,
         max_connections_per_ip: usize,
         max_total_connections: usize,
+        data_runtime: Handle,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .await
@@ -399,6 +415,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
             max_connections_per_ip,
             max_total_connections,
             auth_rate_limiter: Arc::new(AuthRateLimiter::new()),
+            data_runtime,
         })
     }
 
@@ -520,7 +537,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
 
                     active_connections.fetch_add(1, Ordering::SeqCst);
 
-                    tokio::spawn(async move {
+                    self.data_runtime.spawn(async move {
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 let mut conn = connection::TlsClientConnection::new_with_rate_limiter(
@@ -622,7 +639,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_kafka_server_with_config() {
-        match KafkaServer::with_config("127.0.0.1:0", TestHandler, 50, 100).await {
+        match KafkaServer::with_config("127.0.0.1:0", TestHandler, 50, 100, Handle::current()).await
+        {
             Ok(server) => {
                 let addr = server.local_addr().unwrap();
                 assert!(addr.port() > 0);
@@ -640,7 +658,8 @@ mod tests {
     #[tokio::test]
     async fn test_kafka_server_unlimited_connections() {
         // max_total_connections = 0 means unlimited
-        match KafkaServer::with_config("127.0.0.1:0", TestHandler, 100, 0).await {
+        match KafkaServer::with_config("127.0.0.1:0", TestHandler, 100, 0, Handle::current()).await
+        {
             Ok(server) => {
                 assert_eq!(server.max_total_connections, 0);
                 server.shutdown();

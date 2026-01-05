@@ -45,6 +45,7 @@
 //! ```rust,no_run
 //! use kafkaesque::cluster::raft::{RaftCoordinator, RaftConfig};
 //! use std::sync::Arc;
+//! use tokio::runtime::Handle;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,7 +53,7 @@
 //!     // Create an object store (local, S3, GCS, or Azure)
 //!     let object_store: Arc<dyn object_store::ObjectStore> =
 //!         Arc::new(object_store::memory::InMemory::new());
-//!     let coordinator = RaftCoordinator::new(config, object_store).await?;
+//!     let coordinator = RaftCoordinator::new(config, object_store, Handle::current()).await?;
 //!     // Use coordinator for cluster operations...
 //!     Ok(())
 //! }

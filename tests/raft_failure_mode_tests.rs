@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
+use tokio::runtime::Handle;
 use tokio::time::sleep;
 
 use kafkaesque::cluster::raft::{
@@ -121,7 +122,9 @@ async fn test_lease_expiration_allows_reassignment() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let node = RaftNode::new(config, store).await.unwrap();
+    let node = RaftNode::new(config, store, Handle::current())
+        .await
+        .unwrap();
     node.initialize_cluster().await.unwrap();
 
     assert!(wait_for_leader(&node, Duration::from_secs(5)).await);
@@ -235,7 +238,9 @@ async fn test_broker_registration_and_heartbeat() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let node = RaftNode::new(config, store).await.unwrap();
+    let node = RaftNode::new(config, store, Handle::current())
+        .await
+        .unwrap();
     node.initialize_cluster().await.unwrap();
 
     assert!(wait_for_leader(&node, Duration::from_secs(5)).await);
@@ -301,7 +306,9 @@ async fn test_partition_ownership_tracking() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let node = RaftNode::new(config, store).await.unwrap();
+    let node = RaftNode::new(config, store, Handle::current())
+        .await
+        .unwrap();
     node.initialize_cluster().await.unwrap();
 
     assert!(wait_for_leader(&node, Duration::from_secs(5)).await);
@@ -380,7 +387,9 @@ async fn test_consumer_group_member_expiration() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let node = RaftNode::new(config, store).await.unwrap();
+    let node = RaftNode::new(config, store, Handle::current())
+        .await
+        .unwrap();
     node.initialize_cluster().await.unwrap();
 
     assert!(wait_for_leader(&node, Duration::from_secs(5)).await);
@@ -447,7 +456,9 @@ async fn test_offset_persistence() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let node = RaftNode::new(config, store).await.unwrap();
+    let node = RaftNode::new(config, store, Handle::current())
+        .await
+        .unwrap();
     node.initialize_cluster().await.unwrap();
 
     assert!(wait_for_leader(&node, Duration::from_secs(5)).await);
@@ -510,7 +521,9 @@ async fn test_producer_id_monotonic() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let node = RaftNode::new(config, store).await.unwrap();
+    let node = RaftNode::new(config, store, Handle::current())
+        .await
+        .unwrap();
     node.initialize_cluster().await.unwrap();
 
     assert!(wait_for_leader(&node, Duration::from_secs(5)).await);
@@ -552,7 +565,9 @@ async fn test_lease_renewal() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let node = RaftNode::new(config, store).await.unwrap();
+    let node = RaftNode::new(config, store, Handle::current())
+        .await
+        .unwrap();
     node.initialize_cluster().await.unwrap();
 
     assert!(wait_for_leader(&node, Duration::from_secs(5)).await);
@@ -642,7 +657,9 @@ async fn test_topic_deletion() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let node = RaftNode::new(config, store).await.unwrap();
+    let node = RaftNode::new(config, store, Handle::current())
+        .await
+        .unwrap();
     node.initialize_cluster().await.unwrap();
 
     assert!(wait_for_leader(&node, Duration::from_secs(5)).await);
@@ -715,7 +732,9 @@ async fn test_coordinator_partition_lifecycle() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let coordinator = RaftCoordinator::new(config, store).await.unwrap();
+    let coordinator = RaftCoordinator::new(config, store, Handle::current())
+        .await
+        .unwrap();
     coordinator.initialize_cluster().await.unwrap();
 
     assert!(wait_for_coordinator_leader(&coordinator, Duration::from_secs(5)).await);
@@ -767,7 +786,9 @@ async fn test_coordinator_consumer_groups() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let coordinator = RaftCoordinator::new(config, store).await.unwrap();
+    let coordinator = RaftCoordinator::new(config, store, Handle::current())
+        .await
+        .unwrap();
     coordinator.initialize_cluster().await.unwrap();
 
     assert!(wait_for_coordinator_leader(&coordinator, Duration::from_secs(5)).await);
@@ -809,7 +830,9 @@ async fn test_coordinator_producer_ids() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let coordinator = RaftCoordinator::new(config, store).await.unwrap();
+    let coordinator = RaftCoordinator::new(config, store, Handle::current())
+        .await
+        .unwrap();
     coordinator.initialize_cluster().await.unwrap();
 
     assert!(wait_for_coordinator_leader(&coordinator, Duration::from_secs(5)).await);
@@ -836,7 +859,11 @@ async fn test_coordinator_concurrent_requests() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let coordinator = Arc::new(RaftCoordinator::new(config, store).await.unwrap());
+    let coordinator = Arc::new(
+        RaftCoordinator::new(config, store, Handle::current())
+            .await
+            .unwrap(),
+    );
     coordinator.initialize_cluster().await.unwrap();
 
     assert!(wait_for_coordinator_leader(&coordinator, Duration::from_secs(5)).await);
@@ -883,7 +910,9 @@ async fn test_coordinator_verify_and_extend_lease() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let coordinator = RaftCoordinator::new(config, store).await.unwrap();
+    let coordinator = RaftCoordinator::new(config, store, Handle::current())
+        .await
+        .unwrap();
     coordinator.initialize_cluster().await.unwrap();
 
     assert!(wait_for_coordinator_leader(&coordinator, Duration::from_secs(5)).await);
@@ -918,7 +947,9 @@ async fn test_coordinator_get_partition_owners() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let coordinator = RaftCoordinator::new(config, store).await.unwrap();
+    let coordinator = RaftCoordinator::new(config, store, Handle::current())
+        .await
+        .unwrap();
     coordinator.initialize_cluster().await.unwrap();
 
     assert!(wait_for_coordinator_leader(&coordinator, Duration::from_secs(5)).await);
@@ -967,7 +998,9 @@ async fn test_coordinator_linearizable_ownership() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let coordinator = RaftCoordinator::new(config, store).await.unwrap();
+    let coordinator = RaftCoordinator::new(config, store, Handle::current())
+        .await
+        .unwrap();
     coordinator.initialize_cluster().await.unwrap();
 
     assert!(wait_for_coordinator_leader(&coordinator, Duration::from_secs(5)).await);
@@ -1005,7 +1038,9 @@ async fn test_coordinator_broker_unregistration() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let coordinator = RaftCoordinator::new(config, store).await.unwrap();
+    let coordinator = RaftCoordinator::new(config, store, Handle::current())
+        .await
+        .unwrap();
     coordinator.initialize_cluster().await.unwrap();
 
     assert!(wait_for_coordinator_leader(&coordinator, Duration::from_secs(5)).await);
@@ -1027,7 +1062,9 @@ async fn test_coordinator_get_brokers() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let coordinator = RaftCoordinator::new(config, store).await.unwrap();
+    let coordinator = RaftCoordinator::new(config, store, Handle::current())
+        .await
+        .unwrap();
     coordinator.initialize_cluster().await.unwrap();
 
     assert!(wait_for_coordinator_leader(&coordinator, Duration::from_secs(5)).await);
@@ -1054,7 +1091,9 @@ async fn test_coordinator_release_unowned_partition() {
     let config = test_config(1, port, vec![]);
     let store = create_object_store();
 
-    let coordinator = RaftCoordinator::new(config, store).await.unwrap();
+    let coordinator = RaftCoordinator::new(config, store, Handle::current())
+        .await
+        .unwrap();
     coordinator.initialize_cluster().await.unwrap();
 
     assert!(wait_for_coordinator_leader(&coordinator, Duration::from_secs(5)).await);

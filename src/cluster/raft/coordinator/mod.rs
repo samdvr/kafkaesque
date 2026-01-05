@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use moka::future::Cache;
 use object_store::ObjectStore;
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -56,6 +57,8 @@ pub struct RaftCoordinator {
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
     /// Atomic counter for generating unique transaction IDs.
     transaction_counter: std::sync::atomic::AtomicU64,
+    /// Runtime handle for spawning control plane tasks.
+    runtime: Handle,
 }
 
 impl RaftCoordinator {
@@ -64,11 +67,13 @@ impl RaftCoordinator {
     /// # Arguments
     /// * `config` - Raft configuration
     /// * `object_store` - Object store for durable snapshot persistence
+    /// * `runtime` - Runtime handle for spawning control plane tasks
     pub async fn new(
         config: RaftConfig,
         object_store: Arc<dyn ObjectStore>,
+        runtime: Handle,
     ) -> SlateDBResult<Self> {
-        let node = RaftNode::new(config.clone(), object_store).await?;
+        let node = RaftNode::new(config.clone(), object_store, runtime.clone()).await?;
         let node = Arc::new(node);
 
         let broker_info = BrokerInfo {
@@ -95,6 +100,7 @@ impl RaftCoordinator {
             task_handles: RwLock::new(Vec::new()),
             shutdown_tx,
             transaction_counter: std::sync::atomic::AtomicU64::new(0),
+            runtime,
         };
 
         Ok(coordinator)
@@ -134,7 +140,7 @@ impl RaftCoordinator {
         let heartbeat_interval = self.config.broker_heartbeat_interval;
 
         // Broker heartbeat task with jitter to prevent thundering herd
-        let handle = tokio::spawn(async move {
+        let handle = self.runtime.spawn(async move {
             // Add initial jitter (0-50% of interval) to stagger startup
             let initial_jitter = jitter_duration(heartbeat_interval, 0.5);
             tokio::time::sleep(initial_jitter).await;
@@ -172,7 +178,7 @@ impl RaftCoordinator {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let check_interval = Duration::from_secs(5);
 
-        let handle = tokio::spawn(async move {
+        let handle = self.runtime.spawn(async move {
             // Add initial jitter (0-100% of interval) to stagger across brokers
             let initial_jitter = jitter_duration(check_interval, 1.0);
             tokio::time::sleep(initial_jitter).await;

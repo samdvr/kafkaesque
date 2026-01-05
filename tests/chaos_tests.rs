@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use bytes::{BufMut, Bytes, BytesMut};
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
+use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 
@@ -3381,12 +3382,13 @@ mod rebalance_coordinator_tests {
     use kafkaesque::cluster::rebalance_coordinator::{
         RebalanceCoordinator, RebalanceCoordinatorConfig,
     };
+    use tokio::runtime::Handle;
 
     /// Test: Rebalance coordinator basic functionality
     #[tokio::test]
     async fn test_rebalance_coordinator_creation() {
         let config = RebalanceCoordinatorConfig::default();
-        let coordinator = RebalanceCoordinator::new(config, 1);
+        let coordinator = RebalanceCoordinator::new(config, 1, Handle::current());
 
         assert_eq!(coordinator.total_failovers(), 0);
         assert_eq!(coordinator.total_rebalances(), 0);
@@ -3396,7 +3398,7 @@ mod rebalance_coordinator_tests {
     /// Test: Broker registration and heartbeat tracking
     #[tokio::test]
     async fn test_rebalance_broker_health_tracking() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
 
         coordinator.register_broker(2);
         coordinator.register_broker(3);
@@ -3416,7 +3418,7 @@ mod rebalance_coordinator_tests {
     /// Test: State summary contains correct information
     #[tokio::test]
     async fn test_rebalance_state_summary() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
 
         coordinator.register_broker(2);
         coordinator.register_broker(3);

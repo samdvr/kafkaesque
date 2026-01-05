@@ -9,6 +9,7 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use openraft::storage::Adaptor;
 use openraft::{BasicNode, Raft};
+use tokio::runtime::Handle;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::timeout;
 use tracing::info;
@@ -47,9 +48,11 @@ impl RaftNode {
     /// # Arguments
     /// * `config` - Raft configuration
     /// * `object_store` - Object store for durable snapshot persistence
+    /// * `runtime` - Runtime handle for spawning control plane tasks
     pub async fn new(
         config: RaftConfig,
         object_store: Arc<dyn ObjectStore>,
+        runtime: Handle,
     ) -> SlateDBResult<Self> {
         // Validate config
         if let Err(errors) = config.validate() {
@@ -128,10 +131,11 @@ impl RaftNode {
             proposal_semaphore,
         };
 
-        // Start RPC server
-        let rpc_server = RaftRpcServer::new(raft.clone(), config.raft_addr.clone());
+        // Start RPC server on control plane runtime
+        let rpc_server =
+            RaftRpcServer::new(raft.clone(), config.raft_addr.clone(), runtime.clone());
         let mut shutdown_rx = node.shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             tokio::select! {
                 result = rpc_server.run() => {
                     if let Err(e) = result {

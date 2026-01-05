@@ -6,6 +6,7 @@ use kafkaesque::cluster::{ClusterConfig, MockCoordinator, PartitionCoordinator, 
 use object_store::memory::InMemory;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::runtime::Handle;
 use tokio::time::sleep;
 
 /// Create a test partition manager with mock coordinator.
@@ -20,7 +21,7 @@ async fn create_test_pm() -> (PartitionManager<MockCoordinator>, Arc<MockCoordin
     let coordinator = Arc::new(MockCoordinator::new(1, "localhost", 9092));
     coordinator.register_broker().await.unwrap();
     let object_store = Arc::new(InMemory::new());
-    let pm = PartitionManager::new(coordinator.clone(), object_store, config);
+    let pm = PartitionManager::new(coordinator.clone(), object_store, config, Handle::current());
     (pm, coordinator)
 }
 
@@ -233,7 +234,7 @@ async fn test_partition_manager_auto_create_topic() {
     let coordinator = Arc::new(MockCoordinator::new(1, "localhost", 9092));
     coordinator.register_broker().await.unwrap();
     let object_store = Arc::new(InMemory::new());
-    let pm = PartitionManager::new(coordinator, object_store, config);
+    let pm = PartitionManager::new(coordinator, object_store, config, Handle::current());
 
     // Ensure partition on non-existent topic should auto-create
     let result = pm.ensure_partition("auto-created", 0).await;
@@ -252,7 +253,7 @@ async fn test_partition_manager_no_auto_create_topic() {
     let coordinator = Arc::new(MockCoordinator::new(1, "localhost", 9092));
     coordinator.register_broker().await.unwrap();
     let object_store = Arc::new(InMemory::new());
-    let pm = PartitionManager::new(coordinator, object_store, config);
+    let pm = PartitionManager::new(coordinator, object_store, config, Handle::current());
 
     // Ensure partition on non-existent topic should fail
     // Note: MockCoordinator may still allow it, but we're testing the config path
@@ -337,7 +338,7 @@ async fn test_partition_manager_with_fast_failover() {
     let coordinator = Arc::new(MockCoordinator::new(1, "localhost", 9092));
     coordinator.register_broker().await.unwrap();
     let object_store = Arc::new(InMemory::new());
-    let pm = PartitionManager::new(coordinator.clone(), object_store, config);
+    let pm = PartitionManager::new(coordinator.clone(), object_store, config, Handle::current());
 
     // Verify config
     assert!(pm.config().fast_failover_enabled);

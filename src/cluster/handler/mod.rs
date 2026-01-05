@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 
 use crate::error::KafkaCode;
 use crate::protocol::{CrcValidationResult, validate_batch_crc};
+use crate::runtime::RuntimeHandles;
 use crate::server::request::*;
 use crate::server::response::*;
 use crate::server::{Handler, RequestContext};
@@ -88,21 +89,52 @@ pub struct SlateDBClusterHandler {
 
     /// Cache for topic name Arc<str> allocations to reduce hot path allocations.
     topic_name_cache: Cache<String, Arc<str>>,
+
+    /// Runtime handle for spawning data plane tasks (fire-and-forget produce).
+    pub(crate) data_runtime: tokio::runtime::Handle,
 }
 
 impl SlateDBClusterHandler {
     /// Create a new SlateDB cluster handler.
     ///
     /// Uses the `object_store` field from config to determine storage backend.
+    /// Uses the current tokio runtime for all tasks (backwards compatible).
     pub async fn new(config: ClusterConfig) -> SlateDBResult<Self> {
         let object_store = create_object_store(&config)?;
-        Self::with_object_store(config, object_store).await
+        let runtime_handles = RuntimeHandles::from_current();
+        Self::with_runtimes(config, object_store, runtime_handles).await
     }
 
     /// Create a new handler with a custom object store.
+    ///
+    /// Uses the current tokio runtime for all tasks (backwards compatible).
     pub async fn with_object_store(
         config: ClusterConfig,
         object_store: Arc<dyn ObjectStore>,
+    ) -> SlateDBResult<Self> {
+        let runtime_handles = RuntimeHandles::from_current();
+        Self::with_runtimes(config, object_store, runtime_handles).await
+    }
+
+    /// Create a new handler with custom runtime handles.
+    ///
+    /// Creates the object store from config. This is the recommended constructor
+    /// when using separate control/data plane runtimes.
+    pub async fn with_runtime_handles(
+        config: ClusterConfig,
+        runtime_handles: RuntimeHandles,
+    ) -> SlateDBResult<Self> {
+        let object_store = create_object_store(&config)?;
+        Self::with_runtimes(config, object_store, runtime_handles).await
+    }
+
+    /// Create a new handler with custom object store and runtime handles.
+    ///
+    /// This is the full constructor allowing customization of both storage and runtimes.
+    pub async fn with_runtimes(
+        config: ClusterConfig,
+        object_store: Arc<dyn ObjectStore>,
+        runtime_handles: RuntimeHandles,
     ) -> SlateDBResult<Self> {
         // Initialize circuit breaker config from ClusterConfig
         super::metrics::init_circuit_breaker_config(
@@ -113,8 +145,14 @@ impl SlateDBClusterHandler {
 
         // Create Raft coordinator with object store for snapshot persistence
         let raft_config = RaftConfig::from_cluster_config(&config);
-        let coordinator =
-            Arc::new(RaftCoordinator::new(raft_config.clone(), object_store.clone()).await?);
+        let coordinator = Arc::new(
+            RaftCoordinator::new(
+                raft_config.clone(),
+                object_store.clone(),
+                runtime_handles.control.clone(),
+            )
+            .await?,
+        );
 
         // Check if the cluster is already initialized from persisted state.
         // This handles the restart case where snapshots were loaded.
@@ -233,6 +271,7 @@ impl SlateDBClusterHandler {
             coordinator.clone(),
             object_store,
             config.clone(),
+            runtime_handles.control.clone(),
         ));
 
         // Start background tasks
@@ -259,6 +298,7 @@ impl SlateDBClusterHandler {
             max_concurrent_partition_writes: config.max_concurrent_partition_writes,
             max_concurrent_partition_reads: config.max_concurrent_partition_reads,
             topic_name_cache: Cache::new(10_000),
+            data_runtime: runtime_handles.data,
         })
     }
 

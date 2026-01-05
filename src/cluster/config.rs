@@ -683,6 +683,23 @@ pub struct ClusterConfig {
     ///
     /// Default: 100ms
     pub slatedb_flush_interval_ms: u64,
+
+    // --- Runtime Configuration ---
+    /// Number of worker threads for the control plane runtime.
+    ///
+    /// The control plane handles Raft consensus, heartbeats, lease management,
+    /// and coordination tasks. These are low-throughput but latency-sensitive.
+    ///
+    /// Default: 2
+    pub control_plane_threads: usize,
+
+    /// Number of worker threads for the data plane runtime.
+    ///
+    /// The data plane handles client connections and produce/fetch requests.
+    /// These are high-throughput I/O-heavy tasks.
+    ///
+    /// Default: number of CPU cores
+    pub data_plane_threads: usize,
 }
 
 impl Default for ClusterConfig {
@@ -764,6 +781,11 @@ impl Default for ClusterConfig {
             slatedb_max_unflushed_bytes: 256 * 1024 * 1024, // 256 MB
             slatedb_l0_sst_size_bytes: 64 * 1024 * 1024,    // 64 MB
             slatedb_flush_interval_ms: 100,
+            // Runtime configuration
+            control_plane_threads: 2,
+            data_plane_threads: std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4),
         }
     }
 }
@@ -1364,6 +1386,17 @@ impl ClusterConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.slatedb_flush_interval_ms);
 
+        // Runtime configuration
+        let control_plane_threads: usize = std::env::var("CONTROL_PLANE_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.control_plane_threads);
+
+        let data_plane_threads: usize = std::env::var("DATA_PLANE_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.data_plane_threads);
+
         let config = Self {
             broker_id,
             host: host.clone(),
@@ -1393,6 +1426,8 @@ impl ClusterConfig {
             slatedb_max_unflushed_bytes,
             slatedb_l0_sst_size_bytes,
             slatedb_flush_interval_ms,
+            control_plane_threads,
+            data_plane_threads,
             ..defaults
         };
 
@@ -1424,6 +1459,10 @@ impl ClusterConfig {
         eprintln!("Broker Heartbeat TTL: {}s", broker_heartbeat_ttl_secs);
         eprintln!("SASL Enabled: {}", sasl_enabled);
         eprintln!("Fail on Recovery Gap: {}", fail_on_recovery_gap);
+        eprintln!(
+            "Runtime: control_plane={} threads, data_plane={} threads",
+            control_plane_threads, data_plane_threads
+        );
         eprintln!("==========================");
 
         // Run validation

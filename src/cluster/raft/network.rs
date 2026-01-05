@@ -701,12 +701,22 @@ pub struct RaftRpcServer {
     raft: Arc<openraft::Raft<TypeConfig>>,
     /// Address to listen on.
     listen_addr: String,
+    /// Runtime handle for spawning connection handler tasks.
+    runtime: tokio::runtime::Handle,
 }
 
 impl RaftRpcServer {
     /// Create a new RPC server.
-    pub fn new(raft: Arc<openraft::Raft<TypeConfig>>, listen_addr: String) -> Self {
-        Self { raft, listen_addr }
+    pub fn new(
+        raft: Arc<openraft::Raft<TypeConfig>>,
+        listen_addr: String,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            raft,
+            listen_addr,
+            runtime,
+        }
     }
 
     /// Start the RPC server.
@@ -718,7 +728,7 @@ impl RaftRpcServer {
             let (stream, peer_addr) = listener.accept().await?;
             let raft = self.raft.clone();
 
-            tokio::spawn(async move {
+            self.runtime.spawn(async move {
                 if let Err(e) = Self::handle_connection(raft, stream).await {
                     tracing::warn!(peer = %peer_addr, error = %e, "Error handling Raft RPC");
                 }

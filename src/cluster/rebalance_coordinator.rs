@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -275,11 +276,14 @@ pub struct RebalanceCoordinator {
 
     /// This broker's ID.
     broker_id: i32,
+
+    /// Runtime handle for spawning control plane tasks.
+    runtime: Handle,
 }
 
 impl RebalanceCoordinator {
     /// Create a new rebalance coordinator.
-    pub fn new(config: RebalanceCoordinatorConfig, broker_id: i32) -> Self {
+    pub fn new(config: RebalanceCoordinatorConfig, broker_id: i32, runtime: Handle) -> Self {
         info!(
             broker_id,
             fast_failover = config.fast_failover_enabled,
@@ -299,12 +303,13 @@ impl RebalanceCoordinator {
             total_rebalances: AtomicU64::new(0),
             config,
             broker_id,
+            runtime,
         }
     }
 
     /// Create with default configuration.
-    pub fn with_defaults(broker_id: i32) -> Self {
-        Self::new(RebalanceCoordinatorConfig::default(), broker_id)
+    pub fn with_defaults(broker_id: i32, runtime: Handle) -> Self {
+        Self::new(RebalanceCoordinatorConfig::default(), broker_id, runtime)
     }
 
     /// Get the configuration.
@@ -702,7 +707,7 @@ impl RebalanceCoordinator {
         let failure_check_handle = if self.config.fast_failover_enabled {
             let coordinator = Arc::clone(self);
             let exec = Arc::clone(&executor);
-            Some(tokio::spawn(async move {
+            Some(self.runtime.spawn(async move {
                 coordinator.failure_check_loop(exec).await;
             }))
         } else {
@@ -712,7 +717,7 @@ impl RebalanceCoordinator {
         let rebalance_handle = if self.config.auto_balancer.enabled {
             let coordinator = Arc::clone(self);
             let exec = Arc::clone(&executor);
-            Some(tokio::spawn(async move {
+            Some(self.runtime.spawn(async move {
                 coordinator.rebalance_loop(exec).await;
             }))
         } else {
@@ -721,7 +726,7 @@ impl RebalanceCoordinator {
 
         let metrics_reset_handle = {
             let coordinator = Arc::clone(self);
-            Some(tokio::spawn(async move {
+            Some(self.runtime.spawn(async move {
                 coordinator.metrics_reset_loop().await;
             }))
         };
@@ -886,18 +891,18 @@ mod tests {
         assert_eq!(config.transfer_lease_duration_ms, 60_000);
     }
 
-    #[test]
-    fn test_coordinator_creation() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+    #[tokio::test]
+    async fn test_coordinator_creation() {
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         assert_eq!(coordinator.broker_id, 1);
         assert!(!coordinator.is_running());
         assert_eq!(coordinator.total_failovers(), 0);
         assert_eq!(coordinator.total_rebalances(), 0);
     }
 
-    #[test]
-    fn test_broker_registration() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+    #[tokio::test]
+    async fn test_broker_registration() {
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
 
         coordinator.register_broker(2);
         coordinator.register_broker(3);
@@ -908,9 +913,9 @@ mod tests {
         assert_eq!(coordinator.failure_detector.broker_count(), 1);
     }
 
-    #[test]
-    fn test_heartbeat_recording() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+    #[tokio::test]
+    async fn test_heartbeat_recording() {
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
 
         coordinator.register_broker(2);
         coordinator.record_heartbeat(2);
@@ -920,7 +925,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_summary() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         coordinator.register_broker(2);
         coordinator.register_broker(3);
 
@@ -944,35 +949,35 @@ mod tests {
         assert!(!config.auto_balancer.enabled);
     }
 
-    #[test]
-    fn test_config_accessor() {
+    #[tokio::test]
+    async fn test_config_accessor() {
         let config = RebalanceCoordinatorConfig {
             transfer_lease_duration_ms: 120_000,
             ..Default::default()
         };
-        let coordinator = RebalanceCoordinator::new(config, 1);
+        let coordinator = RebalanceCoordinator::new(config, 1, Handle::current());
         assert_eq!(coordinator.config().transfer_lease_duration_ms, 120_000);
     }
 
-    #[test]
-    fn test_failure_detector_accessor() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+    #[tokio::test]
+    async fn test_failure_detector_accessor() {
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         coordinator.register_broker(2);
 
         let fd = coordinator.failure_detector();
         assert_eq!(fd.broker_count(), 1);
     }
 
-    #[test]
-    fn test_load_collector_accessor() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+    #[tokio::test]
+    async fn test_load_collector_accessor() {
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let lc = coordinator.load_collector();
         assert_eq!(lc.partition_count(), 0);
     }
 
-    #[test]
-    fn test_check_broker_health() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+    #[tokio::test]
+    async fn test_check_broker_health() {
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         coordinator.register_broker(2);
         coordinator.record_heartbeat(2);
 
@@ -981,9 +986,9 @@ mod tests {
         assert!(changes.is_empty());
     }
 
-    #[test]
-    fn test_stop() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+    #[tokio::test]
+    async fn test_stop() {
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         assert!(!coordinator.is_running());
 
         // Note: start_background_tasks would set running to true
@@ -1158,7 +1163,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_broker_failure_disabled() {
         let config = RebalanceCoordinatorConfig::default().with_failover_disabled();
-        let coordinator = RebalanceCoordinator::new(config, 1);
+        let coordinator = RebalanceCoordinator::new(config, 1, Handle::current());
         let executor = MockExecutor::new();
 
         let result = coordinator.handle_broker_failure(2, &executor).await;
@@ -1168,7 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_broker_failure_no_partitions() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2, 3]);
 
         let result = coordinator.handle_broker_failure(2, &executor).await;
@@ -1182,7 +1187,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_broker_failure_no_available_brokers() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::new();
         executor.set_mark_failed_result(Ok(5)); // Broker owns 5 partitions
 
@@ -1196,7 +1201,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_broker_failure_with_partitions() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2, 3]);
         executor.add_partition("topic", 0, 2);
         executor.add_partition("topic", 1, 2);
@@ -1215,7 +1220,7 @@ mod tests {
     #[tokio::test]
     async fn test_evaluate_and_rebalance_disabled() {
         let config = RebalanceCoordinatorConfig::default().with_balancing_disabled();
-        let coordinator = RebalanceCoordinator::new(config, 1);
+        let coordinator = RebalanceCoordinator::new(config, 1, Handle::current());
         let executor = MockExecutor::new();
 
         let result = coordinator.evaluate_and_rebalance(&executor).await;
@@ -1228,7 +1233,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_evaluate_and_rebalance_should_not_evaluate() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2]);
 
         // Trigger first evaluation
@@ -1243,7 +1248,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_broker_failure_batch_error_propagation() {
         // Test that batch transfer failures properly track all partitions as failed
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2, 3]);
 
         // Add partitions owned by broker 2 (the one that will fail)
@@ -1269,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_broker_failure_partial_batch_failure() {
         // Test that individual partition failures within a batch are tracked
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2, 3]);
 
         // Add partitions owned by broker 2
@@ -1307,7 +1312,7 @@ mod tests {
             failover_batch_delay_ms: 0, // No delay for faster test
             ..Default::default()
         };
-        let coordinator = RebalanceCoordinator::new(config, 1);
+        let coordinator = RebalanceCoordinator::new(config, 1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2, 3]);
 
         // Add 8 partitions owned by broker 2 (will require 3 batches: 3+3+2)
@@ -1333,7 +1338,7 @@ mod tests {
             failover_batch_delay_ms: 50, // 50ms delay between batches
             ..Default::default()
         };
-        let coordinator = RebalanceCoordinator::new(config, 1);
+        let coordinator = RebalanceCoordinator::new(config, 1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2, 3]);
 
         // Add 4 partitions (2 batches)
@@ -1358,7 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_broker_failure_distributes_to_least_loaded() {
         // Verify partitions are distributed to brokers with fewest partitions
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2, 3]);
 
         // Broker 3 already has 5 partitions, broker 1 has 1
@@ -1383,7 +1388,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_and_stop() {
-        let coordinator = Arc::new(RebalanceCoordinator::with_defaults(1));
+        let coordinator = Arc::new(RebalanceCoordinator::with_defaults(1, Handle::current()));
         let executor = Arc::new(MockExecutor::with_brokers(vec![1, 2]));
 
         // Start background tasks
@@ -1410,7 +1415,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let coordinator = RebalanceCoordinator::new(config, 42);
+        let coordinator = RebalanceCoordinator::new(config, 42, Handle::current());
 
         // Register some brokers
         // Note: Registering a broker sets it as healthy with last_heartbeat=now
@@ -1442,7 +1447,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let coordinator = RebalanceCoordinator::new(config, 1);
+        let coordinator = RebalanceCoordinator::new(config, 1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2]);
 
         // First evaluation triggers internal state update
@@ -1460,7 +1465,7 @@ mod tests {
             .with_failover_disabled()
             .with_balancing_disabled();
 
-        let coordinator = RebalanceCoordinator::new(config.clone(), 1);
+        let coordinator = RebalanceCoordinator::new(config.clone(), 1, Handle::current());
 
         assert!(!coordinator.config().fast_failover_enabled);
         assert!(!coordinator.config().auto_balancer.enabled);
@@ -1468,7 +1473,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_broker_failure_mark_failed_error() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2, 3]);
 
         // Make mark_broker_failed return error
@@ -1481,7 +1486,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_collector_from_coordinator() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let load_collector = coordinator.load_collector();
 
         // Should be able to use the load collector
@@ -1490,7 +1495,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_failure_detector_from_coordinator() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
 
         coordinator.register_broker(5);
         let fd = coordinator.failure_detector();
@@ -1499,7 +1504,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_failovers_increment_counter() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2, 3, 4]);
 
         // First failover
@@ -1523,7 +1528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_background_task_handles_abort_with_handles() {
-        let coordinator = Arc::new(RebalanceCoordinator::with_defaults(1));
+        let coordinator = Arc::new(RebalanceCoordinator::with_defaults(1, Handle::current()));
         let executor = Arc::new(MockExecutor::with_brokers(vec![1, 2]));
 
         let handles = coordinator.start_background_tasks(executor);
@@ -1541,7 +1546,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_broker_failure_empty_active_brokers_except_failed() {
         // Edge case: Only broker available is the failed one
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::new();
 
         executor.add_partition("topic", 0, 1);
@@ -1555,7 +1560,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_failover_clears_failed_broker_from_detector() {
-        let coordinator = RebalanceCoordinator::with_defaults(1);
+        let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::with_brokers(vec![1, 2, 3]);
 
         // Register and fail broker 2

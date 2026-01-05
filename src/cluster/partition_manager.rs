@@ -12,6 +12,7 @@ use object_store::ObjectStore;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -111,6 +112,9 @@ pub struct PartitionManager<C: ClusterCoordinator> {
 
     /// Handles for rebalance coordinator background tasks.
     rebalance_task_handles: RwLock<Option<BackgroundTaskHandles>>,
+
+    /// Runtime handle for spawning control plane tasks.
+    control_runtime: Handle,
 }
 
 impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
@@ -119,6 +123,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         coordinator: Arc<C>,
         object_store: Arc<dyn ObjectStore>,
         config: ClusterConfig,
+        control_runtime: Handle,
     ) -> Self {
         // Create shutdown channel with capacity for all background tasks
         let (shutdown_tx, _) = broadcast::channel(4);
@@ -155,6 +160,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             Some(Arc::new(RebalanceCoordinator::new(
                 rebalance_config,
                 config.broker_id,
+                control_runtime.clone(),
             )))
         } else {
             None
@@ -173,6 +179,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             lease_cache: Arc::new(DashMap::new()),
             rebalance_coordinator,
             rebalance_task_handles: RwLock::new(None),
+            control_runtime,
         }
     }
 
@@ -313,7 +320,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         let max_consecutive_failures = self.config.max_consecutive_heartbeat_failures;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
+        self.control_runtime.spawn(async move {
             let mut consecutive_failures: u32 = 0;
 
             loop {
@@ -417,7 +424,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         // In this case, clear the entire lease cache to be safe.
         const BULK_FAILURE_THRESHOLD: usize = 3;
 
-        tokio::spawn(async move {
+        self.control_runtime.spawn(async move {
             loop {
                 // Use jittered sleep instead of fixed interval to prevent thundering herd
                 tokio::select! {
@@ -513,7 +520,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         let interval = self.config.ownership_check_interval;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
+        self.control_runtime.spawn(async move {
             loop {
                 // Use jittered sleep instead of fixed interval to prevent thundering herd
                 tokio::select! {
@@ -712,7 +719,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         let broker_id = self.broker_id;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
+        self.control_runtime.spawn(async move {
             loop {
                 // Use jittered sleep instead of fixed interval to prevent thundering herd
                 tokio::select! {
@@ -1727,7 +1734,8 @@ mod tests {
 
         coordinator.register_broker().await.unwrap();
 
-        let pm = PartitionManager::new(coordinator.clone(), object_store, config);
+        let pm =
+            PartitionManager::new(coordinator.clone(), object_store, config, Handle::current());
         (pm, coordinator)
     }
 
@@ -1833,7 +1841,8 @@ mod tests {
             .await
             .unwrap();
 
-        let pm = PartitionManager::new(coordinator.clone(), object_store, config);
+        let pm =
+            PartitionManager::new(coordinator.clone(), object_store, config, Handle::current());
 
         // Should fail when trying to ensure partition beyond limit
         let result = pm.ensure_partition("limited-topic", 4).await;
@@ -1913,7 +1922,8 @@ mod tests {
         let coordinator = Arc::new(MockCoordinator::new(1, "localhost", 9092));
         let object_store = Arc::new(InMemory::new());
         coordinator.register_broker().await.unwrap();
-        let pm = PartitionManager::new(coordinator.clone(), object_store, config);
+        let pm =
+            PartitionManager::new(coordinator.clone(), object_store, config, Handle::current());
 
         // Action: Ensure partition 0 of a new topic. This should auto-create the topic.
         let result = pm.ensure_partition("new-topic", 0).await;
@@ -1939,7 +1949,8 @@ mod tests {
         let coordinator = Arc::new(MockCoordinator::new(1, "localhost", 9092));
         let object_store = Arc::new(InMemory::new());
         coordinator.register_broker().await.unwrap();
-        let pm = PartitionManager::new(coordinator.clone(), object_store, config);
+        let pm =
+            PartitionManager::new(coordinator.clone(), object_store, config, Handle::current());
 
         // Action: Ensure a partition that is out of bounds for a new topic.
         let result = pm.ensure_partition("new-topic", 8).await;
@@ -1962,7 +1973,8 @@ mod tests {
         let coordinator = Arc::new(MockCoordinator::new(1, "localhost", 9092));
         let object_store = Arc::new(InMemory::new());
         coordinator.register_broker().await.unwrap();
-        let pm = PartitionManager::new(coordinator.clone(), object_store, config);
+        let pm =
+            PartitionManager::new(coordinator.clone(), object_store, config, Handle::current());
 
         // Setup: create a topic first
         pm.ensure_partition("existing-topic", 0).await.unwrap();
@@ -2123,7 +2135,8 @@ mod tests {
         let coordinator = Arc::new(MockCoordinator::new(1, "localhost", 9092));
         let object_store = Arc::new(InMemory::new());
         coordinator.register_broker().await.unwrap();
-        let pm = PartitionManager::new(coordinator.clone(), object_store, config);
+        let pm =
+            PartitionManager::new(coordinator.clone(), object_store, config, Handle::current());
 
         // Verify the config was applied
         assert!(!pm.config().auto_create_topics);
@@ -2302,7 +2315,7 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         coordinator.register_broker().await.unwrap();
 
-        let pm = PartitionManager::new(coordinator, object_store, config);
+        let pm = PartitionManager::new(coordinator, object_store, config, Handle::current());
 
         // Should still work without rebalance coordinator
         assert_eq!(pm.config().broker_id, 1);
@@ -2324,7 +2337,7 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         coordinator.register_broker().await.unwrap();
 
-        let pm = PartitionManager::new(coordinator, object_store, config);
+        let pm = PartitionManager::new(coordinator, object_store, config, Handle::current());
 
         // Should have rebalance coordinator enabled
         assert_eq!(pm.config().broker_id, 1);
@@ -2517,7 +2530,7 @@ mod tests {
         let object_store = Arc::new(InMemory::new());
         coordinator.register_broker().await.unwrap();
 
-        let pm = PartitionManager::new(coordinator, object_store, config);
+        let pm = PartitionManager::new(coordinator, object_store, config, Handle::current());
 
         assert_eq!(pm.config().broker_id, 42);
     }

@@ -1973,6 +1973,37 @@ pub static PRODUCER_STATE_RECOVERY_COUNT: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
 });
 
+/// Producer state cache evictions.
+/// Tracks when producer idempotency states are evicted from the in-memory cache.
+/// Evictions with has_sequence=true are concerning as they indicate potential
+/// idempotency gaps if the producer reconnects.
+///
+/// **ALERT**: Monitor evictions where has_sequence=true - these could lead to
+/// duplicate messages being accepted if producers reconnect after idle period.
+pub static PRODUCER_STATE_EVICTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec_safe(
+        &REGISTRY,
+        "producer_state_evictions_total",
+        "Producer state cache evictions (has_sequence=true indicates idempotency risk)",
+        &["topic", "partition", "has_sequence"],
+    )
+});
+
+/// Record a producer state eviction from the cache.
+///
+/// This is called when a producer's idempotency state is evicted from the
+/// in-memory cache due to TTL expiry or capacity limits.
+///
+/// # Arguments
+/// * `topic` - The topic name
+/// * `partition` - The partition ID
+/// * `has_sequence` - Whether the producer had sequence > 0 (active producer)
+pub fn record_producer_state_eviction(topic: &str, partition: i32, has_sequence: bool) {
+    PRODUCER_STATE_EVICTIONS
+        .with_label_values(&[topic, &partition.to_string(), if has_sequence { "true" } else { "false" }])
+        .inc();
+}
+
 /// Record consumer lag for a consumer group.
 ///
 /// This tracks the difference between the high watermark (latest available offset)

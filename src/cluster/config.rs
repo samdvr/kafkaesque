@@ -1123,6 +1123,20 @@ impl ClusterConfig {
             ));
         }
 
+        // TOCTOU safety: min_lease_ttl_for_write_secs must be less than the lease buffer
+        // to allow writes. If min_lease_ttl_for_write_secs >= lease_buffer, writes would
+        // be rejected immediately after lease renewal, leaving no usable write window.
+        if self.min_lease_ttl_for_write_secs >= lease_buffer {
+            errors.push(format!(
+                "min_lease_ttl_for_write_secs ({}) must be less than lease buffer ({} seconds). \
+                 Writes require at least {} seconds of remaining lease. \
+                 Increase lease_duration or decrease lease_renewal_interval.",
+                self.min_lease_ttl_for_write_secs,
+                lease_buffer,
+                self.min_lease_ttl_for_write_secs
+            ));
+        }
+
         if self.default_num_partitions <= 0 {
             errors.push(format!(
                 "default_num_partitions ({}) must be positive",

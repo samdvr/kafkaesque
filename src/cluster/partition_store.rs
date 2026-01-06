@@ -473,14 +473,23 @@ impl PartitionStore {
                         );
                         return Err(err);
                     }
-                    // Prevents transient storage errors from blocking writes
-                    warn!(
+                    // SAFETY: Do NOT fall back to cached epoch on storage errors.
+                    // If we cannot verify the epoch, we must fail the write to prevent
+                    // split-brain scenarios where:
+                    // 1. Storage is temporarily unavailable (e.g., network partition)
+                    // 2. Another broker acquires partition and writes new epoch
+                    // 3. We fall back to cached (stale) epoch and write anyway
+                    // 4. Both brokers write to same partition = data corruption
+                    error!(
                         topic = %self.topic,
                         partition = self.partition,
                         error = %err,
-                        "Failed to read epoch from storage, using cached value"
+                        "Failed to read epoch from storage - rejecting write for safety"
                     );
-                    self.leader_epoch
+                    return Err(SlateDBError::Storage(format!(
+                        "Cannot verify epoch for {}/{}: {}",
+                        self.topic, self.partition, err
+                    )));
                 }
             };
 
@@ -1522,10 +1531,34 @@ impl PartitionStoreBuilder {
 
         info!(topic = %topic_for_task, partition, high_watermark = hwm, leader_epoch = validated_epoch, "Partition store opened via builder");
 
-        // Build producer state cache with configured TTL
+        // Build producer state cache with configured TTL and eviction warning
+        // Clone topic for the eviction listener closure
+        let topic_for_eviction = topic.clone();
         let producer_states_cache = MokaCache::builder()
             .max_capacity(DEFAULT_PRODUCER_STATE_CACHE_SIZE)
             .time_to_idle(Duration::from_secs(self.producer_state_cache_ttl_secs))
+            .eviction_listener(move |producer_id: Arc<i64>, state: ProducerState, cause| {
+                // Log warning when producers with active sequences are evicted.
+                // This is important because:
+                // 1. If the producer reconnects after eviction, its sequence tracking is lost
+                // 2. A duplicate message could be accepted as new (idempotency gap)
+                // The warning helps operators identify producers with idle periods > TTL
+                if state.last_sequence > 0 {
+                    warn!(
+                        topic = %topic_for_eviction,
+                        partition,
+                        producer_id = *producer_id,
+                        last_sequence = state.last_sequence,
+                        producer_epoch = state.producer_epoch,
+                        eviction_cause = ?cause,
+                        ttl_secs = self.producer_state_cache_ttl_secs,
+                        "Producer state evicted from cache - idempotency may be lost if producer reconnects"
+                    );
+                    super::metrics::record_producer_state_eviction(&topic_for_eviction, partition, true);
+                } else {
+                    super::metrics::record_producer_state_eviction(&topic_for_eviction, partition, false);
+                }
+            })
             .build();
 
         // Populate the cache with persisted producer states

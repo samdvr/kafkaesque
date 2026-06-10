@@ -189,6 +189,22 @@ pub const DEFAULT_REQUEST_READ_TIMEOUT_SECS: u64 = 30;
 /// Long-running operations should be designed to complete within this timeout.
 pub const DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS: u64 = 60;
 
+/// Default timeout for writing a response back to a client (30 seconds).
+///
+/// Mirrors `DEFAULT_REQUEST_READ_TIMEOUT_SECS` on the response path. Without
+/// it, a client that opens a TCP connection and never reads pins a slot in
+/// the connection pool indefinitely (reverse-slowloris): the broker buffers
+/// fill, `write_all` waits for `writable()` forever, and at scale a few
+/// thousand silent clients exhaust the connection limit.
+pub const DEFAULT_REQUEST_WRITE_TIMEOUT_SECS: u64 = 30;
+
+/// Idle disconnect timeout (5 minutes).
+///
+/// A connection with no activity in either direction for this long is
+/// closed. Pairs with the read/write timeouts to bound how long an
+/// idle-but-not-dead client can keep a slot.
+pub const DEFAULT_IDLE_CONNECTION_TIMEOUT_SECS: u64 = 300;
+
 // =============================================================================
 // Lease and Heartbeat Constants
 // =============================================================================
@@ -229,10 +245,12 @@ pub const DEFAULT_SESSION_TIMEOUT_CHECK_INTERVAL_SECS: u64 = 10;
 /// Should be significantly less than MIN_LEASE_TTL_FOR_WRITE_SECS but large
 /// enough to absorb network latency and write time.
 ///
-/// With 25s: We refresh when lease has <25s remaining, giving ~35s of cache hits
-/// per 60s lease. This removes Raft overhead from ~58% of produce requests while
-/// maintaining safety margins for the increased MIN_LEASE_TTL_FOR_WRITE_SECS.
-pub const LEASE_CACHE_REFRESH_THRESHOLD_SECS: u64 = 25;
+/// With 55s: on a 60s lease the cache is only trusted for ~5s after each
+/// Raft verify, narrowing the split-brain write window described in audit
+/// B4. The previous 25s value gave ~35s of cache trust per lease, which on
+/// a paused-then-resumed broker could overlap an entire failover handoff
+/// before the cache invalidated.
+pub const LEASE_CACHE_REFRESH_THRESHOLD_SECS: u64 = 55;
 
 /// Default minimum remaining lease TTL (in seconds) required to allow writes.
 ///

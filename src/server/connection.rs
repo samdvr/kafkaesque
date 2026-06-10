@@ -15,7 +15,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "tls")]
 use tokio_rustls::server::TlsStream;
 
-use crate::constants::{DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS, DEFAULT_REQUEST_READ_TIMEOUT_SECS};
+use crate::constants::{
+    DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS, DEFAULT_REQUEST_READ_TIMEOUT_SECS,
+    DEFAULT_REQUEST_WRITE_TIMEOUT_SECS,
+};
 use crate::error::{Error, KafkaCode, Result};
 
 use super::handler::{Handler, RequestContext};
@@ -202,6 +205,7 @@ async fn dispatch_request_common<H: Handler>(
     data: Bytes,
     client_addr: SocketAddr,
     _connection_type: &str, // Used for logging to distinguish plain vs TLS
+    auth_gate: &mut AuthGate,
 ) -> (Result<Vec<u8>>, AuthResult) {
     let start = Instant::now();
 
@@ -228,11 +232,47 @@ async fn dispatch_request_common<H: Handler>(
     let header = request.header();
     let correlation_id = header.correlation_id;
 
+    // Audit S1 scaffold: when SASL is required and the connection has not
+    // completed authentication, refuse anything except the connection-setup
+    // API keys (ApiVersions, SaslHandshake, SaslAuthenticate). Without this
+    // check the dispatch table happily answers Produce/Fetch/Admin even
+    // before any handshake has happened.
+    if auth_gate.required
+        && !auth_gate.authenticated
+        && !AuthGate::allows_pre_auth(header.api_key)
+    {
+        tracing::warn!(
+            client = %client_addr,
+            api_key = ?header.api_key,
+            "Rejecting unauthenticated request: SASL handshake required first"
+        );
+        return (
+            Err(Error::Authentication(format!(
+                "SASL authentication required for API key {:?}",
+                header.api_key
+            ))),
+            AuthResult::Failure,
+        );
+    }
+
+    // Resolve the effective principal for this request (audit S2). We use
+    // the gate's stored principal when present, else `User:ANONYMOUS` —
+    // matching real Kafka's identity for a non-SASL connection. ACL
+    // bindings against `User:ANONYMOUS` let operators allow specific things
+    // through without enabling SASL.
+    let principal = auth_gate
+        .principal
+        .clone()
+        .unwrap_or_else(|| "User:ANONYMOUS".to_string());
+    let client_host = client_addr.ip().to_string();
+
     let ctx = RequestContext {
         client_addr,
         api_version: header.api_version,
         client_id: header.client_id.clone(),
         request_id: uuid::Uuid::new_v4(),
+        principal,
+        client_host,
     };
 
     tracing::debug!(
@@ -374,10 +414,48 @@ async fn dispatch_request_common<H: Handler>(
             &handler.handle_sasl_handshake(&ctx, req).await,
         ),
         Request::SaslAuthenticate(_, req) => {
-            // Track SASL auth result
+            // Track SASL auth result. We must extract the principal from the
+            // wire bytes BEFORE moving `req` into the handler so the gate
+            // (and downstream authorizer) can attribute future requests to
+            // a real identity (audit S2). For PLAIN that's `\0user\0pass`;
+            // for unsupported mechanisms we fall back to None and the
+            // dispatcher treats the connection as anonymous.
+            //
+            // SCRAM-SHA-256 (audit P0-3) is multi-step: the first
+            // round-trip returns `error_code = None` but the handshake
+            // isn't done yet. The cluster handler signals this via
+            // `take_sasl_post_auth`, which we consult before flipping the
+            // gate.
+            let plain_principal = principal_from_sasl_plain(&req.auth_bytes);
             let response = handler.handle_sasl_authenticate(&ctx, req).await;
+            let post = handler.take_sasl_post_auth(client_addr).await;
             auth_result = if response.error_code == KafkaCode::None {
-                AuthResult::Success
+                match post {
+                    Some(p) if p.complete => {
+                        auth_gate.authenticated = true;
+                        if let Some(principal) = p.principal {
+                            auth_gate.principal = Some(principal);
+                        } else if let Some(p) = plain_principal {
+                            auth_gate.principal = Some(p);
+                        }
+                        AuthResult::Success
+                    }
+                    Some(_) => {
+                        // Intermediate SCRAM step — keep the gate closed,
+                        // the client will send another SaslAuthenticate
+                        // and we'll re-evaluate then.
+                        AuthResult::NotAuth
+                    }
+                    None => {
+                        // Single-step PLAIN (no override): treat success
+                        // the same as the original behavior.
+                        auth_gate.authenticated = true;
+                        if let Some(p) = plain_principal {
+                            auth_gate.principal = Some(p);
+                        }
+                        AuthResult::Success
+                    }
+                }
             } else {
                 AuthResult::Failure
             };
@@ -413,12 +491,78 @@ async fn dispatch_request_common<H: Handler>(
     (result, auth_result)
 }
 
+/// Connection-level SASL gate state (audit S1 scaffold).
+///
+/// Tracks per-connection authentication so `dispatch_request_common` can
+/// reject every non-handshake API key when `sasl_required` is true and the
+/// client has not yet completed a SaslAuthenticate exchange. Without this
+/// gate the server still answers Produce/Fetch/Metadata/Admin requests on
+/// the same socket regardless of any subsequent SASL handshake.
+///
+/// Always-on (not feature-gated): when the `sasl` feature is off the
+/// `required` flag stays false and this is a free no-op.
+///
+/// Also carries the authenticated principal (audit S2). This is what the
+/// authorizer keys against — so flipping `authenticated` without writing
+/// the principal would let through every API on the connection. ACL
+/// enforcement consults `principal` after the gate, defaulting to
+/// `User:ANONYMOUS` when SASL is not required.
+#[derive(Debug, Clone, Default)]
+pub struct AuthGate {
+    /// True if a SaslAuthenticate succeeded on this connection.
+    pub authenticated: bool,
+    /// True if the cluster config requires SASL on the wire. Set from
+    /// `ClusterConfig::sasl_required` at connection-accept time.
+    pub required: bool,
+    /// The authenticated principal in `User:<name>` form, if any. `None`
+    /// before the first successful SaslAuthenticate; the dispatcher promotes
+    /// it to `User:ANONYMOUS` for downstream authz when the gate is off.
+    pub principal: Option<String>,
+}
+
+impl AuthGate {
+    /// Should we allow this API key without authentication?
+    /// ApiVersions, SaslHandshake, and SaslAuthenticate are part of the
+    /// connection-setup protocol clients run before they have credentials,
+    /// so they bypass the gate. Everything else requires auth when the gate
+    /// is enabled.
+    fn allows_pre_auth(api_key: crate::server::request::ApiKey) -> bool {
+        use crate::server::request::ApiKey;
+        matches!(
+            api_key,
+            ApiKey::ApiVersions | ApiKey::SaslHandshake | ApiKey::SaslAuthenticate
+        )
+    }
+}
+
+/// Best-effort principal extraction from a SASL PLAIN auth payload.
+///
+/// PLAIN's wire format is `[authzid] \0 authcid \0 password`. We treat
+/// `authcid` (the actual login name) as the principal. SCRAM and other
+/// mechanisms aren't implemented yet — for those this returns `None` and
+/// the dispatcher leaves the principal slot empty, which causes authz to
+/// fall through to `User:ANONYMOUS`.
+fn principal_from_sasl_plain(auth_bytes: &[u8]) -> Option<String> {
+    let mut parts = auth_bytes.splitn(3, |b| *b == 0);
+    let _authzid = parts.next()?;
+    let authcid = parts.next()?;
+    if authcid.is_empty() {
+        return None;
+    }
+    let username = std::str::from_utf8(authcid).ok()?;
+    Some(format!("User:{}", username))
+}
+
 /// A client connection to the Kafka server.
 pub struct ClientConnection {
     stream: TcpStream,
     addr: SocketAddr,
     /// Rate limiter for auth failures (optional for backwards compat)
     rate_limiter: Option<Arc<AuthRateLimiter>>,
+    /// Connection-level SASL gate. Defaults to "not required" so existing
+    /// deployments continue to work; set `required=true` from config when
+    /// SASL is required cluster-wide.
+    auth_gate: AuthGate,
 }
 
 impl ClientConnection {
@@ -428,6 +572,7 @@ impl ClientConnection {
             stream,
             addr,
             rate_limiter: None,
+            auth_gate: AuthGate::default(),
         }
     }
 
@@ -444,7 +589,15 @@ impl ClientConnection {
             stream,
             addr,
             rate_limiter: Some(rate_limiter),
+            auth_gate: AuthGate::default(),
         }
+    }
+
+    /// Mark this connection as requiring SASL before any non-handshake API
+    /// is served. The server's accept loop calls this when
+    /// `ClusterConfig::sasl_required` is true.
+    pub fn require_sasl(&mut self) {
+        self.auth_gate.required = true;
     }
 
     /// Record an auth failure for rate limiting.
@@ -477,6 +630,9 @@ impl ClientConnection {
     }
 
     async fn handle_requests_inner<H: Handler>(&mut self, handler: Arc<H>) -> Result<()> {
+        // Per-request read budget; covers both the wait-for-first-byte
+        // (effectively the inter-request idle window — slowloris bound) and
+        // the in-flight read time.
         let read_timeout = Duration::from_secs(DEFAULT_REQUEST_READ_TIMEOUT_SECS);
         let handler_timeout = Duration::from_secs(DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS);
 
@@ -610,9 +766,9 @@ impl ClientConnection {
     /// Dispatch a request to the appropriate handler.
     ///
     /// Tracks SASL authentication failures for rate limiting via AuthRateLimited trait.
-    async fn dispatch_request<H: Handler>(&self, handler: &Arc<H>, data: Bytes) -> Result<Vec<u8>> {
+    async fn dispatch_request<H: Handler>(&mut self, handler: &Arc<H>, data: Bytes) -> Result<Vec<u8>> {
         let (result, auth_result) =
-            dispatch_request_common(handler.as_ref(), data, self.addr, "plain").await;
+            dispatch_request_common(handler.as_ref(), data, self.addr, "plain", &mut self.auth_gate).await;
 
         // Track auth result for rate limiting (unified via trait)
         self.record_auth_result(auth_result).await;
@@ -629,25 +785,45 @@ impl ClientConnection {
             "Writing response"
         );
 
+        let write_deadline = Duration::from_secs(DEFAULT_REQUEST_WRITE_TIMEOUT_SECS);
         let mut bytes_written = 0;
 
-        while bytes_written < response.len() {
-            self.stream
-                .writable()
-                .await
-                .map_err(|e| Error::IoError(e.kind()))?;
+        let result = timeout(write_deadline, async {
+            while bytes_written < response.len() {
+                self.stream
+                    .writable()
+                    .await
+                    .map_err(|e| Error::IoError(e.kind()))?;
 
-            match self.stream.try_write(&response[bytes_written..]) {
-                Ok(n) => {
-                    bytes_written += n;
-                    tracing::trace!("Wrote {} bytes to {}", n, self.addr);
+                match self.stream.try_write(&response[bytes_written..]) {
+                    Ok(n) => {
+                        bytes_written += n;
+                        tracing::trace!("Wrote {} bytes to {}", n, self.addr);
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(Error::IoError(e.kind()));
+                    }
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(Error::IoError(e.kind()));
-                }
+            }
+            Ok::<(), Error>(())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                tracing::warn!(
+                    client = %self.addr,
+                    bytes_written,
+                    response_len = response.len(),
+                    timeout_secs = DEFAULT_REQUEST_WRITE_TIMEOUT_SECS,
+                    "Response write timed out (slow / non-reading client)"
+                );
+                return Err(Error::MissingData("Response write timeout".to_owned()));
             }
         }
 
@@ -678,6 +854,9 @@ pub struct TlsClientConnection {
     addr: SocketAddr,
     /// Rate limiter for auth failures (optional for backwards compat)
     rate_limiter: Option<Arc<AuthRateLimiter>>,
+    /// Connection-level SASL gate (mirrors `ClientConnection`). The TLS
+    /// listener uses the same authz/authn machinery.
+    auth_gate: AuthGate,
 }
 
 #[cfg(feature = "tls")]
@@ -689,6 +868,7 @@ impl TlsClientConnection {
             stream,
             addr,
             rate_limiter: None,
+            auth_gate: AuthGate::default(),
         }
     }
 
@@ -705,7 +885,14 @@ impl TlsClientConnection {
             stream,
             addr,
             rate_limiter: Some(rate_limiter),
+            auth_gate: AuthGate::default(),
         }
+    }
+
+    /// Mark this connection as requiring SASL before any non-handshake API
+    /// is served. Mirrors `ClientConnection::require_sasl`.
+    pub fn require_sasl(&mut self) {
+        self.auth_gate.required = true;
     }
 
     /// Handle requests from this connection until closed.
@@ -822,9 +1009,9 @@ impl TlsClientConnection {
     /// Dispatch a request to the appropriate handler.
     ///
     /// Tracks SASL authentication failures for rate limiting via AuthRateLimited trait.
-    async fn dispatch_request<H: Handler>(&self, handler: &Arc<H>, data: Bytes) -> Result<Vec<u8>> {
+    async fn dispatch_request<H: Handler>(&mut self, handler: &Arc<H>, data: Bytes) -> Result<Vec<u8>> {
         let (result, auth_result) =
-            dispatch_request_common(handler.as_ref(), data, self.addr, "tls").await;
+            dispatch_request_common(handler.as_ref(), data, self.addr, "tls", &mut self.auth_gate).await;
 
         // Track auth result for rate limiting (unified via trait)
         self.record_auth_result(auth_result).await;
@@ -834,15 +1021,32 @@ impl TlsClientConnection {
 
     /// Write a response to the TLS connection.
     async fn write_response(&mut self, response: &[u8]) -> Result<()> {
-        self.stream
-            .write_all(response)
-            .await
-            .map_err(|e| Error::IoError(e.kind()))?;
-
-        self.stream
-            .flush()
-            .await
-            .map_err(|e| Error::IoError(e.kind()))?;
+        let write_deadline = Duration::from_secs(DEFAULT_REQUEST_WRITE_TIMEOUT_SECS);
+        match timeout(write_deadline, async {
+            self.stream
+                .write_all(response)
+                .await
+                .map_err(|e| Error::IoError(e.kind()))?;
+            self.stream
+                .flush()
+                .await
+                .map_err(|e| Error::IoError(e.kind()))?;
+            Ok::<(), Error>(())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                tracing::warn!(
+                    client = %self.addr,
+                    response_len = response.len(),
+                    timeout_secs = DEFAULT_REQUEST_WRITE_TIMEOUT_SECS,
+                    "TLS response write timed out (slow / non-reading client)"
+                );
+                return Err(Error::MissingData("Response write timeout".to_owned()));
+            }
+        }
 
         tracing::trace!("Wrote {} bytes to TLS client {}", response.len(), self.addr);
         Ok(())

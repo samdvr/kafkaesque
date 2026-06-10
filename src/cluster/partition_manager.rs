@@ -211,6 +211,13 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         &self.coordinator
     }
 
+    /// The local rebalance coordinator, if fast failover or auto-balancing
+    /// is enabled. Used by the cluster handler to wire broker heartbeats
+    /// from the Raft state machine into the failure detector (audit P1-7).
+    pub fn rebalance_coordinator(&self) -> Option<&Arc<RebalanceCoordinator>> {
+        self.rebalance_coordinator.as_ref()
+    }
+
     /// Get the cached lease expiry time for a partition (test-only).
     ///
     /// Returns the `Instant` when the cached lease expires, or `None` if not cached.
@@ -369,17 +376,24 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                                 // Clear entire lease cache when entering zombie mode
                                 lease_cache.clear();
 
-                                let partitions: Vec<_> = partition_states
-                                    .iter()
-                                    .filter_map(|entry| {
-                                        if entry.value().is_owned() {
-                                            Some(entry.key().clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                for (topic, partition) in partitions {
+                                // Snapshot partitions AND their open stores in one
+                                // pass so we can close them after dropping the
+                                // map. Just removing entries leaves SlateDB
+                                // memtables, S3 connections, and background
+                                // compaction tasks alive on the dead writer
+                                // (B10 in audit.md).
+                                let mut owned: Vec<(PartitionKey, Option<Arc<PartitionStore>>)> =
+                                    Vec::new();
+                                for entry in partition_states.iter() {
+                                    if entry.value().is_owned() {
+                                        owned.push((entry.key().clone(), entry.value().store()));
+                                    }
+                                }
+                                for (key, _) in &owned {
+                                    partition_states.remove(key);
+                                }
+                                for (key, store_opt) in owned {
+                                    let (topic, partition) = key;
                                     warn!(
                                         topic = &*topic,
                                         partition, "Releasing partition due to zombie mode"
@@ -388,6 +402,16 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                                         coordinator.release_partition(&topic, partition).await
                                     {
                                         error!(topic = &*topic, partition, error = %e, "Failed to release partition during zombie mode");
+                                    }
+                                    if let Some(store) = store_opt {
+                                        if let Err(e) = store.close().await {
+                                            warn!(
+                                                topic = &*topic,
+                                                partition,
+                                                error = %e,
+                                                "Failed to close partition store on zombie entry"
+                                            );
+                                        }
                                     }
                                 }
                                 super::metrics::record_coordinator_failure("zombie_mode");
@@ -473,10 +497,24 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                             );
                             // Invalidate lease cache for this partition
                             lease_cache.remove(&(Arc::clone(&topic), partition));
-                            // Remove from partition_states to reject further operations
-                            if let Some((key, _)) =
+                            // Remove from partition_states to reject further operations,
+                            // and close the underlying SlateDB handle so its memtables,
+                            // S3 connections, and background tasks are released
+                            // (B10 in audit.md). Without this the new owner relies
+                            // on SlateDB-internal fencing while we leak resources.
+                            if let Some((key, prev_state)) =
                                 partition_states.remove(&(Arc::clone(&topic), partition))
                             {
+                                if let Some(store) = prev_state.store() {
+                                    if let Err(e) = store.close().await {
+                                        warn!(
+                                            topic = &*key.0,
+                                            partition = key.1,
+                                            error = %e,
+                                            "Failed to close partition store after lease loss"
+                                        );
+                                    }
+                                }
                                 info!(
                                     topic = &*key.0,
                                     partition = key.1,
@@ -910,6 +948,17 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         topic: &str,
         partition: i32,
     ) -> SlateDBResult<Arc<PartitionStore>> {
+        // Reject reads in zombie mode for the same reason produce does:
+        // we've lost cluster coordination, so any data we serve may already
+        // belong to another owner who has advanced the log. Without this
+        // check fetch returned stale data while produce was already
+        // rejecting (B10 in audit.md).
+        if self.is_zombie() {
+            return Err(SlateDBError::NotOwned {
+                topic: topic.to_string(),
+                partition,
+            });
+        }
         self.get_store(topic, partition)
             .await
             .ok_or_else(|| SlateDBError::NotOwned {
@@ -1052,9 +1101,14 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         if self.owns_partition(topic, partition).await {
             self.release_partition(topic, partition).await?;
         }
-        let path_prefix = format!("{}/topic-{}/partition-{}", self.base_path, topic, partition);
+        // The object_store is already configured with `base_path` as its
+        // prefix (see PartitionStore::open / ObjectStoreBuilder), so we list
+        // and delete using the same relative prefix that the store opens at.
+        // Prepending `base_path` here would double the prefix and silently
+        // delete nothing — leaving the SST/WAL objects in S3 forever.
+        let path_prefix = format!("topic-{}/partition-{}", topic, partition);
         let prefix = ObjectPath::from(path_prefix.as_str());
-        info!(topic, partition, path = %path_prefix, "Deleting partition data from object store");
+        info!(topic, partition, path = %path_prefix, base_path = %self.base_path, "Deleting partition data from object store");
         let objects: Vec<_> = self
             .object_store
             .list(Some(&prefix))

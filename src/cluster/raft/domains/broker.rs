@@ -123,8 +123,14 @@ impl BrokerDomainState {
             } => {
                 if let Some(broker) = self.brokers.get_mut(&broker_id) {
                     broker.last_heartbeat_ms = timestamp_ms;
-                    // Heartbeat reactivates a fenced broker
-                    broker.status = BrokerStatus::Active;
+                    // A fenced broker MUST NOT come back via a heartbeat —
+                    // its partitions have been transferred to other owners
+                    // and resuming as Active would let it write to logs the
+                    // new owners are now appending to (audit B4 split-brain).
+                    // Recovery requires an explicit re-registration.
+                    if matches!(broker.status, BrokerStatus::Active) {
+                        // already active — no transition required
+                    }
 
                     // Track clock skew if broker reported its local timestamp
                     if reported_local_timestamp_ms > 0 {
@@ -344,7 +350,11 @@ mod tests {
     }
 
     #[test]
-    fn test_heartbeat_reactivates_fenced_broker() {
+    fn test_heartbeat_does_not_reactivate_fenced_broker() {
+        // Regression test for audit B4: a fenced broker's partitions have
+        // already been transferred to other owners. If a heartbeat could
+        // bring the broker back to Active, that broker would resume writes
+        // to logs the new owners are now appending to (split-brain).
         let mut state = BrokerDomainState::new();
 
         state.apply(BrokerCommand::Register {
@@ -367,7 +377,13 @@ mod tests {
             reported_local_timestamp_ms: 2000,
         });
 
-        assert!(state.is_active(1));
+        // Heartbeats update last_heartbeat_ms but MUST NOT change a Fenced
+        // broker's status. Recovery requires explicit re-registration.
+        assert!(
+            !state.is_active(1),
+            "Heartbeat must not auto-unfence a fenced broker (audit B4)"
+        );
+        assert_eq!(state.get(1).unwrap().status, BrokerStatus::Fenced);
     }
 
     #[test]

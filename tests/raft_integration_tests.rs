@@ -40,7 +40,18 @@ fn next_port() -> u16 {
 }
 
 /// Create a test configuration for a Raft node.
+///
+/// Uses a freshly-generated `tempfile::TempDir` for the on-disk WAL and
+/// snapshot dirs (audit P0-6). The directory is leaked into the system temp
+/// folder via `into_path()` so its lifetime isn't tied to this function's
+/// scope — tests still find their files but no two test invocations
+/// collide. Without this, the B1 WAL persistence (committed vote and log
+/// entries) made every test after the first see leftover state and panic
+/// in `initialize_cluster` with "not allowed to initialize due to current
+/// raft state".
 fn test_config(node_id: u64, port: u16) -> RaftConfig {
+    let tmp = tempfile::tempdir().expect("create test temp dir");
+    let root = tmp.keep();
     RaftConfig {
         node_id,
         broker_id: node_id as i32,
@@ -48,8 +59,8 @@ fn test_config(node_id: u64, port: u16) -> RaftConfig {
         port: 9092 + node_id as i32,
         raft_addr: format!("127.0.0.1:{}", port),
         cluster_members: vec![],
-        raft_log_dir: format!("/tmp/kafkaesque-test-{}/log", node_id),
-        snapshot_dir: format!("/tmp/kafkaesque-test-{}/snapshots", node_id),
+        raft_log_dir: root.join("log").to_string_lossy().into_owned(),
+        snapshot_dir: root.join("snapshots").to_string_lossy().into_owned(),
         // Fast timeouts for testing
         heartbeat_interval: Duration::from_millis(50),
         election_timeout_min: Duration::from_millis(150),
@@ -67,6 +78,8 @@ fn test_config(node_id: u64, port: u16) -> RaftConfig {
         max_partitions_per_topic: 100,
         max_pending_proposals: 100,
         proposal_timeout: Duration::from_secs(5),
+        auth_keys: std::sync::Arc::new(kafkaesque::cluster::raft::RaftAuthKeys::default()),
+        tls: None,
     }
 }
 
@@ -1608,6 +1621,24 @@ async fn test_consumer_group_validate_member_for_commit() {
     // Join group
     let (generation, member_id, _, _, _) = coordinator
         .join_group("validate-group", "", &[1, 2, 3], 30000)
+        .await
+        .unwrap();
+
+    // Audit P1-9: validate_member_for_commit now also requires the group
+    // to be Stable. A fresh JoinGroup leaves the group in PreparingRebalance
+    // until SyncGroup lands; drive the group through one cycle so Success
+    // is reachable.
+    let _ = coordinator
+        .set_assignments_atomically(
+            "validate-group",
+            &member_id,
+            generation,
+            &[(member_id.clone(), vec![])],
+        )
+        .await
+        .unwrap();
+    let _ = coordinator
+        .complete_rebalance("validate-group", generation)
         .await
         .unwrap();
 

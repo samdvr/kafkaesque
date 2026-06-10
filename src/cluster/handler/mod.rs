@@ -32,7 +32,7 @@ use crate::server::{Handler, RequestContext};
 use crate::types::BrokerId;
 
 use super::config::ClusterConfig;
-use super::error::SlateDBResult;
+use super::error::{SlateDBError, SlateDBResult};
 use super::object_store::create_object_store;
 use super::partition_manager::PartitionManager;
 use super::raft::{RaftConfig, RaftCoordinator, request_cluster_join};
@@ -92,6 +92,41 @@ pub struct SlateDBClusterHandler {
 
     /// Runtime handle for spawning data plane tasks (fire-and-forget produce).
     pub(crate) data_runtime: tokio::runtime::Handle,
+
+    /// Whether SASL must complete before any non-handshake API key is served.
+    /// Mirrors `ClusterConfig::sasl_required`. The connection-accept loop
+    /// reads this via `Handler::sasl_required` and arms the per-connection
+    /// `AuthGate` (audit S1 scaffold).
+    pub(crate) sasl_required: bool,
+
+    /// Authorizer used by the per-handler ACL checks (audit S2). Always
+    /// `Some` — set to `AllowAllAuthorizer` when ACL enforcement is off so
+    /// the call sites don't need to special-case the disabled path.
+    pub(crate) authorizer: Arc<dyn crate::cluster::authorizer::Authorizer>,
+
+    /// Broker-wide notify that fires after every successful append (audit
+    /// P0-7). Fetch handlers waiting under `max_wait_ms` / `min_bytes`
+    /// listen on this; producing on any partition wakes them. We use a
+    /// single broker-wide notify rather than per-partition because a
+    /// long-poll fetch typically targets multiple partitions and selecting
+    /// across N notifies is significantly more code for no real benefit —
+    /// the wakeup just re-checks HWM, which is cheap.
+    pub(crate) hwm_advanced: Arc<tokio::sync::Notify>,
+
+    /// SASL provider (audit S1). Holds the in-memory user table when the
+    /// `sasl` feature is compiled in. `None` when the feature is off.
+    #[cfg(feature = "sasl")]
+    pub(crate) sasl_provider: Option<Arc<crate::cluster::sasl_provider::SaslProvider>>,
+
+    /// Pending SASL post-authenticate state, keyed by client `SocketAddr`
+    /// (audit P0-3). The cluster handler stashes the result of the most
+    /// recent `handle_sasl_authenticate` here so the connection
+    /// dispatcher's `take_sasl_post_auth` can read out whether the
+    /// handshake is complete and what principal was authenticated. Used
+    /// only by SCRAM today (PLAIN is single-step) but always populated for
+    /// uniformity.
+    #[cfg(feature = "sasl")]
+    pub(crate) sasl_post_auth: dashmap::DashMap<std::net::SocketAddr, crate::server::SaslPostAuth>,
 }
 
 impl SlateDBClusterHandler {
@@ -160,7 +195,10 @@ impl SlateDBClusterHandler {
 
         // Initialize cluster:
         // - Skip if cluster is already initialized (restart with persisted state)
-        // - Single node (no peers): always initialize on fresh start
+        // - Single node (no peers): require explicit RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE
+        //   to permit single-node bootstrap. Without this gate, every fresh node
+        //   on every host with no RAFT_PEERS happily forms its own one-node
+        //   cluster against the same object-store prefix (B8 in audit.md).
         // - Multi-node: only the node with the lowest broker_id initializes on fresh start
         let should_initialize = if already_initialized {
             info!(
@@ -170,7 +208,25 @@ impl SlateDBClusterHandler {
             false
         } else {
             match &config.raft_peers {
-                None => true, // Single node
+                None => {
+                    let allow_single = std::env::var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE")
+                        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                        .unwrap_or(false);
+                    if !allow_single {
+                        return Err(SlateDBError::Config(
+                            "Refusing to bootstrap: RAFT_PEERS is unset and \
+                             RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE is not enabled. \
+                             Set RAFT_PEERS for multi-node deployments, or set \
+                             RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE=true if a one-node \
+                             cluster is intended (e.g. local development). \
+                             Without this gate two fresh brokers can race to \
+                             form independent one-node clusters against the same \
+                             object store."
+                                .to_string(),
+                        ));
+                    }
+                    true
+                }
                 Some(peers) => {
                     // Parse peer IDs from format "node_id=host:port,node_id=host:port,..."
                     let peer_ids: Vec<i32> = peers
@@ -229,7 +285,15 @@ impl SlateDBClusterHandler {
                         );
 
                         // Send join request to the peer (who will forward to leader if needed)
-                        match request_cluster_join(peer_addr, node_id, &raft_addr).await {
+                        match request_cluster_join(
+                            peer_addr,
+                            node_id,
+                            &raft_addr,
+                            &raft_config.auth_keys,
+                            raft_config.tls.as_ref(),
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 info!(
                                     broker_id = config.broker_id,
@@ -251,10 +315,17 @@ impl SlateDBClusterHandler {
                 }
 
                 if !joined {
-                    warn!(
-                        broker_id = config.broker_id,
-                        "Could not join cluster via any peer, will retry during operation"
-                    );
+                    // Per audit B8: best-effort, warn-only joins let a node
+                    // run as a non-member of any cluster, then later get
+                    // misclassified as a fresh init candidate. Fail closed —
+                    // the operator must restart once the cluster is reachable.
+                    return Err(SlateDBError::Config(format!(
+                        "Failed to join Raft cluster: tried all peers in \
+                         RAFT_PEERS={:?} and none accepted the join request. \
+                         Verify the seed peers are running and routable, then \
+                         restart this broker.",
+                        peers
+                    )));
                 }
             }
         }
@@ -274,6 +345,18 @@ impl SlateDBClusterHandler {
             runtime_handles.control.clone(),
         ));
 
+        // Audit P1-7: install a heartbeat hook on the Raft state machine so
+        // every applied broker heartbeat refreshes the local failure
+        // detector. Without this, fast-failover relied on lease-TTL expiry
+        // (~60s) instead of the configured ~2.5s heartbeat budget.
+        if let Some(rebalance_coord) = partition_manager.rebalance_coordinator() {
+            let rc = rebalance_coord.clone();
+            let sm_arc = coordinator.node().state_machine();
+            sm_arc.read().await.set_heartbeat_hook(Arc::new(move |broker_id| {
+                rc.record_heartbeat(broker_id);
+            }));
+        }
+
         // Start background tasks
         partition_manager.start().await;
 
@@ -287,6 +370,63 @@ impl SlateDBClusterHandler {
             "SlateDB cluster handler initialized with Raft coordination"
         );
 
+        // Pick the authorizer (audit S2). When ACL enforcement is off we
+        // route every request through `AllowAllAuthorizer` so the call sites
+        // can be unconditional. When on, the Raft-backed authorizer reads
+        // bindings from the local state machine and consults the configured
+        // super-user list.
+        let authorizer: Arc<dyn crate::cluster::authorizer::Authorizer> = if config.acl_enabled {
+            // Bootstrap the ACL state from a file on the leader. Followers
+            // pick up the bindings via Raft replication. Idempotent: a
+            // restart re-applies the same file (CreateAcls deduplicates).
+            if let Some(path) = config.acl_bootstrap_file.as_ref() {
+                if coordinator.is_leader().await {
+                    match std::fs::read_to_string(path) {
+                        Ok(contents) => {
+                            match serde_json::from_str::<
+                                Vec<crate::cluster::raft::AclBinding>,
+                            >(&contents)
+                            {
+                                Ok(bindings) => {
+                                    let n = bindings.len();
+                                    match coordinator.create_acls(bindings).await {
+                                        Ok(created) => info!(
+                                            file = %path,
+                                            entries = n,
+                                            new_bindings = created,
+                                            "Bootstrapped ACL bindings from file"
+                                        ),
+                                        Err(e) => warn!(
+                                            file = %path,
+                                            error = %e,
+                                            "Failed to apply ACL bootstrap"
+                                        ),
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    file = %path,
+                                    error = %e,
+                                    "Failed to parse ACL bootstrap file"
+                                ),
+                            }
+                        }
+                        Err(e) => warn!(
+                            file = %path,
+                            error = %e,
+                            "Failed to read ACL bootstrap file"
+                        ),
+                    }
+                }
+            }
+            Arc::new(crate::cluster::authorizer::RaftAclAuthorizer::new(
+                coordinator.clone(),
+                config.super_users.clone(),
+                config.acl_deny_by_default,
+            ))
+        } else {
+            Arc::new(crate::cluster::authorizer::AllowAllAuthorizer)
+        };
+
         Ok(Self {
             partition_manager,
             coordinator,
@@ -299,6 +439,15 @@ impl SlateDBClusterHandler {
             max_concurrent_partition_reads: config.max_concurrent_partition_reads,
             topic_name_cache: Cache::new(10_000),
             data_runtime: runtime_handles.data,
+            sasl_required: config.sasl_required,
+            authorizer,
+            hwm_advanced: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "sasl")]
+            sasl_provider: crate::cluster::sasl_provider::SaslProvider::from_config(&config)
+                .await
+                .map(Arc::new),
+            #[cfg(feature = "sasl")]
+            sasl_post_auth: dashmap::DashMap::new(),
         })
     }
 
@@ -318,6 +467,15 @@ impl SlateDBClusterHandler {
     /// `true` if the broker is in zombie mode and writes should be rejected.
     pub fn is_zombie(&self) -> bool {
         self.partition_manager.is_zombie()
+    }
+
+    /// Get the underlying zombie-mode state.
+    ///
+    /// Used to wire the K8s readiness probe to the real flag the
+    /// `PartitionManager` toggles. Returning a separate `Arc<AtomicBool>` here
+    /// would yield a flag that is never updated — see B12 in audit.md.
+    pub fn zombie_state(&self) -> Arc<crate::cluster::zombie_mode::ZombieModeState> {
+        self.partition_manager.zombie_state()
     }
 
     /// Get a cached Arc<str> for a topic name.
@@ -405,7 +563,26 @@ impl SlateDBClusterHandler {
         &self,
         topic: &str,
         partition: ProducePartitionData,
-        _acks: i16,
+        acks: i16,
+    ) -> ProducePartitionResponse {
+        // Audit P1-4: time the full per-partition produce path so the
+        // pre-existing PRODUCE_DURATION histogram is actually populated.
+        let start = std::time::Instant::now();
+        let response = self.produce_to_partition_inner(topic, partition, acks).await;
+        let status = if response.error_code == KafkaCode::None {
+            "success"
+        } else {
+            "error"
+        };
+        super::metrics::record_produce_latency(topic, status, start.elapsed().as_secs_f64());
+        response
+    }
+
+    async fn produce_to_partition_inner(
+        &self,
+        topic: &str,
+        partition: ProducePartitionData,
+        acks: i16,
     ) -> ProducePartitionResponse {
         // Reject writes when in zombie mode
         if self.partition_manager.is_zombie() {
@@ -477,11 +654,25 @@ impl SlateDBClusterHandler {
             }
         }
 
+        // For acks>=1 ("leader" / "all") Kafka clients are guaranteed durability
+        // once the produce response returns success. Use the durable write path.
+        // acks=0 was already short-circuited in handle_produce.
+        let append_result = if acks == 0 {
+            store.append_batch(&partition.records).await
+        } else {
+            store.append_batch_durable(&partition.records).await
+        };
+
         // Append the batch
-        match store.append_batch(&partition.records).await {
+        match append_result {
             Ok(base_offset) => {
                 let bytes = partition.records.len() as u64;
                 super::metrics::record_produce(topic, partition.partition_index, 1, bytes);
+
+                // Wake any fetch handlers blocked under max_wait_ms / min_bytes
+                // (audit P0-7). Cheap broadcast — `Notify::notify_waiters` is
+                // a no-op when no one is waiting.
+                self.hwm_advanced.notify_waiters();
 
                 ProducePartitionResponse {
                     partition_index: partition.partition_index,
@@ -516,6 +707,115 @@ impl SlateDBClusterHandler {
 
 #[async_trait]
 impl Handler for SlateDBClusterHandler {
+    fn sasl_required(&self) -> bool {
+        self.sasl_required
+    }
+
+    /// Handle SaslHandshake by advertising the SaslProvider's mechanism list
+    /// when the `sasl` feature is built in. Audit S1: previously the broker
+    /// always rejected with `UnsupportedSaslMechanism` because no override
+    /// of this method existed; SASL was only ever scaffolding.
+    #[cfg(feature = "sasl")]
+    async fn handle_sasl_handshake(
+        &self,
+        _ctx: &RequestContext,
+        request: SaslHandshakeRequestData,
+    ) -> SaslHandshakeResponseData {
+        let Some(provider) = &self.sasl_provider else {
+            return SaslHandshakeResponseData {
+                error_code: KafkaCode::UnsupportedSaslMechanism,
+                mechanisms: vec![],
+            };
+        };
+        let mechanisms: Vec<String> = provider.supported_mechanisms().to_vec();
+        let mech_upper = request.mechanism.to_uppercase();
+        let supported = mechanisms.iter().any(|m| m.eq_ignore_ascii_case(&mech_upper));
+        SaslHandshakeResponseData {
+            error_code: if supported {
+                KafkaCode::None
+            } else {
+                KafkaCode::UnsupportedSaslMechanism
+            },
+            mechanisms,
+        }
+    }
+
+    /// Handle SaslAuthenticate via the SaslProvider when the `sasl` feature
+    /// is on. Successful authentication flips the connection-level
+    /// `AuthGate` in `dispatch_request_common` (audit S1).
+    ///
+    /// Mechanism is sniffed from the wire bytes (audit P0-3): a SCRAM
+    /// session in progress for this connection wins; otherwise a leading
+    /// `n,,` / `y,,` / `c=` indicates SCRAM, while a leading NUL byte
+    /// indicates PLAIN. The post-auth state for this connection is
+    /// stashed in `self.sasl_post_auth` so the dispatcher knows whether
+    /// the handshake is complete.
+    #[cfg(feature = "sasl")]
+    async fn handle_sasl_authenticate(
+        &self,
+        ctx: &RequestContext,
+        request: SaslAuthenticateRequestData,
+    ) -> SaslAuthenticateResponseData {
+        use crate::server::SaslPostAuth;
+        let Some(provider) = &self.sasl_provider else {
+            self.sasl_post_auth.insert(
+                ctx.client_addr,
+                SaslPostAuth { principal: None, complete: false },
+            );
+            return SaslAuthenticateResponseData {
+                error_code: KafkaCode::SaslAuthenticationFailed,
+                error_message: Some("SASL not configured".to_string()),
+                auth_bytes: bytes::Bytes::new(),
+            };
+        };
+
+        let mechanism = pick_sasl_mechanism(provider.has_scram_session(ctx.client_addr).await, &request.auth_bytes);
+        let (ok, principal, response_bytes) = provider
+            .authenticate_with_session(ctx.client_addr, mechanism, &request.auth_bytes)
+            .await;
+
+        // Decide whether the handshake is complete. SCRAM has two stages:
+        // the first call returns `ok=false, principal=None` even on the
+        // happy path (intermediate challenge), and the second returns
+        // `ok=true` with the principal. PLAIN is single-step.
+        let intermediate = !ok
+            && principal.is_none()
+            && !response_bytes.is_empty()
+            && !response_bytes.starts_with(b"e=");
+        self.sasl_post_auth.insert(
+            ctx.client_addr,
+            SaslPostAuth {
+                principal: principal.clone(),
+                complete: ok,
+            },
+        );
+
+        if ok || intermediate {
+            // Both happy-path final and intermediate use error_code=None
+            // per the Kafka SASL framing; the dispatcher tells them apart
+            // via `take_sasl_post_auth`.
+            SaslAuthenticateResponseData {
+                error_code: KafkaCode::None,
+                error_message: None,
+                auth_bytes: bytes::Bytes::from(response_bytes),
+            }
+        } else {
+            SaslAuthenticateResponseData {
+                error_code: KafkaCode::SaslAuthenticationFailed,
+                error_message: Some("Authentication failed".to_string()),
+                auth_bytes: bytes::Bytes::from(response_bytes),
+            }
+        }
+    }
+
+    #[cfg(feature = "sasl")]
+    async fn take_sasl_post_auth(
+        &self,
+        client_addr: std::net::SocketAddr,
+    ) -> Option<crate::server::SaslPostAuth> {
+        self.sasl_post_auth.remove(&client_addr).map(|(_k, v)| v)
+    }
+
     #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id))]
     async fn handle_metadata(
         &self,
@@ -552,7 +852,7 @@ impl Handler for SlateDBClusterHandler {
         offsets::handle_list_offsets(self, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id, key = %request.key))]
+    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id))]
     async fn handle_find_coordinator(
         &self,
         _ctx: &RequestContext,
@@ -561,76 +861,103 @@ impl Handler for SlateDBClusterHandler {
         groups::handle_find_coordinator(self, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id, group_id = %request.group_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id, group_id = %request.group_id))]
     async fn handle_join_group(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: JoinGroupRequestData,
     ) -> JoinGroupResponseData {
-        groups::handle_join_group(self, request).await
+        groups::handle_join_group(self, ctx, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id, group_id = %request.group_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id, group_id = %request.group_id))]
     async fn handle_sync_group(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: SyncGroupRequestData,
     ) -> SyncGroupResponseData {
-        groups::handle_sync_group(self, request).await
+        groups::handle_sync_group(self, ctx, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id, group_id = %request.group_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id, group_id = %request.group_id))]
     async fn handle_heartbeat(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: HeartbeatRequestData,
     ) -> HeartbeatResponseData {
-        groups::handle_heartbeat(self, request).await
+        groups::handle_heartbeat(self, ctx, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id, group_id = %request.group_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id, group_id = %request.group_id))]
     async fn handle_leave_group(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: LeaveGroupRequestData,
     ) -> LeaveGroupResponseData {
-        groups::handle_leave_group(self, request).await
+        groups::handle_leave_group(self, ctx, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id, group_id = %request.group_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id, group_id = %request.group_id))]
     async fn handle_offset_commit(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: OffsetCommitRequestData,
     ) -> OffsetCommitResponseData {
-        offsets::handle_offset_commit(self, request).await
+        offsets::handle_offset_commit(self, ctx, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id, group_id = %request.group_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id, group_id = %request.group_id))]
     async fn handle_offset_fetch(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: OffsetFetchRequestData,
     ) -> OffsetFetchResponseData {
-        offsets::handle_offset_fetch(self, request).await
+        offsets::handle_offset_fetch(self, ctx, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_describe_groups(
+        &self,
+        ctx: &RequestContext,
+        request: DescribeGroupsRequestData,
+    ) -> DescribeGroupsResponseData {
+        groups::handle_describe_groups(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_list_groups(
+        &self,
+        ctx: &RequestContext,
+        request: ListGroupsRequestData,
+    ) -> ListGroupsResponseData {
+        groups::handle_list_groups(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_delete_groups(
+        &self,
+        ctx: &RequestContext,
+        request: DeleteGroupsRequestData,
+    ) -> DeleteGroupsResponseData {
+        groups::handle_delete_groups(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
     async fn handle_create_topics(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: CreateTopicsRequestData,
     ) -> CreateTopicsResponseData {
-        admin::handle_create_topics(self, request).await
+        admin::handle_create_topics(self, ctx, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
     async fn handle_delete_topics(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: DeleteTopicsRequestData,
     ) -> DeleteTopicsResponseData {
-        admin::handle_delete_topics(self, request).await
+        admin::handle_delete_topics(self, ctx, request).await
     }
 
     #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id))]
@@ -640,6 +967,34 @@ impl Handler for SlateDBClusterHandler {
         request: InitProducerIdRequestData,
     ) -> InitProducerIdResponseData {
         producer_id::handle_init_producer_id(self, request).await
+    }
+}
+
+/// Pick the SASL mechanism for an incoming `auth_bytes` payload.
+///
+/// Kafka clients commit to a mechanism in `SaslHandshake` and the server
+/// is expected to remember it for the subsequent `SaslAuthenticate`
+/// requests, but our handler trait is intentionally stateless so we
+/// instead detect the mechanism from the bytes (audit P0-3):
+///
+/// - If a SCRAM session is in flight for this connection, the bytes are
+///   interpreted as SCRAM `client-final-message`, regardless of leading
+///   characters.
+/// - Otherwise leading `n,,` / `y,,` / `c=` is SCRAM `client-first-message`
+///   (RFC 5802 GS2 header).
+/// - Otherwise the message is PLAIN (`[authzid] \0 authcid \0 password`).
+#[cfg(feature = "sasl")]
+fn pick_sasl_mechanism(has_scram_session: bool, auth_bytes: &[u8]) -> &'static str {
+    if has_scram_session {
+        return "SCRAM-SHA-256";
+    }
+    if auth_bytes.starts_with(b"n,,")
+        || auth_bytes.starts_with(b"y,,")
+        || auth_bytes.starts_with(b"c=")
+    {
+        "SCRAM-SHA-256"
+    } else {
+        "PLAIN"
     }
 }
 

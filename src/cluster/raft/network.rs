@@ -1,12 +1,26 @@
 //! Network transport for Raft communication.
 //!
 //! This module provides the network layer for Raft RPCs between nodes.
-//! We use a simple TCP-based transport with bincode serialization.
+//! We use a simple TCP-based transport with bincode serialization. Every
+//! frame is HMAC-SHA256 signed (audit S3) — see `super::auth` for the wire
+//! format and key plumbing.
+//!
+//! When `RaftConfig.tls` is `Some` (audit P0-5), the underlying TCP socket
+//! is wrapped in a rustls `TlsStream` before any frame bytes flow. The
+//! HMAC layer remains in place on top — TLS adds peer identity (mTLS) and
+//! encryption, HMAC adds replay/integrity defense and stays cheap to verify
+//! even under TLS termination at a proxy. The wrapper enum
+//! [`MaybeTlsStreamServer`] / [`MaybeTlsStreamClient`] lets the same accept
+//! and connect code paths feed both plain and TLS sockets to the framing
+//! helpers (which are already generic over `AsyncRead`/`AsyncWrite`).
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use backon::Retryable;
 use openraft::BasicNode;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -14,12 +28,14 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
+use super::auth::{RaftAuthKeys, read_rpc_frame, write_rpc_frame};
 use super::commands::{CoordinationCommand, CoordinationResponse};
+use super::tls::RaftTlsConfig;
 use super::types::{RaftNodeId, TypeConfig};
 
 /// Timeout for RPC connection establishment.
@@ -46,15 +62,161 @@ const CIRCUIT_BREAKER_RESET_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum number of hops for forwarded requests to prevent loops.
 const MAX_FORWARD_HOPS: u8 = 3;
 
+/// Server-side Raft socket: either a plain TCP stream or a rustls
+/// `TlsStream` produced by `TlsAcceptor::accept`. Implements `AsyncRead` /
+/// `AsyncWrite` by forwarding to whichever variant is live, so the existing
+/// HMAC framing helpers (`read_rpc_frame` / `write_rpc_frame`) work over
+/// either transport unchanged.
+pub enum MaybeTlsStreamServer {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for MaybeTlsStreamServer {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTlsStreamServer {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Client-side counterpart to [`MaybeTlsStreamServer`]. Holds whatever
+/// `TlsConnector::connect` produced when TLS is configured, or a raw
+/// `TcpStream` otherwise. Used as the cached connection type on
+/// [`RaftNetworkConnection`] so reused outbound sockets keep their TLS
+/// session.
+pub enum MaybeTlsStreamClient {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for MaybeTlsStreamClient {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTlsStreamClient {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Establish an outbound Raft socket and apply TLS if configured. Set
+/// `TCP_NODELAY` on the underlying TCP stream before the TLS handshake so
+/// the small Raft frames don't sit in Nagle.
+async fn connect_raft(
+    addr: &str,
+    tls: Option<&RaftTlsConfig>,
+) -> std::io::Result<MaybeTlsStreamClient> {
+    let stream = timeout(RPC_CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Connection timeout to {}", addr),
+            )
+        })??;
+    stream.set_nodelay(true)?;
+
+    #[cfg(feature = "tls")]
+    {
+        if let Some(t) = tls {
+            let tls_stream = t
+                .connector
+                .connect(t.outbound_server_name(), stream)
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        format!("Raft TLS handshake to {} failed: {}", addr, e),
+                    )
+                })?;
+            return Ok(MaybeTlsStreamClient::Tls(Box::new(tls_stream)));
+        }
+    }
+    #[cfg(not(feature = "tls"))]
+    let _ = tls;
+
+    Ok(MaybeTlsStreamClient::Plain(stream))
+}
+
 /// Message types for Raft RPC.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum RaftRpcMessage {
     AppendEntries(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<RaftNodeId>),
     InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
-    /// Client write request (forwarded from non-leader to leader)
-    /// Legacy variant without term validation - kept for backwards compatibility
-    ClientWrite(CoordinationCommand),
     /// Client write request with term validation to prevent stale leader forwarding.
     ///
     /// This prevents the race condition where:
@@ -69,7 +231,13 @@ pub enum RaftRpcMessage {
         /// Number of hops this request has taken. Used to prevent infinite loops.
         forward_hops: u8,
     },
-    /// Request to join the cluster as a new member
+    /// Request to join the cluster as a new member.
+    ///
+    /// Frames carrying this variant are signed with the join key (or the
+    /// cluster secret as a fallback) — see `super::auth`. The server further
+    /// rejects any *other* variant carried under the join purpose tag, so a
+    /// holder of the join token cannot inject arbitrary `ClientWriteWithTerm`
+    /// commands without also holding the cluster secret.
     JoinCluster {
         node_id: RaftNodeId,
         raft_addr: String,
@@ -167,13 +335,36 @@ pub enum RaftRpcResponse {
 pub struct RaftNetworkFactoryImpl {
     /// Known node addresses.
     nodes: Arc<RwLock<BTreeMap<RaftNodeId, String>>>,
+    /// HMAC keys used to sign all outbound traffic.
+    auth_keys: Arc<RaftAuthKeys>,
+    /// Optional mTLS config used to wrap every outbound socket (audit
+    /// P0-5). Cloned into each `RaftNetworkConnection` at construction so
+    /// per-connection TLS sessions can be cached alongside the TCP socket.
+    tls: Option<RaftTlsConfig>,
 }
 
 impl RaftNetworkFactoryImpl {
-    /// Create a new network factory.
+    /// Create a new network factory with no auth keys (legacy / dev).
     pub fn new() -> Self {
+        Self::with_keys(Arc::new(RaftAuthKeys::default()))
+    }
+
+    /// Create a new network factory using the given HMAC keys.
+    pub fn with_keys(auth_keys: Arc<RaftAuthKeys>) -> Self {
+        Self::with_keys_and_tls(auth_keys, None)
+    }
+
+    /// Create a new network factory with HMAC keys and optional TLS.
+    /// When `tls` is `Some`, every outbound Raft connection will perform
+    /// a TLS handshake against the peer's listener (audit P0-5).
+    pub fn with_keys_and_tls(
+        auth_keys: Arc<RaftAuthKeys>,
+        tls: Option<RaftTlsConfig>,
+    ) -> Self {
         Self {
             nodes: Arc::new(RwLock::new(BTreeMap::new())),
+            auth_keys,
+            tls,
         }
     }
 
@@ -186,27 +377,11 @@ impl RaftNetworkFactoryImpl {
     pub async fn get_node_addr(&self, node_id: RaftNodeId) -> Option<String> {
         self.nodes.read().await.get(&node_id).cloned()
     }
-}
 
-/// Forward a client write request to a remote node with timeout.
-///
-/// This is used when a non-leader node needs to forward a write to the leader.
-///
-/// # Arguments
-/// * `addr` - Address of the node to forward to
-/// * `command` - The coordination command to forward
-/// * `expected_term` - The expected Raft term of the leader (for stale leader detection)
-/// * `forward_hops` - Number of hops this request has taken (for loop prevention)
-///
-/// Includes term validation and hop counting to prevent:
-/// 1. Forwarding to stale leaders (term validation)
-/// 2. Infinite forwarding loops (hop count limit)
-#[allow(dead_code)]
-pub async fn forward_client_write(
-    addr: &str,
-    command: CoordinationCommand,
-) -> Result<CoordinationResponse, std::io::Error> {
-    forward_client_write_with_term(addr, command, 0, 0).await
+    /// Borrow the auth keys this factory hands to outbound connections.
+    pub fn auth_keys(&self) -> Arc<RaftAuthKeys> {
+        self.auth_keys.clone()
+    }
 }
 
 /// Forward a client write request with term validation and hop tracking.
@@ -218,6 +393,8 @@ pub async fn forward_client_write_with_term(
     command: CoordinationCommand,
     expected_term: u64,
     forward_hops: u8,
+    auth_keys: &RaftAuthKeys,
+    tls: Option<&RaftTlsConfig>,
 ) -> Result<CoordinationResponse, std::io::Error> {
     if forward_hops >= MAX_FORWARD_HOPS {
         return Err(std::io::Error::other(format!(
@@ -226,17 +403,7 @@ pub async fn forward_client_write_with_term(
         )));
     }
 
-    let stream = timeout(RPC_CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("Connection timeout to leader at {}", addr),
-            )
-        })??;
-
-    let mut stream = stream;
-    stream.set_nodelay(true)?;
+    let mut stream = connect_raft(addr, tls).await?;
 
     // Wrap the entire operation in a timeout
     let result = timeout(RPC_OPERATION_TIMEOUT, async {
@@ -246,25 +413,19 @@ pub async fn forward_client_write_with_term(
             expected_term,
             forward_hops: forward_hops + 1, // Increment hop count
         };
-        let data = bincode::serialize(&message)
+        let data = postcard::to_stdvec(&message)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        // Send length-prefixed message
-        let len = data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&data).await?;
+        // Send length-prefixed, HMAC-signed message (audit S3).
+        write_rpc_frame(&mut stream, auth_keys, false, &data).await?;
 
-        // Read response length
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let response_len = u32::from_be_bytes(len_buf) as usize;
-
-        // Read response
-        let mut response_buf = vec![0u8; response_len];
-        stream.read_exact(&mut response_buf).await?;
+        // Read response (length-prefixed and HMAC-verified, with size cap to
+        // bound memory and close the unauthenticated-allocation hole — audit
+        // S3+S4).
+        let (_purpose, response_buf) = read_rpc_frame(&mut stream, auth_keys).await?;
 
         // Deserialize response
-        let response: RaftRpcResponse = bincode::deserialize(&response_buf)
+        let response: RaftRpcResponse = postcard::from_bytes(&response_buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         Ok::<_, std::io::Error>(response)
@@ -305,23 +466,18 @@ pub async fn forward_client_write_with_term(
 /// This sends a JoinCluster message to the specified peer, asking to be added
 /// as a learner and then promoted to voter. The peer will forward the request
 /// to the leader if necessary.
+///
+/// The frame is signed with the join key (or the cluster secret as a fallback)
+/// — see [`RaftAuthKeys`]. A peer that requires authentication and does not
+/// recognize the signature will refuse the join.
 pub async fn request_cluster_join(
     peer_addr: &str,
     node_id: RaftNodeId,
     raft_addr: &str,
+    auth_keys: &RaftAuthKeys,
+    tls: Option<&RaftTlsConfig>,
 ) -> Result<(), std::io::Error> {
-    // Connect with timeout
-    let stream = timeout(RPC_CONNECT_TIMEOUT, TcpStream::connect(peer_addr))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("Connection timeout to peer at {}", peer_addr),
-            )
-        })??;
-
-    let mut stream = stream;
-    stream.set_nodelay(true)?;
+    let mut stream = connect_raft(peer_addr, tls).await?;
 
     // Wrap the entire operation in a timeout
     let result = timeout(RPC_OPERATION_TIMEOUT, async {
@@ -330,25 +486,17 @@ pub async fn request_cluster_join(
             node_id,
             raft_addr: raft_addr.to_string(),
         };
-        let data = bincode::serialize(&message)
+        let data = postcard::to_stdvec(&message)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        // Send length-prefixed message
-        let len = data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&data).await?;
+        // Send signed message under the Join purpose tag.
+        write_rpc_frame(&mut stream, auth_keys, true, &data).await?;
 
-        // Read response length
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let response_len = u32::from_be_bytes(len_buf) as usize;
-
-        // Read response
-        let mut response_buf = vec![0u8; response_len];
-        stream.read_exact(&mut response_buf).await?;
+        // Read response (length-prefixed and HMAC-verified).
+        let (_purpose, response_buf) = read_rpc_frame(&mut stream, auth_keys).await?;
 
         // Deserialize response
-        let response: RaftRpcResponse = bincode::deserialize(&response_buf)
+        let response: RaftRpcResponse = postcard::from_bytes(&response_buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         Ok::<_, std::io::Error>(response)
@@ -394,6 +542,8 @@ impl Clone for RaftNetworkFactoryImpl {
     fn clone(&self) -> Self {
         Self {
             nodes: self.nodes.clone(),
+            auth_keys: self.auth_keys.clone(),
+            tls: self.tls.clone(),
         }
     }
 }
@@ -409,6 +559,8 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkFactoryImpl {
             target_addr: node.addr.clone(),
             cached_conn: tokio::sync::Mutex::new(None),
             circuit_breaker: tokio::sync::Mutex::new(CircuitBreakerState::new()),
+            auth_keys: self.auth_keys.clone(),
+            tls: self.tls.clone(),
         }
     }
 }
@@ -458,10 +610,17 @@ impl CircuitBreakerState {
 /// A connection to a remote Raft node.
 pub struct RaftNetworkConnection {
     target_addr: String,
-    /// Cached TCP connection for reuse.
-    cached_conn: tokio::sync::Mutex<Option<TcpStream>>,
+    /// Cached socket for reuse. May be plain TCP or wrapped in TLS
+    /// depending on `tls`; reusing it preserves the TLS session so we
+    /// don't pay a handshake per RPC.
+    cached_conn: tokio::sync::Mutex<Option<MaybeTlsStreamClient>>,
     /// Circuit breaker state for this connection.
     circuit_breaker: tokio::sync::Mutex<CircuitBreakerState>,
+    /// HMAC keys used to sign every outbound frame and verify responses.
+    auth_keys: Arc<RaftAuthKeys>,
+    /// Optional mTLS configuration (audit P0-5). When `Some`, every
+    /// reconnect performs a TLS handshake before the first frame flows.
+    tls: Option<RaftTlsConfig>,
 }
 
 impl RaftNetworkConnection {
@@ -487,57 +646,55 @@ impl RaftNetworkConnection {
         }
 
         // Serialize the message once
-        let data = bincode::serialize(&message)
+        let data = postcard::to_stdvec(&message)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let mut last_error = None;
+        // Drive retries through the unified retry framework so RPC backoff
+        // matches the rest of the codebase's jittered exponential schedule
+        // (audit P1-11). Constants below preserve the prior behavior:
+        // 3 retries, 100ms→2s, jitter — the framework's `Retryable` adds
+        // jitter automatically. The circuit breaker still wraps the loop:
+        // a failed final attempt records a failure on the per-target
+        // breaker, which short-circuits subsequent calls until reset.
+        let policy = backon::ExponentialBuilder::default()
+            .with_min_delay(RPC_RETRY_BASE_DELAY)
+            .with_max_delay(RPC_RETRY_MAX_DELAY)
+            .with_max_times(RPC_MAX_RETRIES as usize)
+            .with_jitter();
 
-        // Retry loop with exponential backoff
-        for attempt in 0..=RPC_MAX_RETRIES {
-            if attempt > 0 {
-                // Calculate backoff delay with exponential growth
-                let delay = std::cmp::min(
-                    RPC_RETRY_BASE_DELAY * (1 << (attempt - 1)),
-                    RPC_RETRY_MAX_DELAY,
-                );
-                // Add jitter (±25%)
-                let jitter_factor = 0.75 + (fastrand::f64() * 0.5);
-                let jittered_delay = Duration::from_secs_f64(delay.as_secs_f64() * jitter_factor);
+        let target = self.target_addr.clone();
+        let result = (|| async { self.try_send_rpc(&data).await })
+            .retry(policy)
+            .notify(|err: &std::io::Error, dur| {
                 tracing::debug!(
-                    target = %self.target_addr,
-                    attempt,
-                    delay_ms = jittered_delay.as_millis(),
+                    target = %target,
+                    delay_ms = dur.as_millis(),
+                    error = %err,
                     "Retrying RPC after backoff"
                 );
-                tokio::time::sleep(jittered_delay).await;
-            }
+            })
+            .await;
 
-            match self.try_send_rpc(&data).await {
-                Ok(response) => {
-                    // Reset circuit breaker on success
-                    self.circuit_breaker.lock().await.record_success();
-                    return Ok(response);
+        match result {
+            Ok(response) => {
+                // Reset circuit breaker on success
+                self.circuit_breaker.lock().await.record_success();
+                Ok(response)
+            }
+            Err(e) => {
+                // All retries exhausted, record failure for circuit breaker
+                let mut cb = self.circuit_breaker.lock().await;
+                cb.record_failure();
+                if cb.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+                    tracing::warn!(
+                        target = %self.target_addr,
+                        consecutive_failures = cb.consecutive_failures,
+                        "Circuit breaker opened due to consecutive failures"
+                    );
                 }
-                Err(e) => {
-                    last_error = Some(e);
-                }
+                Err(e)
             }
         }
-
-        // All retries exhausted, record failure for circuit breaker
-        {
-            let mut cb = self.circuit_breaker.lock().await;
-            cb.record_failure();
-            if cb.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
-                tracing::warn!(
-                    target = %self.target_addr,
-                    consecutive_failures = cb.consecutive_failures,
-                    "Circuit breaker opened due to consecutive failures"
-                );
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| std::io::Error::other("RPC failed with no error")))
     }
 
     /// Attempt to send an RPC (single attempt, no retry).
@@ -545,7 +702,7 @@ impl RaftNetworkConnection {
         // Try to reuse cached connection
         let mut guard = self.cached_conn.lock().await;
         if let Some(ref mut stream) = *guard {
-            match Self::do_rpc_with_timeout(stream, data).await {
+            match Self::do_rpc_with_timeout(stream, data, &self.auth_keys).await {
                 Ok(response) => return Ok(response),
                 Err(_) => {
                     // Connection is broken, will reconnect below
@@ -554,30 +711,21 @@ impl RaftNetworkConnection {
             }
         }
 
-        // Create new connection with timeout
-        let stream = timeout(RPC_CONNECT_TIMEOUT, TcpStream::connect(&self.target_addr))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("Connection timeout to {}", self.target_addr),
-                )
-            })??;
+        // Create new connection (with TLS handshake if configured).
+        let mut stream = connect_raft(&self.target_addr, self.tls.as_ref()).await?;
 
-        let mut stream = stream;
-        stream.set_nodelay(true)?;
-
-        let response = Self::do_rpc_with_timeout(&mut stream, data).await?;
+        let response = Self::do_rpc_with_timeout(&mut stream, data, &self.auth_keys).await?;
         *guard = Some(stream);
         Ok(response)
     }
 
     /// Perform the RPC on an existing stream with timeout.
-    async fn do_rpc_with_timeout(
-        stream: &mut TcpStream,
+    async fn do_rpc_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: &mut S,
         data: &[u8],
+        auth_keys: &RaftAuthKeys,
     ) -> Result<RaftRpcResponse, std::io::Error> {
-        timeout(RPC_OPERATION_TIMEOUT, Self::do_rpc(stream, data))
+        timeout(RPC_OPERATION_TIMEOUT, Self::do_rpc(stream, data, auth_keys))
             .await
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "RPC operation timeout")
@@ -585,26 +733,19 @@ impl RaftNetworkConnection {
     }
 
     /// Perform the RPC on an existing stream.
-    async fn do_rpc(
-        stream: &mut TcpStream,
+    async fn do_rpc<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: &mut S,
         data: &[u8],
+        auth_keys: &RaftAuthKeys,
     ) -> Result<RaftRpcResponse, std::io::Error> {
-        // Send length-prefixed message
-        let len = data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(data).await?;
+        // Send signed, length-prefixed message (audit S3).
+        write_rpc_frame(stream, auth_keys, false, data).await?;
 
-        // Read response length
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let response_len = u32::from_be_bytes(len_buf) as usize;
-
-        // Read response
-        let mut response_buf = vec![0u8; response_len];
-        stream.read_exact(&mut response_buf).await?;
+        // Read signed response (length-prefixed, HMAC-verified, size-capped).
+        let (_purpose, response_buf) = read_rpc_frame(stream, auth_keys).await?;
 
         // Deserialize response
-        let response: RaftRpcResponse = bincode::deserialize(&response_buf)
+        let response: RaftRpcResponse = postcard::from_bytes(&response_buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         Ok(response)
@@ -703,55 +844,132 @@ pub struct RaftRpcServer {
     listen_addr: String,
     /// Runtime handle for spawning connection handler tasks.
     runtime: tokio::runtime::Handle,
+    /// HMAC keys used to verify every inbound frame and sign every response.
+    auth_keys: Arc<RaftAuthKeys>,
+    /// Optional mTLS configuration (audit P0-5). When `Some`, every
+    /// accepted socket performs a TLS handshake (with required client
+    /// cert) before any frame bytes are read. HMAC framing still applies
+    /// on top of the TLS session.
+    tls: Option<RaftTlsConfig>,
 }
 
 impl RaftRpcServer {
-    /// Create a new RPC server.
-    pub fn new(
+    /// Create a new RPC server with optional mTLS (audit P0-5). Pass
+    /// `tls = None` for the legacy plain-TCP behavior.
+    pub fn with_tls(
         raft: Arc<openraft::Raft<TypeConfig>>,
         listen_addr: String,
         runtime: tokio::runtime::Handle,
+        auth_keys: Arc<RaftAuthKeys>,
+        tls: Option<RaftTlsConfig>,
     ) -> Self {
         Self {
             raft,
             listen_addr,
             runtime,
+            auth_keys,
+            tls,
         }
     }
 
     /// Start the RPC server.
     pub async fn run(self) -> Result<(), std::io::Error> {
         let listener = tokio::net::TcpListener::bind(&self.listen_addr).await?;
-        tracing::info!(addr = %self.listen_addr, "Raft RPC server listening");
+        tracing::info!(
+            addr = %self.listen_addr,
+            cluster_secret = self.auth_keys.cluster_secret_configured(),
+            join_token = self.auth_keys.join_token_configured(),
+            tls = self.tls.is_some(),
+            "Raft RPC server listening"
+        );
+
+        if !self.auth_keys.cluster_secret_configured() {
+            tracing::warn!(
+                addr = %self.listen_addr,
+                "Raft RPC server running without RAFT_CLUSTER_SECRET — control plane is \
+                 unauthenticated. Set RAFT_CLUSTER_SECRET on every node before exposing the \
+                 Raft port to an untrusted network."
+            );
+        }
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let raft = self.raft.clone();
+            let auth_keys = self.auth_keys.clone();
+            let tls = self.tls.clone();
 
             self.runtime.spawn(async move {
-                if let Err(e) = Self::handle_connection(raft, stream).await {
+                let wrapped = match Self::accept_stream(stream, tls.as_ref()).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(peer = %peer_addr, error = %e, "Raft TLS accept failed");
+                        return;
+                    }
+                };
+                if let Err(e) = Self::handle_connection(raft, wrapped, auth_keys).await {
                     tracing::warn!(peer = %peer_addr, error = %e, "Error handling Raft RPC");
                 }
             });
         }
     }
 
+    /// Wrap an accepted TCP stream in TLS when configured. Kept as a free
+    /// helper so `run` can early-return on handshake failure without
+    /// dropping into the per-message handler with a dead socket.
+    async fn accept_stream(
+        stream: TcpStream,
+        tls: Option<&RaftTlsConfig>,
+    ) -> std::io::Result<MaybeTlsStreamServer> {
+        #[cfg(feature = "tls")]
+        {
+            if let Some(t) = tls {
+                let tls_stream = t.acceptor.accept(stream).await.map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        format!("Raft TLS handshake failed: {}", e),
+                    )
+                })?;
+                return Ok(MaybeTlsStreamServer::Tls(Box::new(tls_stream)));
+            }
+        }
+        #[cfg(not(feature = "tls"))]
+        let _ = tls;
+        Ok(MaybeTlsStreamServer::Plain(stream))
+    }
+
     /// Handle a single connection.
     async fn handle_connection(
         raft: Arc<openraft::Raft<TypeConfig>>,
-        mut stream: TcpStream,
+        mut stream: MaybeTlsStreamServer,
+        auth_keys: Arc<RaftAuthKeys>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Read message length
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-        // Read message
-        let mut msg_buf = vec![0u8; msg_len];
-        stream.read_exact(&mut msg_buf).await?;
+        // Read message (length-prefixed, HMAC-verified, size-capped). The
+        // verification step closes both S3 (unauth control plane) and S4
+        // (allocation amplification on attacker-controlled length).
+        let (frame_purpose, msg_buf) = read_rpc_frame(&mut stream, &auth_keys).await?;
 
         // Deserialize message
-        let message: RaftRpcMessage = bincode::deserialize(&msg_buf)?;
+        let message: RaftRpcMessage = postcard::from_bytes(&msg_buf)?;
+
+        // Cross-check the wire purpose tag against the deserialized variant
+        // (audit S3). Without this, a holder of the join token could submit
+        // arbitrary `ClientWriteWithTerm` commands; with the check, the join
+        // key only opens the door for `JoinCluster`.
+        let is_join_message = matches!(message, RaftRpcMessage::JoinCluster { .. });
+        let join_frame = matches!(frame_purpose, super::auth::FramePurpose::Join);
+        if is_join_message != join_frame {
+            tracing::warn!(
+                purpose = ?frame_purpose,
+                "Rejecting Raft RPC: wire purpose tag does not match message variant"
+            );
+            let response = RaftRpcResponse::ErrorV2(RpcErrorInfo::new(
+                RpcErrorKind::InvalidRequest,
+                "Wire purpose tag does not match message variant",
+            ));
+            let response_data = postcard::to_stdvec(&response)?;
+            write_rpc_frame(&mut stream, &auth_keys, false, &response_data).await?;
+            return Ok(());
+        }
 
         // Handle the message
         let response = match message {
@@ -767,14 +985,6 @@ impl RaftRpcServer {
                 Ok(resp) => RaftRpcResponse::InstallSnapshot(resp),
                 Err(e) => RaftRpcResponse::Error(e.to_string()),
             },
-            RaftRpcMessage::ClientWrite(command) => {
-                // Legacy client write without term validation - forward to Raft
-                // New clients should use ClientWriteWithTerm for better safety
-                match raft.client_write(command).await {
-                    Ok(resp) => RaftRpcResponse::ClientWriteOk(resp.data),
-                    Err(e) => RaftRpcResponse::Error(e.to_string()),
-                }
-            }
             RaftRpcMessage::ClientWriteWithTerm {
                 command,
                 expected_term,
@@ -866,11 +1076,9 @@ impl RaftRpcServer {
             }
         };
 
-        // Serialize and send response
-        let response_data = bincode::serialize(&response)?;
-        let len = response_data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&response_data).await?;
+        // Serialize and send signed response (audit S3).
+        let response_data = postcard::to_stdvec(&response)?;
+        write_rpc_frame(&mut stream, &auth_keys, false, &response_data).await?;
 
         Ok(())
     }
@@ -994,8 +1202,8 @@ mod tests {
             last_log_id: None,
         });
 
-        let serialized = bincode::serialize(&vote_msg).unwrap();
-        let deserialized: RaftRpcMessage = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&vote_msg).unwrap();
+        let deserialized: RaftRpcMessage = postcard::from_bytes(&serialized).unwrap();
 
         match deserialized {
             RaftRpcMessage::Vote(req) => {
@@ -1009,8 +1217,8 @@ mod tests {
     fn test_raft_rpc_response_serialization() {
         // Test Error response serialization
         let error_resp = RaftRpcResponse::Error("test error".to_string());
-        let serialized = bincode::serialize(&error_resp).unwrap();
-        let deserialized: RaftRpcResponse = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&error_resp).unwrap();
+        let deserialized: RaftRpcResponse = postcard::from_bytes(&serialized).unwrap();
 
         match deserialized {
             RaftRpcResponse::Error(msg) => {
@@ -1084,8 +1292,8 @@ mod tests {
             last_log_id: None,
         });
 
-        let serialized = bincode::serialize(&vote_resp).unwrap();
-        let deserialized: RaftRpcResponse = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&vote_resp).unwrap();
+        let deserialized: RaftRpcResponse = postcard::from_bytes(&serialized).unwrap();
 
         match deserialized {
             RaftRpcResponse::Vote(resp) => {
@@ -1102,8 +1310,8 @@ mod tests {
         // AppendEntriesResponse is an enum in openraft 0.9
         let append_resp = RaftRpcResponse::AppendEntries(AppendEntriesResponse::Success);
 
-        let serialized = bincode::serialize(&append_resp).unwrap();
-        let deserialized: RaftRpcResponse = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&append_resp).unwrap();
+        let deserialized: RaftRpcResponse = postcard::from_bytes(&serialized).unwrap();
 
         match deserialized {
             RaftRpcResponse::AppendEntries(AppendEntriesResponse::Success) => {
@@ -1121,8 +1329,8 @@ mod tests {
             vote: openraft::Vote::new(1, 1),
         });
 
-        let serialized = bincode::serialize(&snapshot_resp).unwrap();
-        let deserialized: RaftRpcResponse = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&snapshot_resp).unwrap();
+        let deserialized: RaftRpcResponse = postcard::from_bytes(&serialized).unwrap();
 
         match deserialized {
             RaftRpcResponse::InstallSnapshot(resp) => {
@@ -1208,8 +1416,8 @@ mod tests {
         ];
 
         for kind in kinds {
-            let serialized = bincode::serialize(&kind).unwrap();
-            let deserialized: RpcErrorKind = bincode::deserialize(&serialized).unwrap();
+            let serialized = postcard::to_stdvec(&kind).unwrap();
+            let deserialized: RpcErrorKind = postcard::from_bytes(&serialized).unwrap();
 
             // Verify round-trip preserves retryable semantics
             assert_eq!(
@@ -1277,8 +1485,8 @@ mod tests {
             "Not the leader",
         );
 
-        let serialized = bincode::serialize(&error).unwrap();
-        let deserialized: RpcErrorInfo = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&error).unwrap();
+        let deserialized: RpcErrorInfo = postcard::from_bytes(&serialized).unwrap();
 
         assert!(matches!(
             deserialized.kind,
@@ -1423,8 +1631,8 @@ mod tests {
             forward_hops: 2,
         };
 
-        let serialized = bincode::serialize(&msg).unwrap();
-        let deserialized: RaftRpcMessage = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&msg).unwrap();
+        let deserialized: RaftRpcMessage = postcard::from_bytes(&serialized).unwrap();
 
         match deserialized {
             RaftRpcMessage::ClientWriteWithTerm {
@@ -1446,8 +1654,8 @@ mod tests {
             raft_addr: "192.168.1.100:9093".to_string(),
         };
 
-        let serialized = bincode::serialize(&msg).unwrap();
-        let deserialized: RaftRpcMessage = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&msg).unwrap();
+        let deserialized: RaftRpcMessage = postcard::from_bytes(&serialized).unwrap();
 
         match deserialized {
             RaftRpcMessage::JoinCluster { node_id, raft_addr } => {
@@ -1467,8 +1675,8 @@ mod tests {
         let error_info = RpcErrorInfo::new(RpcErrorKind::LeadershipChanged, "Term changed");
         let resp = RaftRpcResponse::ErrorV2(error_info);
 
-        let serialized = bincode::serialize(&resp).unwrap();
-        let deserialized: RaftRpcResponse = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&resp).unwrap();
+        let deserialized: RaftRpcResponse = postcard::from_bytes(&serialized).unwrap();
 
         match deserialized {
             RaftRpcResponse::ErrorV2(info) => {
@@ -1483,8 +1691,8 @@ mod tests {
     fn test_join_cluster_ok_response_serialization() {
         let resp = RaftRpcResponse::JoinClusterOk;
 
-        let serialized = bincode::serialize(&resp).unwrap();
-        let deserialized: RaftRpcResponse = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&resp).unwrap();
+        let deserialized: RaftRpcResponse = postcard::from_bytes(&serialized).unwrap();
 
         assert!(matches!(deserialized, RaftRpcResponse::JoinClusterOk));
     }

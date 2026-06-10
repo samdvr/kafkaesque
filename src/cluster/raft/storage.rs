@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -14,7 +15,7 @@ use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 use openraft::{
     BasicNode, Entry, EntryPayload, LogId, OptionalSend, RaftStorage, Snapshot, SnapshotMeta,
-    StorageError, StoredMembership, Vote,
+    StorageError, StorageIOError, StoredMembership, Vote,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
@@ -63,14 +64,21 @@ pub struct RaftStore {
     object_store: Arc<dyn ObjectStore>,
     /// Path prefix for snapshots in the object store.
     snapshot_path: ObjectPath,
+    /// Optional on-disk persistence root for vote and log entries.
+    ///
+    /// When `Some`, every `save_vote`, `append_to_log`, `purge_logs_upto`, and
+    /// `delete_conflict_logs_since` writes through to this directory and
+    /// fsyncs before returning, so a crash followed by restart resumes with
+    /// the same vote and log prefix (audit B1). When `None`, the store is
+    /// in-memory only — used by unit tests that don't need durability.
+    log_dir: Option<PathBuf>,
 }
 
 impl RaftStore {
     /// Create a new store with object store backing for snapshots.
     ///
-    /// # Arguments
-    /// * `object_store` - The object store to persist snapshots to
-    /// * `snapshot_prefix` - Path prefix for snapshot files (e.g., "raft/snapshots/node-0")
+    /// This is the in-memory variant — vote and log entries live only in RAM.
+    /// Used by unit tests; production code should use `new_with_log_dir`.
     pub fn new(object_store: Arc<dyn ObjectStore>, snapshot_prefix: &str) -> Self {
         Self {
             vote: Arc::new(RwLock::new(None)),
@@ -82,7 +90,188 @@ impl RaftStore {
             cached_snapshot: Arc::new(RwLock::new(None)),
             object_store,
             snapshot_path: ObjectPath::from(snapshot_prefix),
+            log_dir: None,
         }
+    }
+
+    /// Create a new store backed by an on-disk WAL for vote and log entries
+    /// (audit B1). The WAL is created on first write; `recover_from_disk()`
+    /// must be called before `RaftNode::new` proceeds in order to repopulate
+    /// in-memory state from any existing WAL files.
+    pub fn new_with_log_dir(
+        object_store: Arc<dyn ObjectStore>,
+        snapshot_prefix: &str,
+        log_dir: PathBuf,
+    ) -> Self {
+        Self {
+            vote: Arc::new(RwLock::new(None)),
+            log: Arc::new(RwLock::new(BTreeMap::new())),
+            last_purged_log_id: Arc::new(RwLock::new(None)),
+            sm: Arc::new(RwLock::new(CoordinationStateMachine::new())),
+            last_applied_log: Arc::new(RwLock::new(None)),
+            last_membership: Arc::new(RwLock::new(StoredMembership::default())),
+            cached_snapshot: Arc::new(RwLock::new(None)),
+            object_store,
+            snapshot_path: ObjectPath::from(snapshot_prefix),
+            log_dir: Some(log_dir),
+        }
+    }
+
+    /// Replay the on-disk WAL into in-memory state. Called once at startup
+    /// before openraft is constructed (audit B1). On a fresh node with no
+    /// WAL files this is a no-op; on a restart it loads the durable vote,
+    /// every persisted log entry, and the purged-up-to marker so openraft
+    /// resumes with the same state it had at crash time.
+    ///
+    /// Failures here are fatal — see `RaftNode::new` for the fail-closed
+    /// wrapping. A corrupt WAL is treated the same way a corrupt snapshot
+    /// is: better to crash loudly than to silently lose state.
+    pub async fn recover_from_disk(&self) -> std::io::Result<()> {
+        let Some(dir) = self.log_dir.as_ref() else {
+            return Ok(());
+        };
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        // Vote.
+        let vote_path = dir.join("vote.bin");
+        if vote_path.exists() {
+            let bytes = std::fs::read(&vote_path)?;
+            let vote: Vote<RaftNodeId> = postcard::from_bytes(&bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("vote.bin deserialize: {}", e),
+                )
+            })?;
+            *self.vote.write().await = Some(vote);
+        }
+
+        // Purged marker — used to validate log file ranges.
+        let purged_path = dir.join("purged.bin");
+        if purged_path.exists() {
+            let bytes = std::fs::read(&purged_path)?;
+            let purged: LogId<RaftNodeId> = postcard::from_bytes(&bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("purged.bin deserialize: {}", e),
+                )
+            })?;
+            *self.last_purged_log_id.write().await = Some(purged);
+        }
+
+        // Log entries — every log/{index:020}.bin under the dir.
+        let log_subdir = dir.join("log");
+        if log_subdir.exists() {
+            let mut log = self.log.write().await;
+            for entry in std::fs::read_dir(&log_subdir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+                    continue;
+                }
+                let bytes = std::fs::read(&path)?;
+                let log_entry: Entry<TypeConfig> =
+                    postcard::from_bytes(&bytes).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("log {}: deserialize: {}", path.display(), e),
+                        )
+                    })?;
+                log.insert(log_entry.log_id.index, log_entry);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Atomically write `bytes` to `path` then fsync the file and its parent
+    /// directory. Used for vote, log entry, and purged-marker writes — every
+    /// caller in the audit B1 fix path goes through this.
+    fn atomic_write_fsync(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, path)?;
+        if let Some(parent) = path.parent() {
+            let dir = std::fs::File::open(parent)?;
+            dir.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Persist `vote` to disk if we have a log_dir configured. Errors propagate.
+    fn persist_vote(&self, vote: &Vote<RaftNodeId>) -> std::io::Result<()> {
+        let Some(dir) = self.log_dir.as_ref() else {
+            return Ok(());
+        };
+        let bytes = postcard::to_stdvec(vote).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("vote serialize: {}", e))
+        })?;
+        Self::atomic_write_fsync(&dir.join("vote.bin"), &bytes)
+    }
+
+    /// Persist a log entry to disk if we have a log_dir configured.
+    fn persist_log_entry(&self, entry: &Entry<TypeConfig>) -> std::io::Result<()> {
+        let Some(dir) = self.log_dir.as_ref() else {
+            return Ok(());
+        };
+        let bytes = postcard::to_stdvec(entry).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("log serialize: {}", e),
+            )
+        })?;
+        let path = dir
+            .join("log")
+            .join(format!("{:020}.bin", entry.log_id.index));
+        Self::atomic_write_fsync(&path, &bytes)
+    }
+
+    /// Remove on-disk log entries with index <= `up_to_index`. Best-effort:
+    /// missing files are not an error (the in-memory map is the source of
+    /// truth).
+    fn purge_log_files(&self, up_to_index: u64) -> std::io::Result<()> {
+        let Some(dir) = self.log_dir.as_ref() else {
+            return Ok(());
+        };
+        let log_subdir = dir.join("log");
+        if !log_subdir.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&log_subdir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(idx_str) = name.strip_suffix(".bin")
+                && let Ok(idx) = idx_str.parse::<u64>()
+                && idx <= up_to_index
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist the purged-up-to marker.
+    fn persist_purged(&self, log_id: &LogId<RaftNodeId>) -> std::io::Result<()> {
+        let Some(dir) = self.log_dir.as_ref() else {
+            return Ok(());
+        };
+        let bytes = postcard::to_stdvec(log_id).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("purged serialize: {}", e),
+            )
+        })?;
+        Self::atomic_write_fsync(&dir.join("purged.bin"), &bytes)
     }
 
     /// Get the state machine for reading.
@@ -155,7 +344,7 @@ impl RaftStore {
         };
 
         // Metadata file exists - deserialize it
-        let metadata: SnapshotMetadata = bincode::deserialize(&meta_bytes).map_err(|e| {
+        let metadata: SnapshotMetadata = postcard::from_bytes(&meta_bytes).map_err(|e| {
             // Metadata exists but can't be deserialized - this is corruption
             error!(
                 error = %e,
@@ -335,7 +524,7 @@ impl RaftStore {
             last_membership: meta.last_membership.clone(),
             snapshot_id: meta.snapshot_id.clone(),
         };
-        let meta_bytes = bincode::serialize(&metadata).map_err(|e| {
+        let meta_bytes = postcard::to_stdvec(&metadata).map_err(|e| {
             StorageError::from_io_error(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Write,
@@ -452,10 +641,19 @@ impl RaftStorage<TypeConfig> for RaftStore {
             cached_snapshot: self.cached_snapshot.clone(),
             object_store: self.object_store.clone(),
             snapshot_path: self.snapshot_path.clone(),
+            log_dir: self.log_dir.clone(),
         }
     }
 
     async fn save_vote(&mut self, vote: &Vote<RaftNodeId>) -> Result<(), StorageError<RaftNodeId>> {
+        // Persist BEFORE updating in-memory state. We must never claim to
+        // have voted without it being durable, or two leaders can be elected
+        // for the same term across a crash (audit B1).
+        if let Err(e) = self.persist_vote(vote) {
+            return Err(StorageError::IO {
+                source: StorageIOError::write_vote(&e),
+            });
+        }
         *self.vote.write().await = Some(*vote);
         Ok(())
     }
@@ -483,6 +681,13 @@ impl RaftStorage<TypeConfig> for RaftStore {
     {
         let mut log = self.log.write().await;
         for entry in entries {
+            // Persist BEFORE updating in-memory state, otherwise a crash
+            // between map insert and disk write would lose entries (audit B1).
+            if let Err(e) = self.persist_log_entry(&entry) {
+                return Err(StorageError::IO {
+                    source: StorageIOError::write_logs(&e),
+                });
+            }
             log.insert(entry.log_id.index, entry);
         }
         Ok(())
@@ -494,8 +699,17 @@ impl RaftStorage<TypeConfig> for RaftStore {
     ) -> Result<(), StorageError<RaftNodeId>> {
         let mut log = self.log.write().await;
         let keys_to_remove: Vec<u64> = log.range(log_id.index..).map(|(k, _)| *k).collect();
-        for key in keys_to_remove {
-            log.remove(&key);
+        for key in &keys_to_remove {
+            log.remove(key);
+        }
+        // Mirror the deletion on disk. Failures here are not fatal — the
+        // in-memory state is the source of truth for what openraft sees and
+        // we've already removed from there.
+        if let Some(dir) = self.log_dir.as_ref() {
+            for key in &keys_to_remove {
+                let path = dir.join("log").join(format!("{:020}.bin", key));
+                let _ = std::fs::remove_file(&path);
+            }
         }
         Ok(())
     }
@@ -505,12 +719,19 @@ impl RaftStorage<TypeConfig> for RaftStore {
         log_id: LogId<RaftNodeId>,
     ) -> Result<(), StorageError<RaftNodeId>> {
         *self.last_purged_log_id.write().await = Some(log_id);
+        if let Err(e) = self.persist_purged(&log_id) {
+            return Err(StorageError::IO {
+                source: StorageIOError::write_logs(&e),
+            });
+        }
 
         let mut log = self.log.write().await;
         let keys_to_remove: Vec<u64> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
         for key in keys_to_remove {
             log.remove(&key);
         }
+        // Best-effort on-disk purge.
+        let _ = self.purge_log_files(log_id.index);
         Ok(())
     }
 
@@ -568,6 +789,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             cached_snapshot: self.cached_snapshot.clone(),
             object_store: self.object_store.clone(),
             snapshot_path: self.snapshot_path.clone(),
+            log_dir: self.log_dir.clone(),
         }
     }
 
@@ -993,7 +1215,7 @@ mod tests {
             version: 5,
             ..Default::default()
         };
-        let data = bincode::serialize(&state).unwrap();
+        let data = postcard::to_stdvec(&state).unwrap();
         let cursor = Box::new(Cursor::new(data));
 
         // Create snapshot metadata

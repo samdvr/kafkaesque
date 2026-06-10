@@ -1,0 +1,57 @@
+# cargo-deny configuration (audit P1-6).
+#
+# Checked in CI on every PR. Anything new that trips a finding here
+# either gets fixed (preferred) or explicitly waived in this file with
+# a justification — no silent additions.
+
+[graph]
+# Limit to the targets we ship.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+]
+
+[advisories]
+version = 2
+# Fail closed on advisories. Yanked crates are warnings rather than
+# errors so a yanked-but-still-pinned dep doesn't break CI before we
+# get a chance to bump.
+yanked = "warn"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Skip families of crates known to ship many internal versions
+# (e.g. windows-sys variants pulled by transitive deps).
+skip = []
+skip-tree = []
+
+[licenses]
+version = 2
+# Allow-list of acceptable OSS licenses for the runtime deps. Anything
+# outside this set fails CI; review the dep before broadening.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

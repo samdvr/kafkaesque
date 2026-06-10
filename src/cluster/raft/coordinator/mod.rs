@@ -14,6 +14,7 @@
 //!
 //! Each module implements a single trait for better separation of concerns.
 
+mod acl;
 mod groups;
 mod partition;
 mod producer;
@@ -221,6 +222,14 @@ impl RaftCoordinator {
             let _ = handle.await;
         }
 
+        // Shut down the underlying Raft node so its RPC server, replication
+        // tasks, and openraft state machine all stop cleanly. Previously this
+        // step was skipped, leaving the Raft RPC server bound and openraft
+        // background tasks running past process exit (B6 in audit.md).
+        if let Err(e) = self.node.shutdown().await {
+            tracing::warn!(error = %e, "Raft node shutdown returned an error");
+        }
+
         debug!(
             broker_id = self.broker_id,
             "Raft coordinator shutdown complete"
@@ -234,9 +243,15 @@ impl RaftCoordinator {
     /// and requesting to be added as a learner, then promoted to voter.
     pub async fn join_cluster(&self, leader_addr: &str) -> SlateDBResult<()> {
         use super::network::request_cluster_join;
-        request_cluster_join(leader_addr, self.broker_id as u64, &self.config.raft_addr)
-            .await
-            .map_err(|e| SlateDBError::Storage(format!("Failed to join cluster: {}", e)))
+        request_cluster_join(
+            leader_addr,
+            self.broker_id as u64,
+            &self.config.raft_addr,
+            &self.config.auth_keys,
+            self.config.tls.as_ref(),
+        )
+        .await
+        .map_err(|e| SlateDBError::Storage(format!("Failed to join cluster: {}", e)))
     }
 
     /// Get the current Raft leader.

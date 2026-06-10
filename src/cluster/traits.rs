@@ -365,6 +365,9 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
     /// Get all consumer group IDs.
     async fn get_all_groups(&self) -> SlateDBResult<Vec<String>>;
 
+    /// Delete a consumer group entirely.
+    async fn delete_consumer_group(&self, group_id: &str) -> SlateDBResult<()>;
+
     /// Store member assignment.
     async fn set_member_assignment(
         &self,

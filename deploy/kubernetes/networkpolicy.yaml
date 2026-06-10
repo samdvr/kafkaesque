@@ -17,12 +17,20 @@ spec:
     - Egress
 
   ingress:
-    # Allow Kafka client connections from any pod in the cluster
+    # Allow Kafka client connections only from pods labeled
+    # `kafkaesque.client/allow=true` in any namespace. Audit S11: the previous
+    # `namespaceSelector: {}` rule allowed every pod cluster-wide to reach
+    # the broker, which makes lateral-movement trivial when paired with the
+    # unauthenticated Kafka port (S1). Operators must explicitly opt their
+    # client workloads in by adding the label to grant access.
     - ports:
         - protocol: TCP
           port: 9092
       from:
         - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              kafkaesque.client/allow: "true"
 
     # Allow Raft communication between brokers only
     - ports:
@@ -34,12 +42,18 @@ spec:
               app.kubernetes.io/name: kafkaesque
               app.kubernetes.io/component: broker
 
-    # Allow health check access from any pod (for probes and monitoring)
+    # Allow health check access from pods that explicitly opt in
+    # (e.g. Prometheus scrapers labeled `kafkaesque.health/allow=true`).
+    # Wide-open access here leaks topic names and traffic patterns
+    # via /metrics (audit S8/S11).
     - ports:
         - protocol: TCP
           port: 8080
       from:
         - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              kafkaesque.health/allow: "true"
 
   egress:
     # Allow DNS resolution

@@ -175,6 +175,7 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         member_id: &str,
         generation_id: i32,
     ) -> SlateDBResult<HeartbeatResult> {
+        use crate::cluster::raft::domains::group::GroupStateEnum;
         // Read-only validation of member and generation for offset commit
         let state_machine = self.node.state_machine();
         let state = state_machine.read().await;
@@ -191,6 +192,10 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
 
         if group.generation != generation_id {
             return Ok(HeartbeatResult::IllegalGeneration);
+        }
+
+        if !matches!(group.state, GroupStateEnum::Stable) {
+            return Ok(HeartbeatResult::RebalanceInProgress);
         }
 
         Ok(HeartbeatResult::Success)
@@ -254,6 +259,14 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         let inner_state = state.state().await;
 
         Ok(inner_state.group_domain.groups.keys().cloned().collect())
+    }
+
+    async fn delete_consumer_group(&self, group_id: &str) -> SlateDBResult<()> {
+        let command = CoordinationCommand::GroupDomain(GroupCommand::DeleteGroup {
+            group_id: group_id.to_string(),
+        });
+        self.node.write(command).await?;
+        Ok(())
     }
 
     async fn set_member_assignment(

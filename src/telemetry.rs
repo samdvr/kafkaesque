@@ -125,15 +125,20 @@ pub fn init_logging(format: LogFormat) -> Result<(), Box<dyn std::error::Error +
 
     match format {
         LogFormat::Json => {
-            // JSON logging - uses pretty format as fallback
-            // To enable true JSON, add `features = ["json"]` to tracing-subscriber in Cargo.toml
+            // Production-grade JSON output for log aggregators (audit P1-4).
+            // Each event is a single line of structured JSON, span-flattened
+            // so the existing `tracing::instrument` fields land on the same
+            // record as the log line — no parsing dance for downstream tools.
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(tracing_subscriber::fmt::layer())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_current_span(true)
+                        .with_span_list(false)
+                        .flatten_event(true),
+                )
                 .try_init()?;
-            tracing::warn!(
-                "JSON logging requested but json feature not enabled, using pretty format"
-            );
         }
         LogFormat::Pretty => {
             tracing_subscriber::registry()

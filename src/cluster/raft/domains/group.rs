@@ -243,9 +243,18 @@ impl GroupDomainState {
                             protocol_name: None,
                         });
 
-                // Determine member ID (generate if empty)
+                // Determine member ID. The proposer is responsible for assigning
+                // member IDs; if the command arrives with an empty member_id we
+                // derive one deterministically from the command inputs so every
+                // replica produces the same value when applying this log entry.
+                // Using Uuid::new_v4() here would diverge state across replicas.
                 let final_member_id = if member_id.is_empty() {
-                    format!("{}-{}", client_id, uuid::Uuid::new_v4())
+                    format!(
+                        "{}-{}-{}",
+                        client_id,
+                        timestamp_ms,
+                        group.members.len()
+                    )
                 } else {
                     member_id
                 };
@@ -401,9 +410,12 @@ impl GroupDomainState {
                     group.members.remove(&member_id);
                     group.assignments.remove(&member_id);
 
-                    // If leader left, elect new leader
+                    // If leader left, elect new leader.
+                    // HashMap iteration order is randomized per process, so
+                    // every replica would pick a different new leader. Use the
+                    // lexicographically smallest member_id for determinism.
                     if group.leader_id.as_ref() == Some(&member_id) {
-                        group.leader_id = group.members.keys().next().cloned();
+                        group.leader_id = group.members.keys().min().cloned();
                     }
 
                     // Trigger rebalance if members remain
@@ -447,7 +459,7 @@ impl GroupDomainState {
                         expired.push((group.group_id.clone(), member_id.clone()));
 
                         if group.leader_id.as_ref() == Some(&member_id) {
-                            group.leader_id = group.members.keys().next().cloned();
+                            group.leader_id = group.members.keys().min().cloned();
                         }
                     }
 

@@ -3,6 +3,7 @@
 use tracing::{debug, error};
 
 use crate::error::KafkaCode;
+use crate::server::RequestContext;
 use crate::server::request::{
     ListOffsetsRequestData, OffsetCommitRequestData, OffsetFetchRequestData,
 };
@@ -13,7 +14,9 @@ use crate::server::response::{
 };
 
 use super::SlateDBClusterHandler;
+use crate::cluster::authorizer::{AuthorizeRequest, AuthorizeResult};
 use crate::cluster::coordinator::validate_topic_name;
+use crate::cluster::raft::{AclOperation, AclResourceType};
 use crate::cluster::traits::ConsumerGroupCoordinator;
 
 /// Handle a list offsets request.
@@ -86,9 +89,51 @@ pub(super) async fn handle_list_offsets(
 /// Handle an offset commit request.
 pub(super) async fn handle_offset_commit(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: OffsetCommitRequestData,
 ) -> OffsetCommitResponseData {
     use crate::cluster::error::HeartbeatResult;
+
+    // Audit S2: OffsetCommit requires Read on the Group resource (per
+    // Kafka). Topic-level Read is also required and is enforced inline
+    // per topic below.
+    if handler
+        .authorizer
+        .authorize(AuthorizeRequest {
+            principal: &ctx.principal,
+            host: &ctx.client_host,
+            operation: AclOperation::Read,
+            resource_type: AclResourceType::Group,
+            resource_name: &request.group_id,
+        })
+        .await
+        == AuthorizeResult::Denied
+    {
+        debug!(
+            group_id = %request.group_id,
+            principal = %ctx.principal,
+            "Denied OffsetCommit by ACL (group)"
+        );
+        let topics: Vec<_> = request
+            .topics
+            .iter()
+            .map(|topic| OffsetCommitTopicResponse {
+                name: topic.name.clone(),
+                partitions: topic
+                    .partitions
+                    .iter()
+                    .map(|p| OffsetCommitPartitionResponse {
+                        partition_index: p.partition_index,
+                        error_code: KafkaCode::GroupAuthorizationFailed,
+                    })
+                    .collect(),
+            })
+            .collect();
+        return OffsetCommitResponseData {
+            throttle_time_ms: 0,
+            topics,
+        };
+    }
 
     // Validate member and generation before allowing any commits.
     // This prevents stale consumers (from before a rebalance) from committing offsets.
@@ -161,6 +206,32 @@ pub(super) async fn handle_offset_commit(
                     topics,
                 };
             }
+            Ok(HeartbeatResult::RebalanceInProgress) => {
+                debug!(
+                    group_id = %request.group_id,
+                    member_id = %request.member_id,
+                    "Rejecting offset commit while group is rebalancing"
+                );
+                let topics: Vec<_> = request
+                    .topics
+                    .iter()
+                    .map(|topic| OffsetCommitTopicResponse {
+                        name: topic.name.clone(),
+                        partitions: topic
+                            .partitions
+                            .iter()
+                            .map(|p| OffsetCommitPartitionResponse {
+                                partition_index: p.partition_index,
+                                error_code: KafkaCode::RebalanceInProgress,
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                return OffsetCommitResponseData {
+                    throttle_time_ms: 0,
+                    topics,
+                };
+            }
             Err(e) => {
                 error!(error = %e, "Failed to validate member for offset commit");
                 let topics: Vec<_> = request
@@ -198,6 +269,39 @@ pub(super) async fn handle_offset_commit(
                 .map(|p| OffsetCommitPartitionResponse {
                     partition_index: p.partition_index,
                     error_code: KafkaCode::InvalidTopic,
+                })
+                .collect();
+            responses.push(OffsetCommitTopicResponse {
+                name: topic.name,
+                partitions: partition_responses,
+            });
+            continue;
+        }
+
+        // Audit S2: OffsetCommit also requires Read on each topic.
+        if handler
+            .authorizer
+            .authorize(AuthorizeRequest {
+                principal: &ctx.principal,
+                host: &ctx.client_host,
+                operation: AclOperation::Read,
+                resource_type: AclResourceType::Topic,
+                resource_name: &topic.name,
+            })
+            .await
+            == AuthorizeResult::Denied
+        {
+            debug!(
+                topic = %topic.name,
+                principal = %ctx.principal,
+                "Denied OffsetCommit by ACL (topic)"
+            );
+            let partition_responses: Vec<_> = topic
+                .partitions
+                .iter()
+                .map(|p| OffsetCommitPartitionResponse {
+                    partition_index: p.partition_index,
+                    error_code: KafkaCode::TopicAuthorizationFailed,
                 })
                 .collect();
             responses.push(OffsetCommitTopicResponse {
@@ -278,8 +382,51 @@ pub(super) async fn handle_offset_commit(
 /// Handle an offset fetch request.
 pub(super) async fn handle_offset_fetch(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: OffsetFetchRequestData,
 ) -> OffsetFetchResponseData {
+    // Audit S2: OffsetFetch requires Describe on the Group resource.
+    if handler
+        .authorizer
+        .authorize(AuthorizeRequest {
+            principal: &ctx.principal,
+            host: &ctx.client_host,
+            operation: AclOperation::Describe,
+            resource_type: AclResourceType::Group,
+            resource_name: &request.group_id,
+        })
+        .await
+        == AuthorizeResult::Denied
+    {
+        debug!(
+            group_id = %request.group_id,
+            principal = %ctx.principal,
+            "Denied OffsetFetch by ACL"
+        );
+        let topics: Vec<_> = request
+            .topics
+            .iter()
+            .map(|topic| OffsetFetchTopicResponse {
+                name: topic.name.clone(),
+                partitions: topic
+                    .partition_indexes
+                    .iter()
+                    .map(|&partition_index| OffsetFetchPartitionResponse {
+                        partition_index,
+                        committed_offset: -1,
+                        metadata: None,
+                        error_code: KafkaCode::GroupAuthorizationFailed,
+                    })
+                    .collect(),
+            })
+            .collect();
+        return OffsetFetchResponseData {
+            throttle_time_ms: 0,
+            topics,
+            error_code: KafkaCode::GroupAuthorizationFailed,
+        };
+    }
+
     let mut responses = Vec::with_capacity(request.topics.len());
 
     for topic in request.topics {
@@ -294,6 +441,41 @@ pub(super) async fn handle_offset_fetch(
                     committed_offset: -1,
                     metadata: None,
                     error_code: KafkaCode::InvalidTopic,
+                })
+                .collect();
+            responses.push(OffsetFetchTopicResponse {
+                name: topic.name,
+                partitions: partition_responses,
+            });
+            continue;
+        }
+
+        // Audit S2: also require Describe on each topic.
+        if handler
+            .authorizer
+            .authorize(AuthorizeRequest {
+                principal: &ctx.principal,
+                host: &ctx.client_host,
+                operation: AclOperation::Describe,
+                resource_type: AclResourceType::Topic,
+                resource_name: &topic.name,
+            })
+            .await
+            == AuthorizeResult::Denied
+        {
+            debug!(
+                topic = %topic.name,
+                principal = %ctx.principal,
+                "Denied OffsetFetch by ACL (topic)"
+            );
+            let partition_responses: Vec<_> = topic
+                .partition_indexes
+                .iter()
+                .map(|&partition_index| OffsetFetchPartitionResponse {
+                    partition_index,
+                    committed_offset: -1,
+                    metadata: None,
+                    error_code: KafkaCode::TopicAuthorizationFailed,
                 })
                 .collect();
             responses.push(OffsetFetchTopicResponse {
@@ -699,6 +881,7 @@ mod tests {
             HeartbeatResult::Success => KafkaCode::None,
             HeartbeatResult::UnknownMember => KafkaCode::UnknownMemberId,
             HeartbeatResult::IllegalGeneration => KafkaCode::IllegalGeneration,
+            HeartbeatResult::RebalanceInProgress => KafkaCode::RebalanceInProgress,
         };
         assert_eq!(error_code, KafkaCode::UnknownMemberId);
     }

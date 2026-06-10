@@ -56,6 +56,12 @@ pub enum Error {
     /// Configuration error.
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// Authentication required or rejected at the connection level.
+    /// Surfaced when SASL is required and the client tries to use a
+    /// non-handshake API before completing SaslAuthenticate (audit S1).
+    #[error("Authentication required: {0}")]
+    Authentication(String),
 }
 
 impl PartialEq for Error {
@@ -65,6 +71,7 @@ impl PartialEq for Error {
             (Error::ParsingError(a), Error::ParsingError(b)) => a == b,
             (Error::MissingData(a), Error::MissingData(b)) => a == b,
             (Error::Config(a), Error::Config(b)) => a == b,
+            (Error::Authentication(a), Error::Authentication(b)) => a == b,
             _ => false,
         }
     }

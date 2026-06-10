@@ -673,6 +673,12 @@ impl ConsumerGroupCoordinator for MockCoordinator {
         Ok(groups.keys().cloned().collect())
     }
 
+    async fn delete_consumer_group(&self, group_id: &str) -> SlateDBResult<()> {
+        let mut groups = self.consumer_groups.write().await;
+        groups.remove(group_id);
+        Ok(())
+    }
+
     #[allow(clippy::collapsible_if)]
     async fn set_member_assignment(
         &self,

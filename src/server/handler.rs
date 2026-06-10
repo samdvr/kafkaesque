@@ -25,6 +25,20 @@ use super::request::*;
 use super::response::*;
 use super::versions;
 
+/// Outcome of a SaslAuthenticate exchange that the dispatcher uses to
+/// decide whether to open the connection's auth gate (audit P0-3).
+///
+/// - `complete = true` means the handshake is finished and the gate
+///   should flip. `principal` is the authenticated identity, if any.
+/// - `complete = false` (with `error_code = None` on the wire) is an
+///   intermediate SCRAM challenge — the handshake continues on the next
+///   SaslAuthenticate request.
+#[derive(Debug, Clone)]
+pub struct SaslPostAuth {
+    pub principal: Option<String>,
+    pub complete: bool,
+}
+
 /// Context for a request, containing connection information.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
@@ -36,6 +50,14 @@ pub struct RequestContext {
     pub client_id: Option<String>,
     /// Unique request ID for correlation across logs and traces.
     pub request_id: uuid::Uuid,
+    /// Authenticated principal in `User:<name>` form. Defaults to
+    /// `User:ANONYMOUS` for connections that have not (yet) completed
+    /// SaslAuthenticate. The cluster-handler authorizer (audit S2) keys ACL
+    /// decisions against this value.
+    pub principal: String,
+    /// Client host string used for ACL host matching. Mirrors the IP from
+    /// `client_addr`; ACL bindings can wildcard with `*`.
+    pub client_host: String,
 }
 
 impl RequestContext {
@@ -368,6 +390,30 @@ pub trait Handler: Send + Sync {
             error_code: KafkaCode::UnsupportedSaslMechanism,
             mechanisms: vec![],
         }
+    }
+
+    /// Whether SASL must complete before this connection can issue any
+    /// non-handshake API. Default `false` so existing handlers / tests are
+    /// unchanged. The Kafkaesque cluster handler returns
+    /// `ClusterConfig::sasl_required` (audit S1).
+    fn sasl_required(&self) -> bool {
+        false
+    }
+
+    /// Read out the post-authenticate state for a connection, if any
+    /// (audit P0-3 SCRAM). Multi-step mechanisms — SCRAM-SHA-256 is the
+    /// one we ship — return `error_code = None` for *intermediate*
+    /// challenges as well as final successes; the dispatcher needs to
+    /// know which so it doesn't open the auth gate after just the first
+    /// round-trip. The cluster handler stashes a `(principal, complete)`
+    /// record keyed by the client's `SocketAddr` while running
+    /// `handle_sasl_authenticate`, and the dispatcher takes it back out
+    /// here. Default `None` keeps PLAIN-only and test handlers unchanged.
+    async fn take_sasl_post_auth(
+        &self,
+        _client_addr: SocketAddr,
+    ) -> Option<SaslPostAuth> {
+        None
     }
 
     /// Handle a SaslAuthenticate request.

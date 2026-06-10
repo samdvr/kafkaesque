@@ -124,6 +124,8 @@ mod tests {
         let state = ProducerState {
             last_sequence: 100,
             producer_epoch: 5,
+            last_first_sequence: 91,
+            last_base_offset: 12345,
         };
         let cloned = state;
         assert_eq!(cloned.last_sequence, 100);
@@ -135,6 +137,8 @@ mod tests {
         let state = ProducerState {
             last_sequence: 100,
             producer_epoch: 5,
+            last_first_sequence: 91,
+            last_base_offset: 12345,
         };
         let debug = format!("{:?}", state);
         assert!(debug.contains("last_sequence"));
@@ -501,27 +505,24 @@ mod tests {
 
         // First batch: sequence 0-4
         let batch1 = create_test_batch(12345, 0, 0, 5);
-        store
+        let first_offset = store
             .append_batch(&batch1)
             .await
             .expect("First batch failed");
 
-        // Duplicate batch: same sequence 0-4 - should be rejected
+        // Exact-replay duplicate of the most recent batch must return the
+        // ORIGINAL base_offset as success (Kafka idempotent-producer
+        // contract — see audit B11). Returning DuplicateSequence here would
+        // poison the producer session.
         let batch2 = create_test_batch(12345, 0, 0, 5);
-        let result = store.append_batch(&batch2).await;
-
-        match result {
-            Err(super::super::error::SlateDBError::DuplicateSequence {
-                producer_id,
-                expected_sequence,
-                received_sequence,
-            }) => {
-                assert_eq!(producer_id, 12345);
-                assert_eq!(expected_sequence, 5); // last_sequence(4) + 1
-                assert_eq!(received_sequence, 0);
-            }
-            _ => panic!("Expected DuplicateSequence error, got {:?}", result),
-        }
+        let dup_offset = store
+            .append_batch(&batch2)
+            .await
+            .expect("Exact-replay duplicate must return cached offset, not error");
+        assert_eq!(
+            dup_offset, first_offset,
+            "Duplicate retry must return the original base_offset"
+        );
 
         store.close().await.expect("Failed to close");
     }

@@ -639,6 +639,8 @@ mod tests {
             request_id: uuid::Uuid::new_v4(),
             api_version: 0,
             client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+            principal: "User:ANONYMOUS".to_string(),
+            client_host: "127.0.0.1".to_string(),
         }
     }
 

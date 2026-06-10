@@ -37,6 +37,7 @@ use moka::sync::Cache as MokaCache;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 use slatedb::Db;
+use slatedb::WriteBatch;
 use slatedb::config::{PutOptions, Settings as SlateDbSettings, WriteOptions};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
@@ -90,6 +91,15 @@ pub struct ProducerState {
     pub last_sequence: i32,
     /// Producer epoch for fencing zombie producers.
     pub producer_epoch: i16,
+    /// First sequence number of the most recent successfully appended batch.
+    /// Used together with `last_base_offset` to recognize a duplicate retry
+    /// of *the same* batch and reply with success-and-original-offset, as
+    /// Kafka's idempotent-producer contract requires (audit B11).
+    /// Not persisted: in-memory only, populated on append.
+    pub last_first_sequence: i32,
+    /// Base offset assigned to the most recent successfully appended batch.
+    /// In-memory only.
+    pub last_base_offset: i64,
 }
 
 /// Wrapper around SlateDB for a single Kafka partition.
@@ -262,103 +272,6 @@ impl PartitionStore {
         Ok(store)
     }
 
-    /// Persist a producer's state to SlateDB.
-    ///
-    /// This helps idempotency survive broker restarts. Called after
-    /// successful batch write.
-    ///
-    /// # Performance Note
-    ///
-    /// This is best-effort for non-fencing errors. The producer state is already
-    /// in the in-memory cache for the current session. If persistence fails:
-    /// - Current session: idempotency still works via in-memory cache
-    /// - After restart: may accept duplicates if producer reconnects with same ID
-    ///
-    /// This matches the durability semantics of the record batch itself, which
-    /// uses await_durable=false for throughput.
-    ///
-    /// Retry logic for transient failures
-    ///
-    /// Non-fencing errors are now retried up to 3 times before giving up.
-    /// This reduces the risk of idempotency loss from transient storage issues.
-    ///
-    /// # Errors
-    ///
-    /// Only fencing errors are propagated to fail the produce request.
-    /// Other errors are retried, then logged and ignored (best-effort persistence).
-    async fn persist_producer_state(
-        &self,
-        producer_id: i64,
-        last_sequence: i32,
-        producer_epoch: i16,
-    ) -> SlateDBResult<()> {
-        let key = encode_producer_state_key(producer_id);
-        let value = encode_producer_state_value(last_sequence, producer_epoch);
-
-        // Retry up to 3 times for transient failures
-        const MAX_RETRIES: u32 = 3;
-        let mut last_error: Option<SlateDBError> = None;
-
-        for attempt in 0..MAX_RETRIES {
-            match self
-                .db
-                .put_with_options(&key, &value, &PutOptions::default(), &FAST_WRITE_OPTIONS)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let err = SlateDBError::from(e);
-
-                    // Fencing errors are critical - another writer has taken over
-                    // Don't retry, fail immediately
-                    if err.is_fenced() {
-                        error!(
-                            topic = %self.topic,
-                            partition = self.partition,
-                            producer_id,
-                            "FENCED during producer state persistence"
-                        );
-                        return Err(err);
-                    }
-
-                    if attempt < MAX_RETRIES - 1 {
-                        warn!(
-                            topic = %self.topic,
-                            partition = self.partition,
-                            producer_id,
-                            attempt = attempt + 1,
-                            max_retries = MAX_RETRIES,
-                            error = %err,
-                            "Retrying producer state persistence"
-                        );
-                        // Brief delay before retry (exponential backoff)
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10 * (1 << attempt)))
-                            .await;
-                    }
-
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        // All retries exhausted
-        if let Some(err) = last_error {
-            warn!(
-                topic = %self.topic,
-                partition = self.partition,
-                producer_id,
-                last_sequence,
-                producer_epoch,
-                error = %err,
-                "Failed to persist producer state after {} retries \
-                 (idempotency works for current session but may fail after restart)",
-                MAX_RETRIES
-            );
-            super::metrics::record_producer_state_persistence_failure(&self.topic, self.partition);
-        }
-        Ok(())
-    }
-
     pub fn topic(&self) -> &str {
         &self.topic
     }
@@ -413,6 +326,22 @@ impl PartitionStore {
     /// Returns `SlateDBError::EpochMismatch` if the stored epoch in SlateDB doesn't
     /// match our expected epoch, indicating another broker has acquired this partition.
     pub async fn append_batch(&self, records: &Bytes) -> SlateDBResult<i64> {
+        self.append_batch_inner(records, false).await
+    }
+
+    /// Append a record batch and wait for SlateDB to confirm durability before
+    /// returning. Required for `acks>=1` to honor Kafka's ack contract — the
+    /// fast `append_batch` path can lose acknowledged data in the ~100ms WAL
+    /// flush window if the broker dies between ack and flush.
+    pub async fn append_batch_durable(&self, records: &Bytes) -> SlateDBResult<i64> {
+        self.append_batch_inner(records, true).await
+    }
+
+    async fn append_batch_inner(
+        &self,
+        records: &Bytes,
+        durable: bool,
+    ) -> SlateDBResult<i64> {
         use super::keys::{LEADER_EPOCH_KEY, decode_leader_epoch};
 
         // Check zombie mode BEFORE acquiring write lock
@@ -528,7 +457,11 @@ impl PartitionStore {
             )));
         }
 
-        // Idempotency check: detects and rejects duplicate or out-of-order messages
+        // Idempotency check: detects and rejects duplicate or out-of-order messages.
+        // For *exact-replay* duplicates we return the original base_offset (success)
+        // rather than DuplicateSequence (audit B11) so retries that the network ate
+        // don't break the producer.
+        let mut idempotent_dup_offset: Option<i64> = None;
         if let Some(producer_info) = parse_producer_info(records)
             && producer_info.is_idempotent()
             && let Some(state) = self.producer_states.get(&producer_info.producer_id)
@@ -551,8 +484,28 @@ impl PartitionStore {
                 });
             }
 
-            // Higher epoch indicates new producer incarnation - reset sequence tracking
+            // Higher epoch indicates new producer incarnation. Kafka's contract
+            // is that the producer resets its sequence to 0 on epoch bump, so
+            // we MUST require first_sequence == 0 here (audit B11). Without
+            // this gate, a higher-epoch batch with an arbitrary replayed
+            // sequence would be accepted as fresh.
             if producer_info.producer_epoch > state.producer_epoch {
+                if producer_info.first_sequence != 0 {
+                    warn!(
+                        topic = %self.topic,
+                        partition = self.partition,
+                        producer_id = producer_info.producer_id,
+                        new_epoch = producer_info.producer_epoch,
+                        first_sequence = producer_info.first_sequence,
+                        "Rejecting batch on epoch bump: first_sequence must be 0"
+                    );
+                    super::metrics::record_idempotency_rejection("out_of_order");
+                    return Err(SlateDBError::OutOfOrderSequence {
+                        producer_id: producer_info.producer_id,
+                        expected_sequence: 0,
+                        received_sequence: producer_info.first_sequence,
+                    });
+                }
                 debug!(
                     topic = %self.topic,
                     partition = self.partition,
@@ -583,23 +536,44 @@ impl PartitionStore {
                 };
 
                 if producer_info.first_sequence <= state.last_sequence {
-                    warn!(
-                        topic = %self.topic,
-                        partition = self.partition,
-                        producer_id = producer_info.producer_id,
-                        first_sequence = producer_info.first_sequence,
-                        last_seen = state.last_sequence,
-                        "Rejecting duplicate batch"
-                    );
-                    super::metrics::record_idempotency_rejection("duplicate");
-                    return Err(SlateDBError::DuplicateSequence {
-                        producer_id: producer_info.producer_id,
-                        expected_sequence: expected_seq,
-                        received_sequence: producer_info.first_sequence,
-                    });
+                    // Exact-replay of the most recent batch: return the cached
+                    // base_offset as success rather than DuplicateSequence —
+                    // matches Kafka's idempotent producer contract. Older or
+                    // partial replays still fall through to the error below.
+                    if state.last_first_sequence == producer_info.first_sequence
+                        && state.last_base_offset >= 0
+                    {
+                        debug!(
+                            topic = %self.topic,
+                            partition = self.partition,
+                            producer_id = producer_info.producer_id,
+                            first_sequence = producer_info.first_sequence,
+                            cached_offset = state.last_base_offset,
+                            "Returning cached base_offset for duplicate retry"
+                        );
+                        super::metrics::record_idempotency_rejection("duplicate_idempotent_ok");
+                        idempotent_dup_offset = Some(state.last_base_offset);
+                    } else {
+                        warn!(
+                            topic = %self.topic,
+                            partition = self.partition,
+                            producer_id = producer_info.producer_id,
+                            first_sequence = producer_info.first_sequence,
+                            last_seen = state.last_sequence,
+                            "Rejecting duplicate batch (no cached offset for retry)"
+                        );
+                        super::metrics::record_idempotency_rejection("duplicate");
+                        return Err(SlateDBError::DuplicateSequence {
+                            producer_id: producer_info.producer_id,
+                            expected_sequence: expected_seq,
+                            received_sequence: producer_info.first_sequence,
+                        });
+                    }
                 }
 
-                if producer_info.first_sequence != expected_seq {
+                if idempotent_dup_offset.is_none()
+                    && producer_info.first_sequence != expected_seq
+                {
                     warn!(
                         topic = %self.topic,
                         partition = self.partition,
@@ -618,6 +592,13 @@ impl PartitionStore {
             }
         }
 
+        // If this turned out to be a duplicate retry of the most recent batch,
+        // return the cached base_offset without writing again. The records are
+        // already durable from the first append.
+        if let Some(cached_offset) = idempotent_dup_offset {
+            return Ok(cached_offset);
+        }
+
         let new_hwm = base_offset + record_count as i64;
 
         // Build value with metadata using pooled buffer to reduce allocations.
@@ -634,13 +615,38 @@ impl PartitionStore {
         // Patch base_offset in record batch (at offset 8, where the batch starts)
         patch_base_offset(&mut buffer[8..], base_offset);
 
-        // Uses FAST_WRITE_OPTIONS (await_durable=false) for throughput.
-        // Durability is provided by SlateDB's periodic flush_interval.
+        // For acks>=1 we must wait for SlateDB durability before acking the
+        // producer; otherwise an OOM-kill or rolling restart inside the WAL
+        // flush window silently loses already-acknowledged data.
+        let write_options = if durable {
+            WriteOptions { await_durable: true }
+        } else {
+            FAST_WRITE_OPTIONS
+        };
         let key = encode_record_key(base_offset);
-        let write_result = self
-            .db
-            .put_with_options(&key, &buffer, &PutOptions::default(), &FAST_WRITE_OPTIONS)
-            .await;
+
+        // Pull producer-state metadata up-front so we can atomically commit it
+        // alongside the record batch (audit B11). Persisting after the batch
+        // write let the two diverge: a persist failure either rejected an
+        // already-committed append or silently succeeded non-durably, both of
+        // which break idempotency across restart.
+        let pending_producer_state = parse_producer_info(records)
+            .filter(|info| info.is_idempotent())
+            .map(|info| {
+                let last_sequence = info
+                    .last_sequence()
+                    .unwrap_or(info.first_sequence);
+                let key = encode_producer_state_key(info.producer_id);
+                let value = encode_producer_state_value(last_sequence, info.producer_epoch);
+                (info, last_sequence, key, value)
+            });
+
+        let mut batch = WriteBatch::new();
+        batch.put(key.as_slice(), buffer.as_slice());
+        if let Some((_, _, ps_key, ps_value)) = &pending_producer_state {
+            batch.put(ps_key.as_slice(), ps_value.as_slice());
+        }
+        let write_result = self.db.write_with_options(batch, &write_options).await;
 
         // Return buffer to pool BEFORE handling result (ensures buffer is always returned)
         super::buffer_pool::return_buffer(buffer);
@@ -700,33 +706,20 @@ impl PartitionStore {
         // Add to batch index for efficient lookup during fetch
         self.add_to_batch_index(base_offset, record_count);
 
-        // Update producer state after successful write
-        // This must happen after the write is confirmed durable
-        if let Some(producer_info) = parse_producer_info(records)
-            && producer_info.is_idempotent()
-        {
-            // Calculate last sequence in this batch
-            let last_sequence = producer_info
-                .last_sequence()
-                .unwrap_or(producer_info.first_sequence);
-
+        // Update producer state cache after successful atomic write. The
+        // producer-state key was already written in the same WriteBatch
+        // above, so we don't need a separate persist call (audit B11).
+        if let Some((producer_info, last_sequence, _, _)) = pending_producer_state {
             // Update in-memory cache
             self.producer_states.insert(
                 producer_info.producer_id,
                 ProducerState {
                     last_sequence,
                     producer_epoch: producer_info.producer_epoch,
+                    last_first_sequence: producer_info.first_sequence,
+                    last_base_offset: base_offset,
                 },
             );
-
-            // CRITICAL: Persist producer state to SlateDB for durability
-            // This ensures idempotency survives broker restarts
-            self.persist_producer_state(
-                producer_info.producer_id,
-                last_sequence,
-                producer_info.producer_epoch,
-            )
-            .await?;
 
             // Proactive sequence number monitoring
             // Track sequence numbers and alert when approaching exhaustion
@@ -860,17 +853,11 @@ impl PartitionStore {
                 break;
             }
 
-            // Check if adding this batch would exceed max_size
-            if combined.len() + batch_data.len() > max_size {
-                // If we have some data, return what we have
-                if !combined.is_empty() {
-                    break;
-                }
-                // If this single batch exceeds max_size, truncate it
-                let remaining = max_size.saturating_sub(combined.len());
-                if remaining > 0 {
-                    combined.extend_from_slice(&batch_data[..remaining.min(batch_data.len())]);
-                }
+            // Kafka's fetch contract: always return at least one complete
+            // record batch even if it exceeds `max_bytes`, otherwise the
+            // consumer will be stuck (it can't parse a torn batch). Only
+            // batches *after* the first are gated by the size budget.
+            if !combined.is_empty() && combined.len() + batch_data.len() > max_size {
                 break;
             }
 
@@ -879,6 +866,12 @@ impl PartitionStore {
 
             combined.extend_from_slice(batch_data);
             batch_count += 1;
+
+            // After we've included the first (possibly oversized) batch,
+            // stop if we've already met or exceeded the byte budget.
+            if combined.len() >= max_size {
+                break;
+            }
         }
 
         let records = if combined.is_empty() {
@@ -1561,13 +1554,19 @@ impl PartitionStoreBuilder {
             })
             .build();
 
-        // Populate the cache with persisted producer states
+        // Populate the cache with persisted producer states. The retry-dedup
+        // fields (last_first_sequence / last_base_offset) are not persisted —
+        // a duplicate retry across restart will be safely rejected by the
+        // existing sequence check rather than silently re-acked. Real Kafka
+        // clients bump producer_epoch on reconnect, which advances past this.
         for (producer_id, (last_sequence, producer_epoch)) in persisted_states {
             producer_states_cache.insert(
                 producer_id,
                 ProducerState {
                     last_sequence,
                     producer_epoch,
+                    last_first_sequence: -1,
+                    last_base_offset: -1,
                 },
             );
         }

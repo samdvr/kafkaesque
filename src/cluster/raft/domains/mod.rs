@@ -7,6 +7,7 @@
 //! - **Group**: Consumer group coordination, assignments, offsets
 //! - **Producer**: Producer ID allocation, idempotency state
 //! - **Transfer**: Fast failover, batch partition transfers
+//! - **Acl**: Authorization bindings (audit S2)
 //!
 //! Each domain provides:
 //! - Command enum defining operations
@@ -16,12 +17,17 @@
 //!
 //! The main `CoordinationState` composes these domains.
 
+pub mod acl;
 pub mod broker;
 pub mod group;
 pub mod partition;
 pub mod producer;
 pub mod transfer;
 
+pub use acl::{
+    AclBinding, AclCommand, AclDecision, AclDomainState, AclFilter, AclOperation,
+    AclPatternType, AclPermissionType, AclResourceType, AclResponse,
+};
 pub use broker::{BrokerCommand, BrokerDomainState, BrokerResponse, BrokerStatus};
 pub use group::{GroupCommand, GroupDomainState, GroupResponse, MemberDescription};
 pub use partition::{PartitionCommand, PartitionDomainState, PartitionResponse};

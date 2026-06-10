@@ -15,7 +15,10 @@ spec:
     - Egress
 
   ingress:
-    # Allow Kafka client connections
+    # Allow Kafka client connections. Audit S11: scope by both namespace and
+    # pod label so untrusted neighbour pods can't reach the unauthenticated
+    # Kafka port. Operators that want truly open access must set
+    # `networkPolicy.allowExternal: true` explicitly.
     - ports:
         - protocol: TCP
           port: {{ .Values.config.kafkaPort }}
@@ -26,8 +29,16 @@ spec:
         {{- if .Values.networkPolicy.ingressNamespaceSelector }}
         - namespaceSelector:
             {{- toYaml .Values.networkPolicy.ingressNamespaceSelector | nindent 12 }}
+          {{- with .Values.networkPolicy.ingressClientPodSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
         {{- else }}
         - namespaceSelector: {}
+          {{- with .Values.networkPolicy.ingressClientPodSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
         {{- end }}
       {{- end }}
 
@@ -40,12 +51,18 @@ spec:
             matchLabels:
               {{- include "kafkaesque.selectorLabels" . | nindent 14 }}
 
-    # Allow health check access (for probes and monitoring)
+    # Allow health check access. Restricted to opt-in scrapers; without
+    # this gate /metrics leaks topic names + traffic patterns to any pod
+    # in the cluster (audit S8/S11).
     - ports:
         - protocol: TCP
           port: {{ .Values.config.healthPort }}
       from:
         - namespaceSelector: {}
+          {{- with .Values.networkPolicy.ingressHealthPodSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
 
   egress:
     # Allow DNS resolution

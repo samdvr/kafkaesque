@@ -5,11 +5,32 @@
 
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
+use object_store::prefix::PrefixStore;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::config::{ClusterConfig, ObjectStoreType};
 use super::error::{SlateDBError, SlateDBResult};
+
+/// Wrap a raw `ObjectStore` with the configured `cluster_id` as a top-level
+/// prefix so two Kafkaesque clusters pointed at the same bucket/path can't
+/// interleave SlateDB files (audit S7). When `cluster_id` is empty we keep
+/// the legacy unprefixed layout for backwards compatibility but warn loudly.
+fn wrap_with_cluster_prefix(
+    store: Arc<dyn ObjectStore>,
+    cluster_id: &str,
+) -> Arc<dyn ObjectStore> {
+    if cluster_id.is_empty() {
+        warn!(
+            "cluster_id is empty; object-store layout is unscoped. Two clusters \
+             sharing this bucket will silently corrupt each other. Set \
+             CLUSTER_ID to a unique value (audit S7)."
+        );
+        return store;
+    }
+    info!(cluster_id, "Namespacing object store under cluster_id prefix");
+    Arc::new(PrefixStore::new(store, cluster_id.to_string()))
+}
 
 /// Create an object store from configuration.
 ///
@@ -31,7 +52,7 @@ use super::error::{SlateDBError, SlateDBResult};
 /// - The data directory cannot be created (for local filesystem)
 /// - Cloud provider configuration is invalid
 pub fn create_object_store(config: &ClusterConfig) -> SlateDBResult<Arc<dyn ObjectStore>> {
-    match &config.object_store {
+    let raw: Arc<dyn ObjectStore> = match &config.object_store {
         ObjectStoreType::Local { path } => {
             // Create directory if it doesn't exist
             std::fs::create_dir_all(path).map_err(|e| {
@@ -39,7 +60,7 @@ pub fn create_object_store(config: &ClusterConfig) -> SlateDBResult<Arc<dyn Obje
             })?;
 
             let store = LocalFileSystem::new_with_prefix(path)?;
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
         ObjectStoreType::S3 {
             bucket,
@@ -55,7 +76,29 @@ pub fn create_object_store(config: &ClusterConfig) -> SlateDBResult<Arc<dyn Obje
                 .with_region(region);
 
             if let Some(ep) = endpoint {
-                builder = builder.with_endpoint(ep).with_allow_http(true);
+                // Allow plain HTTP only when the operator has explicitly opted
+                // in via ALLOW_HTTP_S3=true. Otherwise S3 credentials would
+                // transit cleartext to a custom endpoint (audit S9). Common
+                // local dev with `http://minio:9000` requires the opt-in.
+                let allow_http = std::env::var("ALLOW_HTTP_S3")
+                    .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(false);
+                if !allow_http && ep.starts_with("http://") {
+                    return Err(SlateDBError::Config(format!(
+                        "Refusing to use plain-HTTP S3 endpoint {} — credentials \
+                         would transit cleartext. Set ALLOW_HTTP_S3=true to \
+                         opt in (only safe on a trusted network), or switch the \
+                         endpoint to https://.",
+                        ep
+                    )));
+                }
+                if allow_http && ep.starts_with("http://") {
+                    tracing::warn!(
+                        endpoint = %ep,
+                        "ALLOW_HTTP_S3 is enabled — S3 credentials will transit cleartext to this endpoint"
+                    );
+                }
+                builder = builder.with_endpoint(ep).with_allow_http(allow_http);
             }
 
             if let (Some(key), Some(secret)) = (access_key_id, secret_access_key) {
@@ -69,7 +112,7 @@ pub fn create_object_store(config: &ClusterConfig) -> SlateDBResult<Arc<dyn Obje
             })?;
 
             info!(bucket = %bucket, region = %region, "Using S3 object store");
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
         ObjectStoreType::Gcs {
             bucket,
@@ -88,7 +131,7 @@ pub fn create_object_store(config: &ClusterConfig) -> SlateDBResult<Arc<dyn Obje
             })?;
 
             info!(bucket = %bucket, "Using GCS object store");
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
         ObjectStoreType::Azure {
             container,
@@ -110,9 +153,11 @@ pub fn create_object_store(config: &ClusterConfig) -> SlateDBResult<Arc<dyn Obje
             })?;
 
             info!(container = %container, account = %account, "Using Azure object store");
-            Ok(Arc::new(store))
+            Arc::new(store)
         }
-    }
+    };
+
+    Ok(wrap_with_cluster_prefix(raw, &config.cluster_id))
 }
 
 #[cfg(test)]
@@ -457,13 +502,13 @@ mod tests {
 
     #[test]
     fn test_create_s3_store_with_credentials() {
-        // Test S3 builder path with credentials
-        // This doesn't make actual connections, just tests the builder
+        // Test S3 builder path with credentials. Use HTTPS so the audit-S9
+        // plain-HTTP guard doesn't reject the builder before we get here.
         let config = ClusterConfig {
             object_store: ObjectStoreType::S3 {
                 bucket: "test-bucket".to_string(),
                 region: "us-west-2".to_string(),
-                endpoint: Some("http://localhost:9000".to_string()),
+                endpoint: Some("https://s3.example.com".to_string()),
                 access_key_id: Some("test-key".to_string()),
                 secret_access_key: Some("test-secret".to_string()),
             },
@@ -501,7 +546,7 @@ mod tests {
             object_store: ObjectStoreType::S3 {
                 bucket: "test-bucket".to_string(),
                 region: "us-east-1".to_string(),
-                endpoint: Some("http://minio:9000".to_string()),
+                endpoint: Some("https://minio.example.com".to_string()),
                 access_key_id: None,
                 secret_access_key: None,
             },
@@ -510,6 +555,28 @@ mod tests {
 
         let result = create_object_store(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_s3_store_rejects_plain_http_endpoint_by_default() {
+        // Audit S9: a plain-HTTP custom endpoint must be refused unless
+        // ALLOW_HTTP_S3 is explicitly set, so credentials don't transit
+        // cleartext on a default deploy.
+        let config = ClusterConfig {
+            object_store: ObjectStoreType::S3 {
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some("http://insecure.example.com".to_string()),
+                access_key_id: Some("k".to_string()),
+                secret_access_key: Some("s".to_string()),
+            },
+            ..Default::default()
+        };
+        let result = create_object_store(&config);
+        assert!(
+            result.is_err(),
+            "plain-HTTP S3 endpoint must be rejected by default"
+        );
     }
 
     // ========================================================================

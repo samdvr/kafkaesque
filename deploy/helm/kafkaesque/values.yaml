@@ -6,7 +6,12 @@ replicaCount: 3
 image:
   repository: kafkaesque
   pullPolicy: IfNotPresent
+  # Audit S11: prefer pinning to a content digest in production deploys so
+  # the workload can't be silently shifted to a different image with the
+  # same tag (e.g. a tampered `:latest`). Set `digest` to a `sha256:...`
+  # string to override `tag`. Local dev can leave digest empty.
   tag: "latest"
+  digest: ""
 
 imagePullSecrets: []
 nameOverride: ""
@@ -62,6 +67,43 @@ config:
   # Logging
   logLevel: "info"
   logFormat: "json"
+
+# TLS for the Kafka client port (audit P0-4).
+#
+# When `enabled` is true the StatefulSet mounts the configured Kubernetes
+# secret at `/etc/kafkaesque/tls/` and the broker reads the cert/key from
+# that path. Build the image with `--features tls` (the published default
+# already does so). Without TLS, SASL PLAIN credentials transit the wire
+# in cleartext, so production deployments should turn this on or disable
+# PLAIN entirely.
+#
+# Generate the secret with e.g.:
+#   kubectl create secret tls kafkaesque-tls \
+#     --cert=server.crt --key=server.key
+tls:
+  enabled: false
+  # Kubernetes Secret of type `kubernetes.io/tls` containing `tls.crt`
+  # and `tls.key`. Same secret is mounted on every replica.
+  certSecretName: ""
+  # Mount path inside the container. The broker reads `tls.crt` /
+  # `tls.key` from this directory.
+  mountPath: /etc/kafkaesque/tls
+
+# mTLS for the Raft control plane (audit P0-5). Independent of `tls` above:
+# the Kafka client port and the Raft port can run with different cert
+# bundles. The HMAC framing layer (RAFT_CLUSTER_SECRET) stays in place
+# whether or not Raft mTLS is on — TLS adds peer identity, HMAC keeps
+# message integrity guarantees that aren't undermined if a cert is leaked
+# and revoked.
+raftTls:
+  enabled: false
+  # Secret containing tls.crt, tls.key, and ca.crt for verifying peer
+  # certificates.
+  certSecretName: ""
+  mountPath: /etc/kafkaesque/raft-tls
+  # SNI presented when this broker connects out to peers. Operators set
+  # this to whatever name the issued certs carry as a SAN.
+  serverName: kafkaesque-raft
 
 # Kubernetes service configuration
 service:
@@ -168,6 +210,19 @@ networkPolicy:
   allowExternal: false
   # Namespace selector for ingress (default: allow from all namespaces)
   ingressNamespaceSelector: {}
+  # Pod selector for Kafka clients. Audit S11: with no auth on the Kafka
+  # port, every pod cluster-wide should NOT be able to reach 9092 by
+  # default. Workloads must opt in by labelling themselves with the keys
+  # below — change these labels (or add allowExternal: true) once SASL
+  # is wired through (audit S1).
+  ingressClientPodSelector:
+    matchLabels:
+      kafkaesque.client/allow: "true"
+  # Pod selector for /metrics + /health scrapers (Prometheus, etc.).
+  # Wide-open access leaks topic names and traffic patterns.
+  ingressHealthPodSelector:
+    matchLabels:
+      kafkaesque.health/allow: "true"
   # Extra egress rules (e.g., for external services)
   extraEgress: []
 
@@ -181,5 +236,18 @@ extraEnvFrom: []
 # - secretRef:
 #     name: kafkaesque-s3-credentials
 
-# Termination grace period
-terminationGracePeriodSeconds: 30
+# Termination grace period. Bumped from 30s so the preStop drain hook
+# below has time to run before the kubelet sends SIGKILL.
+terminationGracePeriodSeconds: 60
+
+# Pod lifecycle hooks. preStop sleeps long enough for the K8s endpoint
+# controller (~30s lag) to remove this pod from the service backing list,
+# so in-flight clients reconnect to a healthy pod instead of hitting a
+# half-shut-down broker.
+lifecycle:
+  preStop:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - sleep 30

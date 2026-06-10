@@ -19,18 +19,47 @@ use tracing::{debug, error};
 use crate::cluster::coordinator::BrokerInfo;
 use crate::constants::VIRTUAL_NODES_PER_BROKER;
 use crate::error::KafkaCode;
+use crate::server::RequestContext;
 use crate::server::request::{
-    FindCoordinatorRequestData, HeartbeatRequestData, JoinGroupRequestData, LeaveGroupRequestData,
+    DeleteGroupsRequestData, DescribeGroupsRequestData, FindCoordinatorRequestData,
+    HeartbeatRequestData, JoinGroupRequestData, LeaveGroupRequestData, ListGroupsRequestData,
     SyncGroupRequestData,
 };
 use crate::server::response::{
+    DeleteGroupResult, DeleteGroupsResponseData, DescribedGroup, DescribeGroupsResponseData,
     FindCoordinatorResponseData, HeartbeatResponseData, JoinGroupMemberData, JoinGroupResponseData,
-    LeaveGroupResponseData, SyncGroupResponseData,
+    LeaveGroupResponseData, ListGroupsResponseData, ListedGroup, SyncGroupResponseData,
 };
 
 use super::SlateDBClusterHandler;
+use crate::cluster::authorizer::{AuthorizeRequest, AuthorizeResult};
 use crate::cluster::error::HeartbeatResult;
+use crate::cluster::raft::{AclOperation, AclResourceType};
 use crate::cluster::traits::{ConsumerGroupCoordinator, PartitionCoordinator};
+
+/// Run an ACL check for an operation on a consumer-group resource.
+///
+/// Returns `true` when the request is allowed and `false` when the
+/// authorizer denies it. Pulled out so every group/offset handler can
+/// gate against `Group:<id>` without repeating the boilerplate.
+async fn group_authorized(
+    handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
+    op: AclOperation,
+    group_id: &str,
+) -> bool {
+    handler
+        .authorizer
+        .authorize(AuthorizeRequest {
+            principal: &ctx.principal,
+            host: &ctx.client_host,
+            operation: op,
+            resource_type: AclResourceType::Group,
+            resource_name: group_id,
+        })
+        .await
+        == AuthorizeResult::Allowed
+}
 
 /// Select a coordinator for a consumer group using consistent hashing.
 ///
@@ -128,6 +157,7 @@ pub(super) async fn handle_find_coordinator(
 /// Handle a join group request.
 pub(super) async fn handle_join_group(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: JoinGroupRequestData,
 ) -> JoinGroupResponseData {
     // Validate group ID
@@ -136,6 +166,24 @@ pub(super) async fn handle_join_group(
         return JoinGroupResponseData {
             throttle_time_ms: 0,
             error_code: KafkaCode::InvalidGroupId,
+            generation_id: -1,
+            protocol_name: String::new(),
+            leader: String::new(),
+            member_id: request.member_id,
+            members: vec![],
+        };
+    }
+
+    // Audit S2: JoinGroup requires Read on the Group resource.
+    if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
+        debug!(
+            group_id = %request.group_id,
+            principal = %ctx.principal,
+            "Denied JoinGroup by ACL"
+        );
+        return JoinGroupResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::GroupAuthorizationFailed,
             generation_id: -1,
             protocol_name: String::new(),
             leader: String::new(),
@@ -246,8 +294,23 @@ pub(super) async fn handle_join_group(
 /// Handle a sync group request.
 pub(super) async fn handle_sync_group(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: SyncGroupRequestData,
 ) -> SyncGroupResponseData {
+    // Audit S2: SyncGroup requires Read on the Group resource.
+    if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
+        debug!(
+            group_id = %request.group_id,
+            principal = %ctx.principal,
+            "Denied SyncGroup by ACL"
+        );
+        return SyncGroupResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::GroupAuthorizationFailed,
+            assignment: Bytes::new(),
+        };
+    }
+
     // Verify generation matches BEFORE processing anything
     let current_generation = match handler.coordinator.get_generation(&request.group_id).await {
         Ok(generation) => generation,
@@ -370,8 +433,22 @@ pub(super) async fn handle_sync_group(
 /// Handle a heartbeat request.
 pub(super) async fn handle_heartbeat(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: HeartbeatRequestData,
 ) -> HeartbeatResponseData {
+    // Audit S2: Heartbeat requires Read on the Group resource.
+    if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
+        debug!(
+            group_id = %request.group_id,
+            principal = %ctx.principal,
+            "Denied Heartbeat by ACL"
+        );
+        return HeartbeatResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::GroupAuthorizationFailed,
+        };
+    }
+
     let result = handler
         .coordinator
         .update_member_heartbeat_with_generation(
@@ -395,6 +472,10 @@ pub(super) async fn handle_heartbeat(
             crate::cluster::metrics::record_group_operation("heartbeat", "error");
             KafkaCode::IllegalGeneration
         }
+        HeartbeatResult::RebalanceInProgress => {
+            crate::cluster::metrics::record_group_operation("heartbeat", "error");
+            KafkaCode::RebalanceInProgress
+        }
     };
 
     HeartbeatResponseData {
@@ -406,8 +487,22 @@ pub(super) async fn handle_heartbeat(
 /// Handle a leave group request.
 pub(super) async fn handle_leave_group(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: LeaveGroupRequestData,
 ) -> LeaveGroupResponseData {
+    // Audit S2: LeaveGroup requires Read on the Group resource.
+    if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
+        debug!(
+            group_id = %request.group_id,
+            principal = %ctx.principal,
+            "Denied LeaveGroup by ACL"
+        );
+        return LeaveGroupResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::GroupAuthorizationFailed,
+        };
+    }
+
     if let Err(e) = handler
         .coordinator
         .remove_group_member(&request.group_id, &request.member_id)
@@ -423,6 +518,124 @@ pub(super) async fn handle_leave_group(
         throttle_time_ms: 0,
         error_code: KafkaCode::None,
     }
+}
+
+/// Handle a describe-groups request. Authorizes Describe on each
+/// requested group; entries that fail authorization come back with
+/// `GroupAuthorizationFailed`.
+pub(super) async fn handle_describe_groups(
+    handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
+    request: DescribeGroupsRequestData,
+) -> DescribeGroupsResponseData {
+    let mut groups = Vec::with_capacity(request.group_ids.len());
+    for group_id in request.group_ids {
+        if !group_authorized(handler, ctx, AclOperation::Describe, &group_id).await {
+            debug!(
+                group_id = %group_id,
+                principal = %ctx.principal,
+                "Denied DescribeGroups by ACL"
+            );
+            groups.push(DescribedGroup::error(
+                group_id,
+                KafkaCode::GroupAuthorizationFailed,
+            ));
+            continue;
+        }
+
+        match handler.coordinator.get_group_members(&group_id).await {
+            Ok(member_ids) => {
+                groups.push(
+                    DescribedGroup::builder(group_id)
+                        .group_state("Stable")
+                        .protocol_type("consumer")
+                        .members(
+                            member_ids
+                                .into_iter()
+                                .map(|mid| {
+                                    crate::server::response::DescribedGroupMember::new(
+                                        mid,
+                                        "",
+                                        "",
+                                        Bytes::new(),
+                                        Bytes::new(),
+                                    )
+                                })
+                                .collect(),
+                        )
+                        .build(),
+                );
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to get group members for describe");
+                groups.push(DescribedGroup::error(group_id, KafkaCode::Unknown));
+            }
+        }
+    }
+
+    DescribeGroupsResponseData {
+        throttle_time_ms: 0,
+        groups,
+    }
+}
+
+/// Handle a list-groups request. Filters out groups the principal
+/// can't `Describe`, so unauthorized groups simply don't appear in
+/// the response (matches Kafka's behavior).
+pub(super) async fn handle_list_groups(
+    handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
+    _request: ListGroupsRequestData,
+) -> ListGroupsResponseData {
+    let all = match handler.coordinator.get_all_groups().await {
+        Ok(g) => g,
+        Err(e) => {
+            error!(error = %e, "Failed to list groups");
+            return ListGroupsResponseData::error(KafkaCode::Unknown);
+        }
+    };
+
+    let mut visible = Vec::with_capacity(all.len());
+    for group_id in all {
+        if group_authorized(handler, ctx, AclOperation::Describe, &group_id).await {
+            visible.push(ListedGroup::new(group_id, "consumer", "Stable"));
+        }
+    }
+    ListGroupsResponseData::success(visible)
+}
+
+/// Handle a delete-groups request. Each group is gated on `Delete`
+/// independently — the response carries per-group results so a partial
+/// authz failure doesn't block deletion of the rest.
+pub(super) async fn handle_delete_groups(
+    handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
+    request: DeleteGroupsRequestData,
+) -> DeleteGroupsResponseData {
+    let mut results = Vec::with_capacity(request.group_ids.len());
+    for group_id in request.group_ids {
+        if !group_authorized(handler, ctx, AclOperation::Delete, &group_id).await {
+            debug!(
+                group_id = %group_id,
+                principal = %ctx.principal,
+                "Denied DeleteGroups by ACL"
+            );
+            results.push(DeleteGroupResult::error(
+                group_id,
+                KafkaCode::GroupAuthorizationFailed,
+            ));
+            continue;
+        }
+
+        match handler.coordinator.delete_consumer_group(&group_id).await {
+            Ok(()) => results.push(DeleteGroupResult::success(group_id)),
+            Err(e) => {
+                error!(group_id = %group_id, error = %e, "Failed to delete group");
+                results.push(DeleteGroupResult::error(group_id, KafkaCode::Unknown));
+            }
+        }
+    }
+    DeleteGroupsResponseData::new(results)
 }
 
 #[cfg(test)]
@@ -724,6 +937,10 @@ mod tests {
                 HeartbeatResult::IllegalGeneration,
                 KafkaCode::IllegalGeneration,
             ),
+            (
+                HeartbeatResult::RebalanceInProgress,
+                KafkaCode::RebalanceInProgress,
+            ),
         ];
 
         for (result, expected_code) in mappings {
@@ -731,6 +948,7 @@ mod tests {
                 HeartbeatResult::Success => KafkaCode::None,
                 HeartbeatResult::UnknownMember => KafkaCode::UnknownMemberId,
                 HeartbeatResult::IllegalGeneration => KafkaCode::IllegalGeneration,
+                HeartbeatResult::RebalanceInProgress => KafkaCode::RebalanceInProgress,
             };
             assert_eq!(error_code, expected_code);
         }

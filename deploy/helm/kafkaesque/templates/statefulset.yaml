@@ -76,15 +76,20 @@ spec:
         - name: {{ .Chart.Name }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: "{{ .Values.image.repository }}{{ if .Values.image.digest }}@{{ .Values.image.digest }}{{ else }}:{{ .Values.image.tag | default .Chart.AppVersion }}{{ end }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
 
           # Use shell to extract broker ID from hostname (kafkaesque-0 -> 0)
+          # and derive ADVERTISED_HOST as the pod's StatefulSet FQDN so
+          # in-cluster Kafka clients can route back to this specific broker.
+          # Without ADVERTISED_HOST set, the broker would advertise
+          # 127.0.0.1 in Metadata responses (see audit F-K8S-02).
           command:
             - /bin/sh
             - -c
             - |
               export BROKER_ID=$(hostname | sed 's/.*-//')
+              export ADVERTISED_HOST="$(hostname).${HEADLESS_SERVICE}.${POD_NAMESPACE}.svc.cluster.local"
               exec /app/cluster
 
           ports:
@@ -106,10 +111,40 @@ spec:
             {{- end }}
 
           env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HEADLESS_SERVICE
+              value: {{ include "kafkaesque.fullname" . }}-headless
             - name: RAFT_LISTEN_ADDR
               value: "0.0.0.0:{{ .Values.config.raftPort }}"
             - name: RAFT_PEERS
               value: {{ include "kafkaesque.raftPeers" . | quote }}
+            {{- if .Values.tls.enabled }}
+            # Audit P0-4: client-port TLS. Cert + key paths point into the
+            # secret mount below. The broker reads these on start-up via
+            # ClusterConfig::tls_cert_path / tls_key_path.
+            - name: TLS_ENABLED
+              value: "true"
+            - name: TLS_CERT_PATH
+              value: "{{ .Values.tls.mountPath }}/tls.crt"
+            - name: TLS_KEY_PATH
+              value: "{{ .Values.tls.mountPath }}/tls.key"
+            {{- end }}
+            {{- if .Values.raftTls.enabled }}
+            # Audit P0-5: Raft mTLS. CA cert validates peer certificates
+            # in both directions; same cert/key pair identifies this
+            # broker to peers.
+            - name: RAFT_TLS_CERT
+              value: "{{ .Values.raftTls.mountPath }}/tls.crt"
+            - name: RAFT_TLS_KEY
+              value: "{{ .Values.raftTls.mountPath }}/tls.key"
+            - name: RAFT_TLS_CA
+              value: "{{ .Values.raftTls.mountPath }}/ca.crt"
+            - name: RAFT_TLS_SERVER_NAME
+              value: {{ .Values.raftTls.serverName | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -129,6 +164,14 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
 
+          # The endpoint controller takes ~30s to evict a terminating pod
+          # from the service backing list. preStop holds the container
+          # open so in-flight clients have time to drain before SIGTERM.
+          {{- with .Values.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
 
@@ -137,6 +180,16 @@ spec:
               mountPath: {{ .Values.config.objectStore.dataPath }}
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.raftTls.enabled }}
+            - name: raft-tls
+              mountPath: {{ .Values.raftTls.mountPath }}
+              readOnly: true
+            {{- end }}
 
       volumes:
         - name: tmp
@@ -144,6 +197,18 @@ spec:
         {{- if not .Values.persistence.enabled }}
         - name: data
           emptyDir: {}
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.certSecretName | required "tls.certSecretName is required when tls.enabled" }}
+            defaultMode: 0o400
+        {{- end }}
+        {{- if .Values.raftTls.enabled }}
+        - name: raft-tls
+          secret:
+            secretName: {{ .Values.raftTls.certSecretName | required "raftTls.certSecretName is required when raftTls.enabled" }}
+            defaultMode: 0o400
         {{- end }}
 
   {{- if .Values.persistence.enabled }}

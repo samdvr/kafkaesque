@@ -59,6 +59,7 @@
 //! }
 //! ```
 
+mod auth;
 mod commands;
 mod config;
 mod coordinator;
@@ -68,16 +69,21 @@ mod network;
 mod node;
 mod state_machine;
 mod storage;
+mod tls;
 mod types;
 
+pub use auth::RaftAuthKeys;
 pub use commands::{CoordinationCommand, CoordinationResponse};
 pub use config::RaftConfig;
 pub use coordinator::RaftCoordinator;
+pub use tls::RaftTlsConfig;
 pub use domains::{
-    BrokerCommand, BrokerDomainState, BrokerResponse, BrokerStatus, GroupCommand, GroupDomainState,
-    GroupResponse, MemberDescription, PartitionCommand, PartitionDomainState, PartitionResponse,
-    PartitionTransfer, ProducerCommand, ProducerDomainState, ProducerResponse, TransferCommand,
-    TransferDomainState, TransferReason, TransferResponse,
+    AclBinding, AclCommand, AclDecision, AclDomainState, AclFilter, AclOperation, AclPatternType,
+    AclPermissionType, AclResourceType, AclResponse, BrokerCommand, BrokerDomainState,
+    BrokerResponse, BrokerStatus, GroupCommand, GroupDomainState, GroupResponse, MemberDescription,
+    PartitionCommand, PartitionDomainState, PartitionResponse, PartitionTransfer, ProducerCommand,
+    ProducerDomainState, ProducerResponse, TransferCommand, TransferDomainState, TransferReason,
+    TransferResponse,
 };
 pub use network::{RaftNetworkFactoryImpl, RaftRpcMessage, RaftRpcResponse, request_cluster_join};
 pub use node::RaftNode;

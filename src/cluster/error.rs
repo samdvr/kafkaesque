@@ -107,6 +107,8 @@ pub enum HeartbeatResult {
     UnknownMember,
     /// Generation ID doesn't match current group generation.
     IllegalGeneration,
+    /// Group is in the middle of a rebalance — caller must rejoin.
+    RebalanceInProgress,
 }
 
 /// Errors that can occur in the SlateDB storage backend.

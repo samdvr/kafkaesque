@@ -4,6 +4,7 @@ use tracing::{debug, error};
 
 use crate::constants::DEFAULT_NUM_PARTITIONS;
 use crate::error::KafkaCode;
+use crate::server::RequestContext;
 use crate::server::request::{CreateTopicsRequestData, DeleteTopicsRequestData};
 use crate::server::response::{
     CreateTopicResponseData, CreateTopicsResponseData, DeleteTopicResponseData,
@@ -11,12 +12,15 @@ use crate::server::response::{
 };
 
 use super::SlateDBClusterHandler;
+use crate::cluster::authorizer::{AuthorizeRequest, AuthorizeResult};
 use crate::cluster::coordinator::validate_topic_name;
+use crate::cluster::raft::{AclOperation, AclResourceType};
 use crate::cluster::traits::PartitionCoordinator;
 
 /// Handle a create topics request.
 pub(super) async fn handle_create_topics(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: CreateTopicsRequestData,
 ) -> CreateTopicsResponseData {
     let mut topics = Vec::new();
@@ -29,6 +33,34 @@ pub(super) async fn handle_create_topics(
                 name: topic.name,
                 error_code: KafkaCode::InvalidTopic,
                 error_message: Some(e.to_string()),
+            });
+            continue;
+        }
+
+        // Audit S2: CreateTopics requires `Create` on the topic resource.
+        // Real Kafka also accepts cluster-level Create — for simplicity we
+        // require it on the topic itself; super-users bypass via the
+        // authorizer.
+        let decision = handler
+            .authorizer
+            .authorize(AuthorizeRequest {
+                principal: &ctx.principal,
+                host: &ctx.client_host,
+                operation: AclOperation::Create,
+                resource_type: AclResourceType::Topic,
+                resource_name: &topic.name,
+            })
+            .await;
+        if decision == AuthorizeResult::Denied {
+            debug!(
+                topic = %topic.name,
+                principal = %ctx.principal,
+                "Denied CreateTopics by ACL"
+            );
+            topics.push(CreateTopicResponseData {
+                name: topic.name,
+                error_code: KafkaCode::TopicAuthorizationFailed,
+                error_message: Some("Not authorized to create this topic".to_string()),
             });
             continue;
         }
@@ -78,6 +110,7 @@ pub(super) async fn handle_create_topics(
 /// Handle a delete topics request.
 pub(super) async fn handle_delete_topics(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: DeleteTopicsRequestData,
 ) -> DeleteTopicsResponseData {
     let mut responses = Vec::new();
@@ -89,6 +122,32 @@ pub(super) async fn handle_delete_topics(
             responses.push(DeleteTopicResponseData {
                 name,
                 error_code: KafkaCode::InvalidTopic,
+            });
+            continue;
+        }
+
+        // Audit S2: DeleteTopics requires `Delete` on the topic resource.
+        // Without this check `kcat -X delete-topic` from any host could wipe
+        // every topic — the original concern in audit S2.
+        let decision = handler
+            .authorizer
+            .authorize(AuthorizeRequest {
+                principal: &ctx.principal,
+                host: &ctx.client_host,
+                operation: AclOperation::Delete,
+                resource_type: AclResourceType::Topic,
+                resource_name: &name,
+            })
+            .await;
+        if decision == AuthorizeResult::Denied {
+            debug!(
+                topic = %name,
+                principal = %ctx.principal,
+                "Denied DeleteTopics by ACL"
+            );
+            responses.push(DeleteTopicResponseData {
+                name,
+                error_code: KafkaCode::TopicAuthorizationFailed,
             });
             continue;
         }

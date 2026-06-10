@@ -148,6 +148,8 @@ fn create_test_context() -> RequestContext {
         api_version: 8,
         client_id: Some("e2e-test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),
+        principal: "User:ANONYMOUS".to_string(),
+        client_host: "127.0.0.1".to_string(),
     }
 }
 

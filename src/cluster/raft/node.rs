@@ -68,9 +68,38 @@ impl RaftNode {
             config.snapshot_dir, config.node_id
         );
 
-        // Create components
+        // Create components. The Raft store persists vote and log entries
+        // to a local-disk WAL under `raft_log_dir` (audit B1); without
+        // this, a crash within an election could grant two votes for the
+        // same term and elect two leaders. The directory is created on
+        // first run.
         let openraft_config = Arc::new(config.to_openraft_config());
-        let store = RaftStore::new(object_store.clone(), &snapshot_prefix);
+        let raft_log_dir =
+            std::path::PathBuf::from(format!("{}/node-{}", config.raft_log_dir, config.node_id));
+        let store = RaftStore::new_with_log_dir(
+            object_store.clone(),
+            &snapshot_prefix,
+            raft_log_dir.clone(),
+        );
+
+        // Recover vote and log entries before openraft starts. If the WAL
+        // is corrupt we fail closed for the same reason snapshot load
+        // failure does — silent amnesia is worse than a crash.
+        if let Err(e) = store.recover_from_disk().await {
+            tracing::error!(
+                node_id = config.node_id,
+                error = %e,
+                wal_dir = %raft_log_dir.display(),
+                "Failed to recover Raft WAL; refusing to start"
+            );
+            return Err(SlateDBError::Config(format!(
+                "Failed to recover Raft WAL for node {} from {}: {}. \
+                 Refusing to start to avoid consensus-safety violations.",
+                config.node_id,
+                raft_log_dir.display(),
+                e
+            )));
+        }
 
         // Try to restore from existing snapshot
         match store.load_snapshot_from_store().await {
@@ -84,18 +113,31 @@ impl RaftNode {
                 );
             }
             Err(e) => {
-                // Log but don't fail - the cluster can still function
-                tracing::warn!(
+                // Fail closed: a corrupt or partially-read snapshot means our
+                // metadata state is unknown. Continuing with an empty state
+                // would let the node replicate that emptiness or, combined with
+                // a bootstrap race, re-initialize the cluster. An operator
+                // restoring at 3am needs a crash, not a silently amnesiac broker.
+                tracing::error!(
                     node_id = config.node_id,
                     error = %e,
-                    "Failed to load snapshot, starting with empty state"
+                    "Failed to load Raft snapshot; refusing to start with empty state"
                 );
+                return Err(SlateDBError::Config(format!(
+                    "Failed to load Raft snapshot for node {}: {}. \
+                     Refusing to start to avoid metadata loss; \
+                     restore the snapshot from object storage before retrying.",
+                    config.node_id, e
+                )));
             }
         }
 
         let state_machine = store.state_machine();
 
-        let network = Arc::new(RwLock::new(RaftNetworkFactoryImpl::new()));
+        let network = Arc::new(RwLock::new(RaftNetworkFactoryImpl::with_keys_and_tls(
+            config.auth_keys.clone(),
+            config.tls.clone(),
+        )));
 
         // Add known nodes to network
         for (node_id, addr) in &config.cluster_members {
@@ -132,8 +174,13 @@ impl RaftNode {
         };
 
         // Start RPC server on control plane runtime
-        let rpc_server =
-            RaftRpcServer::new(raft.clone(), config.raft_addr.clone(), runtime.clone());
+        let rpc_server = RaftRpcServer::with_tls(
+            raft.clone(),
+            config.raft_addr.clone(),
+            runtime.clone(),
+            config.auth_keys.clone(),
+            config.tls.clone(),
+        );
         let mut shutdown_rx = node.shutdown_tx.subscribe();
         runtime.spawn(async move {
             tokio::select! {
@@ -304,6 +351,8 @@ impl RaftNode {
                             command,
                             current_term,
                             0, // Initial hop count
+                            &self.config.auth_keys,
+                            self.config.tls.as_ref(),
                         )
                         .await
                         {

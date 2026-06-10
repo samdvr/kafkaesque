@@ -27,13 +27,27 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{Error, Result};
+
+/// Read deadline for a single health-check request.
+/// Health probes finish in milliseconds; anything longer is a slow-loris.
+const HEALTH_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Write deadline for a single health-check response.
+const HEALTH_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum concurrent in-flight health-check connections. The server is
+/// internal-facing so this only needs to absorb a probe storm; beyond this
+/// we shed load (and an attacker can't pin all our memory). Audit S8.
+const HEALTH_MAX_CONCURRENT: usize = 256;
 
 /// Health check response status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +165,9 @@ impl HealthServer {
     /// Run the health server, handling HTTP requests.
     pub async fn run(&self) -> Result<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        // Bound the number of in-flight probes so a flood can't OOM us
+        // (audit S8). Probes that exceed the cap are dropped.
+        let semaphore = Arc::new(Semaphore::new(HEALTH_MAX_CONCURRENT));
 
         loop {
             tokio::select! {
@@ -163,25 +180,44 @@ impl HealthServer {
                         Ok((mut stream, addr)) => {
                             debug!(client_addr = %addr, "Health check connection");
 
+                            let permit = match semaphore.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    debug!(client_addr = %addr, "Health check rejected: too many concurrent probes");
+                                    // Best-effort close; ignore errors.
+                                    let _ = stream.shutdown().await;
+                                    continue;
+                                }
+                            };
+
                             let zombie_mode = self.zombie_mode.clone();
                             let broker_id = self.broker_id;
 
                             // Handle request in a separate task to avoid blocking
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 let mut buf = [0u8; 1024];
-                                match stream.read(&mut buf).await {
-                                    Ok(n) if n > 0 => {
+                                match timeout(HEALTH_READ_TIMEOUT, stream.read(&mut buf)).await {
+                                    Ok(Ok(n)) if n > 0 => {
                                         let request = String::from_utf8_lossy(&buf[..n]);
                                         let response = handle_request(&request, &zombie_mode, broker_id);
-                                        if let Err(e) = stream.write_all(response.as_bytes()).await {
-                                            debug!(error = ?e, "Failed to write health response");
+                                        if let Err(e) = timeout(
+                                            HEALTH_WRITE_TIMEOUT,
+                                            stream.write_all(response.as_bytes()),
+                                        )
+                                        .await
+                                        {
+                                            debug!(error = ?e, "Health response write timed out");
                                         }
                                     }
-                                    Ok(_) => {
+                                    Ok(Ok(_)) => {
                                         debug!("Empty request received");
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         debug!(error = ?e, "Failed to read health request");
+                                    }
+                                    Err(_) => {
+                                        debug!(client_addr = %addr, "Health request read timed out");
                                     }
                                 }
                             });

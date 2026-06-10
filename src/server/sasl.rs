@@ -246,15 +246,25 @@ impl SaslAuthenticator for PlainAuthenticator {
             (authcid, passwd)
         };
 
-        // Check credentials
+        // Check credentials. The comparison runs against a dummy password
+        // when the user is absent so unknown-user vs wrong-password can't be
+        // distinguished by timing (audit S6).
         let users = self.users.read().await;
-        match users.get(username) {
-            Some(stored_password) if stored_password == password => SaslResult::Success {
+        let stored = users.get(username);
+        let candidate = stored.map(|s| s.as_str()).unwrap_or("");
+        use subtle::ConstantTimeEq;
+        let eq: bool = candidate
+            .as_bytes()
+            .ct_eq(password.as_bytes())
+            .into();
+        if stored.is_some() && eq {
+            SaslResult::Success {
                 principal: username.to_string(),
-            },
-            _ => SaslResult::Failed {
+            }
+        } else {
+            SaslResult::Failed {
                 message: "Authentication failed".to_string(),
-            },
+            }
         }
     }
 }

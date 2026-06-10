@@ -88,6 +88,12 @@ pub fn parse_join_group_request(
 fn parse_join_group_protocol(s: NomBytes) -> IResult<NomBytes, JoinGroupProtocolData> {
     let (s, name) = parse_string(s)?;
     let (s, metadata_len) = be_i32(s)?;
+    if metadata_len < 0 {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            s,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
     let (s, metadata) = nom::bytes::complete::take(metadata_len as usize)(s)?;
 
     Ok((
@@ -198,6 +204,12 @@ pub fn parse_sync_group_request(
 fn parse_sync_group_assignment(s: NomBytes) -> IResult<NomBytes, SyncGroupAssignmentData> {
     let (s, member_id) = parse_string(s)?;
     let (s, assignment_len) = be_i32(s)?;
+    if assignment_len < 0 {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            s,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
     let (s, assignment) = nom::bytes::complete::take(assignment_len as usize)(s)?;
 
     Ok((

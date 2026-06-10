@@ -425,8 +425,8 @@ mod tests {
     #[test]
     fn test_transfer_reason_serialization() {
         let reason = TransferReason::BrokerFailure;
-        let serialized = bincode::serialize(&reason).unwrap();
-        let deserialized: TransferReason = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&reason).unwrap();
+        let deserialized: TransferReason = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(reason, deserialized);
     }
 
@@ -503,8 +503,8 @@ mod tests {
             expected_leader_epoch: Some(1),
         };
 
-        let serialized = bincode::serialize(&transfer).unwrap();
-        let deserialized: PartitionTransfer = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&transfer).unwrap();
+        let deserialized: PartitionTransfer = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(transfer, deserialized);
     }
 
@@ -549,8 +549,8 @@ mod tests {
             partitions_reassigned: false,
         };
 
-        let serialized = bincode::serialize(&info).unwrap();
-        let deserialized: FailedBrokerInfo = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&info).unwrap();
+        let deserialized: FailedBrokerInfo = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(info, deserialized);
     }
 
@@ -612,8 +612,8 @@ mod tests {
             completed_count: 0,
         };
 
-        let serialized = bincode::serialize(&state).unwrap();
-        let deserialized: BatchTransferState = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&state).unwrap();
+        let deserialized: BatchTransferState = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(state, deserialized);
     }
 
@@ -693,8 +693,8 @@ mod tests {
             timestamp_ms: 1000,
         };
 
-        let serialized = bincode::serialize(&cmd).unwrap();
-        let deserialized: TransferCommand = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&cmd).unwrap();
+        let deserialized: TransferCommand = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(cmd, deserialized);
     }
 
@@ -833,8 +833,8 @@ mod tests {
             partitions_affected: 5,
         };
 
-        let serialized = bincode::serialize(&response).unwrap();
-        let deserialized: TransferResponse = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&response).unwrap();
+        let deserialized: TransferResponse = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(response, deserialized);
     }
 
@@ -946,8 +946,8 @@ mod tests {
             },
         );
 
-        let serialized = bincode::serialize(&state).unwrap();
-        let deserialized: TransferDomainState = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&state).unwrap();
+        let deserialized: TransferDomainState = postcard::from_bytes(&serialized).unwrap();
 
         assert!(deserialized.is_broker_failed(1));
     }

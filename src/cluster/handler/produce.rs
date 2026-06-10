@@ -8,12 +8,13 @@
 //!   Data may be lost if broker crashes before flushing. Use for high-throughput,
 //!   loss-tolerant workloads (e.g., metrics, logs).
 //!
-//! - `acks=1`: Wait for leader write. Data is flushed to object storage before
-//!   returning success. Standard durability guarantee.
+//! - `acks=1`: Wait for the leader's write to be **durable** in object storage
+//!   (SlateDB `await_durable=true`) before returning success. A crash after the
+//!   ack will not lose the record.
 //!
-//! - `acks=-1` (or `all`): Same as `acks=1` in Kafkaesque. Since Kafkaesque uses object storage
-//!   (S3/GCS/Azure) rather than replica-based replication, there's no ISR concept.
-//!   Object storage provides built-in durability via its own replication.
+//! - `acks=-1` (or `all`): Same as `acks=1` in Kafkaesque. Since Kafkaesque uses
+//!   object storage (S3/GCS/Azure) rather than replica-based replication, there's
+//!   no ISR concept. Object storage provides built-in replication.
 //!
 //! **Note**: Unlike Apache Kafka, Kafkaesque doesn't have in-sync replicas (ISR).
 //! Durability is provided by the object storage backend's own replication.
@@ -89,6 +90,29 @@ pub(super) async fn handle_produce(
                 continue; // Skip invalid topics silently for acks=0
             }
 
+            // Audit S2: Produce requires Write on the topic. acks=0 returns
+            // no response, so a Denied check just drops silently — same as
+            // an invalid topic on this path.
+            if handler
+                .authorizer
+                .authorize(crate::cluster::authorizer::AuthorizeRequest {
+                    principal: &ctx.principal,
+                    host: &ctx.client_host,
+                    operation: crate::cluster::raft::AclOperation::Write,
+                    resource_type: crate::cluster::raft::AclResourceType::Topic,
+                    resource_name: &topic.name,
+                })
+                .await
+                == crate::cluster::authorizer::AuthorizeResult::Denied
+            {
+                debug!(
+                    topic = %topic.name,
+                    principal = %ctx.principal,
+                    "Denied acks=0 produce by ACL"
+                );
+                continue;
+            }
+
             let topic_name: Arc<str> = handler.cached_topic_name(&topic.name);
             let partition_manager = handler.partition_manager.clone();
             let validate_crc = handler.validate_record_crc;
@@ -109,15 +133,24 @@ pub(super) async fn handle_produce(
 
                 let topic_name = Arc::clone(&topic_name);
                 let partition_manager = partition_manager.clone();
+                let hwm_advanced = handler.hwm_advanced.clone();
                 handler.data_runtime.spawn(async move {
                     let _permit = permit;
-                    let _ = fire_and_forget_produce(
+                    if fire_and_forget_produce(
                         &partition_manager,
                         &topic_name,
                         partition,
                         validate_crc,
                     )
-                    .await;
+                    .await
+                    .is_ok()
+                    {
+                        // Wake long-poll fetches even on the acks=0 path
+                        // (audit P0-7). Without this, consumers using
+                        // min_bytes>0 only see records after `max_wait_ms`
+                        // expires.
+                        hwm_advanced.notify_waiters();
+                    }
                 });
             }
 
@@ -146,6 +179,43 @@ pub(super) async fn handle_produce(
                 .map(|p| ProducePartitionResponse {
                     partition_index: p.partition_index,
                     error_code: KafkaCode::InvalidTopic,
+                    base_offset: -1,
+                    log_append_time: -1,
+                })
+                .collect();
+            responses.push(ProduceTopicResponse {
+                name: topic.name,
+                partitions: partition_responses,
+            });
+            continue;
+        }
+
+        // Audit S2: Produce requires Write on the topic resource. Denied
+        // requests get TopicAuthorizationFailed for every partition so the
+        // client sees a clean per-partition response (matches Kafka).
+        if handler
+            .authorizer
+            .authorize(crate::cluster::authorizer::AuthorizeRequest {
+                principal: &ctx.principal,
+                host: &ctx.client_host,
+                operation: crate::cluster::raft::AclOperation::Write,
+                resource_type: crate::cluster::raft::AclResourceType::Topic,
+                resource_name: &topic.name,
+            })
+            .await
+            == crate::cluster::authorizer::AuthorizeResult::Denied
+        {
+            debug!(
+                topic = %topic.name,
+                principal = %ctx.principal,
+                "Denied produce by ACL"
+            );
+            let partition_responses: Vec<_> = topic
+                .partitions
+                .iter()
+                .map(|p| ProducePartitionResponse {
+                    partition_index: p.partition_index,
+                    error_code: KafkaCode::TopicAuthorizationFailed,
                     base_offset: -1,
                     log_append_time: -1,
                 })

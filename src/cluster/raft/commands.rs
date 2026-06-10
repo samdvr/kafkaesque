@@ -8,8 +8,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::domains::{
-    BrokerCommand, BrokerResponse, GroupCommand, GroupResponse, PartitionCommand,
-    PartitionResponse, ProducerCommand, ProducerResponse, TransferCommand, TransferResponse,
+    AclCommand, AclResponse, BrokerCommand, BrokerResponse, GroupCommand, GroupResponse,
+    PartitionCommand, PartitionResponse, ProducerCommand, ProducerResponse, TransferCommand,
+    TransferResponse,
 };
 
 /// Commands that can be applied to the coordination state machine.
@@ -40,6 +41,10 @@ pub enum CoordinationCommand {
     /// Transfer domain command (partition transfers, failover).
     #[serde(rename = "transfer_v2")]
     TransferDomain(TransferCommand),
+
+    /// ACL domain command (CreateAcls / DeleteAcls — audit S2).
+    #[serde(rename = "acl_v1")]
+    AclDomain(AclCommand),
 }
 
 /// Responses from applying commands to the state machine.
@@ -67,6 +72,10 @@ pub enum CoordinationResponse {
     /// Transfer domain response.
     #[serde(rename = "transfer_response_v2")]
     TransferDomainResponse(TransferResponse),
+
+    /// ACL domain response.
+    #[serde(rename = "acl_response_v1")]
+    AclDomainResponse(AclResponse),
 }
 
 #[cfg(test)]
@@ -335,8 +344,8 @@ mod tests {
     #[test]
     fn test_noop_command_bincode_roundtrip() {
         let cmd = CoordinationCommand::Noop;
-        let serialized = bincode::serialize(&cmd).unwrap();
-        let deserialized: CoordinationCommand = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&cmd).unwrap();
+        let deserialized: CoordinationCommand = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(cmd, deserialized);
     }
 
@@ -349,8 +358,8 @@ mod tests {
             timestamp_ms: 1000,
         });
 
-        let serialized = bincode::serialize(&cmd).unwrap();
-        let deserialized: CoordinationCommand = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&cmd).unwrap();
+        let deserialized: CoordinationCommand = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(cmd, deserialized);
     }
 
@@ -368,8 +377,8 @@ mod tests {
             timestamp_ms: 1000,
         });
 
-        let serialized = bincode::serialize(&cmd).unwrap();
-        let deserialized: CoordinationCommand = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_stdvec(&cmd).unwrap();
+        let deserialized: CoordinationCommand = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(cmd, deserialized);
     }
 

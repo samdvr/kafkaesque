@@ -144,12 +144,23 @@ pub fn parse_compact_nullable_string(s: NomBytes) -> IResult<NomBytes, Option<By
 /// Skip tagged fields in flexible encoding.
 /// Format: unsigned varint count, then for each: varint tag, varint size, bytes
 pub fn skip_tagged_fields(s: NomBytes) -> IResult<NomBytes, ()> {
+    // Cap iteration count to MAX_PROTOCOL_ARRAY_SIZE so an attacker-supplied
+    // count of u32::MAX can't loop the parser. The varint decoder is happy
+    // to return very large counts; the cap is the same one we apply to
+    // every other length-prefixed array on the wire.
     let (mut s, count) = parse_unsigned_varint(s)?;
+    if count as i64 > MAX_PROTOCOL_ARRAY_SIZE as i64 {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            s,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
 
     for _ in 0..count {
         // Skip tag
         let (remaining, _tag) = parse_unsigned_varint(s)?;
-        // Skip size and data
+        // Skip size and data; the size itself is also attacker-controlled,
+        // but `take` will fail cleanly if the buffer is too short.
         let (remaining, size) = parse_unsigned_varint(remaining)?;
         let (remaining, _) = take(size as usize)(remaining)?;
         s = remaining;

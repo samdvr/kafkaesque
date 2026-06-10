@@ -37,6 +37,12 @@ pub fn parse_sasl_authenticate_request(
     _version: i16,
 ) -> IResult<NomBytes, SaslAuthenticateRequestData> {
     let (s, auth_len) = be_i32(s)?;
+    if auth_len < 0 {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            s,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
     let (s, auth_bytes) = nom::bytes::complete::take(auth_len as usize)(s)?;
 
     Ok((

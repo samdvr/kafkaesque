@@ -62,6 +62,7 @@
 //! ```
 
 pub mod auto_balancer;
+pub mod authorizer;
 pub mod background_tasks;
 pub mod buffer_pool;
 mod config;
@@ -80,12 +81,13 @@ mod partition_manager;
 mod partition_recovery;
 mod partition_state;
 mod partition_store;
-mod partition_store_pool;
 pub mod raft;
 pub mod rebalance_coordinator;
 pub mod retry;
 #[cfg(feature = "sasl")]
 mod sasl_provider;
+#[cfg(feature = "sasl")]
+pub mod scram;
 mod traits;
 mod validation;
 pub mod zombie_mode;
@@ -116,7 +118,6 @@ pub use partition_handle::{PartitionHandle, PartitionId, ReadGuard, WriteGuard};
 pub use partition_manager::PartitionManager;
 pub use partition_state::PartitionState;
 pub use partition_store::PartitionStore;
-pub use partition_store_pool::{PartitionStorePool, PoolConfig};
 pub use raft::{RaftConfig, RaftCoordinator, RaftNode};
 pub use rebalance_coordinator::{
     CoordinatorExecutorAdapter, RebalanceCoordinator, RebalanceCoordinatorConfig,

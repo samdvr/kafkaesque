@@ -44,7 +44,13 @@ fn next_port() -> u16 {
 }
 
 /// Create a test configuration for a Raft node with fast timeouts.
+///
+/// Per-test temp dir for the WAL (audit P0-6) — see the matching helper in
+/// `raft_integration_tests.rs` for why hardcoded `/tmp/kafkaesque-failure-test-N`
+/// paths broke once B1's WAL persistence landed.
 fn test_config(node_id: u64, port: u16, cluster_members: Vec<(u64, String)>) -> RaftConfig {
+    let tmp = tempfile::tempdir().expect("create test temp dir");
+    let root = tmp.keep();
     RaftConfig {
         node_id,
         broker_id: node_id as i32,
@@ -52,8 +58,8 @@ fn test_config(node_id: u64, port: u16, cluster_members: Vec<(u64, String)>) -> 
         port: 9092 + node_id as i32,
         raft_addr: format!("127.0.0.1:{}", port),
         cluster_members,
-        raft_log_dir: format!("/tmp/kafkaesque-failure-test-{}/log", node_id),
-        snapshot_dir: format!("/tmp/kafkaesque-failure-test-{}/snapshots", node_id),
+        raft_log_dir: root.join("log").to_string_lossy().into_owned(),
+        snapshot_dir: root.join("snapshots").to_string_lossy().into_owned(),
         // Fast timeouts for testing failure scenarios
         heartbeat_interval: Duration::from_millis(50),
         election_timeout_min: Duration::from_millis(150),
@@ -71,6 +77,8 @@ fn test_config(node_id: u64, port: u16, cluster_members: Vec<(u64, String)>) -> 
         max_partitions_per_topic: 100,
         max_pending_proposals: 100,
         proposal_timeout: Duration::from_secs(5),
+        auth_keys: std::sync::Arc::new(kafkaesque::cluster::raft::RaftAuthKeys::default()),
+        tls: None,
     }
 }
 

@@ -1,6 +1,7 @@
 //! Fetch request handling.
 
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error};
 
 use crate::error::KafkaCode;
@@ -11,16 +12,30 @@ use crate::server::response::{FetchPartitionResponse, FetchResponseData, FetchTo
 use super::SlateDBClusterHandler;
 use crate::cluster::coordinator::validate_topic_name;
 
+/// Total bytes of records contained in `responses`. Used by the long-poll
+/// loop to compare against the client's `min_bytes` (audit P0-7).
+fn total_record_bytes(responses: &[FetchTopicResponse]) -> usize {
+    responses
+        .iter()
+        .flat_map(|t| t.partitions.iter())
+        .filter_map(|p| p.records.as_ref())
+        .map(|b| b.len())
+        .sum()
+}
+
 /// Handle a fetch request.
+///
+/// Implements Kafka's `max_wait_ms` / `min_bytes` long-poll semantics
+/// (audit P0-7). Without this, consumers spin at full request rate when no
+/// data is available — driving CPU and S3 GET cost linearly with consumer
+/// count regardless of throughput. Producers signal data availability via
+/// `SlateDBClusterHandler::hwm_advanced`; this handler waits on that notify
+/// up to the client's deadline before re-checking.
 pub(super) async fn handle_fetch(
     handler: &SlateDBClusterHandler,
     ctx: &RequestContext,
     request: FetchRequestData,
 ) -> FetchResponseData {
-    use futures::stream::{self, StreamExt};
-
-    let mut responses = Vec::with_capacity(request.topics.len());
-
     debug!(
         client = %ctx.client_addr,
         client_id = ?ctx.client_id,
@@ -30,22 +45,84 @@ pub(super) async fn handle_fetch(
         "FETCH request received"
     );
 
-    // Log fetch details for debugging
-    for topic in &request.topics {
-        for partition in &topic.partitions {
-            debug!(
-                topic = %topic.name,
-                partition = partition.partition_index,
-                fetch_offset = partition.fetch_offset,
-                "FETCH partition request"
-            );
+    // Audit P1-4: time the full fetch path including the long-poll wait so
+    // the pre-existing FETCH_DURATION histogram populates with real data.
+    // Status is per-topic (one batch may span many topics) so we tag with
+    // `_multi` on multi-topic requests, matching record_fetch_latency's
+    // documented convention.
+    let start = std::time::Instant::now();
+    let topic_label: String = if request.topics.len() == 1 {
+        request.topics[0].name.clone()
+    } else {
+        "_multi".to_string()
+    };
+
+    let max_wait = Duration::from_millis(request.max_wait_ms.max(0) as u64);
+    let min_bytes = request.min_bytes.max(0) as usize;
+    let deadline = if max_wait.is_zero() {
+        None
+    } else {
+        Some(tokio::time::Instant::now() + max_wait)
+    };
+
+    // First pass: build the response with whatever's currently available.
+    let mut responses = collect_fetch(handler, ctx, &request).await;
+
+    // Long-poll loop: if min_bytes isn't satisfied and we have time left,
+    // wait on the broker-wide HWM-advance notify, then re-check.
+    while min_bytes > 0
+        && total_record_bytes(&responses) < min_bytes
+        && let Some(deadline) = deadline
+    {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        // `Notify::notified()` must be created before `notify_waiters()` is
+        // called for it to wake — but we hold the future across the wait so
+        // any concurrent producer wake counts. Re-acquired each loop so we
+        // don't miss notifications between iterations.
+        let notified = handler.hwm_advanced.notified();
+        let remaining = deadline - now;
+        match tokio::time::timeout(remaining, notified).await {
+            Ok(()) => {
+                // Some partition advanced — re-fetch.
+                responses = collect_fetch(handler, ctx, &request).await;
+            }
+            Err(_) => {
+                // Deadline elapsed.
+                break;
+            }
         }
     }
 
-    // Use configurable concurrent partition reads to prevent overwhelming the system
+    let response = FetchResponseData {
+        throttle_time_ms: 0,
+        responses,
+    };
+    let total_bytes = total_record_bytes(&response.responses);
+    let status = if total_bytes > 0 { "success" } else { "timeout" };
+    crate::cluster::metrics::record_fetch_latency(
+        &topic_label,
+        status,
+        start.elapsed().as_secs_f64(),
+    );
+    response
+}
+
+/// One pass of per-partition fetching for every topic in the request. Pulled
+/// out of `handle_fetch` so the long-poll loop can re-run it on each wakeup.
+async fn collect_fetch(
+    handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
+    request: &FetchRequestData,
+) -> Vec<FetchTopicResponse> {
+    use futures::stream::{self, StreamExt};
+
+    let mut responses = Vec::with_capacity(request.topics.len());
     let max_concurrent_reads = handler.max_concurrent_partition_reads;
 
-    for topic in request.topics {
+    for topic in &request.topics {
         // Validate topic name to prevent injection attacks
         if validate_topic_name(&topic.name).is_err() {
             debug!(topic = %topic.name, "Invalid topic name in fetch request");
@@ -62,7 +139,44 @@ pub(super) async fn handle_fetch(
                 })
                 .collect();
             responses.push(FetchTopicResponse {
-                name: topic.name,
+                name: topic.name.clone(),
+                partitions: partition_responses,
+            });
+            continue;
+        }
+
+        // Audit S2: Fetch requires Read on the topic resource.
+        if handler
+            .authorizer
+            .authorize(crate::cluster::authorizer::AuthorizeRequest {
+                principal: &ctx.principal,
+                host: &ctx.client_host,
+                operation: crate::cluster::raft::AclOperation::Read,
+                resource_type: crate::cluster::raft::AclResourceType::Topic,
+                resource_name: &topic.name,
+            })
+            .await
+            == crate::cluster::authorizer::AuthorizeResult::Denied
+        {
+            debug!(
+                topic = %topic.name,
+                principal = %ctx.principal,
+                "Denied fetch by ACL"
+            );
+            let partition_responses: Vec<_> = topic
+                .partitions
+                .iter()
+                .map(|p| FetchPartitionResponse {
+                    partition_index: p.partition_index,
+                    error_code: KafkaCode::TopicAuthorizationFailed,
+                    high_watermark: -1,
+                    last_stable_offset: -1,
+                    aborted_transactions: vec![],
+                    records: None,
+                })
+                .collect();
+            responses.push(FetchTopicResponse {
+                name: topic.name.clone(),
                 partitions: partition_responses,
             });
             continue;
@@ -71,7 +185,7 @@ pub(super) async fn handle_fetch(
         let topic_name: Arc<str> = Arc::from(topic.name.as_str());
 
         // Process partitions with concurrency limit
-        let partition_responses: Vec<_> = stream::iter(topic.partitions)
+        let partition_responses: Vec<_> = stream::iter(topic.partitions.clone())
             .map(|partition| {
                 let topic_name = Arc::clone(&topic_name);
                 async move {
@@ -81,10 +195,6 @@ pub(super) async fn handle_fetch(
                         .await
                     {
                         Ok(store) => {
-                            // Validate fetch offset before reading.
-                            // Return OffsetOutOfRange if offset is past high watermark.
-                            // This prevents clients from waiting indefinitely for
-                            // data at offsets that don't exist yet.
                             let current_hwm = store.high_watermark();
                             if partition.fetch_offset > current_hwm {
                                 return FetchPartitionResponse {
@@ -114,7 +224,6 @@ pub(super) async fn handle_fetch(
 
                             match store.fetch_from(partition.fetch_offset).await {
                                 Ok((high_watermark, records)) => {
-                                    // Track fetch metrics
                                     if let Some(ref record_bytes) = records {
                                         let bytes = record_bytes.len() as u64;
                                         let msg_count = 1u64;
@@ -158,17 +267,14 @@ pub(super) async fn handle_fetch(
                                 }
                             }
                         }
-                        Err(_) => {
-                            // We don't own this partition
-                            FetchPartitionResponse {
-                                partition_index: partition.partition_index,
-                                error_code: KafkaCode::NotLeaderForPartition,
-                                high_watermark: -1,
-                                last_stable_offset: -1,
-                                aborted_transactions: vec![],
-                                records: None,
-                            }
-                        }
+                        Err(_) => FetchPartitionResponse {
+                            partition_index: partition.partition_index,
+                            error_code: KafkaCode::NotLeaderForPartition,
+                            high_watermark: -1,
+                            last_stable_offset: -1,
+                            aborted_transactions: vec![],
+                            records: None,
+                        },
                     }
                 }
             })
@@ -177,21 +283,83 @@ pub(super) async fn handle_fetch(
             .await;
 
         responses.push(FetchTopicResponse {
-            name: topic.name,
+            name: topic.name.clone(),
             partitions: partition_responses,
         });
     }
 
-    FetchResponseData {
-        throttle_time_ms: 0,
-        responses,
-    }
+    responses
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    // ========================================================================
+    // total_record_bytes (P0-7 long-poll helper)
+    // ========================================================================
+
+    #[test]
+    fn total_record_bytes_handles_empty() {
+        assert_eq!(total_record_bytes(&[]), 0);
+    }
+
+    #[test]
+    fn total_record_bytes_skips_none_records() {
+        let resp = vec![FetchTopicResponse {
+            name: "t".to_string(),
+            partitions: vec![FetchPartitionResponse {
+                partition_index: 0,
+                error_code: KafkaCode::None,
+                high_watermark: 0,
+                last_stable_offset: 0,
+                aborted_transactions: vec![],
+                records: None,
+            }],
+        }];
+        assert_eq!(total_record_bytes(&resp), 0);
+    }
+
+    #[test]
+    fn total_record_bytes_sums_across_partitions_and_topics() {
+        let resp = vec![
+            FetchTopicResponse {
+                name: "a".to_string(),
+                partitions: vec![
+                    FetchPartitionResponse {
+                        partition_index: 0,
+                        error_code: KafkaCode::None,
+                        high_watermark: 1,
+                        last_stable_offset: 1,
+                        aborted_transactions: vec![],
+                        records: Some(Bytes::from_static(b"hello")),
+                    },
+                    FetchPartitionResponse {
+                        partition_index: 1,
+                        error_code: KafkaCode::None,
+                        high_watermark: 1,
+                        last_stable_offset: 1,
+                        aborted_transactions: vec![],
+                        records: Some(Bytes::from_static(b"world!")),
+                    },
+                ],
+            },
+            FetchTopicResponse {
+                name: "b".to_string(),
+                partitions: vec![FetchPartitionResponse {
+                    partition_index: 0,
+                    error_code: KafkaCode::None,
+                    high_watermark: 1,
+                    last_stable_offset: 1,
+                    aborted_transactions: vec![],
+                    records: Some(Bytes::from_static(b"!!!")),
+                }],
+            },
+        ];
+        // 5 + 6 + 3 = 14
+        assert_eq!(total_record_bytes(&resp), 14);
+    }
 
     // ========================================================================
     // Response Structure Tests

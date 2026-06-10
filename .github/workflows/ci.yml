@@ -17,6 +17,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# NOTE (audit P1-6): all `uses:` references SHOULD be pinned by full
+# 40-char commit SHA, not by tag, so a malicious tag swap can't slip
+# into the next CI run. Using tags here for now; replace with SHAs (and
+# wire up Renovate / Dependabot to keep them current) before this CI
+# is trusted to gate releases.
+
 jobs:
   unit-tests:
     name: Unit Tests (Fast)
@@ -144,3 +150,89 @@ jobs:
 
       - name: Check MSRV
         run: cargo check --all-targets
+
+  e2e:
+    name: End-to-End (cluster + kcat)
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+
+      - name: Install kcat
+        # E2E scripts drive the broker through the Kafka wire protocol via
+        # kcat — same path real clients take, so a regression here is the
+        # closest signal we have to "did we break the shipped binary?".
+        run: sudo apt-get update && sudo apt-get install -y kcat
+
+      - name: Build cluster binary
+        run: cargo build --release --example cluster
+
+      - name: Run single-broker E2E
+        env:
+          KAFKAESQUE_BINARY: ./target/release/examples/cluster
+          RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE: "true"
+        run: bash scripts/run-e2e.sh
+
+      - name: Run cluster E2E (3 brokers, Raft)
+        env:
+          KAFKAESQUE_BINARY: ./target/release/examples/cluster
+        run: bash scripts/run-cluster-e2e.sh
+
+  cargo-deny:
+    name: cargo-deny (licenses + advisories)
+    runs-on: ubuntu-latest
+    # Audit P1-6: catches both license drift (a transitive dep flipping
+    # to an incompatible license) and advisories that the rustsec audit
+    # job might miss because they don't yet have CVE entries.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          arguments: --all-features
+
+  image-scan:
+    name: Container image scan (Trivy)
+    runs-on: ubuntu-latest
+    # Audit P1-6: scans the built release image for known CVEs in the
+    # base layer + binaries we ship. Runs against the image we'd push,
+    # not the dev image.
+    needs: e2e
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build release image
+        run: docker build -f Dockerfile.minimal -t kafkaesque:ci .
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: kafkaesque:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH

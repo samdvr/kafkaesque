@@ -59,7 +59,7 @@ pub mod tls;
 pub mod sasl;
 
 pub use connection::ClientConnection;
-pub use handler::{Handler, RequestContext};
+pub use handler::{Handler, RequestContext, SaslPostAuth};
 pub use rate_limiter::{AuthRateLimiter, RateLimiterConfig};
 
 use std::collections::HashMap;
@@ -77,6 +77,41 @@ use crate::constants::{DEFAULT_MAX_CONNECTIONS_PER_IP, DEFAULT_MAX_TOTAL_CONNECT
 
 #[cfg(feature = "tls")]
 use self::tls::TlsConfig;
+
+/// RAII guard for the per-connection bookkeeping counters (audit P1-13).
+///
+/// Decrements `active_connections` and the per-IP entry on drop, which
+/// runs even if the connection's task panics. Without this guard a panic
+/// inside the spawned task would leak both counters and eventually trip
+/// the connection-limit even though the slots are dead.
+struct ConnectionGuard {
+    active_connections: Arc<AtomicUsize>,
+    connections_per_ip: Arc<RwLock<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::SeqCst);
+        // Decrement under the async lock from a synchronous context by
+        // spawning a small cleanup future on the current runtime. If the
+        // runtime is gone (rare — only during process teardown) the
+        // counter resets are moot.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let map = self.connections_per_ip.clone();
+            let ip = self.ip;
+            handle.spawn(async move {
+                let mut counts = map.write().await;
+                if let Some(count) = counts.get_mut(&ip) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        counts.remove(&ip);
+                    }
+                }
+            });
+        }
+    }
+}
 
 /// A Kafka-compatible TCP server with graceful shutdown support.
 pub struct KafkaServer<H: Handler> {
@@ -179,6 +214,12 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
         tracing::info!("Shutdown signal sent");
+    }
+
+    /// Access the wrapped handler. Used by the binary to call
+    /// `handler.shutdown()` after `shutdown_and_wait()` drains connections.
+    pub fn handler(&self) -> Arc<H> {
+        self.handler.clone()
     }
 
     /// Initiate graceful shutdown and wait for all connections to drain.
@@ -297,23 +338,24 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                     active_connections.fetch_add(1, Ordering::SeqCst);
 
                     self.data_runtime.spawn(async move {
+                        let _guard = ConnectionGuard {
+                            active_connections,
+                            connections_per_ip,
+                            ip,
+                        };
                         let mut conn = ClientConnection::new_with_rate_limiter(stream, addr, rate_limiter);
+                        // Audit S1 scaffold: arm the per-connection SASL gate
+                        // so non-handshake API keys are refused until
+                        // SaslAuthenticate succeeds. Default-off; opt in via
+                        // ClusterConfig::sasl_required.
+                        if handler.sasl_required() {
+                            conn.require_sasl();
+                        }
                         if let Err(e) = conn.handle_requests(handler).await {
                             tracing::warn!(client_addr = %addr, error = ?e, "Error handling connection");
                         }
-                        // Decrement active connection count
-                        active_connections.fetch_sub(1, Ordering::SeqCst);
-
-                        // Decrement per-IP count
-                        {
-                            let mut counts = connections_per_ip.write().await;
-                            if let Some(count) = counts.get_mut(&ip) {
-                                *count = count.saturating_sub(1);
-                                if *count == 0 {
-                                    counts.remove(&ip);
-                                }
-                            }
-                        }
+                        // ConnectionGuard's Drop decrements active_connections
+                        // and connections_per_ip — including on panic.
                     });
                 }
             }
@@ -332,6 +374,9 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
 
         let handler = self.handler.clone();
         let mut conn = ClientConnection::new(stream, addr);
+        if handler.sasl_required() {
+            conn.require_sasl();
+        }
         conn.handle_requests(handler).await
     }
 }
@@ -442,6 +487,13 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
         tracing::info!("TLS server shutdown signal sent");
     }
 
+    /// Access the wrapped handler. Mirrors `KafkaServer::handler` so the
+    /// binary can call `handler.shutdown()` after `shutdown_and_wait()`
+    /// drains connections.
+    pub fn handler(&self) -> Arc<H> {
+        self.handler.clone()
+    }
+
     /// Initiate graceful shutdown and wait for all connections to drain.
     pub async fn shutdown_and_wait(&self, timeout: std::time::Duration) -> bool {
         self.shutdown();
@@ -538,6 +590,11 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                     active_connections.fetch_add(1, Ordering::SeqCst);
 
                     self.data_runtime.spawn(async move {
+                        let _guard = ConnectionGuard {
+                            active_connections,
+                            connections_per_ip,
+                            ip,
+                        };
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 let mut conn = connection::TlsClientConnection::new_with_rate_limiter(
@@ -545,6 +602,9 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                                     addr,
                                     rate_limiter,
                                 );
+                                if handler.sasl_required() {
+                                    conn.require_sasl();
+                                }
                                 if let Err(e) = conn.handle_requests(handler).await {
                                     tracing::error!(client_addr = %addr, error = ?e, "Error handling TLS connection");
                                 }
@@ -553,16 +613,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                                 tracing::error!(client_addr = %addr, error = ?e, "TLS handshake failed");
                             }
                         }
-                        active_connections.fetch_sub(1, Ordering::SeqCst);
-
-                        // Decrement per-IP connection count
-                        let mut ip_counts = connections_per_ip.write().await;
-                        if let Some(count) = ip_counts.get_mut(&ip) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                ip_counts.remove(&ip);
-                            }
-                        }
+                        // ConnectionGuard handles counter cleanup including on panic.
                     });
                 }
             }

@@ -1,6 +1,10 @@
 //! Configuration for the Raft consensus layer.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use super::auth::RaftAuthKeys;
+use super::tls::RaftTlsConfig;
 
 /// Configuration for a Raft node.
 #[derive(Debug, Clone)]
@@ -87,6 +91,22 @@ pub struct RaftConfig {
     /// Timeout for waiting on proposal backpressure semaphore.
     /// If a proposal cannot acquire a slot within this time, it fails with an error.
     pub proposal_timeout: Duration,
+
+    /// HMAC keys used to authenticate every Raft RPC frame (audit S3).
+    ///
+    /// Loaded from `RAFT_CLUSTER_SECRET` (steady-state traffic) and
+    /// `RAFT_JOIN_TOKEN` (`JoinCluster` requests). When neither is set the
+    /// Raft port runs unauthenticated — see [`RaftAuthKeys`].
+    pub auth_keys: Arc<RaftAuthKeys>,
+
+    /// Optional mTLS configuration for the Raft port (audit P0-5). When
+    /// `Some`, `RaftRpcServer` requires client certs that chain to the
+    /// configured CA, and outbound Raft connections present this broker's
+    /// cert. HMAC framing remains in place on top — TLS adds peer
+    /// identity and rotation, HMAC adds replay defense and cheap message
+    /// integrity. Loaded from `RAFT_TLS_CERT` / `RAFT_TLS_KEY` /
+    /// `RAFT_TLS_CA` env vars (see [`RaftTlsConfig::from_env`]).
+    pub tls: Option<RaftTlsConfig>,
 }
 
 impl Default for RaftConfig {
@@ -116,6 +136,8 @@ impl Default for RaftConfig {
             max_partitions_per_topic: 1000,
             max_pending_proposals: 1000,
             proposal_timeout: Duration::from_secs(30),
+            auth_keys: Arc::new(RaftAuthKeys::default()),
+            tls: None,
         }
     }
 }
@@ -186,6 +208,7 @@ impl RaftConfig {
             raft_log_dir,
             snapshot_dir,
             auto_create_topics,
+            auth_keys: Arc::new(RaftAuthKeys::from_env()),
             ..defaults
         })
     }
@@ -286,6 +309,14 @@ impl RaftConfig {
             auto_create_topics: config.auto_create_topics,
             max_partitions_per_topic: config.max_partitions_per_topic,
             snapshot_threshold: config.raft_snapshot_threshold,
+            // Load HMAC keys from env. Default-off (legacy behavior); when set,
+            // every Raft RPC must present a matching signature (audit S3).
+            auth_keys: Arc::new(RaftAuthKeys::from_env()),
+            // Load mTLS config from env (audit P0-5). When the three
+            // RAFT_TLS_* vars are set, the Raft port runs TLS on top of
+            // HMAC framing. Errors propagate out so a half-configured
+            // cluster fails loudly rather than silently dropping mTLS.
+            tls: RaftTlsConfig::from_env().unwrap_or(None),
             ..Default::default()
         }
     }

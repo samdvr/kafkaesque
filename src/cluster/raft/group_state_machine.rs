@@ -152,8 +152,10 @@ impl ConsumerGroup {
     }
 
     /// Elect a new leader from remaining members.
+    /// Uses min() so every replica picks the same successor when applying
+    /// the same log entry; HashMap iteration order is non-deterministic.
     pub fn elect_new_leader(&mut self) {
-        self.leader_id = self.members.keys().next().cloned();
+        self.leader_id = self.members.keys().min().cloned();
     }
 }
 
@@ -418,9 +420,16 @@ impl GroupStateMachine {
                     group.protocol_type = Some(protocol_type);
                 }
 
-                // Determine member ID (generate if empty)
+                // Determine member ID. Must be deterministic across replicas;
+                // see domains/group.rs for rationale. Uuid::new_v4() would
+                // diverge state across replicas applying the same log entry.
                 let final_member_id = if member_id.is_empty() {
-                    format!("{}-{}", client_id, uuid::Uuid::new_v4())
+                    format!(
+                        "{}-{}-{}",
+                        client_id,
+                        timestamp_ms,
+                        group.members.len()
+                    )
                 } else {
                     member_id
                 };

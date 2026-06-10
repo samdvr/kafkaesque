@@ -90,17 +90,23 @@ RUN apk add --no-cache \
     bash \
     && rm -rf /var/cache/apk/*
 
+# Audit S11: don't run the CI image as root. Create an unprivileged user
+# and switch before any of the test-runner setup.
+RUN addgroup -S kafkaesque && adduser -S -G kafkaesque kafkaesque
+
 WORKDIR /app
 
 # Copy statically compiled binary (no runtime dependencies)
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/examples/cluster /app/target/release/examples/cluster
+COPY --from=builder --chown=kafkaesque:kafkaesque /app/target/x86_64-unknown-linux-musl/release/examples/cluster /app/target/release/examples/cluster
 
 # Copy E2E test scripts
-COPY scripts/run-e2e.sh /app/run-e2e.sh
+COPY --chown=kafkaesque:kafkaesque scripts/run-e2e.sh /app/run-e2e.sh
 RUN chmod +x /app/run-e2e.sh
 
 # Verify binary is executable (don't run --help as it starts the server)
 RUN test -x /app/target/release/examples/cluster && echo "Binary verified"
+
+USER kafkaesque
 
 # Run all E2E tests: single-node AND cluster
 CMD ["/app/run-e2e.sh", "--cluster"]

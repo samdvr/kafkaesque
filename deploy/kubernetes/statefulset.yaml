@@ -23,7 +23,7 @@ spec:
     spec:
       serviceAccountName: kafkaesque
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 60
       securityContext:
         runAsUser: 1000
         runAsGroup: 1000
@@ -35,11 +35,16 @@ spec:
           imagePullPolicy: IfNotPresent
 
           # Use shell to extract broker ID from hostname (kafkaesque-0 -> 0)
+          # and derive ADVERTISED_HOST as the pod's StatefulSet FQDN so
+          # in-cluster Kafka clients can route back to this specific broker.
+          # Without ADVERTISED_HOST set, the broker would advertise
+          # 127.0.0.1 in Metadata responses (see audit F-K8S-02).
           command:
             - /bin/sh
             - -c
             - |
               export BROKER_ID=$(hostname | sed 's/.*-//')
+              export ADVERTISED_HOST="$(hostname).${HEADLESS_SERVICE}.${POD_NAMESPACE}.svc.cluster.local"
               exec /app/cluster
 
           ports:
@@ -58,6 +63,12 @@ spec:
                 name: kafkaesque-config
 
           env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HEADLESS_SERVICE
+              value: "kafkaesque-headless"
             # Raft configuration - each broker listens on its own address
             - name: RAFT_LISTEN_ADDR
               value: "0.0.0.0:9093"
@@ -102,6 +113,15 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 30
+
+          # The endpoint controller takes ~30s to evict a terminating pod
+          # from the service backing list. Sleeping in preStop holds the
+          # container open so in-flight clients have time to drain before
+          # SIGTERM hits the broker process and we start refusing connections.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 30"]
 
           resources:
             requests:

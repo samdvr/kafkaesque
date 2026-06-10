@@ -422,28 +422,6 @@ pub struct ClusterConfig {
     /// Default: 10,000
     pub batch_index_max_size: usize,
 
-    /// Maximum number of partition stores to keep open simultaneously.
-    ///
-    /// When a broker owns many partitions, keeping all SlateDB stores open
-    /// consumes significant memory. This setting limits the number of open
-    /// stores using LRU eviction - the least recently used stores are closed
-    /// when the limit is reached.
-    ///
-    /// Set higher for brokers with large memory that own many partitions.
-    /// Set lower for memory-constrained environments.
-    ///
-    /// Default: 1000
-    pub max_open_partition_stores: u64,
-
-    /// Idle timeout for partition stores (seconds).
-    ///
-    /// Stores not accessed for this duration may be evicted from the pool
-    /// even before capacity is reached. This helps free memory from partitions
-    /// that are no longer being accessed.
-    ///
-    /// Default: 300 (5 minutes)
-    pub partition_store_idle_timeout_secs: u64,
-
     /// Minimum remaining lease TTL (in seconds) required to allow writes.
     ///
     /// If the lease has less than this remaining TTL, writes are rejected to prevent
@@ -536,6 +514,57 @@ pub struct ClusterConfig {
     ///
     /// Default: None
     pub sasl_users_file: Option<String>,
+
+    // --- Authorization (audit S2) ---
+    /// Whether ACL enforcement is enabled. When false, the cluster handler
+    /// uses an `AllowAll` authorizer (legacy / dev posture). When true, every
+    /// request goes through the ACL state machine.
+    ///
+    /// Default: false
+    pub acl_enabled: bool,
+
+    /// Whether to deny requests that don't match any ACL binding. Only
+    /// consulted when `acl_enabled` is true. `true` is the production
+    /// posture (deny-by-default — Kafka's standard behavior); `false`
+    /// allows everything that isn't explicitly denied (audit-only mode).
+    ///
+    /// Default: true
+    pub acl_deny_by_default: bool,
+
+    /// Principals that bypass ACL checks (e.g. `User:admin`). Comma-separated
+    /// in the env var `KAFKAESQUE_SUPER_USERS`.
+    ///
+    /// Default: empty
+    pub super_users: Vec<String>,
+
+    /// Optional path to a JSON file containing ACL bindings to load at
+    /// startup (audit S2). The leader writes them via Raft so they replicate
+    /// to every node. The format is a JSON array of `AclBinding` records.
+    ///
+    /// This is operator-friendly bootstrap; future iterations will accept the
+    /// Kafka `CreateAcls` admin RPC. Until then this is the primary way to
+    /// populate the ACL state machine on a fresh cluster.
+    ///
+    /// Default: None
+    pub acl_bootstrap_file: Option<String>,
+
+    /// Whether TLS is enabled on the Kafka client port (audit P0-4).
+    /// When true, `tls_cert_path` and `tls_key_path` must be set; the
+    /// `tls` Cargo feature must be compiled in or startup refuses.
+    ///
+    /// Default: false
+    pub tls_enabled: bool,
+
+    /// Path to the PEM-encoded TLS certificate (chain) for the Kafka
+    /// listener. Loaded by `KafkaServer::new_with_tls` at startup.
+    ///
+    /// Default: None
+    pub tls_cert_path: Option<String>,
+
+    /// Path to the PEM-encoded private key for the Kafka listener.
+    ///
+    /// Default: None
+    pub tls_key_path: Option<String>,
 
     // --- Data Integrity ---
     /// Whether to validate CRC-32C checksums on incoming record batches.
@@ -741,8 +770,6 @@ impl Default for ClusterConfig {
             // Recovery & resilience tuning
             max_consecutive_heartbeat_failures: 1,
             batch_index_max_size: 10_000,
-            max_open_partition_stores: 1000,
-            partition_store_idle_timeout_secs: 300,
             min_lease_ttl_for_write_secs: crate::constants::DEFAULT_MIN_LEASE_TTL_FOR_WRITE_SECS,
             producer_state_cache_ttl_secs: DEFAULT_PRODUCER_STATE_CACHE_TTL_SECS,
             max_groups_per_eviction_scan: 100,
@@ -760,6 +787,14 @@ impl Default for ClusterConfig {
             sasl_enabled: false,
             sasl_required: false,
             sasl_users_file: None,
+            // Authorization
+            acl_enabled: false,
+            acl_deny_by_default: true,
+            super_users: Vec::new(),
+            acl_bootstrap_file: None,
+            tls_enabled: false,
+            tls_cert_path: None,
+            tls_key_path: None,
             // Data integrity
             validate_record_crc: true,
             fail_on_recovery_gap: false,
@@ -1205,15 +1240,51 @@ impl ClusterConfig {
 
         let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
 
-        // ADVERTISED_HOST is what clients use to connect back.
-        // Defaults to HOST, but if HOST is 0.0.0.0, default to 127.0.0.1 for local dev.
-        let advertised_host = std::env::var("ADVERTISED_HOST").unwrap_or_else(|_| {
-            if host == "0.0.0.0" {
-                "127.0.0.1".to_string()
-            } else {
-                host.clone()
+        // ADVERTISED_HOST is the address brokers return in Metadata responses;
+        // every Kafka client uses it to reconnect for produce/fetch. If we
+        // bind to 0.0.0.0 we MUST be told (or be able to derive) a routable
+        // address — falling back to "127.0.0.1" silently is what made the K8s
+        // deployment unusable for in-cluster clients (see audit F-K8S-02).
+        //
+        // Resolution order when ADVERTISED_HOST is unset:
+        //   1. If HOST is a concrete address (not 0.0.0.0), use it.
+        //   2. Else if $HOSTNAME is non-empty (set in every Pod), use it and
+        //      warn loudly that the operator should pin ADVERTISED_HOST to a
+        //      DNS name reachable by clients.
+        //   3. Else fall back to 127.0.0.1 with a warning — only safe for
+        //      local single-node dev.
+        let advertised_host = match std::env::var("ADVERTISED_HOST") {
+            Ok(h) if !h.is_empty() => h,
+            _ => {
+                if host != "0.0.0.0" {
+                    host.clone()
+                } else if let Ok(h) = std::env::var("HOSTNAME") {
+                    if !h.is_empty() {
+                        tracing::warn!(
+                            hostname = %h,
+                            "ADVERTISED_HOST not set; binding 0.0.0.0 and advertising $HOSTNAME. \
+                             Set ADVERTISED_HOST to a fully-qualified DNS name reachable \
+                             by all Kafka clients (e.g. <pod>.<svc>.<ns>.svc.cluster.local)."
+                        );
+                        h
+                    } else {
+                        tracing::warn!(
+                            "ADVERTISED_HOST not set and $HOSTNAME empty; falling back to \
+                             127.0.0.1. This only works for single-node local dev — set \
+                             ADVERTISED_HOST for any deployment with remote clients."
+                        );
+                        "127.0.0.1".to_string()
+                    }
+                } else {
+                    tracing::warn!(
+                        "ADVERTISED_HOST not set and $HOSTNAME unavailable; falling back to \
+                         127.0.0.1. This only works for single-node local dev — set \
+                         ADVERTISED_HOST for any deployment with remote clients."
+                    );
+                    "127.0.0.1".to_string()
+                }
             }
-        });
+        };
 
         let port: i32 = std::env::var("PORT")
             .unwrap_or_else(|_| "9092".to_string())
@@ -1373,6 +1444,31 @@ impl ClusterConfig {
 
         let sasl_users_file = std::env::var("SASL_USERS_FILE").ok();
 
+        // Authorization configuration (audit S2)
+        let acl_enabled = std::env::var("ACL_ENABLED")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+
+        let acl_deny_by_default = std::env::var("ACL_DENY_BY_DEFAULT")
+            .map(|v| v.to_lowercase() != "false" && v != "0")
+            .unwrap_or(true);
+
+        let super_users: Vec<String> = std::env::var("KAFKAESQUE_SUPER_USERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let acl_bootstrap_file = std::env::var("KAFKAESQUE_ACL_BOOTSTRAP_FILE").ok();
+
+        // TLS for Kafka client port (audit P0-4)
+        let tls_enabled = std::env::var("TLS_ENABLED")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+        let tls_cert_path = std::env::var("TLS_CERT_PATH").ok();
+        let tls_key_path = std::env::var("TLS_KEY_PATH").ok();
+
         // Data integrity configuration
         let fail_on_recovery_gap = std::env::var("FAIL_ON_RECOVERY_GAP")
             .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -1435,6 +1531,13 @@ impl ClusterConfig {
             sasl_enabled,
             sasl_required,
             sasl_users_file,
+            acl_enabled,
+            acl_deny_by_default,
+            super_users,
+            acl_bootstrap_file,
+            tls_enabled,
+            tls_cert_path,
+            tls_key_path,
             fail_on_recovery_gap,
             raft_snapshot_threshold,
             slatedb_max_unflushed_bytes,
@@ -2177,26 +2280,6 @@ mod tests {
         assert_eq!(config.max_consecutive_heartbeat_failures, 1);
         assert_eq!(config.batch_index_max_size, 10_000);
         assert_eq!(config.max_groups_per_eviction_scan, 100);
-    }
-
-    #[test]
-    fn test_config_partition_store_pool_defaults() {
-        let config = ClusterConfig::default();
-        assert_eq!(config.max_open_partition_stores, 1000);
-        assert_eq!(config.partition_store_idle_timeout_secs, 300);
-    }
-
-    #[test]
-    fn test_config_partition_store_pool_custom_values() {
-        let config = ClusterConfig {
-            max_open_partition_stores: 500,
-            partition_store_idle_timeout_secs: 600,
-            ..Default::default()
-        };
-
-        assert_eq!(config.max_open_partition_stores, 500);
-        assert_eq!(config.partition_store_idle_timeout_secs, 600);
-        assert!(config.validate().is_ok());
     }
 
     #[test]

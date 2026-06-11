@@ -127,6 +127,8 @@ pub struct KafkaServer<H: Handler> {
     max_connections_per_ip: usize,
     /// Maximum total connections across all clients
     max_total_connections: usize,
+    /// Per-connection inbound frame cap (bytes).
+    max_message_size: usize,
     /// Rate limiter for authentication failures
     auth_rate_limiter: Arc<AuthRateLimiter>,
     /// Runtime handle for spawning data plane tasks.
@@ -163,6 +165,26 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
         max_total_connections: usize,
         data_runtime: Handle,
     ) -> Result<Self> {
+        Self::with_full_config(
+            addr,
+            handler,
+            max_connections_per_ip,
+            max_total_connections,
+            connection::DEFAULT_MAX_MESSAGE_SIZE,
+            data_runtime,
+        )
+        .await
+    }
+
+    /// Same as `with_config` but also sets the per-connection inbound frame cap.
+    pub async fn with_full_config(
+        addr: &str,
+        handler: H,
+        max_connections_per_ip: usize,
+        max_total_connections: usize,
+        max_message_size: usize,
+        data_runtime: Handle,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| Error::IoError(e.kind()))?;
@@ -173,6 +195,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
             addr = %addr,
             max_per_ip = max_connections_per_ip,
             max_total = max_total_connections,
+            max_message_size,
             "Kafka server listening"
         );
 
@@ -184,6 +207,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
             connections_per_ip: Arc::new(RwLock::new(HashMap::new())),
             max_connections_per_ip,
             max_total_connections,
+            max_message_size,
             auth_rate_limiter: Arc::new(AuthRateLimiter::new()),
             data_runtime,
         })
@@ -333,6 +357,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                     let active_connections = self.active_connections.clone();
                     let connections_per_ip = self.connections_per_ip.clone();
                     let rate_limiter = self.auth_rate_limiter.clone();
+                    let max_message_size = self.max_message_size;
 
                     // Increment active connection count
                     active_connections.fetch_add(1, Ordering::SeqCst);
@@ -344,6 +369,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                             ip,
                         };
                         let mut conn = ClientConnection::new_with_rate_limiter(stream, addr, rate_limiter);
+                        conn.set_max_message_size(max_message_size);
                         // Audit S1 scaffold: arm the per-connection SASL gate
                         // so non-handshake API keys are refused until
                         // SaslAuthenticate succeeds. Default-off; opt in via
@@ -374,6 +400,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
 
         let handler = self.handler.clone();
         let mut conn = ClientConnection::new(stream, addr);
+        conn.set_max_message_size(self.max_message_size);
         if handler.sasl_required() {
             conn.require_sasl();
         }
@@ -397,6 +424,8 @@ pub struct TlsKafkaServer<H: Handler> {
     max_connections_per_ip: usize,
     /// Maximum total connections across all clients
     max_total_connections: usize,
+    /// Per-connection inbound frame cap (bytes).
+    max_message_size: usize,
     /// Rate limiter for authentication failures
     auth_rate_limiter: Arc<AuthRateLimiter>,
     /// Runtime handle for spawning data plane tasks.
@@ -437,6 +466,28 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
         max_total_connections: usize,
         data_runtime: Handle,
     ) -> Result<Self> {
+        Self::with_full_config(
+            addr,
+            handler,
+            tls_config,
+            max_connections_per_ip,
+            max_total_connections,
+            connection::DEFAULT_MAX_MESSAGE_SIZE,
+            data_runtime,
+        )
+        .await
+    }
+
+    /// Same as `with_config` but also sets the per-connection inbound frame cap.
+    pub async fn with_full_config(
+        addr: &str,
+        handler: H,
+        tls_config: TlsConfig,
+        max_connections_per_ip: usize,
+        max_total_connections: usize,
+        max_message_size: usize,
+        data_runtime: Handle,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| Error::IoError(e.kind()))?;
@@ -447,6 +498,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
             addr = %addr,
             max_per_ip = max_connections_per_ip,
             max_total = max_total_connections,
+            max_message_size,
             "Kafka TLS server listening"
         );
 
@@ -459,6 +511,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
             connections_per_ip: Arc::new(RwLock::new(HashMap::new())),
             max_connections_per_ip,
             max_total_connections,
+            max_message_size,
             auth_rate_limiter: Arc::new(AuthRateLimiter::new()),
             data_runtime,
         })
@@ -586,6 +639,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                     let active_connections = self.active_connections.clone();
                     let connections_per_ip = self.connections_per_ip.clone();
                     let rate_limiter = self.auth_rate_limiter.clone();
+                    let max_message_size = self.max_message_size;
 
                     active_connections.fetch_add(1, Ordering::SeqCst);
 
@@ -602,6 +656,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                                     addr,
                                     rate_limiter,
                                 );
+                                conn.set_max_message_size(max_message_size);
                                 if handler.sasl_required() {
                                     conn.require_sasl();
                                 }
@@ -640,6 +695,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
         let rate_limiter = self.auth_rate_limiter.clone();
         let mut conn =
             connection::TlsClientConnection::new_with_rate_limiter(tls_stream, addr, rate_limiter);
+        conn.set_max_message_size(self.max_message_size);
         conn.handle_requests(handler).await
     }
 }

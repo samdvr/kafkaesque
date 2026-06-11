@@ -624,7 +624,6 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
 
                 // Collect partition states by category
                 let mut actively_owned: HashSet<(String, i32)> = HashSet::new();
-                let mut draining: HashSet<(String, i32)> = HashSet::new();
                 let mut owned_topics: HashSet<String> = HashSet::new();
 
                 for entry in ctx.partition_states.iter() {
@@ -635,9 +634,6 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                     if state.is_actively_owned() {
                         owned_topics.insert(topic.clone());
                         actively_owned.insert((topic, *partition));
-                    } else if state.is_draining() {
-                        owned_topics.insert(topic.clone());
-                        draining.insert((topic, *partition));
                     }
                 }
 
@@ -648,7 +644,6 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                             info!(topic = %topic, "Topic deleted - releasing all partitions");
                             let topic_partitions: Vec<_> = actively_owned
                                 .iter()
-                                .chain(draining.iter())
                                 .filter(|(t, _)| t == topic)
                                 .cloned()
                                 .collect();
@@ -663,33 +658,8 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                     }
                 }
 
-                // Check draining partitions - release those whose drain is complete
-                let drain_complete: Vec<_> = draining
-                    .iter()
-                    .filter(|(topic, partition)| {
-                        let key: PartitionKey = (Arc::from(topic.as_str()), *partition);
-                        ctx.partition_states
-                            .get(&key)
-                            .is_some_and(|s| s.is_drain_complete())
-                    })
-                    .cloned()
-                    .collect();
-
-                if !drain_complete.is_empty() {
-                    let release_futures: Vec<_> = drain_complete
-                        .iter()
-                        .map(|(topic, partition)| {
-                            info!(topic, partition, "Drain complete, releasing partition");
-                            release_drained_partition(&ctx, topic, *partition)
-                        })
-                        .collect();
-                    futures::future::join_all(release_futures).await;
-                }
-
-                // Acquire new partitions (only if not draining)
-                // A partition being drained might get re-assigned to us if the cluster changes
-                let all_owned: HashSet<_> = actively_owned.union(&draining).cloned().collect();
-                let to_acquire: Vec<_> = assigned_set.difference(&all_owned).cloned().collect();
+                // Acquire new partitions
+                let to_acquire: Vec<_> = assigned_set.difference(&actively_owned).cloned().collect();
                 if !to_acquire.is_empty() {
                     // Rate limit partition acquisitions to prevent thundering herd
                     //
@@ -724,12 +694,17 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                     }
                 }
 
-                // Start draining actively owned partitions that are no longer assigned
-                // This is a graceful handoff - we stop renewing the lease and wait for it to expire
-                let to_drain: Vec<_> = actively_owned.difference(&assigned_set).cloned().collect();
-                if !to_drain.is_empty() {
-                    for (topic, partition) in to_drain {
-                        start_draining_partition(&ctx, &topic, partition).await;
+                // Release actively-owned partitions that are no longer assigned.
+                // The old "drain" state machine kept the store open until the
+                // lease expired, but `start_draining_partition` always closed
+                // SlateDB immediately to keep the compactor from racing the new
+                // owner — so there was never a real drain window. We do the
+                // same close-and-release here.
+                let to_release: Vec<_> =
+                    actively_owned.difference(&assigned_set).cloned().collect();
+                if !to_release.is_empty() {
+                    for (topic, partition) in to_release {
+                        release_reassigned_partition(&ctx, &topic, partition).await;
                     }
                 }
 
@@ -821,6 +796,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             .remove(&key)
             .and_then(|(_, s)| s.store())
         {
+            store.clear_load_metrics().await;
             // Close the store (close() takes &self so this always works)
             if let Err(e) = store.close().await {
                 error!(topic, partition, error = %e, "Failed to close partition store");
@@ -1012,17 +988,10 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             });
         }
 
-        // Check if partition is draining (being handed off to another broker)
-        // Draining partitions should not accept new writes
-        let key: PartitionKey = (Arc::from(topic), partition);
-        if let Some(state) = self.partition_states.get(&key)
-            && state.is_draining()
-        {
-            return Err(SlateDBError::NotOwned {
-                topic: topic.to_string(),
-                partition,
-            });
-        }
+        // No additional draining-state gate is needed; partitions being
+        // released are removed from `partition_states` synchronously by
+        // `release_reassigned_partition`, so any subsequent get_for_write()
+        // simply falls through to `get_store` which checks ownership.
 
         let store =
             self.get_store(topic, partition)
@@ -1059,7 +1028,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             Ok(ttl) => ttl,
             Err(e) => {
                 warn!(topic, partition, error = %e, "Ownership verification failed during write - releasing partition");
-                self.partition_states.remove(&key);
+                self.partition_states.remove(&cache_key);
                 self.lease_cache.remove(&cache_key);
                 return Err(SlateDBError::NotOwned {
                     topic: topic.to_string(),
@@ -1615,66 +1584,40 @@ async fn verify_ownership<C: ClusterCoordinator>(
     }
 }
 
-/// Start draining a partition (graceful handoff to another broker).
-/// This transitions the partition to Draining state, which:
-/// - Stops lease renewal (lease will expire naturally)
-/// - Closes SlateDB immediately to prevent fencing panic from compactor
-/// - Explicitly releases the partition through the coordinator
-/// - The drain period gives the lease time to expire before cleanup
+/// Release a partition that has been reassigned away from this broker.
 ///
-/// # Atomic Handoff
-///
-/// The partition is explicitly released through the coordinator after closing
-/// SlateDB. This ensures:
-/// 1. Old broker closes SlateDB (stops writes)
-/// 2. Old broker releases partition via Raft (atomic state update)
-/// 3. New broker can immediately acquire (doesn't wait for lease expiry)
-///
-/// If coordinator is unreachable during release, the lease will still expire
-/// naturally, ensuring eventual recovery.
-///
-/// Note: SlateDB is closed immediately because keeping it open causes the
-/// background compactor to panic when the new broker opens and fences us.
-async fn start_draining_partition<C: ClusterCoordinator>(
+/// SlateDB is closed immediately to keep the background compactor from
+/// panicking when the new owner opens and fences us. The coordinator
+/// release is best-effort — if it fails, the lease will expire naturally.
+async fn release_reassigned_partition<C: ClusterCoordinator>(
     ctx: &OwnershipContext<C>,
     topic: &str,
     partition: i32,
 ) {
     let key: PartitionKey = (Arc::from(topic), partition);
 
-    // Get the store from the current state and close it immediately
     if let Some((_, state)) = ctx.partition_states.remove(&key)
         && let Some(store) = state.store()
     {
         info!(
             ctx.broker_id,
-            topic,
-            partition,
-            lease_secs = ctx.lease_secs,
-            "Starting partition drain - closing SlateDB immediately to prevent fencing"
+            topic, partition, "Releasing reassigned partition - closing SlateDB"
         );
 
-        // Close SlateDB immediately to prevent compactor from panicking when fenced
+        store.clear_load_metrics().await;
         if let Err(e) = store.close().await {
-            // Fencing errors are acceptable - the new owner may have already opened
             if e.is_fenced() {
-                debug!(topic, partition, "Fenced during drain close (expected)");
+                debug!(topic, partition, "Fenced during close (expected after reassignment)");
             } else {
-                warn!(topic, partition, error = %e, "Error closing store during drain");
+                warn!(topic, partition, error = %e, "Error closing store during reassignment");
             }
         }
 
-        // Explicitly release the partition through the coordinator
-        // This ensures the partition becomes available immediately for the new owner,
-        // rather than waiting for the lease to expire naturally.
-        //
-        // If this fails (e.g., coordinator unreachable), the lease will still expire
-        // naturally, ensuring eventual recovery.
         match ctx.coordinator.release_partition(topic, partition).await {
             Ok(()) => {
                 info!(
                     ctx.broker_id,
-                    topic, partition, "Released partition through coordinator - handoff complete"
+                    topic, partition, "Released partition through coordinator"
                 );
             }
             Err(e) => {
@@ -1688,50 +1631,13 @@ async fn start_draining_partition<C: ClusterCoordinator>(
             }
         }
 
-        // Invalidate lease cache since we've released
         ctx.lease_cache.remove(&key);
 
-        super::metrics::record_lease_operation("release", "drained");
+        super::metrics::record_lease_operation("release", "reassigned");
         super::metrics::OWNED_PARTITIONS
             .with_label_values(&[topic])
             .dec();
     }
-}
-
-/// Release a partition that has completed draining.
-/// The lease has expired, so it's safe to close SlateDB without racing with the new owner.
-async fn release_drained_partition<C: ClusterCoordinator>(
-    ctx: &OwnershipContext<C>,
-    topic: &str,
-    partition: i32,
-) {
-    info!(
-        ctx.broker_id,
-        topic, partition, "Releasing drained partition"
-    );
-
-    let key: PartitionKey = (Arc::from(topic), partition);
-
-    if let Some(store) = ctx
-        .partition_states
-        .remove(&key)
-        .and_then(|(_, s)| s.store())
-    {
-        // Close the store (close() now takes &self so this always works)
-        if let Err(e) = store.close().await {
-            // Fencing errors during close are expected since our lease expired
-            if e.is_fenced() {
-                debug!(topic, partition, "Fenced during drain close (expected)");
-            } else {
-                error!(topic, partition, error = %e, "Failed to close drained partition store");
-            }
-        }
-    }
-
-    super::metrics::record_lease_operation("release", "success");
-    super::metrics::OWNED_PARTITIONS
-        .with_label_values(&[topic])
-        .dec();
 }
 
 async fn release_partition_for_deleted_topic<C: ClusterCoordinator>(
@@ -1749,6 +1655,7 @@ async fn release_partition_for_deleted_topic<C: ClusterCoordinator>(
         .remove(&key)
         .and_then(|(_, s)| s.store())
     {
+        store.clear_load_metrics().await;
         // close() takes &self so this always works
         let _ = store.close().await;
     }

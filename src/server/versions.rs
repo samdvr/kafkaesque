@@ -21,14 +21,34 @@
 //!
 //! # Current Support Matrix
 //!
-//! | API | Min | Max | Notes |
-//! |-----|-----|-----|-------|
-//! | Produce | 0 | 3 | Basic produce, no transactions |
-//! | Fetch | 0 | 4 | Basic fetch, no follower fetch |
-//! | Metadata | 0 | 1 | Broker and topic metadata |
-//! | ApiVersions | 0 | 2 | Protocol negotiation |
+//! Each row reflects what the parsers and encoders actually understand on the
+//! wire. The `min_version` is set so that older clients get a clean
+//! `UnsupportedVersion` from `ApiVersions` rather than a silent
+//! mis-parse. (Audit P2-1: previously the produce/fetch parsers read v3+/v4+
+//! fields unconditionally and v0–v2 clients tripped a `ParsingError`.)
 //!
-//! See `SUPPORTED_VERSIONS` constant for full list.
+//! | API              | Min | Max | Why min isn't 0                                |
+//! |------------------|-----|-----|------------------------------------------------|
+//! | Produce          | 3   | 3   | parser reads `transactional_id` (v3+)          |
+//! | Fetch            | 4   | 4   | parser reads `max_bytes` (v3+) and `isolation` (v4+) |
+//! | ListOffsets      | 0   | 2   | parser is version-agnostic                     |
+//! | Metadata         | 0   | 1   | parser is version-agnostic                     |
+//! | OffsetCommit     | 0   | 2   |                                                |
+//! | OffsetFetch      | 0   | 1   |                                                |
+//! | FindCoordinator  | 0   | 1   |                                                |
+//! | JoinGroup        | 0   | 2   |                                                |
+//! | Heartbeat        | 0   | 1   |                                                |
+//! | LeaveGroup       | 0   | 1   |                                                |
+//! | SyncGroup        | 0   | 1   |                                                |
+//! | DescribeGroups   | 0   | 1   |                                                |
+//! | ListGroups       | 0   | 2   |                                                |
+//! | SaslHandshake    | 0   | 1   |                                                |
+//! | ApiVersions      | 0   | 3   | v3 uses flexible encoding                      |
+//! | CreateTopics     | 0   | 1   |                                                |
+//! | DeleteTopics     | 0   | 1   |                                                |
+//! | SaslAuthenticate | 0   | 1   |                                                |
+//! | InitProducerId   | 0   | 4   | v3+ uses flexible encoding                     |
+//! | DeleteGroups     | 0   | 1   |                                                |
 
 use super::request::ApiKey;
 use super::response::ApiVersionData;
@@ -72,10 +92,16 @@ impl SupportedVersion {
 /// Default supported API versions.
 ///
 /// This is the standard set of API versions that Kafkaesque supports.
-/// Handlers can override this in their ApiVersions response if needed.
+/// The `min_version` for Produce and Fetch is clamped to match what the
+/// parsers actually decode (audit P2-1). Handlers may override this in their
+/// ApiVersions response if needed.
 pub const SUPPORTED_VERSIONS: &[SupportedVersion] = &[
-    SupportedVersion::new(ApiKey::Produce, 0, 3),
-    SupportedVersion::new(ApiKey::Fetch, 0, 4),
+    // Produce v3 added the leading nullable `transactional_id` field that the
+    // parser reads unconditionally; refusing v0–v2 prevents silent misreads.
+    SupportedVersion::new(ApiKey::Produce, 3, 3),
+    // Fetch v3 added `max_bytes`, v4 added `isolation_level` — both are
+    // unconditionally parsed today.
+    SupportedVersion::new(ApiKey::Fetch, 4, 4),
     SupportedVersion::new(ApiKey::ListOffsets, 0, 2),
     SupportedVersion::new(ApiKey::Metadata, 0, 1),
     SupportedVersion::new(ApiKey::OffsetCommit, 0, 2),
@@ -177,7 +203,8 @@ mod tests {
         assert!(produce.is_some());
         let produce = produce.unwrap();
         assert_eq!(produce.api_key, ApiKey::Produce);
-        assert_eq!(produce.min_version, 0);
+        // Produce min is clamped to what the parser actually supports.
+        assert_eq!(produce.min_version, 3);
         assert_eq!(produce.max_version, 3);
     }
 
@@ -192,8 +219,9 @@ mod tests {
 
     #[test]
     fn test_is_version_supported() {
-        assert!(is_version_supported(ApiKey::Produce, 0));
         assert!(is_version_supported(ApiKey::Produce, 3));
+        assert!(!is_version_supported(ApiKey::Produce, 0));
+        assert!(!is_version_supported(ApiKey::Produce, 2));
         assert!(!is_version_supported(ApiKey::Produce, 4));
         assert!(!is_version_supported(ApiKey::Produce, -1));
     }

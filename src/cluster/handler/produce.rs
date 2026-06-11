@@ -265,7 +265,7 @@ async fn fire_and_forget_produce(
     partition: ProducePartitionData,
     validate_crc: bool,
 ) -> Result<(), ()> {
-    use crate::protocol::{CrcValidationResult, validate_batch_crc};
+    use crate::protocol::{CrcValidationResult, validate_batch_crc_async};
 
     // Skip zombie mode check for fire-and-forget (best effort)
     if partition_manager.is_zombie() {
@@ -285,7 +285,7 @@ async fn fire_and_forget_produce(
 
     // Optional CRC validation
     if validate_crc {
-        match validate_batch_crc(&partition.records) {
+        match validate_batch_crc_async(&partition.records).await {
             CrcValidationResult::Valid => {}
             _ => return Err(()),
         }

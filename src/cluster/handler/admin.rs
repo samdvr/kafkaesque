@@ -1,5 +1,6 @@
 //! Admin request handling (create/delete topics).
 
+use futures::stream::{self, StreamExt};
 use tracing::{debug, error};
 
 use crate::constants::DEFAULT_NUM_PARTITIONS;
@@ -86,13 +87,25 @@ pub(super) async fn handle_create_topics(
             continue;
         }
 
-        // Try to acquire partitions
-        for p in 0..num_partitions {
-            let _ = handler
-                .partition_manager
-                .acquire_partition(&topic.name, p)
-                .await;
-        }
+        // Try to acquire partitions. Serial acquisition turned a 1k-partition
+        // topic into a minutes-long admin call; cap concurrency at
+        // `max_concurrent_partition_writes` so create-topic latency tracks the
+        // configured write parallelism instead of partition count.
+        let topic_name = topic.name.clone();
+        let max_concurrent = handler.max_concurrent_partition_writes.max(1);
+        stream::iter(0..num_partitions)
+            .map(|p| {
+                let topic_name = topic_name.clone();
+                async move {
+                    let _ = handler
+                        .partition_manager
+                        .acquire_partition(&topic_name, p)
+                        .await;
+                }
+            })
+            .buffer_unordered(max_concurrent)
+            .for_each(|_| async {})
+            .await;
 
         topics.push(CreateTopicResponseData {
             name: topic.name,
@@ -155,23 +168,34 @@ pub(super) async fn handle_delete_topics(
         // Get partition count to delete data
         let result = match handler.coordinator.get_partition_count(&name).await {
             Ok(Some(partitions)) => {
-                let mut has_error = false;
-
-                for p in 0..partitions {
-                    if let Err(e) = handler
-                        .partition_manager
-                        .delete_partition_data(&name, p)
-                        .await
-                    {
-                        error!(
-                            topic = %name,
-                            partition = p,
-                            error = %e,
-                            "Failed to delete partition data"
-                        );
-                        has_error = true;
-                    }
-                }
+                let max_concurrent = handler.max_concurrent_partition_writes.max(1);
+                let topic_name = name.clone();
+                let errors: Vec<bool> = stream::iter(0..partitions)
+                    .map(|p| {
+                        let topic_name = topic_name.clone();
+                        async move {
+                            match handler
+                                .partition_manager
+                                .delete_partition_data(&topic_name, p)
+                                .await
+                            {
+                                Ok(()) => false,
+                                Err(e) => {
+                                    error!(
+                                        topic = %topic_name,
+                                        partition = p,
+                                        error = %e,
+                                        "Failed to delete partition data"
+                                    );
+                                    true
+                                }
+                            }
+                        }
+                    })
+                    .buffer_unordered(max_concurrent)
+                    .collect()
+                    .await;
+                let has_error = errors.into_iter().any(|e| e);
 
                 // Delete topic metadata from coordinator
                 match handler.coordinator.delete_topic(&name).await {

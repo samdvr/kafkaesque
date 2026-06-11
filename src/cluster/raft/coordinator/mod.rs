@@ -178,6 +178,7 @@ impl RaftCoordinator {
         let node = self.node.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let check_interval = Duration::from_secs(5);
+        let clock_skew_tolerance_ms = self.config.clock_skew_tolerance_ms;
 
         let handle = self.runtime.spawn(async move {
             // Add initial jitter (0-100% of interval) to stagger across brokers
@@ -192,7 +193,10 @@ impl RaftCoordinator {
                         let tick_jitter = jitter_duration(check_interval, 0.2);
                         tokio::time::sleep(tick_jitter).await;
 
-                        let now = current_time_ms();
+                        // Subtract the configured skew tolerance from the
+                        // expiry comparison so a leader whose clock jumps
+                        // forward doesn't mass-expire valid leases. P2-5.
+                        let now = current_time_ms().saturating_sub(clock_skew_tolerance_ms);
                         let command = CoordinationCommand::PartitionDomain(
                             super::domains::PartitionCommand::ExpireLeases { current_time_ms: now }
                         );

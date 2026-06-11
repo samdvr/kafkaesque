@@ -47,7 +47,6 @@ use tokio::sync::RwLock;
 
 use super::load_metrics::LoadMetricsCollector;
 use tokio::sync::Mutex;
-use tokio::task::spawn_blocking;
 use tracing::{debug, error, info, warn};
 
 /// Write options for high-throughput non-blocking writes.
@@ -195,7 +194,7 @@ impl PartitionStore {
             topic,
             partition,
             DEFAULT_MAX_FETCH_RESPONSE_SIZE,
-            false, // fail_on_recovery_gap: default to false for backwards compatibility
+            true, // fail_on_recovery_gap: default to true (refuse to open on confirmed gap)
         )
         .await
     }
@@ -290,6 +289,15 @@ impl PartitionStore {
     /// aggregated load statistics for auto-balancing decisions.
     pub async fn set_load_collector(&self, collector: Arc<LoadMetricsCollector>) {
         *self.load_collector.write().await = Some(collector);
+    }
+
+    /// Drop this partition's metrics from the shared collector so the
+    /// per-partition `DashMap` doesn't grow unboundedly as ownership
+    /// churns. Called from `release_partition` before the store is closed.
+    pub async fn clear_load_metrics(&self) {
+        if let Some(collector) = self.load_collector.write().await.take() {
+            collector.clear_partition(&self.topic, self.partition);
+        }
     }
 
     /// Record a produce operation in the load metrics.
@@ -981,46 +989,50 @@ impl PartitionStore {
         // No manual eviction needed - moka handles LRU automatically
     }
 
-    /// Warm the batch index cache by pre-loading recent batches.
+    /// Warm the batch index cache by pre-loading the most recent batches.
     ///
     /// This is called during partition open to avoid cold-start cache misses.
-    /// Pre-populates the cache with the most recent batches (up to batch_index_max_size).
+    /// Tail reads are the hot pattern (`fetch.offset` follows `HWM`), so we keep
+    /// only the last `batch_index_max_size` batches in a sliding window while
+    /// scanning forward (SlateDB has no native reverse scan in 0.10).
     ///
-    /// Performance: This adds ~10-50ms to partition open time but significantly
-    /// reduces fetch latency for the first requests after partition acquisition.
+    /// Performance: scanning is still sequential and SST-efficient. Memory is
+    /// bounded to the window size. The cache ends up with the newest batches.
     async fn warm_batch_index(&self) {
         use super::keys::{RECORD_KEY_PREFIX, decode_record_offset};
+        use std::collections::VecDeque;
 
         let start = std::time::Instant::now();
-        let mut count = 0u32;
+        let window_cap = self.batch_index_max_size as usize;
+        if window_cap == 0 {
+            return;
+        }
 
-        // Scan all record keys and populate the cache
-        // SlateDB scan is efficient - reads SST files sequentially
         let start_key = [RECORD_KEY_PREFIX];
         let end_key = [RECORD_KEY_PREFIX + 1];
+
+        let mut window: VecDeque<(i64, i32)> = VecDeque::with_capacity(window_cap);
 
         match self.db.scan(start_key.as_slice()..end_key.as_slice()).await {
             Ok(mut iter) => {
                 while let Ok(Some(item)) = iter.next().await {
-                    if count >= self.batch_index_max_size as u32 {
-                        break; // Cache is full
-                    }
+                    let Some(offset) = decode_record_offset(&item.key) else {
+                        continue;
+                    };
+                    let batch_data = if item.value.len() >= 8 {
+                        &item.value[8..]
+                    } else {
+                        item.value.as_ref()
+                    };
+                    let record_count = parse_record_count(batch_data);
 
-                    if let Some(offset) = decode_record_offset(&item.key) {
-                        // Strip HWM metadata if present
-                        let batch_data = if item.value.len() >= 8 {
-                            &item.value[8..]
-                        } else {
-                            item.value.as_ref()
-                        };
-                        let record_count = parse_record_count(batch_data);
-                        self.add_to_batch_index(offset, record_count);
-                        count += 1;
+                    if window.len() == window_cap {
+                        window.pop_front();
                     }
+                    window.push_back((offset, record_count));
                 }
             }
             Err(e) => {
-                // Non-fatal - cache warming is an optimization, not critical
                 warn!(
                     topic = %self.topic,
                     partition = self.partition,
@@ -1028,6 +1040,11 @@ impl PartitionStore {
                     "Failed to warm batch index cache"
                 );
             }
+        }
+
+        let count = window.len() as u32;
+        for (offset, record_count) in window {
+            self.add_to_batch_index(offset, record_count);
         }
 
         let elapsed = start.elapsed();
@@ -1041,7 +1058,6 @@ impl PartitionStore {
             );
         }
 
-        // Record metrics
         super::metrics::record_batch_index_warm_entries(count as i64);
     }
 
@@ -1212,7 +1228,7 @@ impl PartitionStoreBuilder {
             batch_index_max_size: DEFAULT_BATCH_INDEX_MAX_SIZE,
             producer_state_cache_ttl_secs: 900, // 15 minutes
             zombie_mode: None,
-            fail_on_recovery_gap: false,
+            fail_on_recovery_gap: true,
             min_lease_ttl_for_write_secs: crate::constants::DEFAULT_MIN_LEASE_TTL_FOR_WRITE_SECS,
             leader_epoch: 0, // 0 means epoch validation disabled (backwards compat)
             slatedb_max_unflushed_bytes: 256 * 1024 * 1024, // 256 MB default
@@ -1340,7 +1356,10 @@ impl PartitionStoreBuilder {
 
     /// Build the PartitionStore.
     pub async fn build(self) -> SlateDBResult<PartitionStore> {
-        use super::keys::{LEADER_EPOCH_KEY, decode_leader_epoch, encode_leader_epoch};
+        use super::keys::{
+            CURRENT_FORMAT_VERSION, FORMAT_VERSION_KEY, LEADER_EPOCH_KEY, decode_leader_epoch,
+            encode_leader_epoch,
+        };
 
         let object_store = self
             .object_store
@@ -1384,16 +1403,50 @@ impl PartitionStoreBuilder {
             "SlateDB settings configured for backpressure"
         );
 
-        // Open SlateDB in a blocking context
-        let (db, hwm, persisted_states, validated_epoch) = spawn_blocking(move || {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(async move {
-                let object_path = ObjectPath::from(path_for_task.as_str());
-                // Use DbBuilder with explicit settings for memory limits and backpressure
-                let db = Db::builder(object_path, object_store_for_task)
-                    .with_settings(slatedb_settings)
-                    .build()
-                    .await?;
+        // Audit P2-12: previously this opened SlateDB inside `spawn_blocking
+        // → Handle::current().block_on(async)`. SlateDB 0.10's open path is
+        // already async-only and tokio-friendly, so the round-trip through a
+        // blocking pool just wasted a worker. Run the open inline; the slow
+        // step (object-store metadata I/O) yields back to the runtime.
+        let open_future = async move {
+            let object_path = ObjectPath::from(path_for_task.as_str());
+            let db = Db::builder(object_path, object_store_for_task)
+                .with_settings(slatedb_settings)
+                .build()
+                .await?;
+
+                // ==================================================================
+                // FORMAT VERSION: write on first open; reject newer-than-known
+                // ==================================================================
+                // Future migrations branch on this value. Writing it at the first
+                // open of a fresh partition means we never need to forensically
+                // guess "is this v0 or v1?" — a missing key uniquely identifies
+                // pre-versioning partitions and is treated as v1 (the current).
+                match db.get(FORMAT_VERSION_KEY).await? {
+                    Some(bytes) if bytes.len() >= 4 => {
+                        let stored = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                        if stored > CURRENT_FORMAT_VERSION {
+                            error!(
+                                stored_format_version = stored,
+                                supported_format_version = CURRENT_FORMAT_VERSION,
+                                "Partition was written by a newer broker; refusing to open"
+                            );
+                            return Err(slatedb::Error::invalid(format!(
+                                "Partition format version {} is newer than supported {}",
+                                stored, CURRENT_FORMAT_VERSION
+                            )));
+                        }
+                    }
+                    Some(_) | None => {
+                        db.put_with_options(
+                            FORMAT_VERSION_KEY,
+                            &CURRENT_FORMAT_VERSION.to_be_bytes(),
+                            &PutOptions::default(),
+                            &WriteOptions { await_durable: true },
+                        )
+                        .await?;
+                    }
+                }
 
                 // ==================================================================
                 // EPOCH-BASED FENCING: Validate and store leader epoch
@@ -1487,25 +1540,25 @@ impl PartitionStoreBuilder {
                 let producer_states = load_producer_states(&db).await?;
 
                 Ok::<_, slatedb::Error>((db, recovered_hwm, producer_states, final_epoch))
-            })
-        })
-        .await
-        .map_err(|e| SlateDBError::SlateDB(format!("Task join error: {}", e)))?
-        .map_err(|e| {
-            // Convert slatedb::Error to SlateDBError, checking for epoch mismatch
-            let err_str = e.to_string();
-            if err_str.contains("Epoch mismatch") {
-                // Parse out the epochs from the error message
-                SlateDBError::EpochMismatch {
-                    topic: topic_for_epoch_error.clone(),
-                    partition,
-                    expected_epoch: self.leader_epoch,
-                    stored_epoch: 0, // We don't have the exact stored value here
+        };
+
+        let (db, hwm, persisted_states, validated_epoch) = open_future
+            .await
+            .map_err(|e| {
+                // Convert slatedb::Error to SlateDBError, checking for epoch mismatch
+                let err_str = e.to_string();
+                if err_str.contains("Epoch mismatch") {
+                    // Parse out the epochs from the error message
+                    SlateDBError::EpochMismatch {
+                        topic: topic_for_epoch_error.clone(),
+                        partition,
+                        expected_epoch: self.leader_epoch,
+                        stored_epoch: 0, // We don't have the exact stored value here
+                    }
+                } else {
+                    SlateDBError::from(e)
                 }
-            } else {
-                SlateDBError::from(e)
-            }
-        })?;
+            })?;
 
         if !persisted_states.is_empty() {
             info!(

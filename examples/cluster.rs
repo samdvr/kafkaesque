@@ -251,12 +251,13 @@ async fn run_broker(
             let key = config.tls_key_path.as_ref().expect("validated above");
             let tls_config = TlsConfig::from_pem_files(cert, key)
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-            let server = TlsKafkaServer::with_config(
+            let server = TlsKafkaServer::with_full_config(
                 &addr,
                 handler,
                 tls_config,
                 kafkaesque::constants::DEFAULT_MAX_CONNECTIONS_PER_IP,
                 kafkaesque::constants::DEFAULT_MAX_TOTAL_CONNECTIONS,
+                config.max_message_size,
                 runtime_handles.data.clone(),
             )
             .await?;
@@ -274,11 +275,12 @@ async fn run_broker(
             unreachable!("TLS feature disabled; validate_tls_config should have rejected")
         }
     } else {
-        let server = KafkaServer::with_config(
+        let server = KafkaServer::with_full_config(
             &addr,
             handler,
             kafkaesque::constants::DEFAULT_MAX_CONNECTIONS_PER_IP,
             kafkaesque::constants::DEFAULT_MAX_TOTAL_CONNECTIONS,
+            config.max_message_size,
             runtime_handles.data.clone(),
         )
         .await?;

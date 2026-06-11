@@ -79,6 +79,7 @@ fn test_config(node_id: u64, port: u16, cluster_members: Vec<(u64, String)>) -> 
         proposal_timeout: Duration::from_secs(5),
         auth_keys: std::sync::Arc::new(kafkaesque::cluster::raft::RaftAuthKeys::default()),
         tls: None,
+        clock_skew_tolerance_ms: 5_000,
     }
 }
 

@@ -107,6 +107,12 @@ pub struct RaftConfig {
     /// integrity. Loaded from `RAFT_TLS_CERT` / `RAFT_TLS_KEY` /
     /// `RAFT_TLS_CA` env vars (see [`RaftTlsConfig::from_env`]).
     pub tls: Option<RaftTlsConfig>,
+
+    /// Tolerance buffer applied to lease and member-expiry checks to absorb
+    /// leader/broker clock skew. The expiry sweep treats `now - tolerance`
+    /// as the effective timestamp, so a leader whose clock jumps slightly
+    /// forward doesn't mass-expire valid leases. Audit P2-5.
+    pub clock_skew_tolerance_ms: u64,
 }
 
 impl Default for RaftConfig {
@@ -138,6 +144,7 @@ impl Default for RaftConfig {
             proposal_timeout: Duration::from_secs(30),
             auth_keys: Arc::new(RaftAuthKeys::default()),
             tls: None,
+            clock_skew_tolerance_ms: 5_000,
         }
     }
 }
@@ -317,6 +324,7 @@ impl RaftConfig {
             // HMAC framing. Errors propagate out so a half-configured
             // cluster fails loudly rather than silently dropping mTLS.
             tls: RaftTlsConfig::from_env().unwrap_or(None),
+            clock_skew_tolerance_ms: config.clock_skew_tolerance_ms,
             ..Default::default()
         }
     }

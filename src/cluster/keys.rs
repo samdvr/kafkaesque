@@ -18,6 +18,8 @@
 //!
 //! Metadata keys start with underscore (`_`) to separate them from record keys:
 //! - `_hwm` - High watermark (latest committed offset)
+//! - `_epoch` - Leader epoch (fencing token)
+//! - `_fmt` - On-disk format version (u32 big-endian)
 //!
 //! ## SlateDB Namespace
 //!
@@ -69,6 +71,16 @@ pub const HIGH_WATERMARK_KEY: &[u8] = b"_hwm";
 ///
 /// This provides optimistic concurrency control at the storage layer.
 pub const LEADER_EPOCH_KEY: &[u8] = b"_epoch";
+
+/// Key for storing the on-disk format version.
+///
+/// Value format: 4-byte big-endian u32. Written on first partition open if
+/// absent. Future migrations branch on this number; the current format is 1.
+pub const FORMAT_VERSION_KEY: &[u8] = b"_fmt";
+
+/// Current on-disk format version. Bump only when the layout of records,
+/// metadata keys, or value-frame encoding changes incompatibly.
+pub const CURRENT_FORMAT_VERSION: u32 = 1;
 
 /// Encode a leader epoch value.
 ///

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 #[cfg(feature = "tls")]
@@ -33,7 +34,44 @@ use std::time::Instant;
 /// Default maximum allowed message size (100 MB).
 /// This prevents memory exhaustion from malicious or malformed messages.
 /// Can be overridden via KafkaServer configuration.
-const DEFAULT_MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+
+/// Default global inflight-bytes budget (1 GiB). Bounds the total memory
+/// the broker is willing to allocate for not-yet-parsed inbound frames so a
+/// burst of large produces (or a coordinated slow-frame attack) can't OOM
+/// the process. Audit P2-7. Override via `set_global_inflight_byte_budget`.
+const DEFAULT_GLOBAL_INFLIGHT_BUDGET: usize = 1024 * 1024 * 1024;
+
+/// Global semaphore measured in bytes. Each inbound frame acquires N permits
+/// (one per byte) before the buffer is allocated and releases them on drop.
+/// Configured at most once per process; later attempts are ignored.
+static GLOBAL_INFLIGHT: once_cell::sync::Lazy<Arc<Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(DEFAULT_GLOBAL_INFLIGHT_BUDGET)));
+
+/// Permit guard returned by the inflight-bytes acquire helper. Forgotten on
+/// purpose: see `with_inflight_bytes`.
+struct InflightPermit {
+    bytes: usize,
+}
+
+impl Drop for InflightPermit {
+    fn drop(&mut self) {
+        GLOBAL_INFLIGHT.add_permits(self.bytes);
+    }
+}
+
+/// Try to reserve `size` bytes against the global inflight budget. Returns
+/// `Some` if the reservation succeeded, `None` if the budget is exhausted —
+/// the caller must reject the frame in that case rather than queue.
+///
+/// `Semaphore::try_acquire_many` is `u32`; for frames > 4 GiB we already
+/// reject above via `max_message_size`, but cap defensively to be safe.
+fn try_reserve_inflight_bytes(size: usize) -> Option<InflightPermit> {
+    let n = u32::try_from(size).ok()?;
+    let permit = GLOBAL_INFLIGHT.try_acquire_many(n).ok()?;
+    permit.forget();
+    Some(InflightPermit { bytes: size })
+}
 
 /// Encoding style for Kafka responses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -563,6 +601,8 @@ pub struct ClientConnection {
     /// deployments continue to work; set `required=true` from config when
     /// SASL is required cluster-wide.
     auth_gate: AuthGate,
+    /// Maximum allowed inbound frame size for this connection.
+    max_message_size: usize,
 }
 
 impl ClientConnection {
@@ -573,6 +613,7 @@ impl ClientConnection {
             addr,
             rate_limiter: None,
             auth_gate: AuthGate::default(),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 
@@ -590,7 +631,14 @@ impl ClientConnection {
             addr,
             rate_limiter: Some(rate_limiter),
             auth_gate: AuthGate::default(),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         }
+    }
+
+    /// Override the per-connection inbound frame cap. Used by the server
+    /// to propagate `ClusterConfig::max_message_size` down to the wire.
+    pub fn set_max_message_size(&mut self, max: usize) {
+        self.max_message_size = max;
     }
 
     /// Mark this connection as requiring SASL before any non-handshake API
@@ -723,12 +771,25 @@ impl ClientConnection {
             )));
         }
         let size = size as usize;
-        if size > DEFAULT_MAX_MESSAGE_SIZE {
+        if size > self.max_message_size {
             return Err(Error::MissingData(format!(
                 "Message size {} exceeds maximum allowed size {}",
-                size, DEFAULT_MAX_MESSAGE_SIZE
+                size, self.max_message_size
             )));
         }
+
+        // Reserve against the global inflight-bytes budget before allocating.
+        // Without this a coordinated slow-frame burst would OOM the broker
+        // even though every individual frame is under `max_message_size`.
+        let _budget = match try_reserve_inflight_bytes(size) {
+            Some(p) => p,
+            None => {
+                return Err(Error::MissingData(format!(
+                    "Server inflight memory budget exhausted (frame size {})",
+                    size
+                )));
+            }
+        };
 
         tracing::trace!("Reading {} bytes from {}", size, self.addr);
 
@@ -857,6 +918,8 @@ pub struct TlsClientConnection {
     /// Connection-level SASL gate (mirrors `ClientConnection`). The TLS
     /// listener uses the same authz/authn machinery.
     auth_gate: AuthGate,
+    /// Maximum allowed inbound frame size for this connection.
+    max_message_size: usize,
 }
 
 #[cfg(feature = "tls")]
@@ -869,6 +932,7 @@ impl TlsClientConnection {
             addr,
             rate_limiter: None,
             auth_gate: AuthGate::default(),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 
@@ -886,6 +950,7 @@ impl TlsClientConnection {
             addr,
             rate_limiter: Some(rate_limiter),
             auth_gate: AuthGate::default(),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 
@@ -893,6 +958,11 @@ impl TlsClientConnection {
     /// is served. Mirrors `ClientConnection::require_sasl`.
     pub fn require_sasl(&mut self) {
         self.auth_gate.required = true;
+    }
+
+    /// Override the per-connection inbound frame cap.
+    pub fn set_max_message_size(&mut self, max: usize) {
+        self.max_message_size = max;
     }
 
     /// Handle requests from this connection until closed.
@@ -983,12 +1053,23 @@ impl TlsClientConnection {
             )));
         }
         let size = size as usize;
-        if size > DEFAULT_MAX_MESSAGE_SIZE {
+        if size > self.max_message_size {
             return Err(Error::MissingData(format!(
                 "Message size {} exceeds maximum allowed size {}",
-                size, DEFAULT_MAX_MESSAGE_SIZE
+                size, self.max_message_size
             )));
         }
+
+        // Reserve against the global inflight-bytes budget before allocating.
+        let _budget = match try_reserve_inflight_bytes(size) {
+            Some(p) => p,
+            None => {
+                return Err(Error::MissingData(format!(
+                    "Server inflight memory budget exhausted (frame size {})",
+                    size
+                )));
+            }
+        };
 
         tracing::trace!("Reading {} bytes from TLS client {}", size, self.addr);
 

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::error::KafkaCode;
-use crate::protocol::{CrcValidationResult, validate_batch_crc};
+use crate::protocol::{CrcValidationResult, validate_batch_crc_async};
 use crate::runtime::RuntimeHandles;
 use crate::server::request::*;
 use crate::server::response::*;
@@ -618,7 +618,7 @@ impl SlateDBClusterHandler {
 
         // Validate CRC if enabled
         if self.validate_record_crc {
-            match validate_batch_crc(&partition.records) {
+            match validate_batch_crc_async(&partition.records).await {
                 CrcValidationResult::Valid => {}
                 CrcValidationResult::Invalid { expected, actual } => {
                     warn!(
@@ -1494,6 +1494,7 @@ mod tests {
     #[test]
     fn test_validate_batch_crc_empty() {
         use bytes::Bytes;
+        use crate::protocol::validate_batch_crc;
         let empty = Bytes::new();
         let result = validate_batch_crc(&empty);
         assert!(matches!(result, CrcValidationResult::TooSmall));
@@ -1502,6 +1503,7 @@ mod tests {
     #[test]
     fn test_validate_batch_crc_garbage() {
         use bytes::Bytes;
+        use crate::protocol::validate_batch_crc;
         let garbage = Bytes::from_static(b"not a valid kafka batch");
         let result = validate_batch_crc(&garbage);
         // Should not be Valid (either Invalid or TooSmall depending on implementation)
@@ -1511,6 +1513,7 @@ mod tests {
     #[test]
     fn test_validate_batch_crc_minimum_size() {
         use bytes::Bytes;
+        use crate::protocol::validate_batch_crc;
         // 16 bytes is less than the minimum for a valid batch header
         let too_small = Bytes::from(vec![0u8; 16]);
         let result = validate_batch_crc(&too_small);

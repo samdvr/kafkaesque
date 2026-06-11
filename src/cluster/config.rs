@@ -574,19 +574,16 @@ pub struct ClusterConfig {
 
     /// Whether to fail partition startup if offset gaps are detected.
     ///
-    /// When enabled, if the HWM recovery scan detects gaps in the offset sequence
-    /// (indicating potential data loss), the partition will fail to open rather
-    /// than continuing with potentially incomplete data.
+    /// When enabled, if the HWM recovery scan detects confirmed gaps in the
+    /// offset sequence (gaps below the persisted HWM, i.e. real data loss),
+    /// the partition will refuse to open rather than serving truncated data.
     ///
-    /// This is useful for:
-    /// - Production deployments where data integrity is critical
-    /// - Detecting storage layer issues during recovery
-    /// - Preventing silent data loss from going unnoticed
+    /// This is the right default for production: a missing record before HWM
+    /// is unrecoverable, and silently continuing makes the gap permanent.
+    /// Operators with legacy data that pre-dates this check can opt out by
+    /// setting `FAIL_ON_RECOVERY_GAP=false`.
     ///
-    /// When disabled (default), gaps are logged as errors and recorded as metrics,
-    /// but the partition continues to operate.
-    ///
-    /// Default: false (log and continue, for backwards compatibility)
+    /// Default: true (refuse to open on confirmed gap).
     pub fail_on_recovery_gap: bool,
 
     // --- Fast Failover Configuration ---
@@ -686,6 +683,15 @@ pub struct ClusterConfig {
     ///
     /// Default: 1000 (balances durability and cost)
     pub raft_snapshot_threshold: u64,
+
+    /// Tolerance buffer applied to lease and member-expiry checks.
+    ///
+    /// Lease/membership expiry uses the leader's wall-clock; subtracting this
+    /// tolerance from the comparison prevents a leader whose clock jumped
+    /// forward from mass-expiring valid leases. Audit P2-5.
+    ///
+    /// Default: 5000 ms.
+    pub clock_skew_tolerance_ms: u64,
 
     // --- SlateDB Configuration ---
     /// Maximum unflushed bytes in SlateDB memtables before backpressure.
@@ -797,7 +803,7 @@ impl Default for ClusterConfig {
             tls_key_path: None,
             // Data integrity
             validate_record_crc: true,
-            fail_on_recovery_gap: false,
+            fail_on_recovery_gap: true,
             // Fast failover
             fast_failover_enabled: true,
             fast_heartbeat_interval_ms: 500,
@@ -812,6 +818,7 @@ impl Default for ClusterConfig {
             auto_balancer_throughput_weight: 0.7,
             // Raft configuration (additional)
             raft_snapshot_threshold: 1_000,
+            clock_skew_tolerance_ms: 5_000,
             // SlateDB configuration
             slatedb_max_unflushed_bytes: 256 * 1024 * 1024, // 256 MB
             slatedb_l0_sst_size_bytes: 64 * 1024 * 1024,    // 64 MB
@@ -1179,6 +1186,16 @@ impl ClusterConfig {
             ));
         }
 
+        if self.cluster_id.trim().is_empty()
+            && !matches!(self.object_store, ObjectStoreType::Local { .. })
+        {
+            errors.push(
+                "cluster_id must not be empty when using a remote object-store backend; \
+                 two clusters sharing a bucket with the same (or empty) id will corrupt each other"
+                    .to_string(),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1471,14 +1488,22 @@ impl ClusterConfig {
 
         // Data integrity configuration
         let fail_on_recovery_gap = std::env::var("FAIL_ON_RECOVERY_GAP")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or(false);
+            .map(|v| {
+                let v = v.to_lowercase();
+                !(v == "false" || v == "0")
+            })
+            .unwrap_or(true);
 
         // Raft configuration
         let raft_snapshot_threshold: u64 = std::env::var("RAFT_SNAPSHOT_THRESHOLD")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.raft_snapshot_threshold);
+
+        let clock_skew_tolerance_ms: u64 = std::env::var("CLOCK_SKEW_TOLERANCE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.clock_skew_tolerance_ms);
 
         // SlateDB configuration
         let slatedb_max_unflushed_bytes: usize = std::env::var("SLATEDB_MAX_UNFLUSHED_BYTES")
@@ -1540,6 +1565,7 @@ impl ClusterConfig {
             tls_key_path,
             fail_on_recovery_gap,
             raft_snapshot_threshold,
+            clock_skew_tolerance_ms,
             slatedb_max_unflushed_bytes,
             slatedb_l0_sst_size_bytes,
             slatedb_flush_interval_ms,
@@ -2156,12 +2182,34 @@ mod tests {
     fn test_validate_empty_cluster_id() {
         let config = ClusterConfig {
             cluster_id: String::new(),
+            object_store: ObjectStoreType::S3 {
+                bucket: "test-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+            },
             ..Default::default()
         };
 
-        // Note: empty cluster_id might be allowed by current validation
-        // This test documents the behavior
-        let _result = config.validate();
+        let result = config.validate();
+        let errs = result.expect_err("empty cluster_id with S3 backend must fail validation");
+        assert!(
+            errs.iter().any(|e| e.contains("cluster_id")),
+            "expected cluster_id error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_empty_cluster_id_allowed_for_local() {
+        let config = ClusterConfig {
+            cluster_id: String::new(),
+            object_store: ObjectStoreType::Local {
+                path: "/tmp/test".to_string(),
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -2236,7 +2284,7 @@ mod tests {
     fn test_config_data_integrity_defaults() {
         let config = ClusterConfig::default();
         assert!(config.validate_record_crc);
-        assert!(!config.fail_on_recovery_gap);
+        assert!(config.fail_on_recovery_gap);
     }
 
     #[test]

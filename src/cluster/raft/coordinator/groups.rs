@@ -237,8 +237,11 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         &self,
         _default_session_timeout_ms: u64,
     ) -> SlateDBResult<Vec<(String, String)>> {
+        // Apply skew tolerance: a leader with a fast clock would otherwise
+        // mass-evict members that were still inside their session window.
+        let now = current_time_ms().saturating_sub(self.config.clock_skew_tolerance_ms);
         let command = CoordinationCommand::GroupDomain(GroupCommand::ExpireMembers {
-            current_time_ms: current_time_ms(),
+            current_time_ms: now,
         });
 
         let response = self.node.write(command).await?;

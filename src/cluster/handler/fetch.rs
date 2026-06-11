@@ -196,21 +196,46 @@ async fn collect_fetch(
                     {
                         Ok(store) => {
                             let current_hwm = store.high_watermark();
-                            if partition.fetch_offset > current_hwm {
-                                return FetchPartitionResponse {
-                                    partition_index: partition.partition_index,
-                                    error_code: KafkaCode::OffsetOutOfRange,
-                                    high_watermark: current_hwm,
-                                    last_stable_offset: current_hwm,
-                                    aborted_transactions: vec![],
-                                    records: None,
-                                };
-                            }
 
-                            // Also reject negative offsets (except special values)
-                            if partition.fetch_offset < 0
-                                && partition.fetch_offset != -1
-                                && partition.fetch_offset != -2
+                            // Resolve Kafka offset sentinels before any
+                            // range checks. -1 means "latest" (the HWM), -2
+                            // means "earliest" (log-start). Before this fix
+                            // both fell through to `fetch_from`, which
+                            // returns empty for any negative offset, and
+                            // `auto.offset.reset=latest` consumers hung.
+                            let log_start = match store.earliest_offset().await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    error!(error = %e, "earliest_offset failed");
+                                    return FetchPartitionResponse {
+                                        partition_index: partition.partition_index,
+                                        error_code: KafkaCode::Unknown,
+                                        high_watermark: -1,
+                                        last_stable_offset: -1,
+                                        aborted_transactions: vec![],
+                                        records: None,
+                                    };
+                                }
+                            };
+
+                            let effective_offset = match partition.fetch_offset {
+                                -1 => current_hwm,
+                                -2 => log_start,
+                                o if o < 0 => {
+                                    return FetchPartitionResponse {
+                                        partition_index: partition.partition_index,
+                                        error_code: KafkaCode::OffsetOutOfRange,
+                                        high_watermark: current_hwm,
+                                        last_stable_offset: current_hwm,
+                                        aborted_transactions: vec![],
+                                        records: None,
+                                    };
+                                }
+                                o => o,
+                            };
+
+                            if effective_offset > current_hwm
+                                || effective_offset < log_start
                             {
                                 return FetchPartitionResponse {
                                     partition_index: partition.partition_index,
@@ -222,7 +247,7 @@ async fn collect_fetch(
                                 };
                             }
 
-                            match store.fetch_from(partition.fetch_offset).await {
+                            match store.fetch_from(effective_offset).await {
                                 Ok((high_watermark, records)) => {
                                     if let Some(ref record_bytes) = records {
                                         let bytes = record_bytes.len() as u64;

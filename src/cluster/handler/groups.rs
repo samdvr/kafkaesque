@@ -628,7 +628,10 @@ pub(super) async fn handle_delete_groups(
         }
 
         match handler.coordinator.delete_consumer_group(&group_id).await {
-            Ok(()) => results.push(DeleteGroupResult::success(group_id)),
+            Ok(()) => {
+                crate::cluster::metrics::forget_group_metrics(&group_id);
+                results.push(DeleteGroupResult::success(group_id));
+            }
             Err(e) => {
                 error!(group_id = %group_id, error = %e, "Failed to delete group");
                 results.push(DeleteGroupResult::error(group_id, KafkaCode::Unknown));

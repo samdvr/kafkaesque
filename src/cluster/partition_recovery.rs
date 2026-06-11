@@ -137,6 +137,23 @@ fn validate_offset_continuity(
     fail_on_gap: bool,
     highest_found: i64,
 ) -> Result<(), slatedb::Error> {
+    // Invariant: a non-zero persisted HWM with no records means the log was
+    // truncated under us. Before this check the partition would have come back
+    // online empty and silently advertised HWM=0.
+    if batches.is_empty() && persisted_hwm > 0 {
+        error!(
+            persisted_hwm,
+            "Empty record log with non-zero persisted HWM - undetected truncation"
+        );
+        if fail_on_gap {
+            return Err(slatedb::Error::invalid(format!(
+                "Empty record log but persisted HWM = {}; refusing to open. \
+                 Set FAIL_ON_RECOVERY_GAP=false to override.",
+                persisted_hwm
+            )));
+        }
+    }
+
     // Sort batches by offset (should already be sorted from SlateDB scan, but be safe)
     let mut sorted_batches = batches.to_vec();
     sorted_batches.sort_by_key(|(offset, _)| *offset);
@@ -144,6 +161,7 @@ fn validate_offset_continuity(
     let mut expected_offset: i64 = 0;
     let mut gap_count = 0;
     let mut total_gap_records: i64 = 0;
+    let mut overlap_count = 0;
     // Track gaps separately for confirmed (before HWM) vs potential (after HWM)
     let mut confirmed_gap_count = 0;
     let mut potential_gap_count = 0;
@@ -178,11 +196,15 @@ fn validate_offset_continuity(
                 );
             }
         } else if *batch_offset < expected_offset {
-            // Overlap detected - this shouldn't happen
-            warn!(
+            // Overlapping batches break the per-offset uniqueness assumption
+            // every downstream consumer relies on. Promote to error and fail
+            // when gap-checking is enabled — silently accepting overlap risks
+            // double-delivery on read.
+            overlap_count += 1;
+            error!(
                 expected_offset,
                 actual_offset = batch_offset,
-                "Unexpected offset overlap during HWM recovery"
+                "Overlapping batches detected during HWM recovery - duplicate offsets"
             );
         }
         expected_offset = batch_offset + *record_count as i64;
@@ -214,6 +236,14 @@ fn validate_offset_continuity(
             batch_count = sorted_batches.len(),
             highest_found, "HWM recovery completed - offset continuity validated"
         );
+    }
+
+    if fail_on_gap && overlap_count > 0 {
+        return Err(slatedb::Error::invalid(format!(
+            "Overlapping record batches detected during recovery: {} overlap(s). \
+             Set FAIL_ON_RECOVERY_GAP=false to continue.",
+            overlap_count
+        )));
     }
 
     Ok(())
@@ -393,10 +423,12 @@ mod tests {
     fn test_validate_offset_continuity_overlap() {
         // Overlapping batches: [0-10), [5-15) - shouldn't happen but test the handling
         let batches = vec![(0, 10), (5, 10)];
-        // The function should still complete (logs warning for overlap)
+        // Promoted to error: with fail_on_gap=true this now fails.
         let result = validate_offset_continuity(&batches, 15, true, 15);
-        // This is a weird case but the function should handle it
-        assert!(result.is_ok()); // No gap since we just see overlap
+        assert!(result.is_err());
+        // With fail_on_gap=false we tolerate it (logs only).
+        let result_loose = validate_offset_continuity(&batches, 15, false, 15);
+        assert!(result_loose.is_ok());
     }
 
     #[test]
@@ -511,13 +543,13 @@ mod tests {
 
     #[test]
     fn test_validate_offset_continuity_empty_batches_nonzero_hwm() {
-        // No batches but HWM > 0 - implies initial gap
+        // No batches but HWM > 0 implies the log was truncated.
+        // With fail_on_gap=true (the new default) this is now rejected.
         let batches: Vec<(i64, i32)> = vec![];
         let result = validate_offset_continuity(&batches, 10, true, 10);
-        // No batches means expected_offset stays 0, and 0 < HWM=10 is a confirmed gap
-        // But since there are no batches to iterate, the loop doesn't run
-        // Actually the function should handle this case - let's verify
-        assert!(result.is_ok()); // Empty batches means no gaps detected
+        assert!(result.is_err());
+        let result_loose = validate_offset_continuity(&batches, 10, false, 10);
+        assert!(result_loose.is_ok());
     }
 
     #[test]
@@ -568,12 +600,13 @@ mod tests {
 
     #[test]
     fn test_validate_offset_continuity_duplicate_offsets() {
-        // Duplicate base offsets (shouldn't happen, but test handling)
+        // Duplicate base offsets are now treated as overlaps and rejected when
+        // fail_on_gap=true.
         let batches = vec![(0, 10), (0, 10), (10, 10)];
         let result = validate_offset_continuity(&batches, 20, true, 20);
-        // First (0,10) -> expected=10
-        // Second (0,10) -> starts at 0 < expected=10, overlap
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        let result_loose = validate_offset_continuity(&batches, 20, false, 20);
+        assert!(result_loose.is_ok());
     }
 
     #[test]

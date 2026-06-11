@@ -122,6 +122,30 @@ pub fn validate_batch_crc(batch: &[u8]) -> CrcValidationResult {
     }
 }
 
+/// Threshold above which CRC validation is moved to a blocking thread.
+///
+/// For small batches the spawn_blocking + channel overhead exceeds the cost
+/// of computing CRC32C inline. 64 KiB is the empirical break-even — above
+/// it the synchronous path measurably stalls the tokio worker on concurrent
+/// large produces (audit P2-6).
+pub const CRC_OFFLOAD_THRESHOLD: usize = 64 * 1024;
+
+/// Validate batch CRC, offloading to `spawn_blocking` when the batch is
+/// large enough that the synchronous computation would block the runtime.
+///
+/// Wire-protocol entry points should prefer this over `validate_batch_crc`
+/// when running inside a tokio task; small batches still execute inline.
+pub async fn validate_batch_crc_async(batch: &[u8]) -> CrcValidationResult {
+    if batch.len() < CRC_OFFLOAD_THRESHOLD {
+        return validate_batch_crc(batch);
+    }
+    let owned = bytes::Bytes::copy_from_slice(batch);
+    match tokio::task::spawn_blocking(move || validate_batch_crc(&owned)).await {
+        Ok(result) => result,
+        Err(_join) => validate_batch_crc(batch),
+    }
+}
+
 /// Parse record count from a Kafka RecordBatch.
 ///
 /// The `last_offset_delta` field is at bytes 23-26 and indicates the highest

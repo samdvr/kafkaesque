@@ -1679,12 +1679,32 @@ pub fn set_topic_partition_count(topic: &str, count: i64) {
     TOPIC_PARTITION_COUNT.with_label_values(&[topic]).set(count);
 }
 
+/// Soft cap on per-group label cardinality. Beyond this, the set helpers
+/// drop new labels instead of letting the registry grow unboundedly under a
+/// runaway group-ID generator. Pick a number large enough that real
+/// deployments aren't truncated but small enough to limit blast radius.
+const MAX_GROUP_LABEL_CARDINALITY: usize = 10_000;
+
+fn group_label_under_cap<C: prometheus::core::Collector>(metric: &C, _group: &str) -> bool {
+    let mut count = 0usize;
+    for family in metric.collect() {
+        count += family.get_metric().len();
+        if count > MAX_GROUP_LABEL_CARDINALITY {
+            return false;
+        }
+    }
+    true
+}
+
 /// Set the member count for a consumer group.
 ///
 /// # Arguments
 /// * `group` - The consumer group ID
 /// * `count` - Number of members
 pub fn set_group_member_count(group: &str, count: i64) {
+    if !group_label_under_cap(&*GROUP_MEMBER_COUNT, group) {
+        return;
+    }
     GROUP_MEMBER_COUNT.with_label_values(&[group]).set(count);
 }
 
@@ -1694,7 +1714,19 @@ pub fn set_group_member_count(group: &str, count: i64) {
 /// * `group` - The consumer group ID
 /// * `generation` - The current generation ID
 pub fn set_group_generation(group: &str, generation: i64) {
+    if !group_label_under_cap(&*GROUP_GENERATION, group) {
+        return;
+    }
     GROUP_GENERATION.with_label_values(&[group]).set(generation);
+}
+
+/// Remove per-group time series for the named group.
+///
+/// Called from the DeleteGroups path so the Prometheus registry doesn't
+/// accumulate dead labels for short-lived consumer groups.
+pub fn forget_group_metrics(group: &str) {
+    let _ = GROUP_MEMBER_COUNT.remove_label_values(&[group]);
+    let _ = GROUP_GENERATION.remove_label_values(&[group]);
 }
 
 /// Increment pending rebalances count.

@@ -18,15 +18,15 @@
 //! # State Transitions
 //!
 //! ```text
-//! Unowned -> Acquiring -> Owned -> (rebalance) -> Unowned (SlateDB closed immediately)
+//! Unowned -> Acquiring -> Owned -> (rebalance / release) -> Unowned
 //!                  |         |
 //!                  v         v
 //!               (fail)    Fenced -> Unowned
 //! ```
 //!
 //! When a partition is rebalanced to another broker, SlateDB is closed immediately
-//! to prevent the background compactor from panicking when the new broker opens
-//! and fences the old writer. The lease is allowed to expire naturally.
+//! and the entry is removed from the state map. The lease is allowed to expire
+//! naturally (or is explicitly released through the coordinator).
 
 use std::fmt;
 use std::sync::Arc;
@@ -56,18 +56,6 @@ pub enum PartitionState {
         acquired_at: Instant,
     },
 
-    /// Draining: partition is being rebalanced to another broker.
-    /// We stop renewing the lease but keep SlateDB open until the lease expires.
-    /// This ensures a graceful handoff without racing with the new owner.
-    Draining {
-        /// The open partition store (still serving reads).
-        store: Arc<PartitionStore>,
-        /// When we started draining.
-        started_at: Instant,
-        /// When the lease is expected to expire (so we know when to release).
-        lease_expires_at: Instant,
-    },
-
     /// Releasing ownership (flushing, closing store, releasing lease).
     Releasing {
         /// When we started releasing.
@@ -92,18 +80,6 @@ impl fmt::Debug for PartitionState {
             PartitionState::Owned { acquired_at, .. } => f
                 .debug_struct("Owned")
                 .field("duration", &acquired_at.elapsed())
-                .finish(),
-            PartitionState::Draining {
-                started_at,
-                lease_expires_at,
-                ..
-            } => f
-                .debug_struct("Draining")
-                .field("duration", &started_at.elapsed())
-                .field(
-                    "lease_remaining",
-                    &lease_expires_at.saturating_duration_since(Instant::now()),
-                )
                 .finish(),
             PartitionState::Releasing { started_at } => f
                 .debug_struct("Releasing")
@@ -138,16 +114,6 @@ impl PartitionState {
         }
     }
 
-    /// Transition to draining state (partition is being rebalanced away).
-    /// The store is kept open and the lease_expires_at indicates when we can release.
-    pub fn start_draining(store: Arc<PartitionStore>, lease_duration: std::time::Duration) -> Self {
-        PartitionState::Draining {
-            store,
-            started_at: Instant::now(),
-            lease_expires_at: Instant::now() + lease_duration,
-        }
-    }
-
     /// Transition to releasing state.
     pub fn start_releasing() -> Self {
         PartitionState::Releasing {
@@ -163,33 +129,16 @@ impl PartitionState {
     }
 
     /// Check if the partition is owned and ready for operations.
-    /// Note: Draining partitions are still considered "owned" for read operations.
     pub fn is_owned(&self) -> bool {
-        matches!(
-            self,
-            PartitionState::Owned { .. } | PartitionState::Draining { .. }
-        )
-    }
-
-    /// Check if the partition is actively owned (not draining).
-    /// Use this to check if writes should be accepted.
-    pub fn is_actively_owned(&self) -> bool {
         matches!(self, PartitionState::Owned { .. })
     }
 
-    /// Check if the partition is draining (being rebalanced away).
-    pub fn is_draining(&self) -> bool {
-        matches!(self, PartitionState::Draining { .. })
-    }
-
-    /// Check if the lease has expired for a draining partition.
-    pub fn is_drain_complete(&self) -> bool {
-        match self {
-            PartitionState::Draining {
-                lease_expires_at, ..
-            } => Instant::now() >= *lease_expires_at,
-            _ => false,
-        }
+    /// Check if the partition is actively owned (accepting writes).
+    /// Kept as a separate method so call sites that distinguish "owned vs
+    /// owned-but-not-writable" stay explicit if that distinction is ever
+    /// reintroduced.
+    pub fn is_actively_owned(&self) -> bool {
+        matches!(self, PartitionState::Owned { .. })
     }
 
     /// Check if the partition is in a transitional state (acquiring or releasing).
@@ -205,11 +154,10 @@ impl PartitionState {
         matches!(self, PartitionState::Fenced { .. })
     }
 
-    /// Get the store if the partition is owned (including draining).
+    /// Get the store if the partition is owned.
     pub fn store(&self) -> Option<Arc<PartitionStore>> {
         match self {
             PartitionState::Owned { store, .. } => Some(store.clone()),
-            PartitionState::Draining { store, .. } => Some(store.clone()),
             _ => None,
         }
     }
@@ -220,7 +168,6 @@ impl PartitionState {
             PartitionState::Unowned => None,
             PartitionState::Acquiring { started_at } => Some(started_at.elapsed()),
             PartitionState::Owned { acquired_at, .. } => Some(acquired_at.elapsed()),
-            PartitionState::Draining { started_at, .. } => Some(started_at.elapsed()),
             PartitionState::Releasing { started_at } => Some(started_at.elapsed()),
             PartitionState::Fenced { fenced_at } => Some(fenced_at.elapsed()),
         }
@@ -232,7 +179,6 @@ impl PartitionState {
             PartitionState::Unowned => "unowned",
             PartitionState::Acquiring { .. } => "acquiring",
             PartitionState::Owned { .. } => "owned",
-            PartitionState::Draining { .. } => "draining",
             PartitionState::Releasing { .. } => "releasing",
             PartitionState::Fenced { .. } => "fenced",
         }
@@ -270,7 +216,6 @@ mod tests {
         assert!(!state.is_owned());
         assert!(state.is_transitioning());
         assert!(!state.is_fenced());
-        assert!(!state.is_draining());
         assert_eq!(state.state_name(), "releasing");
     }
 
@@ -280,7 +225,6 @@ mod tests {
         assert!(!state.is_owned());
         assert!(!state.is_transitioning());
         assert!(state.is_fenced());
-        assert!(!state.is_draining());
         assert_eq!(state.state_name(), "fenced");
     }
 
@@ -290,10 +234,6 @@ mod tests {
         assert!(!state.is_owned());
         assert_eq!(state.state_name(), "unowned");
     }
-
-    // ========================================================================
-    // Additional tests for improved coverage
-    // ========================================================================
 
     #[test]
     fn test_unowned_duration_is_none() {
@@ -306,7 +246,6 @@ mod tests {
         let state = PartitionState::start_acquiring();
         let duration = state.duration_in_state();
         assert!(duration.is_some());
-        // Duration should be very small (just created)
         assert!(duration.unwrap() < std::time::Duration::from_secs(1));
     }
 
@@ -351,22 +290,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_draining_for_non_draining_states() {
-        assert!(!PartitionState::unowned().is_draining());
-        assert!(!PartitionState::start_acquiring().is_draining());
-        assert!(!PartitionState::start_releasing().is_draining());
-        assert!(!PartitionState::fenced().is_draining());
-    }
-
-    #[test]
-    fn test_is_drain_complete_for_non_draining() {
-        assert!(!PartitionState::unowned().is_drain_complete());
-        assert!(!PartitionState::start_acquiring().is_drain_complete());
-        assert!(!PartitionState::start_releasing().is_drain_complete());
-        assert!(!PartitionState::fenced().is_drain_complete());
-    }
-
-    #[test]
     fn test_store_returns_none_for_unowned() {
         assert!(PartitionState::unowned().store().is_none());
     }
@@ -385,10 +308,6 @@ mod tests {
     fn test_store_returns_none_for_fenced() {
         assert!(PartitionState::fenced().store().is_none());
     }
-
-    // ========================================================================
-    // Debug formatting tests
-    // ========================================================================
 
     #[test]
     fn test_debug_unowned() {
@@ -421,10 +340,6 @@ mod tests {
         assert!(debug.contains("duration"));
     }
 
-    // ========================================================================
-    // State name tests for all states
-    // ========================================================================
-
     #[test]
     fn test_all_state_names() {
         assert_eq!(PartitionState::unowned().state_name(), "unowned");
@@ -432,10 +347,6 @@ mod tests {
         assert_eq!(PartitionState::start_releasing().state_name(), "releasing");
         assert_eq!(PartitionState::fenced().state_name(), "fenced");
     }
-
-    // ========================================================================
-    // Owned and Draining state tests (with mock store)
-    // ========================================================================
 
     mod with_store {
         use super::*;
@@ -466,7 +377,6 @@ mod tests {
             assert!(state.is_actively_owned());
             assert!(!state.is_transitioning());
             assert!(!state.is_fenced());
-            assert!(!state.is_draining());
             assert!(state.store().is_some());
             assert_eq!(state.state_name(), "owned");
         }
@@ -492,77 +402,9 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_draining_state() {
-            let store = create_test_store().await;
-            // Lease expires in 60 seconds
-            let state = PartitionState::start_draining(store, std::time::Duration::from_secs(60));
-
-            assert!(state.is_owned());
-            assert!(!state.is_actively_owned());
-            assert!(!state.is_transitioning());
-            assert!(!state.is_fenced());
-            assert!(state.is_draining());
-            assert!(state.store().is_some());
-            assert_eq!(state.state_name(), "draining");
-        }
-
-        #[tokio::test]
-        async fn test_draining_state_not_complete() {
-            let store = create_test_store().await;
-            // Lease expires in 60 seconds - not complete yet
-            let state = PartitionState::start_draining(store, std::time::Duration::from_secs(60));
-
-            assert!(!state.is_drain_complete());
-        }
-
-        #[tokio::test]
-        async fn test_draining_state_complete_when_expired() {
-            let store = create_test_store().await;
-            // Lease already expired (0 duration)
-            let state = PartitionState::start_draining(store, std::time::Duration::ZERO);
-
-            // Give a tiny bit of time for the instant to pass
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-
-            assert!(state.is_drain_complete());
-        }
-
-        #[tokio::test]
-        async fn test_draining_state_duration() {
-            let store = create_test_store().await;
-            let state = PartitionState::start_draining(store, std::time::Duration::from_secs(60));
-
-            let duration = state.duration_in_state();
-            assert!(duration.is_some());
-            assert!(duration.unwrap() < std::time::Duration::from_secs(1));
-        }
-
-        #[tokio::test]
-        async fn test_draining_state_debug() {
-            let store = create_test_store().await;
-            let state = PartitionState::start_draining(store, std::time::Duration::from_secs(60));
-
-            let debug = format!("{:?}", state);
-            assert!(debug.contains("Draining"));
-            assert!(debug.contains("duration"));
-            assert!(debug.contains("remaining"));
-        }
-
-        #[tokio::test]
         async fn test_store_returns_store_for_owned() {
             let store = create_test_store().await;
             let state = PartitionState::acquired(store.clone());
-
-            let returned_store = state.store();
-            assert!(returned_store.is_some());
-            assert!(Arc::ptr_eq(&store, &returned_store.unwrap()));
-        }
-
-        #[tokio::test]
-        async fn test_store_returns_store_for_draining() {
-            let store = create_test_store().await;
-            let state =
-                PartitionState::start_draining(store.clone(), std::time::Duration::from_secs(60));
 
             let returned_store = state.store();
             assert!(returned_store.is_some());

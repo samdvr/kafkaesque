@@ -74,12 +74,17 @@ pub struct SaslProvider {
 impl SaslProvider {
     /// Create a new SASL provider with no users.
     pub fn new(required: bool) -> Self {
+        Self::with_options(required, true)
+    }
+
+    /// Create a SASL provider with explicit TLS and requirement settings.
+    pub fn with_options(required: bool, plain_require_tls: bool) -> Self {
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
             scram_sessions: Arc::new(RwLock::new(HashMap::new())),
             mechanisms: vec!["SCRAM-SHA-256".to_string(), "PLAIN".to_string()],
             required,
-            plain_require_tls: true,
+            plain_require_tls,
         }
     }
 
@@ -93,7 +98,7 @@ impl SaslProvider {
             return None;
         }
 
-        let provider = Self::new(config.sasl_required);
+        let provider = Self::with_options(config.sasl_required, config.sasl_plain_require_tls);
         let mut user_count = 0;
 
         // Load from environment variable first
@@ -447,6 +452,19 @@ mod tests {
 
         let (ok, principal, _) = provider
             .authenticate_with_session(addr, "PLAIN", b"\0alice\0secret", true)
+            .await;
+        assert!(ok);
+        assert_eq!(principal.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn test_plain_allowed_without_tls_when_configured() {
+        let provider = SaslProvider::with_options(false, false);
+        provider.add_user("alice", "secret").await;
+        let addr: SocketAddr = "127.0.0.1:49997".parse().unwrap();
+
+        let (ok, principal, _) = provider
+            .authenticate_with_session(addr, "PLAIN", b"\0alice\0secret", false)
             .await;
         assert!(ok);
         assert_eq!(principal.as_deref(), Some("alice"));

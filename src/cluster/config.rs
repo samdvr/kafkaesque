@@ -521,6 +521,13 @@ pub struct ClusterConfig {
     /// Default: None
     pub sasl_users_file: Option<String>,
 
+    /// Reject PLAIN SASL on non-TLS client connections. PLAIN sends
+    /// credentials in cleartext; this flag defaults to `true` so operators
+    /// must explicitly opt out (e.g. for local tooling over plaintext).
+    ///
+    /// Default: true
+    pub sasl_plain_require_tls: bool,
+
     // --- Authorization ---
     /// Whether ACL enforcement is enabled. When false, the cluster handler
     /// uses an `AllowAll` authorizer (legacy / dev posture). When true, every
@@ -822,6 +829,7 @@ impl Default for ClusterConfig {
             sasl_enabled: false,
             sasl_required: false,
             sasl_users_file: None,
+            sasl_plain_require_tls: true,
             // Authorization
             acl_enabled: false,
             acl_deny_by_default: true,
@@ -1279,6 +1287,15 @@ impl ClusterConfig {
             );
         }
 
+        if self.sasl_enabled && !self.sasl_plain_require_tls && !self.tls_enabled {
+            errors.push(
+                "sasl_plain_require_tls=false requires tls_enabled=true: PLAIN sends credentials \
+                 in cleartext and must not be allowed on a plaintext Kafka port. Enable TLS or \
+                 keep SASL_PLAIN_REQUIRE_TLS=true (default)."
+                    .to_string(),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1550,6 +1567,10 @@ impl ClusterConfig {
 
         let sasl_users_file = std::env::var("SASL_USERS_FILE").ok();
 
+        let sasl_plain_require_tls = std::env::var("SASL_PLAIN_REQUIRE_TLS")
+            .map(|v| v.to_lowercase() != "false" && v != "0")
+            .unwrap_or(true);
+
         // Authorization configuration
         let acl_enabled = std::env::var("ACL_ENABLED")
             .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -1658,6 +1679,7 @@ impl ClusterConfig {
             sasl_enabled,
             sasl_required,
             sasl_users_file,
+            sasl_plain_require_tls,
             acl_enabled,
             acl_deny_by_default,
             super_users,
@@ -1732,7 +1754,7 @@ impl ClusterConfig {
             return Err(format!("Configuration validation failed: {}", errors.join("; ")).into());
         }
 
-        Self::validate_env_security_posture()?;
+        Self::validate_env_security_posture(&config)?;
 
         Ok(config)
     }
@@ -1751,7 +1773,7 @@ impl ClusterConfig {
     /// of `ClusterConfig` — it must not appear in debug output or config
     /// dumps — and programmatic/test construction of configs should not
     /// require process-global env state.
-    fn validate_env_security_posture() -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_env_security_posture(config: &ClusterConfig) -> Result<(), Box<dyn std::error::Error>> {
         let profile = match std::env::var("CLUSTER_PROFILE") {
             Ok(raw) => raw
                 .parse::<ClusterProfile>()
@@ -1763,6 +1785,18 @@ impl ClusterConfig {
 
         if profile == ClusterProfile::Development {
             return Ok(());
+        }
+
+        if !config.sasl_required && !config.acl_enabled {
+            return Err(format!(
+                "Neither SASL nor ACL enforcement is enabled (profile: {}). A broker with \
+                 sasl_required=false and acl_enabled=false accepts unauthenticated, \
+                 unauthorized clients. Enable SASL_REQUIRED (with SASL_ENABLED) and/or \
+                 ACL_ENABLED, or explicitly opt into an open broker for local development \
+                 with CLUSTER_PROFILE=development.",
+                profile
+            )
+            .into());
         }
 
         // Reuse RaftAuthKeys' normalization so an empty/whitespace-only
@@ -2774,6 +2808,28 @@ mod tests {
         };
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_sasl_plain_require_tls_defaults_true() {
+        let config = ClusterConfig::default();
+        assert!(config.sasl_plain_require_tls);
+    }
+
+    #[test]
+    fn test_validate_plain_without_tls_rejected_when_sasl_enabled() {
+        let config = ClusterConfig {
+            sasl_enabled: true,
+            sasl_plain_require_tls: false,
+            tls_enabled: false,
+            ..Default::default()
+        };
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("sasl_plain_require_tls")),
+            "expected plain/TLS validation error, got: {:?}",
+            errors
+        );
     }
 
     #[test]

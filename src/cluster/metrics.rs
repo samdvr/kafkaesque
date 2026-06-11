@@ -762,6 +762,20 @@ pub static FETCH_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     )
 });
 
+/// Produce records silently dropped on the acks=0 (fire-and-forget) path.
+///
+/// Incremented when backpressure, zombie mode, ACL denial, or other
+/// fire-and-forget failures cause records to be dropped without a client
+/// response.
+pub static PRODUCE_DROPPED: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec_safe(
+        &REGISTRY,
+        "produce_dropped_total",
+        "Produce records dropped on the acks=0 path without client notification",
+        &["reason"],
+    )
+});
+
 /// Consumer group operation latency by operation type
 ///
 /// Tracks latency for specific consumer group operations:
@@ -1254,6 +1268,7 @@ pub fn init_metrics() {
     let _ = &*HWM_RECOVERY_EVENTS;
     let _ = &*PRODUCE_DURATION;
     let _ = &*FETCH_DURATION;
+    let _ = &*PRODUCE_DROPPED;
     let _ = &*GROUP_OPERATION_DURATION;
     let _ = &*ZOMBIE_MODE_STATE;
     let _ = &*ZOMBIE_MODE_DURATION;
@@ -1345,6 +1360,10 @@ static MAX_METRIC_CARDINALITY: AtomicUsize = AtomicUsize::new(10_000);
 static TRACKED_PARTITIONS: Lazy<TokioRwLock<HashSet<(String, i32)>>> =
     Lazy::new(|| TokioRwLock::new(HashSet::new()));
 
+/// Tracks unique topic labels used on latency histograms.
+static TRACKED_LATENCY_TOPICS: Lazy<std::sync::Mutex<HashSet<String>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashSet::new()));
+
 /// Configure metrics cardinality settings.
 ///
 /// Call this once at startup before recording any partition metrics.
@@ -1397,6 +1416,29 @@ async fn get_partition_label(topic: &str, partition: i32) -> String {
     }
 
     "_overflow".to_string()
+}
+
+/// Bound topic labels on latency histograms to avoid unbounded Prometheus
+/// cardinality when clients auto-create topics.
+fn bounded_topic_label(topic: &str) -> String {
+    if topic == "_multi" {
+        return topic.to_string();
+    }
+
+    let max_cardinality = MAX_METRIC_CARDINALITY.load(Ordering::Relaxed);
+    if max_cardinality == 0 {
+        return topic.to_string();
+    }
+
+    let mut tracked = TRACKED_LATENCY_TOPICS.lock().unwrap_or_else(|e| e.into_inner());
+    if tracked.contains(topic) {
+        return topic.to_string();
+    }
+    if tracked.len() >= max_cardinality {
+        return "_overflow".to_string();
+    }
+    tracked.insert(topic.to_string());
+    topic.to_string()
 }
 
 /// Synchronous version of partition label for non-async contexts.
@@ -1541,8 +1583,9 @@ pub fn record_group_operation(operation: &str, status: &str) {
 /// * `status` - The result ("success" or "error")
 /// * `duration_secs` - The request duration in seconds
 pub fn record_produce_latency(topic: &str, status: &str, duration_secs: f64) {
+    let topic_label = bounded_topic_label(topic);
     PRODUCE_DURATION
-        .with_label_values(&[topic, status])
+        .with_label_values(&[topic_label.as_str(), status])
         .observe(duration_secs);
 }
 
@@ -1556,9 +1599,23 @@ pub fn record_produce_latency(topic: &str, status: &str, duration_secs: f64) {
 /// * `status` - The result ("success", "error", or "timeout")
 /// * `duration_secs` - The request duration in seconds
 pub fn record_fetch_latency(topic: &str, status: &str, duration_secs: f64) {
+    let topic_label = bounded_topic_label(topic);
     FETCH_DURATION
-        .with_label_values(&[topic, status])
+        .with_label_values(&[topic_label.as_str(), status])
         .observe(duration_secs);
+}
+
+/// Record produce records dropped on the acks=0 path.
+///
+/// # Arguments
+/// * `reason` - Drop cause (`backpressure`, `zombie`, `not_leader`, `acl_denied`, `invalid_topic`, `crc_invalid`)
+/// * `count` - Number of records (or partition writes) dropped
+pub fn record_produce_dropped(reason: &str, count: u64) {
+    if count > 0 {
+        PRODUCE_DROPPED
+            .with_label_values(&[reason])
+            .inc_by(count);
+    }
 }
 
 /// Record a consumer group operation latency.
@@ -2076,17 +2133,21 @@ pub fn record_consumer_lag(
     committed_offset: i64,
     high_watermark: i64,
 ) {
+    if !group_label_under_cap(&*CONSUMER_LAG, group) {
+        return;
+    }
+    let topic_label = bounded_topic_label(topic);
     let partition_str = partition.to_string();
 
     // Calculate lag (can be negative if committed offset is ahead of HWM due to race)
     let lag = (high_watermark - committed_offset).max(0);
 
     CONSUMER_LAG
-        .with_label_values(&[group, topic, &partition_str])
+        .with_label_values(&[group, topic_label.as_str(), &partition_str])
         .set(lag);
 
     CONSUMER_COMMITTED_OFFSET
-        .with_label_values(&[group, topic, &partition_str])
+        .with_label_values(&[group, topic_label.as_str(), &partition_str])
         .set(committed_offset);
 }
 
@@ -2098,8 +2159,12 @@ pub fn record_consumer_lag(
 /// * `partition` - The partition ID
 /// * `lag` - The calculated lag value
 pub fn set_consumer_lag(group: &str, topic: &str, partition: i32, lag: i64) {
+    if !group_label_under_cap(&*CONSUMER_LAG, group) {
+        return;
+    }
+    let topic_label = bounded_topic_label(topic);
     CONSUMER_LAG
-        .with_label_values(&[group, topic, &partition.to_string()])
+        .with_label_values(&[group, topic_label.as_str(), &partition.to_string()])
         .set(lag.max(0));
 }
 
@@ -2205,11 +2270,15 @@ pub fn record_sequence_number(
     producer_id: i64,
     sequence: i32,
 ) -> bool {
+    if !group_label_under_cap(&*SEQUENCE_HIGH_WATERMARK, &producer_id.to_string()) {
+        return sequence > SEQUENCE_WARNING_80_PCT;
+    }
+    let topic_label = bounded_topic_label(topic);
     let partition_str = partition.to_string();
     let producer_str = producer_id.to_string();
 
     SEQUENCE_HIGH_WATERMARK
-        .with_label_values(&[topic, &partition_str, &producer_str])
+        .with_label_values(&[topic_label.as_str(), &partition_str, &producer_str])
         .set(sequence as i64);
 
     // Check thresholds

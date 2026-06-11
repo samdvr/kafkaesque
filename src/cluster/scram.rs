@@ -81,11 +81,9 @@ impl ScramCredentials {
     /// Generate fresh credentials with a random salt and the default
     /// iteration count.
     pub fn generate(password: &[u8]) -> Self {
-        let mut salt = [0u8; SALT_LEN];
-        for byte in &mut salt {
-            *byte = fastrand::u8(..);
-        }
-        Self::derive(password, &salt, DEFAULT_ITERATIONS)
+        // OS-random salt (16 bytes from uuid v4), matching the nonce path.
+        let salt = uuid::Uuid::new_v4();
+        Self::derive(password, salt.as_bytes(), DEFAULT_ITERATIONS)
     }
 }
 

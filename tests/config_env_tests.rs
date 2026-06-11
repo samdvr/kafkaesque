@@ -713,10 +713,36 @@ fn test_from_env_production_profile_with_secret_succeeds() {
             ("PORT", "9092"),
             ("CLUSTER_PROFILE", "production"),
             ("RAFT_CLUSTER_SECRET", "test-secret-value"),
+            ("ACL_ENABLED", "true"),
         ],
         || {
             let config = ClusterConfig::from_env().expect("Should parse config");
             assert_eq!(config.broker_id, 1);
+            assert!(config.acl_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_from_env_production_open_broker_rejected() {
+    with_env_vars(
+        &[
+            ("BROKER_ID", "1"),
+            ("HOST", "localhost"),
+            ("PORT", "9092"),
+            ("CLUSTER_PROFILE", "production"),
+            ("RAFT_CLUSTER_SECRET", "test-secret-value"),
+            ("ACL_ENABLED", "false"),
+            ("SASL_REQUIRED", "false"),
+        ],
+        || {
+            let result = ClusterConfig::from_env();
+            assert!(result.is_err(), "open broker must fail in production profile");
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("acl_enabled") || err.contains("SASL"),
+                "error should mention missing auth enforcement, got: {err}"
+            );
         },
     );
 }

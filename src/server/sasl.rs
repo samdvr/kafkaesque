@@ -193,8 +193,19 @@ impl SaslAuthenticator for PlainAuthenticator {
         &self,
         _mechanism: SaslMechanism,
         auth_data: &[u8],
-        _session_data: Option<&[u8]>,
+        session_data: Option<&[u8]>,
     ) -> SaslResult {
+        // When TLS is required, callers must pass `Some(b"tls")` in
+        // session_data to indicate the transport was encrypted. Production
+        // Kafka traffic uses `cluster::sasl_provider` which receives the
+        // real transport flag; this guard covers the legacy
+        // `PlainAuthenticator` API used in unit tests.
+        if self.require_tls && !matches!(session_data, Some(b"tls")) {
+            return SaslResult::Failed {
+                message: "PLAIN authentication requires a TLS transport".to_string(),
+            };
+        }
+
         // PLAIN format: [authzid] NUL authcid NUL passwd
         // authzid is optional and usually empty
         let parts: Vec<&[u8]> = auth_data.split(|&b| b == 0).collect();
@@ -414,7 +425,7 @@ mod tests {
         // Valid credentials
         let auth_data = b"\0alice\0secret";
         let result = auth
-            .authenticate(SaslMechanism::Plain, auth_data, None)
+            .authenticate(SaslMechanism::Plain, auth_data, Some(b"tls"))
             .await;
         assert!(result.is_success());
         assert_eq!(result.principal(), Some("alice"));
@@ -422,14 +433,14 @@ mod tests {
         // Invalid password
         let auth_data = b"\0alice\0wrong";
         let result = auth
-            .authenticate(SaslMechanism::Plain, auth_data, None)
+            .authenticate(SaslMechanism::Plain, auth_data, Some(b"tls"))
             .await;
         assert!(!result.is_success());
 
         // Unknown user
         let auth_data = b"\0bob\0secret";
         let result = auth
-            .authenticate(SaslMechanism::Plain, auth_data, None)
+            .authenticate(SaslMechanism::Plain, auth_data, Some(b"tls"))
             .await;
         assert!(!result.is_success());
     }
@@ -442,7 +453,7 @@ mod tests {
         // With authorization ID (empty)
         let auth_data = b"admin\0alice\0secret";
         let result = auth
-            .authenticate(SaslMechanism::Plain, auth_data, None)
+            .authenticate(SaslMechanism::Plain, auth_data, Some(b"tls"))
             .await;
         assert!(result.is_success());
     }
@@ -568,11 +579,11 @@ mod tests {
         auth.add_user("alice", "secret").await;
 
         // Empty auth data
-        let result = auth.authenticate(SaslMechanism::Plain, &[], None).await;
+        let result = auth.authenticate(SaslMechanism::Plain, &[], Some(b"tls")).await;
         assert!(!result.is_success());
 
         // Only one NUL
-        let result = auth.authenticate(SaslMechanism::Plain, b"\0", None).await;
+        let result = auth.authenticate(SaslMechanism::Plain, b"\0", Some(b"tls")).await;
         assert!(!result.is_success());
     }
 
@@ -584,7 +595,7 @@ mod tests {
         // Invalid UTF-8 in username
         let invalid_data = [0, 0xFF, 0xFE, 0, b's', b'e', b'c', b'r', b'e', b't'];
         let result = auth
-            .authenticate(SaslMechanism::Plain, &invalid_data, None)
+            .authenticate(SaslMechanism::Plain, &invalid_data, Some(b"tls"))
             .await;
         assert!(!result.is_success());
     }
@@ -597,7 +608,7 @@ mod tests {
         // Empty password should work if configured
         let auth_data = b"\0alice\0";
         let result = auth
-            .authenticate(SaslMechanism::Plain, auth_data, None)
+            .authenticate(SaslMechanism::Plain, auth_data, Some(b"tls"))
             .await;
         assert!(result.is_success());
     }
@@ -610,7 +621,7 @@ mod tests {
         // Empty username should work if configured
         let auth_data = b"\0\0secret";
         let result = auth
-            .authenticate(SaslMechanism::Plain, auth_data, None)
+            .authenticate(SaslMechanism::Plain, auth_data, Some(b"tls"))
             .await;
         assert!(result.is_success());
     }
@@ -622,7 +633,7 @@ mod tests {
 
         let auth_data = b"\0user@domain.com\0p@ss!w0rd#123";
         let result = auth
-            .authenticate(SaslMechanism::Plain, auth_data, None)
+            .authenticate(SaslMechanism::Plain, auth_data, Some(b"tls"))
             .await;
         assert!(result.is_success());
         assert_eq!(result.principal(), Some("user@domain.com"));
@@ -639,7 +650,7 @@ mod tests {
         auth_data.extend_from_slice("密码".as_bytes());
 
         let result = auth
-            .authenticate(SaslMechanism::Plain, &auth_data, None)
+            .authenticate(SaslMechanism::Plain, &auth_data, Some(b"tls"))
             .await;
         assert!(result.is_success());
         assert_eq!(result.principal(), Some("用户"));
@@ -654,21 +665,21 @@ mod tests {
 
         // Alice authenticates
         let result = auth
-            .authenticate(SaslMechanism::Plain, b"\0alice\0secret1", None)
+            .authenticate(SaslMechanism::Plain, b"\0alice\0secret1", Some(b"tls"))
             .await;
         assert!(result.is_success());
         assert_eq!(result.principal(), Some("alice"));
 
         // Bob authenticates
         let result = auth
-            .authenticate(SaslMechanism::Plain, b"\0bob\0secret2", None)
+            .authenticate(SaslMechanism::Plain, b"\0bob\0secret2", Some(b"tls"))
             .await;
         assert!(result.is_success());
         assert_eq!(result.principal(), Some("bob"));
 
         // Wrong password for Charlie
         let result = auth
-            .authenticate(SaslMechanism::Plain, b"\0charlie\0wrong", None)
+            .authenticate(SaslMechanism::Plain, b"\0charlie\0wrong", Some(b"tls"))
             .await;
         assert!(!result.is_success());
     }
@@ -700,6 +711,22 @@ mod tests {
     fn test_plain_authenticator_requires_tls_default() {
         let auth = PlainAuthenticator::new();
         assert!(auth.requires_tls());
+    }
+
+    #[tokio::test]
+    async fn test_plain_authenticator_rejects_non_tls_transport() {
+        let auth = PlainAuthenticator::new();
+        auth.add_user("alice", "secret").await;
+
+        let result = auth
+            .authenticate(SaslMechanism::Plain, b"\0alice\0secret", None)
+            .await;
+        assert!(!result.is_success());
+
+        let result = auth
+            .authenticate(SaslMechanism::Plain, b"\0alice\0secret", Some(b"tls"))
+            .await;
+        assert!(result.is_success());
     }
 
     #[test]

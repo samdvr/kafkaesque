@@ -120,6 +120,10 @@ pub(super) async fn handle_produce(
             // Validate topic name even for fire-and-forget
             if validate_topic_name(&topic.name).is_err() {
                 debug!(topic = %topic.name, "Invalid topic name in produce request (acks=0)");
+                crate::cluster::metrics::record_produce_dropped(
+                    "invalid_topic",
+                    topic.partitions.len() as u64,
+                );
                 continue; // Skip invalid topics silently for acks=0
             }
 
@@ -143,6 +147,10 @@ pub(super) async fn handle_produce(
                     principal = %ctx.principal,
                     "Denied acks=0 produce by ACL"
                 );
+                crate::cluster::metrics::record_produce_dropped(
+                    "acl_denied",
+                    topic.partitions.len() as u64,
+                );
                 continue;
             }
 
@@ -160,6 +168,7 @@ pub(super) async fn handle_produce(
                             partition = partition.partition_index,
                             "Dropping acks=0 write due to backpressure (too many concurrent writes)"
                         );
+                        crate::cluster::metrics::record_produce_dropped("backpressure", 1);
                         continue;
                     }
                 };
@@ -302,6 +311,7 @@ async fn fire_and_forget_produce(
 
     // Skip zombie mode check for fire-and-forget (best effort)
     if partition_manager.is_zombie() {
+        crate::cluster::metrics::record_produce_dropped("zombie", 1);
         return Err(());
     }
 
@@ -313,14 +323,20 @@ async fn fire_and_forget_produce(
         .await
     {
         Ok(s) => s,
-        Err(_) => return Err(()), // We don't own this partition
+        Err(_) => {
+            crate::cluster::metrics::record_produce_dropped("not_leader", 1);
+            return Err(());
+        } // We don't own this partition
     };
 
     // Optional CRC validation
     if validate_crc {
         match validate_batch_crc_async(&partition.records).await {
             CrcValidationResult::Valid => {}
-            _ => return Err(()),
+            _ => {
+                crate::cluster::metrics::record_produce_dropped("crc_invalid", 1);
+                return Err(());
+            }
         }
     }
 

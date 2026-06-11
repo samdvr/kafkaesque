@@ -371,6 +371,15 @@ impl PartitionStore {
     ///
     /// Returns `SlateDBError::EpochMismatch` if the stored epoch in SlateDB doesn't
     /// match our expected epoch, indicating another broker has acquired this partition.
+    ///
+    /// # Throughput ceiling
+    ///
+    /// Per-partition produce throughput is serialized on [`write_lock`] and,
+    /// for [`append_batch_durable`] / `acks>=1`, bounded by the SlateDB
+    /// durable round-trip latency. Offset allocation, epoch verification, and
+    /// the storage write all happen under the same lock — durability is not
+    /// pipelined because the fencing model requires the epoch check to
+    /// precede every append atomically.
     pub async fn append_batch(&self, records: &Bytes) -> SlateDBResult<i64> {
         self.append_batch_inner(records, false).await
     }
@@ -991,25 +1000,20 @@ impl PartitionStore {
 
             let record_count = parse_record_count(batch_data);
             if record_count <= 0 {
-                // Corrupted batch. If it's the first batch the consumer needs,
-                // surface an explicit error — silently returning an empty
-                // response would stall the consumer at this offset forever
-                // with no diagnostic. If we already collected valid batches,
-                // return them; the consumer will hit the corrupt batch on its
-                // next fetch and get the error then.
+                // Corrupted batch — return an explicit error rather than
+                // silently truncating the response. A partial response would
+                // let the consumer advance past valid data and stall on the
+                // next fetch with no typed error code.
                 error!(
                     topic = %self.topic,
                     partition = self.partition,
                     offset = current_offset,
                     "Batch with invalid record count during fetch"
                 );
-                if combined.is_empty() {
-                    return Err(SlateDBError::Storage(format!(
-                        "Corrupt record batch at offset {} in {}/{}",
-                        current_offset, self.topic, self.partition
-                    )));
-                }
-                break;
+                return Err(SlateDBError::Storage(format!(
+                    "Corrupt record batch at offset {} in {}/{}",
+                    current_offset, self.topic, self.partition
+                )));
             }
 
             // Kafka's fetch contract: always return at least one complete
@@ -1696,7 +1700,8 @@ impl PartitionStoreBuilder {
             let db = Db::builder(object_path, object_store_for_task)
                 .with_settings(slatedb_settings)
                 .build()
-                .await?;
+                .await
+                .map_err(SlateDBError::from)?;
 
             // ==================================================================
             // FORMAT VERSION: write on first open; reject newer-than-known
@@ -1705,7 +1710,7 @@ impl PartitionStoreBuilder {
             // open of a fresh partition means we never need to forensically
             // guess "is this v0 or v1?" — a missing key uniquely identifies
             // pre-versioning partitions and is treated as v1 (the current).
-            match db.get(FORMAT_VERSION_KEY).await? {
+            match db.get(FORMAT_VERSION_KEY).await.map_err(SlateDBError::from)? {
                 Some(bytes) if bytes.len() >= 4 => {
                     let stored = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                     if stored > CURRENT_FORMAT_VERSION {
@@ -1714,7 +1719,7 @@ impl PartitionStoreBuilder {
                             supported_format_version = CURRENT_FORMAT_VERSION,
                             "Partition was written by a newer broker; refusing to open"
                         );
-                        return Err(slatedb::Error::invalid(format!(
+                        return Err(SlateDBError::Config(format!(
                             "Partition format version {} is newer than supported {}",
                             stored, CURRENT_FORMAT_VERSION
                         )));
@@ -1729,7 +1734,8 @@ impl PartitionStoreBuilder {
                             await_durable: true,
                         },
                     )
-                    .await?;
+                    .await
+                    .map_err(SlateDBError::from)?;
                 }
             }
 
@@ -1738,7 +1744,7 @@ impl PartitionStoreBuilder {
             // ==================================================================
             // This prevents TOCTOU races where we might write to a partition
             // that another broker has already acquired.
-            let stored_epoch = match db.get(LEADER_EPOCH_KEY).await? {
+            let stored_epoch = match db.get(LEADER_EPOCH_KEY).await.map_err(SlateDBError::from)? {
                 Some(bytes) => decode_leader_epoch(&bytes).unwrap_or(0),
                 None => 0,
             };
@@ -1753,10 +1759,12 @@ impl PartitionStoreBuilder {
                         stored_epoch,
                         "EPOCH FENCING: Stored epoch is higher than expected - another broker owns this partition"
                     );
-                    return Err(slatedb::Error::invalid(format!(
-                        "Epoch mismatch: expected {}, found {}",
-                        expected_epoch, stored_epoch
-                    )));
+                    return Err(SlateDBError::EpochMismatch {
+                        topic: topic_for_epoch_error.clone(),
+                        partition,
+                        expected_epoch,
+                        stored_epoch,
+                    });
                 }
 
                 // Store our epoch to claim ownership
@@ -1769,7 +1777,8 @@ impl PartitionStoreBuilder {
                         await_durable: true,
                     }, // MUST be durable
                 )
-                .await?;
+                .await
+                .map_err(SlateDBError::from)?;
 
                 info!(
                     expected_epoch,
@@ -1785,7 +1794,7 @@ impl PartitionStoreBuilder {
             };
 
             // Load persisted high watermark from DB
-            let persisted_hwm = match db.get(HIGH_WATERMARK_KEY).await? {
+            let persisted_hwm = match db.get(HIGH_WATERMARK_KEY).await.map_err(SlateDBError::from)? {
                 Some(bytes) => {
                     if bytes.len() >= 8 {
                         // Use expect() with descriptive message instead of unwrap().
@@ -1804,7 +1813,7 @@ impl PartitionStoreBuilder {
 
             // Load the persisted log start offset (0 when retention has
             // never deleted a prefix).
-            let log_start_offset = match db.get(super::keys::LOG_START_OFFSET_KEY).await? {
+            let log_start_offset = match db.get(super::keys::LOG_START_OFFSET_KEY).await.map_err(SlateDBError::from)? {
                 Some(bytes) if bytes.len() >= 8 => i64::from_be_bytes(
                     bytes[..8]
                         .try_into()
@@ -1820,8 +1829,8 @@ impl PartitionStoreBuilder {
             // persisted too), so open latency tracks recent write volume,
             // not total log size.
             let scan_floor = log_start_offset.max(persisted_hwm);
-            let recovery =
-                recover_hwm_from_records(&db, persisted_hwm, fail_on_gap, scan_floor).await?;
+            let recovery = recover_hwm_from_records(&db, persisted_hwm, fail_on_gap, scan_floor)
+                .await?;
             let recovered_hwm = recovery.high_watermark;
 
             // If we recovered a higher HWM, persist it
@@ -1836,13 +1845,14 @@ impl PartitionStoreBuilder {
                     &PutOptions::default(),
                     &FAST_WRITE_OPTIONS,
                 )
-                .await?;
+                .await
+                .map_err(SlateDBError::from)?;
             }
 
             // Load persisted producer states for idempotency
             let producer_states = load_producer_states(&db).await?;
 
-            Ok::<_, slatedb::Error>((
+            Ok((
                 db,
                 recovered_hwm,
                 log_start_offset,
@@ -1853,21 +1863,7 @@ impl PartitionStoreBuilder {
         };
 
         let (db, hwm, log_start_offset, recovered_batches, persisted_states, validated_epoch) =
-            open_future.await.map_err(|e| {
-                // Convert slatedb::Error to SlateDBError, checking for epoch mismatch
-                let err_str = e.to_string();
-                if err_str.contains("Epoch mismatch") {
-                    // Parse out the epochs from the error message
-                    SlateDBError::EpochMismatch {
-                        topic: topic_for_epoch_error.clone(),
-                        partition,
-                        expected_epoch: self.leader_epoch,
-                        stored_epoch: 0, // We don't have the exact stored value here
-                    }
-                } else {
-                    SlateDBError::from(e)
-                }
-            })?;
+            open_future.await?;
 
         if !persisted_states.is_empty() {
             info!(

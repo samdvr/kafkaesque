@@ -181,6 +181,14 @@ pub trait PartitionTransferExecutor: Send + Sync {
 
     /// Get list of active broker IDs.
     async fn get_active_brokers(&self) -> Vec<i32>;
+
+    /// Whether this node should initiate broker-failure handling.
+    ///
+    /// Only the coordination leader should propose `MarkBrokerFailed` and
+    /// drive partition reassignment; followers skip the failure loop tick.
+    async fn should_initiate_failover(&self) -> bool {
+        true
+    }
 }
 
 // ============================================================================
@@ -261,6 +269,13 @@ impl<C: ClusterCoordinator + 'static> PartitionTransferExecutor for CoordinatorE
 
     async fn get_active_brokers(&self) -> Vec<i32> {
         self.coordinator.get_active_broker_ids().await
+    }
+
+    async fn should_initiate_failover(&self) -> bool {
+        match self.coordinator.current_leader_id().await {
+            Ok(Some(leader)) => leader == self.coordinator.broker_id(),
+            _ => false,
+        }
     }
 }
 
@@ -762,6 +777,14 @@ impl RebalanceCoordinator {
 
             for change in state_changes {
                 if change.new_state == BrokerHealthState::Failed {
+                    if !executor.should_initiate_failover().await {
+                        debug!(
+                            broker_id = change.broker_id,
+                            "Skipping failover initiation on non-leader broker"
+                        );
+                        continue;
+                    }
+
                     info!(
                         broker_id = change.broker_id,
                         missed_heartbeats = change.missed_heartbeats,

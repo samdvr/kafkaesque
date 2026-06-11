@@ -371,6 +371,36 @@ impl SlateDBClusterHandler {
                 }));
         }
 
+        // Invalidate the local owner cache whenever the replicated state
+        // machine applies an ownership change. Without this, followers (and
+        // the broker that lost a partition) can serve fetch/metadata from a
+        // stale 1s-TTL cache after failover.
+        {
+            let coordinator_for_hook = coordinator.clone();
+            let runtime = runtime_handles.control.clone();
+            let sm_arc = coordinator.node().state_machine();
+            sm_arc.read().await.set_ownership_change_hook(Arc::new(
+                move |invalidation| {
+                    let coordinator = coordinator_for_hook.clone();
+                    runtime.spawn(async move {
+                        match invalidation {
+                            super::raft::OwnershipCacheInvalidation::Partition {
+                                topic,
+                                partition,
+                            } => {
+                                coordinator
+                                    .invalidate_ownership_cache(&topic, partition)
+                                    .await;
+                            }
+                            super::raft::OwnershipCacheInvalidation::All => {
+                                coordinator.invalidate_all_ownership_cache().await;
+                            }
+                        }
+                    });
+                },
+            ));
+        }
+
         // Start background tasks
         partition_manager.start().await;
 

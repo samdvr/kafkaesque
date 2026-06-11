@@ -85,7 +85,7 @@ pub use domains::{
 };
 pub use network::{RaftNetworkFactoryImpl, RaftRpcMessage, RaftRpcResponse, request_cluster_join};
 pub use node::RaftNode;
-pub use state_machine::CoordinationStateMachine;
+pub use state_machine::{CoordinationStateMachine, OwnershipCacheInvalidation};
 pub use storage::RaftStore;
 pub use tls::RaftTlsConfig;
 pub use types::{RaftNodeId, TypeConfig};

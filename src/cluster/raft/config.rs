@@ -103,9 +103,8 @@ pub struct RaftConfig {
     /// `Some`, `RaftRpcServer` requires client certs that chain to the
     /// configured CA, and outbound Raft connections present this broker's
     /// cert. HMAC framing remains in place on top — TLS adds peer
-    /// identity and rotation, HMAC adds replay defense and cheap message
-    /// integrity. Loaded from `RAFT_TLS_CERT` / `RAFT_TLS_KEY` /
-    /// `RAFT_TLS_CA` env vars (see [`RaftTlsConfig::from_env`]).
+    /// identity and rotation; HMAC adds message integrity plus a
+    /// timestamp/nonce replay cache on authenticated frames.
     pub tls: Option<RaftTlsConfig>,
 
     /// Tolerance buffer applied to lease and member-expiry checks to absorb

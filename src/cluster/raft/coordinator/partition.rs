@@ -269,6 +269,10 @@ impl PartitionCoordinator for RaftCoordinator {
             return Ok(Some(owner));
         }
 
+        // Cache miss on routing-critical metadata: confirm we've applied
+        // through the leader's commit index before consulting local state.
+        self.node.ensure_linearizable().await?;
+
         let state_machine = self.node.state_machine();
         let state = state_machine.read().await;
         let inner_state = state.state().await;
@@ -299,6 +303,10 @@ impl PartitionCoordinator for RaftCoordinator {
         if let Some(owner) = self.owner_cache.get(&(Arc::from(topic), partition)).await {
             return Ok(owner == self.broker_id);
         }
+
+        // Cache miss: use a read-index barrier so ownership checks reflect
+        // the latest committed Raft state, not a follower lag window.
+        self.node.ensure_linearizable().await?;
 
         let state_machine = self.node.state_machine();
         let state = state_machine.read().await;

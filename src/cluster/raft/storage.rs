@@ -1018,7 +1018,6 @@ impl RaftStorage<TypeConfig> for RaftStore {
         entries: &[Entry<TypeConfig>],
     ) -> Result<Vec<CoordinationResponse>, StorageError<RaftNodeId>> {
         let mut responses = Vec::new();
-        let sm = self.sm.write().await;
 
         for entry in entries {
             *self.last_applied_log.write().await = Some(entry.log_id);
@@ -1028,6 +1027,11 @@ impl RaftStorage<TypeConfig> for RaftStore {
                     responses.push(CoordinationResponse::Ok);
                 }
                 EntryPayload::Normal(command) => {
+                    // Read lock only: `apply_command` serializes on the inner
+                    // state-machine lock. Holding the outer write lock here
+                    // blocked snapshot builds and coordinator reads for the
+                    // whole apply batch.
+                    let sm = self.sm.read().await;
                     let response = sm.apply_command(command.clone()).await;
                     responses.push(response);
                 }

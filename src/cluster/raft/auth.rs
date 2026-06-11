@@ -20,14 +20,28 @@
 //!
 //! ## Wire format
 //!
+//! **Unauthenticated** (`purpose=0`, dev/legacy only):
+//!
 //! ```text
 //! [u32 total_len]
-//! [u8 purpose]      // 0=unauth, 1=cluster, 2=join
-//! [32 bytes hmac]   // HMAC-SHA256(key, purpose || payload)
-//! [bincode payload] // total_len - 33 bytes
+//! [u8 purpose=0]
+//! [32 bytes hmac=0]
+//! [bincode payload]
 //! ```
 //!
-//! The HMAC is computed over `purpose || payload` so an attacker cannot
+//! **Authenticated** (`purpose=1|2`, cluster/join keys configured):
+//!
+//! ```text
+//! [u32 total_len]
+//! [u8 purpose]              // 1=cluster, 2=join
+//! [u64 timestamp_ms BE]   // sender wall clock; replay window enforced
+//! [16 bytes nonce]        // unique per frame; tracked in replay cache
+//! [32 bytes hmac]         // HMAC-SHA256(key, purpose || ts || nonce || payload)
+//! [bincode payload]
+//! ```
+//!
+//! The HMAC is computed over `purpose || timestamp || nonce || payload` (or
+//! `purpose || payload` for unauthenticated frames) so an attacker cannot
 //! relabel a cluster-key frame as a join-key frame and have it accepted by a
 //! receiver that knows both keys.
 //!
@@ -40,8 +54,10 @@
 //! when set).
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
+use moka::sync::Cache;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -54,8 +70,21 @@ pub(crate) const HMAC_LEN: usize = 32;
 /// Length of the per-frame purpose tag.
 pub(crate) const PURPOSE_LEN: usize = 1;
 
-/// Total framing overhead added on top of the bincode payload.
+/// Replay-defense fields on authenticated frames.
+pub(crate) const TIMESTAMP_LEN: usize = 8;
+pub(crate) const NONCE_LEN: usize = 16;
+
+/// Framing overhead for unauthenticated frames.
 pub(crate) const FRAME_HEADER_LEN: usize = PURPOSE_LEN + HMAC_LEN;
+
+/// Framing overhead for authenticated (cluster/join) frames.
+pub(crate) const AUTHENTICATED_FRAME_HEADER_LEN: usize =
+    PURPOSE_LEN + TIMESTAMP_LEN + NONCE_LEN + HMAC_LEN;
+
+/// How long signed frames stay valid and how long nonces are remembered.
+const REPLAY_WINDOW: Duration = Duration::from_secs(300);
+/// Maximum clock skew tolerated on incoming frame timestamps.
+const MAX_CLOCK_SKEW: Duration = Duration::from_secs(60);
 
 /// Maximum size in bytes of any single Raft RPC message (request or response)
 /// we will allocate for. The wire format is `[u32 length][purpose][hmac][bincode]`,
@@ -94,10 +123,86 @@ impl FramePurpose {
     }
 }
 
+/// Tracks recently-seen authenticated frame nonces to reject replays.
+#[derive(Clone)]
+pub struct ReplayCache {
+    seen: Cache<[u8; NONCE_LEN], ()>,
+}
+
+impl std::fmt::Debug for ReplayCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayCache")
+            .field("seen_entries", &self.seen.entry_count())
+            .finish()
+    }
+}
+
+impl Default for ReplayCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReplayCache {
+    pub fn new() -> Self {
+        Self {
+            seen: Cache::builder()
+                .time_to_live(REPLAY_WINDOW)
+                .max_capacity(200_000)
+                .build(),
+        }
+    }
+
+    pub(crate) fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    pub(crate) fn fresh_nonce() -> [u8; NONCE_LEN] {
+        let id = uuid::Uuid::new_v4();
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&id.as_bytes()[..NONCE_LEN]);
+        nonce
+    }
+
+    /// Reject frames outside the replay window or with a reused nonce.
+    pub fn check_and_record(
+        &self,
+        timestamp_ms: u64,
+        nonce: &[u8; NONCE_LEN],
+    ) -> std::io::Result<()> {
+        let now = Self::now_ms();
+        let max_skew_ms = MAX_CLOCK_SKEW.as_millis() as u64;
+        let window_ms = REPLAY_WINDOW.as_millis() as u64;
+        if timestamp_ms > now.saturating_add(max_skew_ms) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Raft RPC frame timestamp too far in the future",
+            ));
+        }
+        if now.saturating_sub(timestamp_ms) > window_ms {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Raft RPC frame timestamp outside replay window",
+            ));
+        }
+        if self.seen.contains_key(nonce) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Rejected Raft frame: nonce replay detected",
+            ));
+        }
+        self.seen.insert(*nonce, ());
+        Ok(())
+    }
+}
+
 /// Shared secrets that gate Raft RPC traffic.
 ///
 /// Wrapped in an `Arc` and cloned cheaply across connections.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct RaftAuthKeys {
     /// Cluster-wide HMAC key. When `Some`, every steady-state RPC must be
     /// signed with this key; when `None`, unsigned frames are accepted (legacy
@@ -108,6 +213,28 @@ pub struct RaftAuthKeys {
     /// `cluster_secret` (so an operator can use the same key for both, or
     /// rotate them independently).
     join_token: Option<Arc<[u8]>>,
+    /// Replay cache shared across all connections on this broker.
+    replay_cache: Arc<ReplayCache>,
+}
+
+impl std::fmt::Debug for RaftAuthKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RaftAuthKeys")
+            .field("cluster_secret_configured", &self.cluster_secret_configured())
+            .field("join_token_configured", &self.join_token_configured())
+            .field("replay_cache", &self.replay_cache)
+            .finish()
+    }
+}
+
+impl Default for RaftAuthKeys {
+    fn default() -> Self {
+        Self {
+            cluster_secret: None,
+            join_token: None,
+            replay_cache: Arc::new(ReplayCache::new()),
+        }
+    }
 }
 
 impl RaftAuthKeys {
@@ -128,6 +255,7 @@ impl RaftAuthKeys {
         Self {
             cluster_secret: normalize(cluster_secret),
             join_token: normalize(join_token),
+            replay_cache: Arc::new(ReplayCache::new()),
         }
     }
 
@@ -183,21 +311,32 @@ impl RaftAuthKeys {
         }
     }
 
-    /// Compute the HMAC tag the sender will include on the wire.
+    /// Compute the HMAC tag for an unauthenticated (legacy) frame.
     pub(crate) fn sign(&self, purpose: FramePurpose, payload: &[u8]) -> [u8; HMAC_LEN] {
+        self.sign_authenticated(purpose, None, None, payload)
+    }
+
+    fn sign_authenticated(
+        &self,
+        purpose: FramePurpose,
+        timestamp_ms: Option<u64>,
+        nonce: Option<&[u8; NONCE_LEN]>,
+        payload: &[u8],
+    ) -> [u8; HMAC_LEN] {
         let key = match purpose {
             FramePurpose::Unauthenticated => return [0u8; HMAC_LEN],
             FramePurpose::Cluster => self.cluster_secret(),
             FramePurpose::Join => self.join_key(),
         };
         let Some(key) = key else {
-            // The caller asked us to sign with a key we don't hold. Return a
-            // zero tag — the receiver will reject it. We don't panic because
-            // signing happens in async tasks where panics are inconvenient.
             return [0u8; HMAC_LEN];
         };
         let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
         mac.update(&[purpose as u8]);
+        if let (Some(ts), Some(nonce)) = (timestamp_ms, nonce) {
+            mac.update(&ts.to_be_bytes());
+            mac.update(nonce);
+        }
         mac.update(payload);
         let result = mac.finalize().into_bytes();
         let mut out = [0u8; HMAC_LEN];
@@ -205,14 +344,22 @@ impl RaftAuthKeys {
         out
     }
 
-    /// Verify a received frame.
-    ///
-    /// Returns `Ok(())` when the frame is acceptable on this receiver. Any
-    /// auth failure (missing tag, wrong key, unknown purpose, unauthenticated
-    /// frame on a configured server) is mapped to an `InvalidData` io error.
+    /// Verify a received frame (legacy unauthenticated layout).
     pub(crate) fn verify(
         &self,
         purpose: FramePurpose,
+        tag: &[u8; HMAC_LEN],
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        self.verify_authenticated(purpose, None, None, tag, payload)
+    }
+
+    /// Verify a received authenticated frame, including replay defense.
+    pub(crate) fn verify_authenticated(
+        &self,
+        purpose: FramePurpose,
+        timestamp_ms: Option<u64>,
+        nonce: Option<&[u8; NONCE_LEN]>,
         tag: &[u8; HMAC_LEN],
         payload: &[u8],
     ) -> std::io::Result<()> {
@@ -239,8 +386,23 @@ impl RaftAuthKeys {
                 ),
             ));
         };
+
+        if purpose != FramePurpose::Unauthenticated {
+            let (Some(ts), Some(nonce)) = (timestamp_ms, nonce) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Authenticated Raft frame missing timestamp/nonce replay fields",
+                ));
+            };
+            self.replay_cache.check_and_record(ts, nonce)?;
+        }
+
         let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
         mac.update(&[purpose as u8]);
+        if let (Some(ts), Some(nonce)) = (timestamp_ms, nonce) {
+            mac.update(&ts.to_be_bytes());
+            mac.update(nonce);
+        }
         mac.update(payload);
         let expected = mac.finalize().into_bytes();
         if expected.ct_eq(tag.as_ref()).into() {
@@ -251,6 +413,10 @@ impl RaftAuthKeys {
                 "Rejected Raft frame: HMAC mismatch",
             ))
         }
+    }
+
+    pub(crate) fn replay_cache(&self) -> &ReplayCache {
+        &self.replay_cache
     }
 }
 
@@ -281,7 +447,7 @@ pub(crate) async fn read_rpc_frame<S: AsyncReadExt + Unpin>(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "Raft RPC frame length {} smaller than header overhead {}",
+                "Raft RPC frame length {} smaller than minimum header {}",
                 total_len, FRAME_HEADER_LEN
             ),
         ));
@@ -289,20 +455,53 @@ pub(crate) async fn read_rpc_frame<S: AsyncReadExt + Unpin>(
 
     let mut purpose_byte = [0u8; PURPOSE_LEN];
     stream.read_exact(&mut purpose_byte).await?;
-    let mut tag = [0u8; HMAC_LEN];
-    stream.read_exact(&mut tag).await?;
-
-    let payload_len = total_len - FRAME_HEADER_LEN;
-    let mut payload = vec![0u8; payload_len];
-    stream.read_exact(&mut payload).await?;
-
     let purpose = FramePurpose::from_u8(purpose_byte[0]).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Unknown Raft RPC frame purpose tag {}", purpose_byte[0]),
         )
     })?;
-    keys.verify(purpose, &tag, &payload)?;
+
+    let (timestamp_ms, nonce, header_len) = if purpose == FramePurpose::Unauthenticated {
+        if total_len < FRAME_HEADER_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Unauthenticated Raft frame too short",
+            ));
+        }
+        (None, None, FRAME_HEADER_LEN)
+    } else {
+        if total_len < AUTHENTICATED_FRAME_HEADER_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Authenticated Raft frame missing replay header fields",
+            ));
+        }
+        let mut ts_buf = [0u8; TIMESTAMP_LEN];
+        stream.read_exact(&mut ts_buf).await?;
+        let mut nonce = [0u8; NONCE_LEN];
+        stream.read_exact(&mut nonce).await?;
+        (
+            Some(u64::from_be_bytes(ts_buf)),
+            Some(nonce),
+            AUTHENTICATED_FRAME_HEADER_LEN,
+        )
+    };
+
+    let mut tag = [0u8; HMAC_LEN];
+    stream.read_exact(&mut tag).await?;
+
+    let payload_len = total_len - header_len;
+    let mut payload = vec![0u8; payload_len];
+    stream.read_exact(&mut payload).await?;
+
+    keys.verify_authenticated(
+        purpose,
+        timestamp_ms,
+        nonce.as_ref(),
+        &tag,
+        &payload,
+    )?;
     Ok((purpose, payload))
 }
 
@@ -316,10 +515,22 @@ pub(crate) async fn write_rpc_frame<S: AsyncWriteExt + Unpin>(
     payload: &[u8],
 ) -> std::io::Result<()> {
     let purpose = keys.outbound_purpose(is_join);
-    let tag = keys.sign(purpose, payload);
+    let (timestamp_ms, nonce, header_len) = if purpose == FramePurpose::Unauthenticated {
+        (None, None, FRAME_HEADER_LEN)
+    } else {
+        let ts = ReplayCache::now_ms();
+        let nonce = ReplayCache::fresh_nonce();
+        (Some(ts), Some(nonce), AUTHENTICATED_FRAME_HEADER_LEN)
+    };
+    let tag = keys.sign_authenticated(
+        purpose,
+        timestamp_ms,
+        nonce.as_ref(),
+        payload,
+    );
     let total_len = payload
         .len()
-        .checked_add(FRAME_HEADER_LEN)
+        .checked_add(header_len)
         .ok_or_else(|| std::io::Error::other("Raft RPC payload too large to frame"))?;
     if total_len > MAX_RPC_MESSAGE_BYTES {
         return Err(std::io::Error::other(format!(
@@ -335,6 +546,10 @@ pub(crate) async fn write_rpc_frame<S: AsyncWriteExt + Unpin>(
     })?;
     stream.write_all(&total_len_u32.to_be_bytes()).await?;
     stream.write_all(&[purpose as u8]).await?;
+    if let (Some(ts), Some(nonce)) = (timestamp_ms, nonce) {
+        stream.write_all(&ts.to_be_bytes()).await?;
+        stream.write_all(&nonce).await?;
+    }
     stream.write_all(&tag).await?;
     stream.write_all(payload).await?;
     Ok(())
@@ -369,20 +584,41 @@ mod tests {
     fn cluster_signed_roundtrip() {
         let keys = RaftAuthKeys::from_strings(Some("hunter2".into()), None);
         let payload = b"vote-request";
-        let tag = keys.sign(FramePurpose::Cluster, payload);
-        keys.verify(FramePurpose::Cluster, &tag, payload).unwrap();
+        let ts = ReplayCache::now_ms();
+        let nonce = ReplayCache::fresh_nonce();
+        let tag = keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
+        keys.verify_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), &tag, payload)
+            .unwrap();
     }
 
     #[test]
     fn cluster_signed_rejects_tamper() {
         let keys = RaftAuthKeys::from_strings(Some("hunter2".into()), None);
         let payload = b"vote-request";
-        let mut tag = keys.sign(FramePurpose::Cluster, payload);
+        let ts = ReplayCache::now_ms();
+        let nonce = ReplayCache::fresh_nonce();
+        let mut tag = keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
         tag[0] ^= 0xff;
         let err = keys
-            .verify(FramePurpose::Cluster, &tag, payload)
+            .verify_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), &tag, payload)
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn cluster_signed_rejects_replay() {
+        let keys = RaftAuthKeys::from_strings(Some("hunter2".into()), None);
+        let payload = b"vote-request";
+        let ts = ReplayCache::now_ms();
+        let nonce = ReplayCache::fresh_nonce();
+        let tag = keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
+        keys.verify_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), &tag, payload)
+            .unwrap();
+        let err = keys
+            .verify_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), &tag, payload)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("replay"));
     }
 
     #[test]
@@ -392,21 +628,25 @@ mod tests {
         // HMAC input).
         let keys = RaftAuthKeys::from_strings(Some("clusterkey".into()), Some("joinkey".into()));
         let payload = b"join-request";
-        let cluster_tag = keys.sign(FramePurpose::Cluster, payload);
+        let ts = ReplayCache::now_ms();
+        let nonce = ReplayCache::fresh_nonce();
+        let cluster_tag =
+            keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
         let err = keys
-            .verify(FramePurpose::Join, &cluster_tag, payload)
+            .verify_authenticated(FramePurpose::Join, Some(ts), Some(&nonce), &cluster_tag, payload)
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]
     fn join_falls_back_to_cluster_secret_when_token_missing() {
-        // Single-key deployments: setting only RAFT_CLUSTER_SECRET should
-        // still gate JoinCluster requests.
         let keys = RaftAuthKeys::from_strings(Some("clusterkey".into()), None);
         let payload = b"join-request";
-        let tag = keys.sign(FramePurpose::Join, payload);
-        keys.verify(FramePurpose::Join, &tag, payload).unwrap();
+        let ts = ReplayCache::now_ms();
+        let nonce = ReplayCache::fresh_nonce();
+        let tag = keys.sign_authenticated(FramePurpose::Join, Some(ts), Some(&nonce), payload);
+        keys.verify_authenticated(FramePurpose::Join, Some(ts), Some(&nonce), &tag, payload)
+            .unwrap();
     }
 
     #[test]

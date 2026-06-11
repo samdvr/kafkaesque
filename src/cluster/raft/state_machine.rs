@@ -106,6 +106,19 @@ impl From<LegacyCoordinationState> for CoordinationState {
 /// failure detector can refresh its liveness map.
 pub type HeartbeatHook = Arc<dyn Fn(i32) + Send + Sync>;
 
+/// What to invalidate in the local partition-owner cache after an applied
+/// command changes ownership. Fired on every replica so read-path routing
+/// (`owns_partition_for_read`) cannot serve stale ownership after a
+/// transfer or lease expiry that this broker did not initiate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipCacheInvalidation {
+    Partition { topic: String, partition: i32 },
+    All,
+}
+
+/// Callback fired after applied commands that change partition ownership.
+pub type OwnershipChangeHook = Arc<dyn Fn(OwnershipCacheInvalidation) + Send + Sync>;
+
 /// The state machine wrapper for coordination.
 #[derive(Clone)]
 pub struct CoordinationStateMachine {
@@ -116,6 +129,10 @@ pub struct CoordinationStateMachine {
     /// so fast failover sees liveness from all brokers, not just self.
     /// Set once at startup; read on every apply.
     heartbeat_hook: Arc<std::sync::OnceLock<HeartbeatHook>>,
+    /// Optional sink fired when an applied command changes partition
+    /// ownership. Used to invalidate the local owner cache on every
+    /// replica, not only the broker that initiated the transfer.
+    ownership_change_hook: Arc<std::sync::OnceLock<OwnershipChangeHook>>,
 }
 
 impl CoordinationStateMachine {
@@ -124,6 +141,7 @@ impl CoordinationStateMachine {
         Self {
             state: Arc::new(RwLock::new(CoordinationState::default())),
             heartbeat_hook: Arc::new(std::sync::OnceLock::new()),
+            ownership_change_hook: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -133,6 +151,19 @@ impl CoordinationStateMachine {
     /// `RebalanceCoordinator` for fast failover.
     pub fn set_heartbeat_hook(&self, hook: HeartbeatHook) {
         let _ = self.heartbeat_hook.set(hook);
+    }
+
+    /// Install a callback that fires after applied commands change partition
+    /// ownership. Idempotent: set once at startup. Every replica should
+    /// install this so read-path owner caches stay consistent with the SM.
+    pub fn set_ownership_change_hook(&self, hook: OwnershipChangeHook) {
+        let _ = self.ownership_change_hook.set(hook);
+    }
+
+    fn fire_ownership_change_hook(&self, invalidation: OwnershipCacheInvalidation) {
+        if let Some(hook) = self.ownership_change_hook.get() {
+            hook(invalidation);
+        }
     }
 
     /// Get a read-only reference to the current state.
@@ -196,9 +227,12 @@ impl CoordinationStateMachine {
                 }
                 // Disjoint borrows of `partition_domain` and `lease_clock_ms`.
                 let state = &mut *state;
-                CoordinationResponse::PartitionDomainResponse(
-                    state.partition_domain.apply(cmd, &mut state.lease_clock_ms),
-                )
+                let response =
+                    state.partition_domain.apply(cmd.clone(), &mut state.lease_clock_ms);
+                if let Some(invalidation) = ownership_invalidation_for_partition(&cmd, &response) {
+                    self.fire_ownership_change_hook(invalidation);
+                }
+                CoordinationResponse::PartitionDomainResponse(response)
             }
 
             CoordinationCommand::GroupDomain(cmd) => {
@@ -217,10 +251,13 @@ impl CoordinationStateMachine {
                 // fields, so no cloning is needed.
                 let state = &mut *state;
                 let response = state.transfer_domain.apply_with_context(
-                    cmd,
+                    cmd.clone(),
                     &mut state.broker_domain.brokers,
                     &mut state.partition_domain.partitions,
                 );
+                if let Some(invalidation) = ownership_invalidation_for_transfer(&response) {
+                    self.fire_ownership_change_hook(invalidation);
+                }
 
                 CoordinationResponse::TransferDomainResponse(response)
             }
@@ -298,8 +335,165 @@ impl CoordinationStateMachine {
     }
 }
 
+fn ownership_invalidation_for_partition(
+    cmd: &super::domains::PartitionCommand,
+    response: &super::domains::PartitionResponse,
+) -> Option<OwnershipCacheInvalidation> {
+    use super::domains::{PartitionCommand, PartitionResponse};
+
+    match response {
+        PartitionResponse::PartitionAcquired { topic, partition, .. }
+        | PartitionResponse::PartitionReleased { topic, partition } => {
+            Some(OwnershipCacheInvalidation::Partition {
+                topic: topic.clone(),
+                partition: *partition,
+            })
+        }
+        PartitionResponse::LeasesExpired { count } if *count > 0 => {
+            Some(OwnershipCacheInvalidation::All)
+        }
+        // A failed acquire against an active owner means our cached view
+        // of who owns this partition may be stale.
+        PartitionResponse::PartitionOwnedByOther { topic, partition, .. }
+            if matches!(cmd, PartitionCommand::AcquirePartition { .. }) =>
+        {
+            Some(OwnershipCacheInvalidation::Partition {
+                topic: topic.clone(),
+                partition: *partition,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn ownership_invalidation_for_transfer(
+    response: &super::domains::TransferResponse,
+) -> Option<OwnershipCacheInvalidation> {
+    use super::domains::TransferResponse;
+
+    match response {
+        TransferResponse::PartitionTransferred { topic, partition, .. } => {
+            Some(OwnershipCacheInvalidation::Partition {
+                topic: topic.clone(),
+                partition: *partition,
+            })
+        }
+        TransferResponse::BrokerMarkedFailed {
+            partitions_affected,
+            ..
+        } if *partitions_affected > 0 => Some(OwnershipCacheInvalidation::All),
+        TransferResponse::BatchTransferCompleted {
+            successful_transfers,
+            ..
+        } if *successful_transfers > 0 => Some(OwnershipCacheInvalidation::All),
+        _ => None,
+    }
+}
+
 impl Default for CoordinationStateMachine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::domains::{PartitionCommand, PartitionResponse, TransferResponse};
+    use super::*;
+
+    #[test]
+    fn ownership_invalidation_on_partition_acquire() {
+        let inv = ownership_invalidation_for_partition(
+            &PartitionCommand::AcquirePartition {
+                topic: "t".to_string(),
+                partition: 1,
+                broker_id: 2,
+                lease_duration_ms: 60_000,
+                timestamp_ms: 1,
+            },
+            &PartitionResponse::PartitionAcquired {
+                topic: "t".to_string(),
+                partition: 1,
+                leader_epoch: 1,
+                lease_expires_at_ms: 61_000,
+            },
+        );
+        assert_eq!(
+            inv,
+            Some(OwnershipCacheInvalidation::Partition {
+                topic: "t".to_string(),
+                partition: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_invalidation_on_lease_expiry_sweep() {
+        let inv = ownership_invalidation_for_partition(
+            &PartitionCommand::ExpireLeases {
+                current_time_ms: 100,
+            },
+            &PartitionResponse::LeasesExpired { count: 3 },
+        );
+        assert_eq!(inv, Some(OwnershipCacheInvalidation::All));
+    }
+
+    #[test]
+    fn ownership_invalidation_on_broker_failure() {
+        let inv = ownership_invalidation_for_transfer(&TransferResponse::BrokerMarkedFailed {
+            broker_id: 2,
+            partitions_affected: 5,
+            released_partitions: vec![("t".to_string(), 0)],
+        });
+        assert_eq!(inv, Some(OwnershipCacheInvalidation::All));
+    }
+
+    #[test]
+    fn no_invalidation_on_noop_lease_sweep() {
+        let inv = ownership_invalidation_for_partition(
+            &PartitionCommand::ExpireLeases {
+                current_time_ms: 100,
+            },
+            &PartitionResponse::LeasesExpired { count: 0 },
+        );
+        assert!(inv.is_none());
+    }
+
+    #[test]
+    fn ownership_invalidation_on_transfer() {
+        let inv = ownership_invalidation_for_transfer(&TransferResponse::PartitionTransferred {
+            topic: "orders".to_string(),
+            partition: 0,
+            from_broker_id: 1,
+            to_broker_id: 2,
+            new_epoch: 3,
+            lease_expires_at_ms: 99_000,
+        });
+        assert_eq!(
+            inv,
+            Some(OwnershipCacheInvalidation::Partition {
+                topic: "orders".to_string(),
+                partition: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_invalidation_on_failed_acquire_against_active_owner() {
+        let inv = ownership_invalidation_for_partition(
+            &PartitionCommand::AcquirePartition {
+                topic: "t".to_string(),
+                partition: 0,
+                broker_id: 2,
+                lease_duration_ms: 60_000,
+                timestamp_ms: 1,
+            },
+            &PartitionResponse::PartitionOwnedByOther {
+                topic: "t".to_string(),
+                partition: 0,
+                owner: 1,
+            },
+        );
+        assert!(inv.is_some());
     }
 }

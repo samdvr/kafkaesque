@@ -65,7 +65,7 @@ fn parse_produce_topic(s: NomBytes) -> IResult<NomBytes, ProduceTopicData> {
 fn parse_produce_partition(s: NomBytes) -> IResult<NomBytes, ProducePartitionData> {
     let (s, partition_index) = be_i32(s)?;
     let (s, record_set_size) = be_i32(s)?;
-    // Audit: a negative i32 cast to usize wraps to ~4 GiB on 32-bit and to
+    // A negative i32 cast to usize wraps to ~4 GiB on 32-bit and to
     // 18 EiB on 64-bit, so an attacker-controlled negative length here would
     // ask `take` for a colossal slice. Reject negative lengths up front.
     if record_set_size < 0 {

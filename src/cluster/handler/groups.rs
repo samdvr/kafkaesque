@@ -174,7 +174,7 @@ pub(super) async fn handle_join_group(
         };
     }
 
-    // Audit S2: JoinGroup requires Read on the Group resource.
+    // JoinGroup requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
         debug!(
             group_id = %request.group_id,
@@ -297,7 +297,7 @@ pub(super) async fn handle_sync_group(
     ctx: &RequestContext,
     request: SyncGroupRequestData,
 ) -> SyncGroupResponseData {
-    // Audit S2: SyncGroup requires Read on the Group resource.
+    // SyncGroup requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
         debug!(
             group_id = %request.group_id,
@@ -436,7 +436,7 @@ pub(super) async fn handle_heartbeat(
     ctx: &RequestContext,
     request: HeartbeatRequestData,
 ) -> HeartbeatResponseData {
-    // Audit S2: Heartbeat requires Read on the Group resource.
+    // Heartbeat requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
         debug!(
             group_id = %request.group_id,
@@ -490,7 +490,7 @@ pub(super) async fn handle_leave_group(
     ctx: &RequestContext,
     request: LeaveGroupRequestData,
 ) -> LeaveGroupResponseData {
-    // Audit S2: LeaveGroup requires Read on the Group resource.
+    // LeaveGroup requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
         debug!(
             group_id = %request.group_id,

@@ -46,7 +46,7 @@ const HEALTH_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum concurrent in-flight health-check connections. The server is
 /// internal-facing so this only needs to absorb a probe storm; beyond this
-/// we shed load (and an attacker can't pin all our memory). Audit S8.
+/// we shed load (and an attacker can't pin all our memory).
 const HEALTH_MAX_CONCURRENT: usize = 256;
 
 /// Health check response status.
@@ -165,8 +165,8 @@ impl HealthServer {
     /// Run the health server, handling HTTP requests.
     pub async fn run(&self) -> Result<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        // Bound the number of in-flight probes so a flood can't OOM us
-        // (audit S8). Probes that exceed the cap are dropped.
+        // Bound the number of in-flight probes so a flood can't OOM us.
+        // Probes that exceed the cap are dropped.
         let semaphore = Arc::new(Semaphore::new(HEALTH_MAX_CONCURRENT));
 
         loop {

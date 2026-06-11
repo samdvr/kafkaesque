@@ -246,8 +246,8 @@ pub const DEFAULT_SESSION_TIMEOUT_CHECK_INTERVAL_SECS: u64 = 10;
 /// enough to absorb network latency and write time.
 ///
 /// With 55s: on a 60s lease the cache is only trusted for ~5s after each
-/// Raft verify, narrowing the split-brain write window described in audit
-/// B4. The previous 25s value gave ~35s of cache trust per lease, which on
+/// Raft verify, narrowing the split-brain write window. A larger value
+/// like 25s would give ~35s of cache trust per lease, which on
 /// a paused-then-resumed broker could overlap an entire failover handoff
 /// before the cache invalidated.
 pub const LEASE_CACHE_REFRESH_THRESHOLD_SECS: u64 = 55;

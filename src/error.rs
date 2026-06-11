@@ -59,7 +59,7 @@ pub enum Error {
 
     /// Authentication required or rejected at the connection level.
     /// Surfaced when SASL is required and the client tries to use a
-    /// non-handshake API before completing SaslAuthenticate (audit S1).
+    /// non-handshake API before completing SaslAuthenticate.
     #[error("Authentication required: {0}")]
     Authentication(String),
 }

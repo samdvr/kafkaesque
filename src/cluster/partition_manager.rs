@@ -213,7 +213,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
 
     /// The local rebalance coordinator, if fast failover or auto-balancing
     /// is enabled. Used by the cluster handler to wire broker heartbeats
-    /// from the Raft state machine into the failure detector (audit P1-7).
+    /// from the Raft state machine into the failure detector.
     pub fn rebalance_coordinator(&self) -> Option<&Arc<RebalanceCoordinator>> {
         self.rebalance_coordinator.as_ref()
     }
@@ -380,8 +380,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                                 // pass so we can close them after dropping the
                                 // map. Just removing entries leaves SlateDB
                                 // memtables, S3 connections, and background
-                                // compaction tasks alive on the dead writer
-                                // (B10 in audit.md).
+                                // compaction tasks alive on the dead writer.
                                 let mut owned: Vec<(PartitionKey, Option<Arc<PartitionStore>>)> =
                                     Vec::new();
                                 for entry in partition_states.iter() {
@@ -499,8 +498,8 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                             lease_cache.remove(&(Arc::clone(&topic), partition));
                             // Remove from partition_states to reject further operations,
                             // and close the underlying SlateDB handle so its memtables,
-                            // S3 connections, and background tasks are released
-                            // (B10 in audit.md). Without this the new owner relies
+                            // S3 connections, and background tasks are released.
+                            // Without this the new owner relies
                             // on SlateDB-internal fencing while we leak resources.
                             if let Some((key, prev_state)) =
                                 partition_states.remove(&(Arc::clone(&topic), partition))
@@ -927,8 +926,8 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         // Reject reads in zombie mode for the same reason produce does:
         // we've lost cluster coordination, so any data we serve may already
         // belong to another owner who has advanced the log. Without this
-        // check fetch returned stale data while produce was already
-        // rejecting (B10 in audit.md).
+        // check fetch would return stale data while produce was already
+        // rejecting.
         if self.is_zombie() {
             return Err(SlateDBError::NotOwned {
                 topic: topic.to_string(),

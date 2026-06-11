@@ -26,7 +26,7 @@ use super::response::*;
 use super::versions;
 
 /// Outcome of a SaslAuthenticate exchange that the dispatcher uses to
-/// decide whether to open the connection's auth gate (audit P0-3).
+/// decide whether to open the connection's auth gate.
 ///
 /// - `complete = true` means the handshake is finished and the gate
 ///   should flip. `principal` is the authenticated identity, if any.
@@ -52,7 +52,7 @@ pub struct RequestContext {
     pub request_id: uuid::Uuid,
     /// Authenticated principal in `User:<name>` form. Defaults to
     /// `User:ANONYMOUS` for connections that have not (yet) completed
-    /// SaslAuthenticate. The cluster-handler authorizer (audit S2) keys ACL
+    /// SaslAuthenticate. The cluster-handler authorizer keys ACL
     /// decisions against this value.
     pub principal: String,
     /// Client host string used for ACL host matching. Mirrors the IP from
@@ -395,13 +395,13 @@ pub trait Handler: Send + Sync {
     /// Whether SASL must complete before this connection can issue any
     /// non-handshake API. Default `false` so existing handlers / tests are
     /// unchanged. The Kafkaesque cluster handler returns
-    /// `ClusterConfig::sasl_required` (audit S1).
+    /// `ClusterConfig::sasl_required`.
     fn sasl_required(&self) -> bool {
         false
     }
 
-    /// Read out the post-authenticate state for a connection, if any
-    /// (audit P0-3 SCRAM). Multi-step mechanisms — SCRAM-SHA-256 is the
+    /// Read out the post-authenticate state for a connection, if any.
+    /// Multi-step mechanisms — SCRAM-SHA-256 is the
     /// one we ship — return `error_code = None` for *intermediate*
     /// challenges as well as final successes; the dispatcher needs to
     /// know which so it doesn't open the auth gate after just the first

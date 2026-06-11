@@ -78,7 +78,7 @@ use crate::constants::{DEFAULT_MAX_CONNECTIONS_PER_IP, DEFAULT_MAX_TOTAL_CONNECT
 #[cfg(feature = "tls")]
 use self::tls::TlsConfig;
 
-/// RAII guard for the per-connection bookkeeping counters (audit P1-13).
+/// RAII guard for the per-connection bookkeeping counters.
 ///
 /// Decrements `active_connections` and the per-IP entry on drop, which
 /// runs even if the connection's task panics. Without this guard a panic
@@ -370,7 +370,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                         };
                         let mut conn = ClientConnection::new_with_rate_limiter(stream, addr, rate_limiter);
                         conn.set_max_message_size(max_message_size);
-                        // Audit S1 scaffold: arm the per-connection SASL gate
+                        // Arm the per-connection SASL gate
                         // so non-handshake API keys are refused until
                         // SaslAuthenticate succeeds. Default-off; opt in via
                         // ClusterConfig::sasl_required.

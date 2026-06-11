@@ -1,6 +1,6 @@
 //! Distributed Systems Test Suite
 //!
-//! This module addresses test coverage gaps identified in the distributed systems audit:
+//! This module covers distributed systems test gaps:
 //!
 //! 1. **Multi-broker partition assignment tests** - Validates consistent hash partitioning
 //! 2. **Network partition simulation** - Jepsen-style fault injection tests

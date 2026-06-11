@@ -42,11 +42,11 @@ fn next_port() -> u16 {
 /// Create a test configuration for a Raft node.
 ///
 /// Uses a freshly-generated `tempfile::TempDir` for the on-disk WAL and
-/// snapshot dirs (audit P0-6). The directory is leaked into the system temp
+/// snapshot dirs. The directory is leaked into the system temp
 /// folder via `into_path()` so its lifetime isn't tied to this function's
 /// scope — tests still find their files but no two test invocations
-/// collide. Without this, the B1 WAL persistence (committed vote and log
-/// entries) made every test after the first see leftover state and panic
+/// collide. Without this, the WAL persistence (committed vote and log
+/// entries) would make every test after the first see leftover state and panic
 /// in `initialize_cluster` with "not allowed to initialize due to current
 /// raft state".
 fn test_config(node_id: u64, port: u16) -> RaftConfig {
@@ -1625,7 +1625,7 @@ async fn test_consumer_group_validate_member_for_commit() {
         .await
         .unwrap();
 
-    // Audit P1-9: validate_member_for_commit now also requires the group
+    // validate_member_for_commit also requires the group
     // to be Stable. A fresh JoinGroup leaves the group in PreparingRebalance
     // until SyncGroup lands; drive the group through one cycle so Success
     // is reachable.

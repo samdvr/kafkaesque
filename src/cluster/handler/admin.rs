@@ -38,7 +38,7 @@ pub(super) async fn handle_create_topics(
             continue;
         }
 
-        // Audit S2: CreateTopics requires `Create` on the topic resource.
+        // CreateTopics requires `Create` on the topic resource.
         // Real Kafka also accepts cluster-level Create — for simplicity we
         // require it on the topic itself; super-users bypass via the
         // authorizer.
@@ -139,9 +139,9 @@ pub(super) async fn handle_delete_topics(
             continue;
         }
 
-        // Audit S2: DeleteTopics requires `Delete` on the topic resource.
+        // DeleteTopics requires `Delete` on the topic resource.
         // Without this check `kcat -X delete-topic` from any host could wipe
-        // every topic — the original concern in audit S2.
+        // every topic.
         let decision = handler
             .authorizer
             .authorize(AuthorizeRequest {

@@ -42,7 +42,7 @@ pub enum CoordinationCommand {
     #[serde(rename = "transfer_v2")]
     TransferDomain(TransferCommand),
 
-    /// ACL domain command (CreateAcls / DeleteAcls — audit S2).
+    /// ACL domain command (CreateAcls / DeleteAcls).
     #[serde(rename = "acl_v1")]
     AclDomain(AclCommand),
 }

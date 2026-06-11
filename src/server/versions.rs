@@ -24,8 +24,8 @@
 //! Each row reflects what the parsers and encoders actually understand on the
 //! wire. The `min_version` is set so that older clients get a clean
 //! `UnsupportedVersion` from `ApiVersions` rather than a silent
-//! mis-parse. (Audit P2-1: previously the produce/fetch parsers read v3+/v4+
-//! fields unconditionally and v0–v2 clients tripped a `ParsingError`.)
+//! mis-parse. Without this, the produce/fetch parsers (which read v3+/v4+
+//! fields unconditionally) would trip a `ParsingError` on v0–v2 clients.
 //!
 //! | API              | Min | Max | Why min isn't 0                                |
 //! |------------------|-----|-----|------------------------------------------------|
@@ -93,7 +93,7 @@ impl SupportedVersion {
 ///
 /// This is the standard set of API versions that Kafkaesque supports.
 /// The `min_version` for Produce and Fetch is clamped to match what the
-/// parsers actually decode (audit P2-1). Handlers may override this in their
+/// parsers actually decode. Handlers may override this in their
 /// ApiVersions response if needed.
 pub const SUPPORTED_VERSIONS: &[SupportedVersion] = &[
     // Produce v3 added the leading nullable `transactional_id` field that the

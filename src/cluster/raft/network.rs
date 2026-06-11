@@ -2,10 +2,10 @@
 //!
 //! This module provides the network layer for Raft RPCs between nodes.
 //! We use a simple TCP-based transport with bincode serialization. Every
-//! frame is HMAC-SHA256 signed (audit S3) — see `super::auth` for the wire
+//! frame is HMAC-SHA256 signed — see `super::auth` for the wire
 //! format and key plumbing.
 //!
-//! When `RaftConfig.tls` is `Some` (audit P0-5), the underlying TCP socket
+//! When `RaftConfig.tls` is `Some`, the underlying TCP socket
 //! is wrapped in a rustls `TlsStream` before any frame bytes flow. The
 //! HMAC layer remains in place on top — TLS adds peer identity (mTLS) and
 //! encryption, HMAC adds replay/integrity defense and stays cheap to verify
@@ -337,8 +337,8 @@ pub struct RaftNetworkFactoryImpl {
     nodes: Arc<RwLock<BTreeMap<RaftNodeId, String>>>,
     /// HMAC keys used to sign all outbound traffic.
     auth_keys: Arc<RaftAuthKeys>,
-    /// Optional mTLS config used to wrap every outbound socket (audit
-    /// P0-5). Cloned into each `RaftNetworkConnection` at construction so
+    /// Optional mTLS config used to wrap every outbound socket.
+    /// Cloned into each `RaftNetworkConnection` at construction so
     /// per-connection TLS sessions can be cached alongside the TCP socket.
     tls: Option<RaftTlsConfig>,
 }
@@ -356,7 +356,7 @@ impl RaftNetworkFactoryImpl {
 
     /// Create a new network factory with HMAC keys and optional TLS.
     /// When `tls` is `Some`, every outbound Raft connection will perform
-    /// a TLS handshake against the peer's listener (audit P0-5).
+    /// a TLS handshake against the peer's listener.
     pub fn with_keys_and_tls(
         auth_keys: Arc<RaftAuthKeys>,
         tls: Option<RaftTlsConfig>,
@@ -416,12 +416,11 @@ pub async fn forward_client_write_with_term(
         let data = postcard::to_stdvec(&message)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        // Send length-prefixed, HMAC-signed message (audit S3).
+        // Send length-prefixed, HMAC-signed message.
         write_rpc_frame(&mut stream, auth_keys, false, &data).await?;
 
         // Read response (length-prefixed and HMAC-verified, with size cap to
-        // bound memory and close the unauthenticated-allocation hole — audit
-        // S3+S4).
+        // bound memory and close the unauthenticated-allocation hole).
         let (_purpose, response_buf) = read_rpc_frame(&mut stream, auth_keys).await?;
 
         // Deserialize response
@@ -618,7 +617,7 @@ pub struct RaftNetworkConnection {
     circuit_breaker: tokio::sync::Mutex<CircuitBreakerState>,
     /// HMAC keys used to sign every outbound frame and verify responses.
     auth_keys: Arc<RaftAuthKeys>,
-    /// Optional mTLS configuration (audit P0-5). When `Some`, every
+    /// Optional mTLS configuration. When `Some`, every
     /// reconnect performs a TLS handshake before the first frame flows.
     tls: Option<RaftTlsConfig>,
 }
@@ -650,8 +649,8 @@ impl RaftNetworkConnection {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         // Drive retries through the unified retry framework so RPC backoff
-        // matches the rest of the codebase's jittered exponential schedule
-        // (audit P1-11). Constants below preserve the prior behavior:
+        // matches the rest of the codebase's jittered exponential schedule.
+        // Constants below preserve the prior behavior:
         // 3 retries, 100ms→2s, jitter — the framework's `Retryable` adds
         // jitter automatically. The circuit breaker still wraps the loop:
         // a failed final attempt records a failure on the per-target
@@ -738,7 +737,7 @@ impl RaftNetworkConnection {
         data: &[u8],
         auth_keys: &RaftAuthKeys,
     ) -> Result<RaftRpcResponse, std::io::Error> {
-        // Send signed, length-prefixed message (audit S3).
+        // Send signed, length-prefixed message.
         write_rpc_frame(stream, auth_keys, false, data).await?;
 
         // Read signed response (length-prefixed, HMAC-verified, size-capped).
@@ -846,7 +845,7 @@ pub struct RaftRpcServer {
     runtime: tokio::runtime::Handle,
     /// HMAC keys used to verify every inbound frame and sign every response.
     auth_keys: Arc<RaftAuthKeys>,
-    /// Optional mTLS configuration (audit P0-5). When `Some`, every
+    /// Optional mTLS configuration. When `Some`, every
     /// accepted socket performs a TLS handshake (with required client
     /// cert) before any frame bytes are read. HMAC framing still applies
     /// on top of the TLS session.
@@ -854,7 +853,7 @@ pub struct RaftRpcServer {
 }
 
 impl RaftRpcServer {
-    /// Create a new RPC server with optional mTLS (audit P0-5). Pass
+    /// Create a new RPC server with optional mTLS. Pass
     /// `tls = None` for the legacy plain-TCP behavior.
     pub fn with_tls(
         raft: Arc<openraft::Raft<TypeConfig>>,
@@ -951,8 +950,8 @@ impl RaftRpcServer {
         // Deserialize message
         let message: RaftRpcMessage = postcard::from_bytes(&msg_buf)?;
 
-        // Cross-check the wire purpose tag against the deserialized variant
-        // (audit S3). Without this, a holder of the join token could submit
+        // Cross-check the wire purpose tag against the deserialized variant.
+        // Without this, a holder of the join token could submit
         // arbitrary `ClientWriteWithTerm` commands; with the check, the join
         // key only opens the door for `JoinCluster`.
         let is_join_message = matches!(message, RaftRpcMessage::JoinCluster { .. });
@@ -1076,7 +1075,7 @@ impl RaftRpcServer {
             }
         };
 
-        // Serialize and send signed response (audit S3).
+        // Serialize and send signed response.
         let response_data = postcard::to_stdvec(&response)?;
         write_rpc_frame(&mut stream, &auth_keys, false, &response_data).await?;
 

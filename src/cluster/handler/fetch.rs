@@ -13,7 +13,7 @@ use super::SlateDBClusterHandler;
 use crate::cluster::coordinator::validate_topic_name;
 
 /// Total bytes of records contained in `responses`. Used by the long-poll
-/// loop to compare against the client's `min_bytes` (audit P0-7).
+/// loop to compare against the client's `min_bytes`.
 fn total_record_bytes(responses: &[FetchTopicResponse]) -> usize {
     responses
         .iter()
@@ -25,8 +25,8 @@ fn total_record_bytes(responses: &[FetchTopicResponse]) -> usize {
 
 /// Handle a fetch request.
 ///
-/// Implements Kafka's `max_wait_ms` / `min_bytes` long-poll semantics
-/// (audit P0-7). Without this, consumers spin at full request rate when no
+/// Implements Kafka's `max_wait_ms` / `min_bytes` long-poll semantics.
+/// Without this, consumers would spin at full request rate when no
 /// data is available — driving CPU and S3 GET cost linearly with consumer
 /// count regardless of throughput. Producers signal data availability via
 /// `SlateDBClusterHandler::hwm_advanced`; this handler waits on that notify
@@ -45,7 +45,7 @@ pub(super) async fn handle_fetch(
         "FETCH request received"
     );
 
-    // Audit P1-4: time the full fetch path including the long-poll wait so
+    // Time the full fetch path including the long-poll wait so
     // the pre-existing FETCH_DURATION histogram populates with real data.
     // Status is per-topic (one batch may span many topics) so we tag with
     // `_multi` on multi-topic requests, matching record_fetch_latency's
@@ -145,7 +145,7 @@ async fn collect_fetch(
             continue;
         }
 
-        // Audit S2: Fetch requires Read on the topic resource.
+        // Fetch requires Read on the topic resource.
         if handler
             .authorizer
             .authorize(crate::cluster::authorizer::AuthorizeRequest {
@@ -322,7 +322,7 @@ mod tests {
     use bytes::Bytes;
 
     // ========================================================================
-    // total_record_bytes (P0-7 long-poll helper)
+    // total_record_bytes (long-poll helper)
     // ========================================================================
 
     #[test]

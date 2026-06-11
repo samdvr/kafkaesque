@@ -90,7 +90,7 @@ pub(super) async fn handle_produce(
                 continue; // Skip invalid topics silently for acks=0
             }
 
-            // Audit S2: Produce requires Write on the topic. acks=0 returns
+            // Produce requires Write on the topic. acks=0 returns
             // no response, so a Denied check just drops silently — same as
             // an invalid topic on this path.
             if handler
@@ -145,8 +145,8 @@ pub(super) async fn handle_produce(
                     .await
                     .is_ok()
                     {
-                        // Wake long-poll fetches even on the acks=0 path
-                        // (audit P0-7). Without this, consumers using
+                        // Wake long-poll fetches even on the acks=0 path.
+                        // Without this, consumers using
                         // min_bytes>0 only see records after `max_wait_ms`
                         // expires.
                         hwm_advanced.notify_waiters();
@@ -190,7 +190,7 @@ pub(super) async fn handle_produce(
             continue;
         }
 
-        // Audit S2: Produce requires Write on the topic resource. Denied
+        // Produce requires Write on the topic resource. Denied
         // requests get TopicAuthorizationFailed for every partition so the
         // client sees a clean per-partition response (matches Kafka).
         if handler

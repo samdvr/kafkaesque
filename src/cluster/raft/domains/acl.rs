@@ -1,4 +1,4 @@
-//! ACL domain for the Raft state machine (audit S2).
+//! ACL domain for the Raft state machine.
 //!
 //! Implements deny-by-default authorization for the Kafka API. ACLs are
 //! replicated through Raft so every broker sees the same rule set, and the

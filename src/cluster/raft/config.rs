@@ -92,14 +92,14 @@ pub struct RaftConfig {
     /// If a proposal cannot acquire a slot within this time, it fails with an error.
     pub proposal_timeout: Duration,
 
-    /// HMAC keys used to authenticate every Raft RPC frame (audit S3).
+    /// HMAC keys used to authenticate every Raft RPC frame.
     ///
     /// Loaded from `RAFT_CLUSTER_SECRET` (steady-state traffic) and
     /// `RAFT_JOIN_TOKEN` (`JoinCluster` requests). When neither is set the
     /// Raft port runs unauthenticated — see [`RaftAuthKeys`].
     pub auth_keys: Arc<RaftAuthKeys>,
 
-    /// Optional mTLS configuration for the Raft port (audit P0-5). When
+    /// Optional mTLS configuration for the Raft port. When
     /// `Some`, `RaftRpcServer` requires client certs that chain to the
     /// configured CA, and outbound Raft connections present this broker's
     /// cert. HMAC framing remains in place on top — TLS adds peer
@@ -111,7 +111,7 @@ pub struct RaftConfig {
     /// Tolerance buffer applied to lease and member-expiry checks to absorb
     /// leader/broker clock skew. The expiry sweep treats `now - tolerance`
     /// as the effective timestamp, so a leader whose clock jumps slightly
-    /// forward doesn't mass-expire valid leases. Audit P2-5.
+    /// forward doesn't mass-expire valid leases.
     pub clock_skew_tolerance_ms: u64,
 }
 
@@ -317,9 +317,9 @@ impl RaftConfig {
             max_partitions_per_topic: config.max_partitions_per_topic,
             snapshot_threshold: config.raft_snapshot_threshold,
             // Load HMAC keys from env. Default-off (legacy behavior); when set,
-            // every Raft RPC must present a matching signature (audit S3).
+            // every Raft RPC must present a matching signature.
             auth_keys: Arc::new(RaftAuthKeys::from_env()),
-            // Load mTLS config from env (audit P0-5). When the three
+            // Load mTLS config from env. When the three
             // RAFT_TLS_* vars are set, the Raft port runs TLS on top of
             // HMAC framing. Errors propagate out so a half-configured
             // cluster fails loudly rather than silently dropping mTLS.

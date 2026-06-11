@@ -1,10 +1,10 @@
-//! Authentication for the Raft RPC port (audit S3).
+//! Authentication for the Raft RPC port.
 //!
 //! Without this, the Raft port is plaintext bincode that any host with network
 //! reachability can speak — `JoinCluster` adds the caller as a learner and
 //! promotes them to voter, and the legacy `ClientWrite` accepts arbitrary
-//! coordination commands. Even with the size cap added in S4, the protocol
-//! itself trusts every byte.
+//! coordination commands. Even with the size cap, the protocol
+//! itself would trust every byte.
 //!
 //! This module wraps every Raft RPC frame with an HMAC-SHA256 over the
 //! payload. Two keys are supported:
@@ -61,7 +61,7 @@ pub(crate) const FRAME_HEADER_LEN: usize = PURPOSE_LEN + HMAC_LEN;
 /// we will allocate for. The wire format is `[u32 length][purpose][hmac][bincode]`,
 /// and the length field is attacker-controlled on the Raft listener — without
 /// this cap a single byte sequence on the Raft listener could request up to
-/// 4 GiB of allocation per connection (audit S4).
+/// 4 GiB of allocation per connection.
 ///
 /// 64 MiB comfortably covers an `InstallSnapshot` chunk (the largest legitimate
 /// message) plus serialization overhead while bounding peak memory under

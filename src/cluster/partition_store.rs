@@ -93,7 +93,7 @@ pub struct ProducerState {
     /// First sequence number of the most recent successfully appended batch.
     /// Used together with `last_base_offset` to recognize a duplicate retry
     /// of *the same* batch and reply with success-and-original-offset, as
-    /// Kafka's idempotent-producer contract requires (audit B11).
+    /// Kafka's idempotent-producer contract requires.
     /// Not persisted: in-memory only, populated on append.
     pub last_first_sequence: i32,
     /// Base offset assigned to the most recent successfully appended batch.
@@ -467,7 +467,7 @@ impl PartitionStore {
 
         // Idempotency check: detects and rejects duplicate or out-of-order messages.
         // For *exact-replay* duplicates we return the original base_offset (success)
-        // rather than DuplicateSequence (audit B11) so retries that the network ate
+        // rather than DuplicateSequence so retries that the network ate
         // don't break the producer.
         let mut idempotent_dup_offset: Option<i64> = None;
         if let Some(producer_info) = parse_producer_info(records)
@@ -494,7 +494,7 @@ impl PartitionStore {
 
             // Higher epoch indicates new producer incarnation. Kafka's contract
             // is that the producer resets its sequence to 0 on epoch bump, so
-            // we MUST require first_sequence == 0 here (audit B11). Without
+            // we MUST require first_sequence == 0 here. Without
             // this gate, a higher-epoch batch with an arbitrary replayed
             // sequence would be accepted as fresh.
             if producer_info.producer_epoch > state.producer_epoch {
@@ -634,7 +634,7 @@ impl PartitionStore {
         let key = encode_record_key(base_offset);
 
         // Pull producer-state metadata up-front so we can atomically commit it
-        // alongside the record batch (audit B11). Persisting after the batch
+        // alongside the record batch. Persisting after the batch
         // write let the two diverge: a persist failure either rejected an
         // already-committed append or silently succeeded non-durably, both of
         // which break idempotency across restart.
@@ -716,7 +716,7 @@ impl PartitionStore {
 
         // Update producer state cache after successful atomic write. The
         // producer-state key was already written in the same WriteBatch
-        // above, so we don't need a separate persist call (audit B11).
+        // above, so we don't need a separate persist call.
         if let Some((producer_info, last_sequence, _, _)) = pending_producer_state {
             // Update in-memory cache
             self.producer_states.insert(
@@ -1403,11 +1403,10 @@ impl PartitionStoreBuilder {
             "SlateDB settings configured for backpressure"
         );
 
-        // Audit P2-12: previously this opened SlateDB inside `spawn_blocking
-        // → Handle::current().block_on(async)`. SlateDB 0.10's open path is
-        // already async-only and tokio-friendly, so the round-trip through a
-        // blocking pool just wasted a worker. Run the open inline; the slow
-        // step (object-store metadata I/O) yields back to the runtime.
+        // SlateDB 0.10's open path is already async-only and tokio-friendly, so
+        // a round-trip through a blocking pool would just waste a worker. Run
+        // the open inline; the slow step (object-store metadata I/O) yields
+        // back to the runtime.
         let open_future = async move {
             let object_path = ObjectPath::from(path_for_task.as_str());
             let db = Db::builder(object_path, object_store_for_task)

@@ -515,7 +515,7 @@ pub struct ClusterConfig {
     /// Default: None
     pub sasl_users_file: Option<String>,
 
-    // --- Authorization (audit S2) ---
+    // --- Authorization ---
     /// Whether ACL enforcement is enabled. When false, the cluster handler
     /// uses an `AllowAll` authorizer (legacy / dev posture). When true, every
     /// request goes through the ACL state machine.
@@ -526,7 +526,7 @@ pub struct ClusterConfig {
     /// Whether to deny requests that don't match any ACL binding. Only
     /// consulted when `acl_enabled` is true. `true` is the production
     /// posture (deny-by-default — Kafka's standard behavior); `false`
-    /// allows everything that isn't explicitly denied (audit-only mode).
+    /// allows everything that isn't explicitly denied.
     ///
     /// Default: true
     pub acl_deny_by_default: bool,
@@ -538,7 +538,7 @@ pub struct ClusterConfig {
     pub super_users: Vec<String>,
 
     /// Optional path to a JSON file containing ACL bindings to load at
-    /// startup (audit S2). The leader writes them via Raft so they replicate
+    /// startup. The leader writes them via Raft so they replicate
     /// to every node. The format is a JSON array of `AclBinding` records.
     ///
     /// This is operator-friendly bootstrap; future iterations will accept the
@@ -548,7 +548,7 @@ pub struct ClusterConfig {
     /// Default: None
     pub acl_bootstrap_file: Option<String>,
 
-    /// Whether TLS is enabled on the Kafka client port (audit P0-4).
+    /// Whether TLS is enabled on the Kafka client port.
     /// When true, `tls_cert_path` and `tls_key_path` must be set; the
     /// `tls` Cargo feature must be compiled in or startup refuses.
     ///
@@ -688,7 +688,7 @@ pub struct ClusterConfig {
     ///
     /// Lease/membership expiry uses the leader's wall-clock; subtracting this
     /// tolerance from the comparison prevents a leader whose clock jumped
-    /// forward from mass-expiring valid leases. Audit P2-5.
+    /// forward from mass-expiring valid leases.
     ///
     /// Default: 5000 ms.
     pub clock_skew_tolerance_ms: u64,
@@ -1260,8 +1260,8 @@ impl ClusterConfig {
         // ADVERTISED_HOST is the address brokers return in Metadata responses;
         // every Kafka client uses it to reconnect for produce/fetch. If we
         // bind to 0.0.0.0 we MUST be told (or be able to derive) a routable
-        // address — falling back to "127.0.0.1" silently is what made the K8s
-        // deployment unusable for in-cluster clients (see audit F-K8S-02).
+        // address — falling back to "127.0.0.1" silently makes the K8s
+        // deployment unusable for in-cluster clients.
         //
         // Resolution order when ADVERTISED_HOST is unset:
         //   1. If HOST is a concrete address (not 0.0.0.0), use it.
@@ -1461,7 +1461,7 @@ impl ClusterConfig {
 
         let sasl_users_file = std::env::var("SASL_USERS_FILE").ok();
 
-        // Authorization configuration (audit S2)
+        // Authorization configuration
         let acl_enabled = std::env::var("ACL_ENABLED")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
@@ -1479,7 +1479,7 @@ impl ClusterConfig {
 
         let acl_bootstrap_file = std::env::var("KAFKAESQUE_ACL_BOOTSTRAP_FILE").ok();
 
-        // TLS for Kafka client port (audit P0-4)
+        // TLS for Kafka client port
         let tls_enabled = std::env::var("TLS_ENABLED")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);

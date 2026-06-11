@@ -7,7 +7,7 @@
 //! - **Group**: Consumer group coordination, assignments, offsets
 //! - **Producer**: Producer ID allocation, idempotency state
 //! - **Transfer**: Fast failover, batch partition transfers
-//! - **Acl**: Authorization bindings (audit S2)
+//! - **Acl**: Authorization bindings
 //!
 //! Each domain provides:
 //! - Command enum defining operations

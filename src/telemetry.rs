@@ -125,7 +125,7 @@ pub fn init_logging(format: LogFormat) -> Result<(), Box<dyn std::error::Error +
 
     match format {
         LogFormat::Json => {
-            // Production-grade JSON output for log aggregators (audit P1-4).
+            // Production-grade JSON output for log aggregators.
             // Each event is a single line of structured JSON, span-flattened
             // so the existing `tracing::instrument` fields land on the same
             // record as the log line — no parsing dance for downstream tools.

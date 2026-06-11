@@ -418,7 +418,7 @@ pub static CIRCUIT_BREAKER_TRIPS: Lazy<IntCounterVec> = Lazy::new(|| {
 });
 
 // =============================================================================
-// Distributed Systems Observability Metrics (Audit Section 7.2)
+// Distributed Systems Observability Metrics
 // =============================================================================
 
 /// Raft query latency histogram.
@@ -1059,7 +1059,7 @@ pub fn record_failover_duration(reason: &str, duration_secs: f64) {
 }
 
 // =============================================================================
-// Distributed Systems Metrics Helper Functions (Audit Section 7.2)
+// Distributed Systems Metrics Helper Functions
 // =============================================================================
 
 /// Record a Raft query latency.
@@ -1287,7 +1287,7 @@ pub fn init_metrics() {
     let _ = &*CLOCK_SKEW_ESTIMATE;
     let _ = &*MAX_CLOCK_SKEW;
     let _ = &*CLOCK_SKEW_WARNINGS;
-    // Distributed systems observability metrics (Audit Section 7.2)
+    // Distributed systems observability metrics
     let _ = &*RAFT_QUERY_DURATION;
     let _ = &*SLATEDB_FLUSH_DURATION;
     let _ = &*REBALANCE_STALE_DECISIONS;
@@ -3574,7 +3574,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Distributed Systems Observability Metrics Tests (Audit Section 7.2)
+    // Distributed Systems Observability Metrics Tests
     // ========================================================================
 
     #[test]

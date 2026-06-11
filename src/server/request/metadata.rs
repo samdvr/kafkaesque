@@ -22,7 +22,7 @@ pub fn parse_metadata_request(
         return Ok((s, MetadataRequestData { topics: None }));
     }
 
-    // Audit: enforce the same array-size cap that `parser::parse_array` uses
+    // Enforce the same array-size cap that `parser::parse_array` uses
     // (MAX_PROTOCOL_ARRAY_SIZE = 100k). Without this gate a remote attacker
     // could send `topic_count = i32::MAX` and force a 2 GiB Vec allocation
     // before any data is read.

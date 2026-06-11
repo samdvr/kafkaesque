@@ -14,7 +14,7 @@ use super::error::{SlateDBError, SlateDBResult};
 
 /// Wrap a raw `ObjectStore` with the configured `cluster_id` as a top-level
 /// prefix so two Kafkaesque clusters pointed at the same bucket/path can't
-/// interleave SlateDB files (audit S7). When `cluster_id` is empty we keep
+/// interleave SlateDB files. When `cluster_id` is empty we keep
 /// the legacy unprefixed layout for backwards compatibility but warn loudly.
 fn wrap_with_cluster_prefix(
     store: Arc<dyn ObjectStore>,
@@ -24,7 +24,7 @@ fn wrap_with_cluster_prefix(
         warn!(
             "cluster_id is empty; object-store layout is unscoped. Two clusters \
              sharing this bucket will silently corrupt each other. Set \
-             CLUSTER_ID to a unique value (audit S7)."
+             CLUSTER_ID to a unique value."
         );
         return store;
     }
@@ -78,7 +78,7 @@ pub fn create_object_store(config: &ClusterConfig) -> SlateDBResult<Arc<dyn Obje
             if let Some(ep) = endpoint {
                 // Allow plain HTTP only when the operator has explicitly opted
                 // in via ALLOW_HTTP_S3=true. Otherwise S3 credentials would
-                // transit cleartext to a custom endpoint (audit S9). Common
+                // transit cleartext to a custom endpoint. Common
                 // local dev with `http://minio:9000` requires the opt-in.
                 let allow_http = std::env::var("ALLOW_HTTP_S3")
                     .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_create_s3_store_with_credentials() {
-        // Test S3 builder path with credentials. Use HTTPS so the audit-S9
+        // Test S3 builder path with credentials. Use HTTPS so the
         // plain-HTTP guard doesn't reject the builder before we get here.
         let config = ClusterConfig {
             object_store: ObjectStoreType::S3 {
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_s3_store_rejects_plain_http_endpoint_by_default() {
-        // Audit S9: a plain-HTTP custom endpoint must be refused unless
+        // A plain-HTTP custom endpoint must be refused unless
         // ALLOW_HTTP_S3 is explicitly set, so credentials don't transit
         // cleartext on a default deploy.
         let config = ClusterConfig {

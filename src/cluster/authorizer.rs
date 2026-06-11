@@ -1,4 +1,4 @@
-//! Request authorization surface (audit S2).
+//! Request authorization surface.
 //!
 //! Sits between `dispatch_request_common` and the handler implementations.
 //! For every Kafka API key we map the request to one or more

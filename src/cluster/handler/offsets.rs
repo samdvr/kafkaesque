@@ -94,7 +94,7 @@ pub(super) async fn handle_offset_commit(
 ) -> OffsetCommitResponseData {
     use crate::cluster::error::HeartbeatResult;
 
-    // Audit S2: OffsetCommit requires Read on the Group resource (per
+    // OffsetCommit requires Read on the Group resource (per
     // Kafka). Topic-level Read is also required and is enforced inline
     // per topic below.
     if handler
@@ -278,7 +278,7 @@ pub(super) async fn handle_offset_commit(
             continue;
         }
 
-        // Audit S2: OffsetCommit also requires Read on each topic.
+        // OffsetCommit also requires Read on each topic.
         if handler
             .authorizer
             .authorize(AuthorizeRequest {
@@ -385,7 +385,7 @@ pub(super) async fn handle_offset_fetch(
     ctx: &RequestContext,
     request: OffsetFetchRequestData,
 ) -> OffsetFetchResponseData {
-    // Audit S2: OffsetFetch requires Describe on the Group resource.
+    // OffsetFetch requires Describe on the Group resource.
     if handler
         .authorizer
         .authorize(AuthorizeRequest {
@@ -450,7 +450,7 @@ pub(super) async fn handle_offset_fetch(
             continue;
         }
 
-        // Audit S2: also require Describe on each topic.
+        // Also require Describe on each topic.
         if handler
             .authorizer
             .authorize(AuthorizeRequest {

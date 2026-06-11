@@ -127,7 +127,7 @@ pub fn validate_batch_crc(batch: &[u8]) -> CrcValidationResult {
 /// For small batches the spawn_blocking + channel overhead exceeds the cost
 /// of computing CRC32C inline. 64 KiB is the empirical break-even — above
 /// it the synchronous path measurably stalls the tokio worker on concurrent
-/// large produces (audit P2-6).
+/// large produces.
 pub const CRC_OFFLOAD_THRESHOLD: usize = 64 * 1024;
 
 /// Validate batch CRC, offloading to `spawn_blocking` when the batch is

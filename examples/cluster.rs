@@ -11,7 +11,7 @@
 //! ```
 //!
 //! The `RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE=true` opt-in is required when
-//! `RAFT_PEERS` is unset to prevent the bootstrap race in audit.md (B8) where
+//! `RAFT_PEERS` is unset to prevent a bootstrap race where
 //! two nodes with no peers configured would each form their own one-node
 //! cluster against the same object store.
 //!
@@ -78,7 +78,7 @@ use kafkaesque::telemetry::{LogFormat, init_logging};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
-/// Audit P0-4: validate TLS configuration before the broker starts.
+/// Validate TLS configuration before the broker starts.
 /// Three failure modes worth distinguishing because the operator-facing
 /// fix is different:
 /// - the binary wasn't built with `--features tls`
@@ -164,7 +164,7 @@ async fn run_broker(
     config: ClusterConfig,
     runtime_handles: kafkaesque::runtime::RuntimeHandles,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Audit P0-4: validate TLS configuration up front. Three failure modes
+    // Validate TLS configuration up front. Three failure modes
     // worth distinguishing because the operator-facing fix is different:
     // (a) `TLS_ENABLED=true` but the binary wasn't built with `--features tls`,
     // (b) `TLS_ENABLED=true` but cert/key paths are missing,
@@ -185,8 +185,7 @@ async fn run_broker(
     );
 
     // Create handler first so the health server can be wired to the real
-    // zombie-mode flag the PartitionManager toggles. Previously the health
-    // probe was wired to a flag nothing ever set (B12 in audit.md).
+    // zombie-mode flag the PartitionManager toggles.
     let handler =
         SlateDBClusterHandler::with_runtime_handles(config.clone(), runtime_handles.clone())
             .await?;
@@ -303,8 +302,8 @@ async fn run_broker(
     );
 
     // Run the Kafka server until SIGTERM/SIGINT, then drain. Without this,
-    // every `kubectl rollout restart` was a data-loss event (B6 in audit.md):
-    // the process died with un-flushed SlateDB writes, un-released partition
+    // every `kubectl rollout restart` would be a data-loss event:
+    // the process would die with un-flushed SlateDB writes, un-released partition
     // leases, and no Raft deregistration.
     let mut sigterm = signal(SignalKind::terminate()).map_err(Box::new)?;
     let mut sigint = signal(SignalKind::interrupt()).map_err(Box::new)?;

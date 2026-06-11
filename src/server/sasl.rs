@@ -248,7 +248,7 @@ impl SaslAuthenticator for PlainAuthenticator {
 
         // Check credentials. The comparison runs against a dummy password
         // when the user is absent so unknown-user vs wrong-password can't be
-        // distinguished by timing (audit S6).
+        // distinguished by timing.
         let users = self.users.read().await;
         let stored = users.get(username);
         let candidate = stored.map(|s| s.as_str()).unwrap_or("");

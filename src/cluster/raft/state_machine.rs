@@ -39,7 +39,7 @@ pub struct CoordinationState {
     #[serde(default)]
     pub transfer_domain: TransferDomainState,
 
-    /// ACL domain state (audit S2).
+    /// ACL domain state.
     ///
     /// `#[serde(default)]` keeps existing snapshots loadable even though
     /// they predate this field — the fall-back is an empty rule set, which
@@ -61,8 +61,8 @@ pub struct CoordinationStateMachine {
     state: Arc<RwLock<CoordinationState>>,
     /// Optional sink fired on every applied broker heartbeat. Used by
     /// the partition manager to feed `RebalanceCoordinator::record_heartbeat`
-    /// so fast failover sees liveness from all brokers, not just self
-    /// (audit P1-7). Set once at startup; read on every apply.
+    /// so fast failover sees liveness from all brokers, not just self.
+    /// Set once at startup; read on every apply.
     heartbeat_hook: Arc<std::sync::OnceLock<HeartbeatHook>>,
 }
 
@@ -78,7 +78,7 @@ impl CoordinationStateMachine {
     /// Install a callback that fires after each broker-heartbeat command
     /// is applied. Idempotent: the hook is set once; subsequent calls are
     /// silently ignored. Used to plumb broker liveness into the local
-    /// `RebalanceCoordinator` for fast failover (audit P1-7).
+    /// `RebalanceCoordinator` for fast failover.
     pub fn set_heartbeat_hook(&self, hook: HeartbeatHook) {
         let _ = self.heartbeat_hook.set(hook);
     }

@@ -69,7 +69,7 @@ pub struct RaftStore {
     /// When `Some`, every `save_vote`, `append_to_log`, `purge_logs_upto`, and
     /// `delete_conflict_logs_since` writes through to this directory and
     /// fsyncs before returning, so a crash followed by restart resumes with
-    /// the same vote and log prefix (audit B1). When `None`, the store is
+    /// the same vote and log prefix. When `None`, the store is
     /// in-memory only — used by unit tests that don't need durability.
     log_dir: Option<PathBuf>,
 }
@@ -94,8 +94,8 @@ impl RaftStore {
         }
     }
 
-    /// Create a new store backed by an on-disk WAL for vote and log entries
-    /// (audit B1). The WAL is created on first write; `recover_from_disk()`
+    /// Create a new store backed by an on-disk WAL for vote and log entries.
+    /// The WAL is created on first write; `recover_from_disk()`
     /// must be called before `RaftNode::new` proceeds in order to repopulate
     /// in-memory state from any existing WAL files.
     pub fn new_with_log_dir(
@@ -118,7 +118,7 @@ impl RaftStore {
     }
 
     /// Replay the on-disk WAL into in-memory state. Called once at startup
-    /// before openraft is constructed (audit B1). On a fresh node with no
+    /// before openraft is constructed. On a fresh node with no
     /// WAL files this is a no-op; on a restart it loads the durable vote,
     /// every persisted log entry, and the purged-up-to marker so openraft
     /// resumes with the same state it had at crash time.
@@ -186,8 +186,7 @@ impl RaftStore {
     }
 
     /// Atomically write `bytes` to `path` then fsync the file and its parent
-    /// directory. Used for vote, log entry, and purged-marker writes — every
-    /// caller in the audit B1 fix path goes through this.
+    /// directory. Used for vote, log entry, and purged-marker writes.
     fn atomic_write_fsync(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
         if let Some(parent) = path.parent() {
@@ -648,7 +647,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
     async fn save_vote(&mut self, vote: &Vote<RaftNodeId>) -> Result<(), StorageError<RaftNodeId>> {
         // Persist BEFORE updating in-memory state. We must never claim to
         // have voted without it being durable, or two leaders can be elected
-        // for the same term across a crash (audit B1).
+        // for the same term across a crash.
         if let Err(e) = self.persist_vote(vote) {
             return Err(StorageError::IO {
                 source: StorageIOError::write_vote(&e),
@@ -682,7 +681,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
         let mut log = self.log.write().await;
         for entry in entries {
             // Persist BEFORE updating in-memory state, otherwise a crash
-            // between map insert and disk write would lose entries (audit B1).
+            // between map insert and disk write would lose entries.
             if let Err(e) = self.persist_log_entry(&entry) {
                 return Err(StorageError::IO {
                     source: StorageIOError::write_logs(&e),

@@ -69,7 +69,7 @@ impl RaftNode {
         );
 
         // Create components. The Raft store persists vote and log entries
-        // to a local-disk WAL under `raft_log_dir` (audit B1); without
+        // to a local-disk WAL under `raft_log_dir`; without
         // this, a crash within an election could grant two votes for the
         // same term and elect two leaders. The directory is created on
         // first run.

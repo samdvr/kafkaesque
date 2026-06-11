@@ -1,4 +1,4 @@
-# cargo-deny configuration (audit P1-6).
+# cargo-deny configuration.
 #
 # Checked in CI on every PR. Anything new that trips a finding here
 # either gets fixed (preferred) or explicitly waived in this file with

@@ -1,5 +1,5 @@
 //! ACL coordinator surface — wraps `AclCommand` writes and `AclDomainState`
-//! reads (audit S2).
+//! reads.
 //!
 //! This module gives the request handler a typed API: callers don't have to
 //! pattern-match on `CoordinationCommand`/`CoordinationResponse`, and the

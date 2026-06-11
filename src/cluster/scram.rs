@@ -1,4 +1,4 @@
-//! SCRAM-SHA-256 protocol primitives (audit P0-3).
+//! SCRAM-SHA-256 protocol primitives.
 //!
 //! Implements the parts of [RFC 5802](https://www.rfc-editor.org/rfc/rfc5802)
 //! we need to authenticate Kafka clients with `SCRAM-SHA-256`. Compared to
@@ -158,7 +158,7 @@ pub fn handle_client_first(
     let Some(creds) = creds_lookup(&username) else {
         // Don't reveal user existence — produce a server-first as if the
         // user existed, so the client only learns about the failure at the
-        // proof-verification step. Audit S6: avoid user enumeration.
+        // proof-verification step. Avoids user enumeration.
         let dummy = ScramCredentials {
             salt: vec![0u8; SALT_LEN],
             iterations: DEFAULT_ITERATIONS,

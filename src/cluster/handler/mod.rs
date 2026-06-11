@@ -96,16 +96,16 @@ pub struct SlateDBClusterHandler {
     /// Whether SASL must complete before any non-handshake API key is served.
     /// Mirrors `ClusterConfig::sasl_required`. The connection-accept loop
     /// reads this via `Handler::sasl_required` and arms the per-connection
-    /// `AuthGate` (audit S1 scaffold).
+    /// `AuthGate`.
     pub(crate) sasl_required: bool,
 
-    /// Authorizer used by the per-handler ACL checks (audit S2). Always
+    /// Authorizer used by the per-handler ACL checks. Always
     /// `Some` — set to `AllowAllAuthorizer` when ACL enforcement is off so
     /// the call sites don't need to special-case the disabled path.
     pub(crate) authorizer: Arc<dyn crate::cluster::authorizer::Authorizer>,
 
-    /// Broker-wide notify that fires after every successful append (audit
-    /// P0-7). Fetch handlers waiting under `max_wait_ms` / `min_bytes`
+    /// Broker-wide notify that fires after every successful append.
+    /// Fetch handlers waiting under `max_wait_ms` / `min_bytes`
     /// listen on this; producing on any partition wakes them. We use a
     /// single broker-wide notify rather than per-partition because a
     /// long-poll fetch typically targets multiple partitions and selecting
@@ -113,13 +113,13 @@ pub struct SlateDBClusterHandler {
     /// the wakeup just re-checks HWM, which is cheap.
     pub(crate) hwm_advanced: Arc<tokio::sync::Notify>,
 
-    /// SASL provider (audit S1). Holds the in-memory user table when the
+    /// SASL provider. Holds the in-memory user table when the
     /// `sasl` feature is compiled in. `None` when the feature is off.
     #[cfg(feature = "sasl")]
     pub(crate) sasl_provider: Option<Arc<crate::cluster::sasl_provider::SaslProvider>>,
 
-    /// Pending SASL post-authenticate state, keyed by client `SocketAddr`
-    /// (audit P0-3). The cluster handler stashes the result of the most
+    /// Pending SASL post-authenticate state, keyed by client `SocketAddr`.
+    /// The cluster handler stashes the result of the most
     /// recent `handle_sasl_authenticate` here so the connection
     /// dispatcher's `take_sasl_post_auth` can read out whether the
     /// handshake is complete and what principal was authenticated. Used
@@ -198,7 +198,7 @@ impl SlateDBClusterHandler {
         // - Single node (no peers): require explicit RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE
         //   to permit single-node bootstrap. Without this gate, every fresh node
         //   on every host with no RAFT_PEERS happily forms its own one-node
-        //   cluster against the same object-store prefix (B8 in audit.md).
+        //   cluster against the same object-store prefix.
         // - Multi-node: only the node with the lowest broker_id initializes on fresh start
         let should_initialize = if already_initialized {
             info!(
@@ -315,7 +315,7 @@ impl SlateDBClusterHandler {
                 }
 
                 if !joined {
-                    // Per audit B8: best-effort, warn-only joins let a node
+                    // Best-effort, warn-only joins would let a node
                     // run as a non-member of any cluster, then later get
                     // misclassified as a fresh init candidate. Fail closed —
                     // the operator must restart once the cluster is reachable.
@@ -345,9 +345,9 @@ impl SlateDBClusterHandler {
             runtime_handles.control.clone(),
         ));
 
-        // Audit P1-7: install a heartbeat hook on the Raft state machine so
+        // Install a heartbeat hook on the Raft state machine so
         // every applied broker heartbeat refreshes the local failure
-        // detector. Without this, fast-failover relied on lease-TTL expiry
+        // detector. Without this, fast-failover would rely on lease-TTL expiry
         // (~60s) instead of the configured ~2.5s heartbeat budget.
         if let Some(rebalance_coord) = partition_manager.rebalance_coordinator() {
             let rc = rebalance_coord.clone();
@@ -370,7 +370,7 @@ impl SlateDBClusterHandler {
             "SlateDB cluster handler initialized with Raft coordination"
         );
 
-        // Pick the authorizer (audit S2). When ACL enforcement is off we
+        // Pick the authorizer. When ACL enforcement is off we
         // route every request through `AllowAllAuthorizer` so the call sites
         // can be unconditional. When on, the Raft-backed authorizer reads
         // bindings from the local state machine and consults the configured
@@ -473,7 +473,7 @@ impl SlateDBClusterHandler {
     ///
     /// Used to wire the K8s readiness probe to the real flag the
     /// `PartitionManager` toggles. Returning a separate `Arc<AtomicBool>` here
-    /// would yield a flag that is never updated — see B12 in audit.md.
+    /// would yield a flag that is never updated.
     pub fn zombie_state(&self) -> Arc<crate::cluster::zombie_mode::ZombieModeState> {
         self.partition_manager.zombie_state()
     }
@@ -565,7 +565,7 @@ impl SlateDBClusterHandler {
         partition: ProducePartitionData,
         acks: i16,
     ) -> ProducePartitionResponse {
-        // Audit P1-4: time the full per-partition produce path so the
+        // Time the full per-partition produce path so the
         // pre-existing PRODUCE_DURATION histogram is actually populated.
         let start = std::time::Instant::now();
         let response = self.produce_to_partition_inner(topic, partition, acks).await;
@@ -669,8 +669,8 @@ impl SlateDBClusterHandler {
                 let bytes = partition.records.len() as u64;
                 super::metrics::record_produce(topic, partition.partition_index, 1, bytes);
 
-                // Wake any fetch handlers blocked under max_wait_ms / min_bytes
-                // (audit P0-7). Cheap broadcast — `Notify::notify_waiters` is
+                // Wake any fetch handlers blocked under max_wait_ms / min_bytes.
+                // Cheap broadcast — `Notify::notify_waiters` is
                 // a no-op when no one is waiting.
                 self.hwm_advanced.notify_waiters();
 
@@ -712,9 +712,7 @@ impl Handler for SlateDBClusterHandler {
     }
 
     /// Handle SaslHandshake by advertising the SaslProvider's mechanism list
-    /// when the `sasl` feature is built in. Audit S1: previously the broker
-    /// always rejected with `UnsupportedSaslMechanism` because no override
-    /// of this method existed; SASL was only ever scaffolding.
+    /// when the `sasl` feature is built in.
     #[cfg(feature = "sasl")]
     async fn handle_sasl_handshake(
         &self,
@@ -742,9 +740,9 @@ impl Handler for SlateDBClusterHandler {
 
     /// Handle SaslAuthenticate via the SaslProvider when the `sasl` feature
     /// is on. Successful authentication flips the connection-level
-    /// `AuthGate` in `dispatch_request_common` (audit S1).
+    /// `AuthGate` in `dispatch_request_common`.
     ///
-    /// Mechanism is sniffed from the wire bytes (audit P0-3): a SCRAM
+    /// Mechanism is sniffed from the wire bytes: a SCRAM
     /// session in progress for this connection wins; otherwise a leading
     /// `n,,` / `y,,` / `c=` indicates SCRAM, while a leading NUL byte
     /// indicates PLAIN. The post-auth state for this connection is
@@ -975,7 +973,7 @@ impl Handler for SlateDBClusterHandler {
 /// Kafka clients commit to a mechanism in `SaslHandshake` and the server
 /// is expected to remember it for the subsequent `SaslAuthenticate`
 /// requests, but our handler trait is intentionally stateless so we
-/// instead detect the mechanism from the bytes (audit P0-3):
+/// instead detect the mechanism from the bytes:
 ///
 /// - If a SCRAM session is in flight for this connection, the bytes are
 ///   interpreted as SCRAM `client-final-message`, regardless of leading

@@ -227,9 +227,9 @@ impl RaftCoordinator {
         }
 
         // Shut down the underlying Raft node so its RPC server, replication
-        // tasks, and openraft state machine all stop cleanly. Previously this
-        // step was skipped, leaving the Raft RPC server bound and openraft
-        // background tasks running past process exit (B6 in audit.md).
+        // tasks, and openraft state machine all stop cleanly. Skipping this
+        // step would leave the Raft RPC server bound and openraft
+        // background tasks running past process exit.
         if let Err(e) = self.node.shutdown().await {
             tracing::warn!(error = %e, "Raft node shutdown returned an error");
         }

@@ -1,4 +1,4 @@
-//! Optional TLS / mTLS for the Raft RPC port (audit P0-5).
+//! Optional TLS / mTLS for the Raft RPC port.
 //!
 //! HMAC framing (`super::auth`) handles peer authentication today, but mTLS
 //! adds per-broker identities and lets operators rotate without restarting

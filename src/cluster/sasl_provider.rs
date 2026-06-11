@@ -46,7 +46,7 @@ use super::scram::{
 
 /// Per-user record. Stores both the cleartext password (for PLAIN) and
 /// SCRAM-derived credentials (for SCRAM-SHA-256). PLAIN is kept for the
-/// audit-S6 timing-safety story; SCRAM never recovers the cleartext.
+/// timing-safety story; SCRAM never recovers the cleartext.
 struct UserRecord {
     password: String,
     scram_creds: ScramCredentials,
@@ -251,7 +251,7 @@ impl SaslProvider {
         // Look up the user but always run the constant-time comparison —
         // including against a dummy password when the user is absent — so
         // unknown-user vs wrong-password timings can't be distinguished.
-        // Audit S6: don't leak user enumeration via timing or via distinct
+        // Don't leak user enumeration via timing or via distinct
         // log lines either.
         let stored = users.get(username);
         let candidate = stored.map(|r| r.password.as_str()).unwrap_or("");
@@ -489,7 +489,7 @@ mod tests {
 
     /// End-to-end SCRAM-SHA-256 handshake against a SaslProvider — proves
     /// the multi-step session map plumbing in `authenticate_with_session`
-    /// works for the happy path. Audit P0-3.
+    /// works for the happy path.
     #[tokio::test]
     async fn test_authenticate_scram_sha256_roundtrip() {
         use base64::Engine;

@@ -512,7 +512,7 @@ mod tests {
 
         // Exact-replay duplicate of the most recent batch must return the
         // ORIGINAL base_offset as success (Kafka idempotent-producer
-        // contract — see audit B11). Returning DuplicateSequence here would
+        // contract). Returning DuplicateSequence here would
         // poison the producer session.
         let batch2 = create_test_batch(12345, 0, 0, 5);
         let dup_offset = store

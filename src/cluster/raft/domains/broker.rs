@@ -126,7 +126,7 @@ impl BrokerDomainState {
                     // A fenced broker MUST NOT come back via a heartbeat —
                     // its partitions have been transferred to other owners
                     // and resuming as Active would let it write to logs the
-                    // new owners are now appending to (audit B4 split-brain).
+                    // new owners are now appending to (split-brain).
                     // Recovery requires an explicit re-registration.
                     if matches!(broker.status, BrokerStatus::Active) {
                         // already active — no transition required
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_heartbeat_does_not_reactivate_fenced_broker() {
-        // Regression test for audit B4: a fenced broker's partitions have
+        // Regression test: a fenced broker's partitions have
         // already been transferred to other owners. If a heartbeat could
         // bring the broker back to Active, that broker would resume writes
         // to logs the new owners are now appending to (split-brain).
@@ -381,7 +381,7 @@ mod tests {
         // broker's status. Recovery requires explicit re-registration.
         assert!(
             !state.is_active(1),
-            "Heartbeat must not auto-unfence a fenced broker (audit B4)"
+            "Heartbeat must not auto-unfence a fenced broker"
         );
         assert_eq!(state.get(1).unwrap().status, BrokerStatus::Fenced);
     }

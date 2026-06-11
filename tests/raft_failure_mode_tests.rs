@@ -45,9 +45,9 @@ fn next_port() -> u16 {
 
 /// Create a test configuration for a Raft node with fast timeouts.
 ///
-/// Per-test temp dir for the WAL (audit P0-6) — see the matching helper in
+/// Per-test temp dir for the WAL — see the matching helper in
 /// `raft_integration_tests.rs` for why hardcoded `/tmp/kafkaesque-failure-test-N`
-/// paths broke once B1's WAL persistence landed.
+/// paths broke once WAL persistence landed.
 fn test_config(node_id: u64, port: u16, cluster_members: Vec<(u64, String)>) -> RaftConfig {
     let tmp = tempfile::tempdir().expect("create test temp dir");
     let root = tmp.keep();

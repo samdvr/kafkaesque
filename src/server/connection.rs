@@ -39,7 +39,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 /// Default global inflight-bytes budget (1 GiB). Bounds the total memory
 /// the broker is willing to allocate for not-yet-parsed inbound frames so a
 /// burst of large produces (or a coordinated slow-frame attack) can't OOM
-/// the process. Audit P2-7. Override via `set_global_inflight_byte_budget`.
+/// the process. Override via `set_global_inflight_byte_budget`.
 const DEFAULT_GLOBAL_INFLIGHT_BUDGET: usize = 1024 * 1024 * 1024;
 
 /// Global semaphore measured in bytes. Each inbound frame acquires N permits
@@ -270,7 +270,7 @@ async fn dispatch_request_common<H: Handler>(
     let header = request.header();
     let correlation_id = header.correlation_id;
 
-    // Audit S1 scaffold: when SASL is required and the connection has not
+    // When SASL is required and the connection has not
     // completed authentication, refuse anything except the connection-setup
     // API keys (ApiVersions, SaslHandshake, SaslAuthenticate). Without this
     // check the dispatch table happily answers Produce/Fetch/Admin even
@@ -293,7 +293,7 @@ async fn dispatch_request_common<H: Handler>(
         );
     }
 
-    // Resolve the effective principal for this request (audit S2). We use
+    // Resolve the effective principal for this request. We use
     // the gate's stored principal when present, else `User:ANONYMOUS` —
     // matching real Kafka's identity for a non-SASL connection. ACL
     // bindings against `User:ANONYMOUS` let operators allow specific things
@@ -455,11 +455,11 @@ async fn dispatch_request_common<H: Handler>(
             // Track SASL auth result. We must extract the principal from the
             // wire bytes BEFORE moving `req` into the handler so the gate
             // (and downstream authorizer) can attribute future requests to
-            // a real identity (audit S2). For PLAIN that's `\0user\0pass`;
+            // a real identity. For PLAIN that's `\0user\0pass`;
             // for unsupported mechanisms we fall back to None and the
             // dispatcher treats the connection as anonymous.
             //
-            // SCRAM-SHA-256 (audit P0-3) is multi-step: the first
+            // SCRAM-SHA-256 is multi-step: the first
             // round-trip returns `error_code = None` but the handshake
             // isn't done yet. The cluster handler signals this via
             // `take_sasl_post_auth`, which we consult before flipping the
@@ -529,7 +529,7 @@ async fn dispatch_request_common<H: Handler>(
     (result, auth_result)
 }
 
-/// Connection-level SASL gate state (audit S1 scaffold).
+/// Connection-level SASL gate state.
 ///
 /// Tracks per-connection authentication so `dispatch_request_common` can
 /// reject every non-handshake API key when `sasl_required` is true and the
@@ -540,7 +540,7 @@ async fn dispatch_request_common<H: Handler>(
 /// Always-on (not feature-gated): when the `sasl` feature is off the
 /// `required` flag stays false and this is a free no-op.
 ///
-/// Also carries the authenticated principal (audit S2). This is what the
+/// Also carries the authenticated principal. This is what the
 /// authorizer keys against — so flipping `authenticated` without writing
 /// the principal would let through every API on the connection. ACL
 /// enforcement consults `principal` after the gate, defaulting to

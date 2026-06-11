@@ -80,6 +80,21 @@ const DEFAULT_BATCH_INDEX_MAX_SIZE: usize = 10_000;
 /// Bounds memory usage for the producer state cache.
 const DEFAULT_PRODUCER_STATE_CACHE_SIZE: u64 = 10_000;
 
+/// Checkpoint the `_hwm` key every N appended batches.
+///
+/// The HWM is embedded in every batch value, so the standalone `_hwm` key is
+/// purely an optimization: it bounds the recovery scan on open to the batches
+/// appended since the last checkpoint instead of the whole log. Every 64th
+/// append piggybacks the checkpoint on the batch's own atomic `WriteBatch`,
+/// so it costs no extra storage round-trip.
+const HWM_CHECKPOINT_INTERVAL_BATCHES: u64 = 64;
+
+/// Initial back-scan window (in offsets) used by `find_batch_start` when the
+/// batch index misses. The window doubles until a covering batch is found or
+/// the log start offset is reached, so lookups are O(window) reads instead of
+/// O(partition size) scans from offset 0.
+const INITIAL_BATCH_BACKSCAN_WINDOW: i64 = 4096;
+
 /// State tracked per producer for idempotency checks.
 ///
 /// This tracks the last sequence number and epoch for each producer_id,
@@ -94,10 +109,11 @@ pub struct ProducerState {
     /// Used together with `last_base_offset` to recognize a duplicate retry
     /// of *the same* batch and reply with success-and-original-offset, as
     /// Kafka's idempotent-producer contract requires.
-    /// Not persisted: in-memory only, populated on append.
+    /// Persisted atomically with each batch so retry dedup survives restart;
+    /// -1 when unknown (legacy persisted values).
     pub last_first_sequence: i32,
     /// Base offset assigned to the most recent successfully appended batch.
-    /// In-memory only.
+    /// Persisted with each batch; -1 when unknown.
     pub last_base_offset: i64,
 }
 
@@ -108,6 +124,17 @@ pub struct PartitionStore {
 
     /// Cached high watermark (also persisted in DB).
     high_watermark: AtomicI64,
+
+    /// Cached log start offset (also persisted under `_lso`).
+    ///
+    /// Starts at 0 and only advances when retention deletes a log prefix.
+    /// Kept in memory so `earliest_offset()` is a load instead of a storage
+    /// scan — the fetch path consults it for every partition on every pass.
+    log_start_offset: AtomicI64,
+
+    /// Appends since the last `_hwm` checkpoint (drives the periodic
+    /// checkpoint that bounds the recovery scan on open).
+    appends_since_checkpoint: std::sync::atomic::AtomicU64,
 
     /// Write lock to ensure atomic append operations.
     write_lock: Mutex<()>,
@@ -281,6 +308,12 @@ impl PartitionStore {
 
     pub fn high_watermark(&self) -> i64 {
         self.high_watermark.load(Ordering::SeqCst)
+    }
+
+    /// The log start offset: the lowest offset still present in the log.
+    /// 0 until retention deletes a prefix.
+    pub fn log_start_offset(&self) -> i64 {
+        self.log_start_offset.load(Ordering::SeqCst)
     }
 
     /// Minimum remaining lease TTL (seconds) the store requires for new writes.
@@ -466,14 +499,30 @@ impl PartitionStore {
             )));
         }
 
+        // Parse producer info once; reused by both the idempotency check here
+        // and the producer-state persistence below (previously parsed twice
+        // per append).
+        let idempotent_producer_info = parse_producer_info(records).filter(|i| i.is_idempotent());
+
         // Idempotency check: detects and rejects duplicate or out-of-order messages.
         // For *exact-replay* duplicates we return the original base_offset (success)
         // rather than DuplicateSequence so retries that the network ate
         // don't break the producer.
+        //
+        // On an in-memory cache miss we consult the persisted `p<producer_id>`
+        // key before treating the producer as new. Without this, idle-producer
+        // cache eviction (time_to_idle TTL) silently accepted duplicate
+        // batches as new — an idempotence violation.
         let mut idempotent_dup_offset: Option<i64> = None;
-        if let Some(producer_info) = parse_producer_info(records)
-            && producer_info.is_idempotent()
-            && let Some(state) = self.producer_states.get(&producer_info.producer_id)
+        let cached_producer_state = match &idempotent_producer_info {
+            Some(info) => match self.producer_states.get(&info.producer_id) {
+                Some(state) => Some(state),
+                None => self.load_persisted_producer_state(info.producer_id).await?,
+            },
+            None => None,
+        };
+        if let Some(producer_info) = idempotent_producer_info
+            && let Some(state) = cached_producer_state
         {
             // Check for epoch fencing (zombie producer detection)
             if producer_info.producer_epoch < state.producer_epoch {
@@ -639,19 +688,38 @@ impl PartitionStore {
         // write let the two diverge: a persist failure either rejected an
         // already-committed append or silently succeeded non-durably, both of
         // which break idempotency across restart.
-        let pending_producer_state = parse_producer_info(records)
-            .filter(|info| info.is_idempotent())
-            .map(|info| {
-                let last_sequence = info.last_sequence().unwrap_or(info.first_sequence);
-                let key = encode_producer_state_key(info.producer_id);
-                let value = encode_producer_state_value(last_sequence, info.producer_epoch);
-                (info, last_sequence, key, value)
+        //
+        // The persisted value includes the retry-dedup pair
+        // (last_first_sequence / last_base_offset) so an exact retry of this
+        // batch is re-acked with its original offset even across a restart.
+        let pending_producer_state = idempotent_producer_info.map(|info| {
+            let last_sequence = info.last_sequence().unwrap_or(info.first_sequence);
+            let key = encode_producer_state_key(info.producer_id);
+            let value = encode_producer_state_value(&super::keys::PersistedProducerState {
+                last_sequence,
+                producer_epoch: info.producer_epoch,
+                last_first_sequence: info.first_sequence,
+                last_base_offset: base_offset,
             });
+            (info, last_sequence, key, value)
+        });
+
+        // Periodically checkpoint `_hwm` inside the same atomic WriteBatch.
+        // The checkpoint bounds the recovery scan on the next open to batches
+        // appended after it (SlateDB's WAL is ordered, so a persisted
+        // checkpoint implies every earlier batch is persisted too).
+        let checkpoint_hwm = self
+            .appends_since_checkpoint
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(HWM_CHECKPOINT_INTERVAL_BATCHES);
 
         let mut batch = WriteBatch::new();
         batch.put(key.as_slice(), buffer.as_slice());
         if let Some((_, _, ps_key, ps_value)) = &pending_producer_state {
             batch.put(ps_key.as_slice(), ps_value.as_slice());
+        }
+        if checkpoint_hwm {
+            batch.put(HIGH_WATERMARK_KEY, new_hwm.to_be_bytes());
         }
         let write_result = self.db.write_with_options(batch, &write_options).await;
 
@@ -763,6 +831,68 @@ impl PartitionStore {
         Ok(base_offset)
     }
 
+    /// Load a producer's persisted idempotency state on an in-memory cache
+    /// miss, repopulating the cache.
+    ///
+    /// Returns `Ok(None)` for a genuinely unknown producer. Storage errors
+    /// propagate — if we cannot verify whether a producer was seen before,
+    /// accepting the batch could admit a duplicate, so the write must fail
+    /// (same fail-closed posture as the epoch check).
+    async fn load_persisted_producer_state(
+        &self,
+        producer_id: i64,
+    ) -> SlateDBResult<Option<ProducerState>> {
+        let key = encode_producer_state_key(producer_id);
+        let bytes = match self.db.get(key.as_slice()).await {
+            Ok(maybe) => maybe,
+            Err(e) => {
+                let err = SlateDBError::from(e);
+                error!(
+                    topic = %self.topic,
+                    partition = self.partition,
+                    producer_id,
+                    error = %err,
+                    "Failed to read persisted producer state - rejecting write for safety"
+                );
+                return Err(err);
+            }
+        };
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let Some(persisted) = super::keys::decode_producer_state_value(&bytes) else {
+            warn!(
+                topic = %self.topic,
+                partition = self.partition,
+                producer_id,
+                "Undecodable persisted producer state - treating producer as new"
+            );
+            return Ok(None);
+        };
+        let state = ProducerState {
+            last_sequence: persisted.last_sequence,
+            producer_epoch: persisted.producer_epoch,
+            last_first_sequence: persisted.last_first_sequence,
+            last_base_offset: persisted.last_base_offset,
+        };
+        debug!(
+            topic = %self.topic,
+            partition = self.partition,
+            producer_id,
+            last_sequence = state.last_sequence,
+            "Restored producer state from storage after cache miss"
+        );
+        self.producer_states.insert(producer_id, state);
+        Ok(Some(state))
+    }
+
+    /// Fetch records starting from the given offset, using the store-wide
+    /// default byte budget. See [`Self::fetch_from_with_budget`].
+    pub async fn fetch_from(&self, fetch_offset: i64) -> SlateDBResult<(i64, Option<Bytes>)> {
+        let max_size = self.max_fetch_response_size.load(Ordering::Relaxed);
+        self.fetch_from_with_budget(fetch_offset, max_size).await
+    }
+
     /// Fetch records starting from the given offset.
     ///
     /// Returns (high_watermark, records).
@@ -772,10 +902,17 @@ impl PartitionStore {
     /// This uses SlateDB range scan for efficient sequential access:
     /// 1. Find the batch containing or following the fetch offset
     /// 2. Use range scan to iterate through consecutive batches
-    /// 3. Collect batches until max response size is reached
+    /// 3. Collect batches until the byte budget is reached
     ///
-    /// Replaced individual db.get() calls in loop with range scan.
-    pub async fn fetch_from(&self, fetch_offset: i64) -> SlateDBResult<(i64, Option<Bytes>)> {
+    /// `max_bytes` is the per-call byte budget — the smaller of the client's
+    /// `partition_max_bytes`, the remaining request-level `max_bytes`, and
+    /// the broker's `max_fetch_response_size`. Kafka's contract that the
+    /// first batch is always returned whole (even if oversized) is preserved.
+    pub async fn fetch_from_with_budget(
+        &self,
+        fetch_offset: i64,
+        max_bytes: usize,
+    ) -> SlateDBResult<(i64, Option<Bytes>)> {
         use super::keys::decode_record_offset;
 
         let high_watermark = self.high_watermark.load(Ordering::SeqCst);
@@ -797,7 +934,8 @@ impl PartitionStore {
             }
         };
 
-        let max_size = self.max_fetch_response_size.load(Ordering::Relaxed);
+        // Never exceed the broker-wide cap regardless of the client's ask.
+        let max_size = max_bytes.min(self.max_fetch_response_size.load(Ordering::Relaxed));
 
         // Estimate capacity based on max_size, capped at 256KB to avoid over-allocation
         // for very large max_size values. The 4KB minimum handles small fetches efficiently.
@@ -832,7 +970,10 @@ impl PartitionStore {
             }
         };
 
-        while let Ok(Some(item)) = iter.next().await {
+        // Propagate scan errors instead of treating them as end-of-data: a
+        // transient storage error mid-scan must not silently truncate the
+        // response (consumers would interpret it as "caught up").
+        while let Some(item) = iter.next().await.map_err(SlateDBError::from)? {
             // Verify this is a record key and decode offset
             let current_offset = match decode_record_offset(&item.key) {
                 Some(offset) => offset,
@@ -850,13 +991,24 @@ impl PartitionStore {
 
             let record_count = parse_record_count(batch_data);
             if record_count <= 0 {
-                // Corrupted batch, stop iteration
-                warn!(
+                // Corrupted batch. If it's the first batch the consumer needs,
+                // surface an explicit error — silently returning an empty
+                // response would stall the consumer at this offset forever
+                // with no diagnostic. If we already collected valid batches,
+                // return them; the consumer will hit the corrupt batch on its
+                // next fetch and get the error then.
+                error!(
                     topic = %self.topic,
                     partition = self.partition,
                     offset = current_offset,
-                    "Batch with invalid record count"
+                    "Batch with invalid record count during fetch"
                 );
+                if combined.is_empty() {
+                    return Err(SlateDBError::Storage(format!(
+                        "Corrupt record batch at offset {} in {}/{}",
+                        current_offset, self.topic, self.partition
+                    )));
+                }
                 break;
             }
 
@@ -910,7 +1062,14 @@ impl PartitionStore {
     /// Strategy:
     /// 1. Check if fetch_offset is exactly a batch start in the cache (fast path)
     /// 2. Try exact match in SlateDB
-    /// 3. Use SlateDB range scan to find next batch
+    /// 3. Bounded back-scan: scan forward from a window before `fetch_offset`,
+    ///    doubling the window down to the log start offset on a miss.
+    ///
+    /// The bounded back-scan replaces the old fallback that scanned from
+    /// offset 0 — O(partition size) object-store reads per fetch for any
+    /// lagging consumer with a cold index. A batch containing `fetch_offset`
+    /// must start within one batch-length of it, so the first (small) window
+    /// almost always suffices; the widening loop is only taken on gappy logs.
     ///
     /// Note: The batch index uses moka cache (hash-based) which doesn't support
     /// range queries. For range lookups, we fall back to SlateDB scan which is
@@ -941,44 +1100,70 @@ impl PartitionStore {
             return Ok(Some(fetch_offset));
         }
 
-        // Strategy 3: Use SlateDB range scan to find the batch containing or following fetch_offset
-        // This is efficient because SlateDB organizes data by key prefix
-        let start_key = encode_record_key(0); // Start from beginning to find batch containing offset
-        let end_key = encode_record_key(high_watermark);
+        // Strategy 3: Bounded back-scan with widening window.
+        let log_start = self.log_start_offset.load(Ordering::SeqCst);
+        let mut window = INITIAL_BATCH_BACKSCAN_WINDOW;
 
-        let mut iter = self
-            .db
-            .scan(start_key.as_slice()..end_key.as_slice())
-            .await?;
+        loop {
+            let scan_start = (fetch_offset - window).max(log_start);
+            let start_key = encode_record_key(scan_start);
+            let end_key = encode_record_key(high_watermark);
 
-        // Scan through batches to find the one containing or following fetch_offset
-        while let Ok(Some(item)) = iter.next().await {
-            if let Some(offset) = decode_record_offset(&item.key) {
-                // Strip HWM metadata if present
-                let batch_data = if item.value.len() >= 8 {
-                    &item.value[8..]
-                } else {
-                    item.value.as_ref()
-                };
-                let record_count = parse_record_count(batch_data);
+            let mut iter = self
+                .db
+                .scan(start_key.as_slice()..end_key.as_slice())
+                .await?;
 
-                // Add to cache for future lookups
-                self.add_to_batch_index(offset, record_count);
+            // Track whether the window contained any batch starting at or
+            // before fetch_offset. If not, a batch containing fetch_offset
+            // could still start before the window — we must widen rather
+            // than wrongly return the next-following batch.
+            let mut saw_batch_at_or_before = false;
 
-                // Check if this batch contains or follows fetch_offset
-                let batch_end = offset + record_count as i64;
-                if offset <= fetch_offset && batch_end > fetch_offset {
-                    // This batch contains fetch_offset
-                    return Ok(Some(offset));
-                } else if offset > fetch_offset {
-                    // This batch comes after fetch_offset
-                    return Ok(Some(offset));
+            while let Some(item) = iter.next().await.map_err(SlateDBError::from)? {
+                if let Some(offset) = decode_record_offset(&item.key) {
+                    // Strip HWM metadata if present
+                    let batch_data = if item.value.len() >= 8 {
+                        &item.value[8..]
+                    } else {
+                        item.value.as_ref()
+                    };
+                    let record_count = parse_record_count(batch_data);
+
+                    // Add to cache for future lookups
+                    self.add_to_batch_index(offset, record_count);
+
+                    let batch_end = offset + record_count as i64;
+                    if offset <= fetch_offset {
+                        saw_batch_at_or_before = true;
+                        if batch_end > fetch_offset {
+                            // This batch contains fetch_offset
+                            return Ok(Some(offset));
+                        }
+                    } else {
+                        // First batch after fetch_offset. This is the right
+                        // answer only if we can rule out an earlier batch
+                        // containing fetch_offset — i.e. we saw at least one
+                        // batch at/before it in this window, or the window
+                        // already reaches the log start.
+                        if saw_batch_at_or_before || scan_start == log_start {
+                            return Ok(Some(offset));
+                        }
+                        break; // widen the window and retry
+                    }
                 }
             }
-        }
 
-        // No batch found
-        Ok(None)
+            if scan_start == log_start {
+                // Whole remaining range scanned: no batch contains or
+                // follows fetch_offset.
+                return Ok(None);
+            }
+
+            // Saw only batches before the window edge (or none) without a
+            // conclusion — widen and retry.
+            window = window.saturating_mul(2);
+        }
     }
 
     /// Add a batch entry to the index.
@@ -991,101 +1176,201 @@ impl PartitionStore {
     /// Warm the batch index cache by pre-loading the most recent batches.
     ///
     /// This is called during partition open to avoid cold-start cache misses.
-    /// Tail reads are the hot pattern (`fetch.offset` follows `HWM`), so we keep
-    /// only the last `batch_index_max_size` batches in a sliding window while
-    /// scanning forward (SlateDB has no native reverse scan in 0.10).
+    /// The batch boundaries come from the recovery scan, so opening a
+    /// partition makes one pass over the record keyspace instead of two
+    /// (recovery + warm) — a 2x open/failover latency win on large logs.
     ///
-    /// Performance: scanning is still sequential and SST-efficient. Memory is
-    /// bounded to the window size. The cache ends up with the newest batches.
-    async fn warm_batch_index(&self) {
-        use super::keys::{RECORD_KEY_PREFIX, decode_record_offset};
-        use std::collections::VecDeque;
-
-        let start = std::time::Instant::now();
+    /// Tail reads are the hot pattern (`fetch.offset` follows `HWM`), so only
+    /// the last `batch_index_max_size` batches are inserted.
+    fn warm_batch_index_from(&self, batches: &[(i64, i32)]) {
         let window_cap = self.batch_index_max_size;
         if window_cap == 0 {
             return;
         }
 
-        let start_key = [RECORD_KEY_PREFIX];
-        let end_key = [RECORD_KEY_PREFIX + 1];
-
-        let mut window: VecDeque<(i64, i32)> = VecDeque::with_capacity(window_cap);
-
-        match self.db.scan(start_key.as_slice()..end_key.as_slice()).await {
-            Ok(mut iter) => {
-                while let Ok(Some(item)) = iter.next().await {
-                    let Some(offset) = decode_record_offset(&item.key) else {
-                        continue;
-                    };
-                    let batch_data = if item.value.len() >= 8 {
-                        &item.value[8..]
-                    } else {
-                        item.value.as_ref()
-                    };
-                    let record_count = parse_record_count(batch_data);
-
-                    if window.len() == window_cap {
-                        window.pop_front();
-                    }
-                    window.push_back((offset, record_count));
-                }
-            }
-            Err(e) => {
-                warn!(
-                    topic = %self.topic,
-                    partition = self.partition,
-                    error = %e,
-                    "Failed to warm batch index cache"
-                );
-            }
-        }
-
-        let count = window.len() as u32;
-        for (offset, record_count) in window {
+        let skip = batches.len().saturating_sub(window_cap);
+        let mut count: u32 = 0;
+        for &(offset, record_count) in &batches[skip..] {
             self.add_to_batch_index(offset, record_count);
+            count += 1;
         }
 
-        let elapsed = start.elapsed();
         if count > 0 {
             info!(
                 topic = %self.topic,
                 partition = self.partition,
                 entries = count,
-                elapsed_ms = elapsed.as_millis(),
-                "Warmed batch index cache"
+                "Warmed batch index cache from recovery scan"
             );
         }
 
         super::metrics::record_batch_index_warm_entries(count as i64);
     }
 
-    /// Get the earliest offset in this partition.
+    /// Get the earliest offset in this partition (the log start offset).
     ///
-    /// Uses SlateDB range scan to find the first record key.
-    /// This is important for log compaction scenarios where records
-    /// at the beginning may have been deleted.
+    /// This is a cached atomic load — the LSO only changes when retention
+    /// runs. The fetch path consults it for every partition on every pass,
+    /// so it must not be a storage scan (it used to be one; combined with
+    /// the long-poll wakeup it produced a thundering herd of object-store
+    /// reads scaling with consumers x partitions).
     pub async fn earliest_offset(&self) -> SlateDBResult<i64> {
-        use super::keys::{RECORD_KEY_PREFIX, decode_record_offset};
+        Ok(self.log_start_offset.load(Ordering::SeqCst))
+    }
 
-        // Scan from the beginning of record keys to find the first one
-        let start_key = [RECORD_KEY_PREFIX];
-        let end_key = [RECORD_KEY_PREFIX + 1];
+    /// Find the earliest offset whose batch `max_timestamp` is at or after
+    /// `target_timestamp_ms` (Kafka `ListOffsets` timestamp semantics, at
+    /// batch granularity — the same granularity Kafka's sparse time index
+    /// provides before its final linear scan).
+    ///
+    /// Returns `Ok(None)` when no such batch exists (all data is older than
+    /// the target), in which case Kafka reports offset -1.
+    pub async fn offset_for_timestamp(
+        &self,
+        target_timestamp_ms: i64,
+    ) -> SlateDBResult<Option<i64>> {
+        use super::keys::{decode_record_offset, parse_batch_max_timestamp};
+
+        let log_start = self.log_start_offset.load(Ordering::SeqCst);
+        let high_watermark = self.high_watermark.load(Ordering::SeqCst);
+        if log_start >= high_watermark {
+            return Ok(None); // Empty log
+        }
+
+        let start_key = encode_record_key(log_start);
+        let end_key = encode_record_key(high_watermark);
 
         let mut iter = self
             .db
             .scan(start_key.as_slice()..end_key.as_slice())
             .await?;
 
-        // Get the first record
-        if let Ok(Some(item)) = iter.next().await
-            && let Some(offset) = decode_record_offset(&item.key)
-        {
-            return Ok(offset);
+        while let Some(item) = iter.next().await.map_err(SlateDBError::from)? {
+            let Some(offset) = decode_record_offset(&item.key) else {
+                continue;
+            };
+            let batch_data = if item.value.len() >= 8 {
+                &item.value[8..]
+            } else {
+                item.value.as_ref()
+            };
+            match parse_batch_max_timestamp(batch_data) {
+                // -1 = producer set no timestamps; skip (cannot match a time query)
+                Some(ts) if ts != -1 && ts >= target_timestamp_ms => {
+                    return Ok(Some(offset));
+                }
+                _ => {}
+            }
         }
 
-        // No records found, earliest is 0
-        Ok(0)
+        Ok(None)
+    }
+
+    /// Apply time-based retention: delete every batch whose `max_timestamp`
+    /// is older than `now_ms - retention_ms`, advance the persisted log start
+    /// offset, and evict deleted entries from the batch index.
+    ///
+    /// Crash-safety: the new `_lso` is written durably *before* the record
+    /// keys below it are deleted. A crash mid-delete leaves orphaned batches
+    /// below the LSO, which are invisible to fetches (offset range checks use
+    /// the LSO) and are re-deleted on the next retention pass.
+    ///
+    /// Conservative rules:
+    /// - Batches whose timestamp cannot be parsed (or is -1) are never
+    ///   deleted, and deletion stops at the first non-expired batch so the
+    ///   surviving log stays contiguous.
+    ///
+    /// Returns the number of deleted batches.
+    pub async fn apply_retention(&self, retention_ms: i64, now_ms: i64) -> SlateDBResult<u64> {
+        use super::keys::{decode_record_offset, parse_batch_max_timestamp};
+
+        if retention_ms <= 0 {
+            return Ok(0); // Retention disabled
+        }
+        let cutoff_ms = now_ms.saturating_sub(retention_ms);
+
+        let log_start = self.log_start_offset.load(Ordering::SeqCst);
+        let high_watermark = self.high_watermark.load(Ordering::SeqCst);
+        if log_start >= high_watermark {
+            return Ok(0); // Empty log
+        }
+
+        // Pass 1: collect the contiguous prefix of expired batches.
+        let start_key = encode_record_key(log_start);
+        let end_key = encode_record_key(high_watermark);
+        let mut expired: Vec<(i64, i32)> = Vec::new();
+        let mut new_log_start = log_start;
+
+        {
+            let mut iter = self
+                .db
+                .scan(start_key.as_slice()..end_key.as_slice())
+                .await?;
+            while let Some(item) = iter.next().await.map_err(SlateDBError::from)? {
+                let Some(offset) = decode_record_offset(&item.key) else {
+                    continue;
+                };
+                let batch_data = if item.value.len() >= 8 {
+                    &item.value[8..]
+                } else {
+                    item.value.as_ref()
+                };
+                let max_ts = parse_batch_max_timestamp(batch_data);
+                let record_count = parse_record_count(batch_data);
+
+                match max_ts {
+                    Some(ts) if ts != -1 && ts < cutoff_ms && record_count > 0 => {
+                        expired.push((offset, record_count));
+                        new_log_start = offset + record_count as i64;
+                    }
+                    _ => break, // First non-expired (or unparseable) batch — stop.
+                }
+            }
+        }
+
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        // Persist the new LSO durably BEFORE deleting any data. See method
+        // docs for the crash-ordering argument.
+        self.db
+            .put_with_options(
+                super::keys::LOG_START_OFFSET_KEY,
+                &new_log_start.to_be_bytes(),
+                &PutOptions::default(),
+                &WriteOptions {
+                    await_durable: true,
+                },
+            )
+            .await?;
+        self.log_start_offset.store(new_log_start, Ordering::SeqCst);
+
+        // Delete the expired record keys (batched; fast writes are fine —
+        // resurrection after a crash is harmless because the LSO already
+        // moved past them).
+        let mut delete_batch = WriteBatch::new();
+        for &(offset, _) in &expired {
+            delete_batch.delete(encode_record_key(offset).as_slice());
+            self.batch_index.invalidate(&offset);
+        }
+        self.db
+            .write_with_options(delete_batch, &FAST_WRITE_OPTIONS)
+            .await?;
+
+        let deleted = expired.len() as u64;
+        info!(
+            topic = %self.topic,
+            partition = self.partition,
+            deleted_batches = deleted,
+            old_log_start = log_start,
+            new_log_start,
+            retention_ms,
+            "Applied time-based retention"
+        );
+        super::metrics::record_retention_deleted_batches(&self.topic, self.partition, deleted);
+
+        Ok(deleted)
     }
 
     /// Flush pending writes to storage.
@@ -1517,8 +1802,27 @@ impl PartitionStoreBuilder {
                 None => 0,
             };
 
-            // Scan for highest record to recover from crash
-            let recovered_hwm = recover_hwm_from_records(&db, persisted_hwm, fail_on_gap).await?;
+            // Load the persisted log start offset (0 when retention has
+            // never deleted a prefix).
+            let log_start_offset = match db.get(super::keys::LOG_START_OFFSET_KEY).await? {
+                Some(bytes) if bytes.len() >= 8 => i64::from_be_bytes(
+                    bytes[..8]
+                        .try_into()
+                        .expect("slice of exactly 8 bytes should convert to [u8; 8]"),
+                ),
+                _ => 0,
+            };
+
+            // Scan for highest record to recover from crash. The scan is
+            // bounded below by the LSO (records beneath it were deleted by
+            // retention) and the checkpointed HWM (SlateDB's WAL ordering
+            // means a persisted checkpoint implies every earlier batch
+            // persisted too), so open latency tracks recent write volume,
+            // not total log size.
+            let scan_floor = log_start_offset.max(persisted_hwm);
+            let recovery =
+                recover_hwm_from_records(&db, persisted_hwm, fail_on_gap, scan_floor).await?;
+            let recovered_hwm = recovery.high_watermark;
 
             // If we recovered a higher HWM, persist it
             if recovered_hwm > persisted_hwm {
@@ -1538,24 +1842,32 @@ impl PartitionStoreBuilder {
             // Load persisted producer states for idempotency
             let producer_states = load_producer_states(&db).await?;
 
-            Ok::<_, slatedb::Error>((db, recovered_hwm, producer_states, final_epoch))
+            Ok::<_, slatedb::Error>((
+                db,
+                recovered_hwm,
+                log_start_offset,
+                recovery.batches,
+                producer_states,
+                final_epoch,
+            ))
         };
 
-        let (db, hwm, persisted_states, validated_epoch) = open_future.await.map_err(|e| {
-            // Convert slatedb::Error to SlateDBError, checking for epoch mismatch
-            let err_str = e.to_string();
-            if err_str.contains("Epoch mismatch") {
-                // Parse out the epochs from the error message
-                SlateDBError::EpochMismatch {
-                    topic: topic_for_epoch_error.clone(),
-                    partition,
-                    expected_epoch: self.leader_epoch,
-                    stored_epoch: 0, // We don't have the exact stored value here
+        let (db, hwm, log_start_offset, recovered_batches, persisted_states, validated_epoch) =
+            open_future.await.map_err(|e| {
+                // Convert slatedb::Error to SlateDBError, checking for epoch mismatch
+                let err_str = e.to_string();
+                if err_str.contains("Epoch mismatch") {
+                    // Parse out the epochs from the error message
+                    SlateDBError::EpochMismatch {
+                        topic: topic_for_epoch_error.clone(),
+                        partition,
+                        expected_epoch: self.leader_epoch,
+                        stored_epoch: 0, // We don't have the exact stored value here
+                    }
+                } else {
+                    SlateDBError::from(e)
                 }
-            } else {
-                SlateDBError::from(e)
-            }
-        })?;
+            })?;
 
         if !persisted_states.is_empty() {
             info!(
@@ -1604,19 +1916,17 @@ impl PartitionStoreBuilder {
             })
             .build();
 
-        // Populate the cache with persisted producer states. The retry-dedup
-        // fields (last_first_sequence / last_base_offset) are not persisted —
-        // a duplicate retry across restart will be safely rejected by the
-        // existing sequence check rather than silently re-acked. Real Kafka
-        // clients bump producer_epoch on reconnect, which advances past this.
-        for (producer_id, (last_sequence, producer_epoch)) in persisted_states {
+        // Populate the cache with persisted producer states, including the
+        // persisted retry-dedup pair so an exact retry of the last acked
+        // batch is re-acked with its original offset across restarts.
+        for (producer_id, persisted) in persisted_states {
             producer_states_cache.insert(
                 producer_id,
                 ProducerState {
-                    last_sequence,
-                    producer_epoch,
-                    last_first_sequence: -1,
-                    last_base_offset: -1,
+                    last_sequence: persisted.last_sequence,
+                    producer_epoch: persisted.producer_epoch,
+                    last_first_sequence: persisted.last_first_sequence,
+                    last_base_offset: persisted.last_base_offset,
                 },
             );
         }
@@ -1629,6 +1939,8 @@ impl PartitionStoreBuilder {
         let store = PartitionStore {
             db,
             high_watermark: AtomicI64::new(hwm),
+            log_start_offset: AtomicI64::new(log_start_offset),
+            appends_since_checkpoint: std::sync::atomic::AtomicU64::new(1),
             write_lock: Mutex::new(()),
             topic,
             partition,
@@ -1642,8 +1954,9 @@ impl PartitionStoreBuilder {
             leader_epoch: validated_epoch,
         };
 
-        // Warm the batch index cache (performance optimization)
-        store.warm_batch_index().await;
+        // Warm the batch index cache from the recovery scan (one storage
+        // pass instead of two).
+        store.warm_batch_index_from(&recovered_batches);
 
         Ok(store)
     }

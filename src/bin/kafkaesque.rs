@@ -173,6 +173,16 @@ async fn run_broker(
         validate_tls_config(&config)?;
     }
 
+    // Wire the process-wide inbound-frame memory budget before any client
+    // connection is accepted. Without this call the budget silently stayed at
+    // the 1 GiB default regardless of operator configuration.
+    if !kafkaesque::server::set_global_inflight_byte_budget(config.global_inflight_byte_budget) {
+        warn!(
+            budget_bytes = config.global_inflight_byte_budget,
+            "Global inflight byte budget was already fixed; config value ignored"
+        );
+    }
+
     info!(
         broker_id = config.broker_id,
         host = %config.host,

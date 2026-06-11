@@ -45,6 +45,10 @@ pub type ProducerStatesMap = HashMap<(String, i32, i64), (i32, i16)>;
 pub struct MockMember {
     pub member_id: String,
     pub metadata: Vec<u8>,
+    /// Full `(protocol_name, metadata)` list from the member's last join,
+    /// in preference order. Mirrors the Raft group domain so the
+    /// protocol-aware join path can be tested against the mock.
+    pub protocols: Vec<(String, Vec<u8>)>,
     pub assignment: Vec<u8>,
     pub session_timeout_ms: i32,
     pub last_heartbeat: Instant,
@@ -57,6 +61,8 @@ pub struct MockGroup {
     pub leader_id: Option<String>,
     pub members: HashMap<String, MockMember>,
     pub state: GroupState,
+    /// Protocol negotiated at the last rebalance, if any.
+    pub protocol_name: Option<String>,
 }
 
 /// Group state machine states.
@@ -75,6 +81,7 @@ impl Default for MockGroup {
             leader_id: None,
             members: HashMap::new(),
             state: GroupState::Empty,
+            protocol_name: None,
         }
     }
 }
@@ -227,6 +234,12 @@ impl PartitionCoordinator for MockCoordinator {
         let brokers = self.brokers.read().await;
         // In this mock, all registered brokers are considered live.
         Ok(brokers.values().map(|(info, _)| info.clone()).collect())
+    }
+
+    async fn current_leader_id(&self) -> SlateDBResult<Option<i32>> {
+        // The mock is a standalone single-broker "cluster": this broker is
+        // always the controller.
+        Ok(Some(self.broker_id))
     }
 
     async fn unregister_broker(&self) -> SlateDBResult<()> {
@@ -451,6 +464,7 @@ impl ConsumerGroupCoordinator for MockCoordinator {
         let member = MockMember {
             member_id: final_member_id.clone(),
             metadata: protocol_metadata.to_vec(),
+            protocols: vec![("range".to_string(), protocol_metadata.to_vec())],
             assignment: Vec::new(),
             session_timeout_ms,
             last_heartbeat: Instant::now(),
@@ -483,6 +497,136 @@ impl ConsumerGroupCoordinator for MockCoordinator {
             leader_id,
             members,
         ))
+    }
+
+    async fn join_group_with_protocols(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        protocols: &[(String, Vec<u8>)],
+        session_timeout_ms: i32,
+        _rebalance_timeout_ms: i32,
+    ) -> SlateDBResult<super::traits::GroupJoinOutcome> {
+        use super::raft::domains::group::{ProtocolSelection, select_group_protocol};
+        use super::traits::{GroupJoinOutcome, GroupJoinResult};
+
+        let mut groups = self.consumer_groups.write().await;
+        let group = groups.entry(group_id.to_string()).or_default();
+
+        let final_member_id = if member_id.is_empty() {
+            let id = self.next_member_id.fetch_add(1, Ordering::SeqCst);
+            format!("member-{}-{}", group_id, id)
+        } else {
+            member_id.to_string()
+        };
+
+        // Negotiate the protocol across existing members plus the joiner
+        // BEFORE mutating state, mirroring the Raft group domain. The
+        // prospective leader's preferences go first to drive tie-breaks.
+        let prospective_leader = group
+            .leader_id
+            .clone()
+            .unwrap_or_else(|| final_member_id.clone());
+        let mut member_prefs: Vec<(String, Vec<String>)> = group
+            .members
+            .iter()
+            .filter(|(id, _)| **id != final_member_id)
+            .map(|(id, m)| {
+                (
+                    id.clone(),
+                    m.protocols.iter().map(|(n, _)| n.clone()).collect(),
+                )
+            })
+            .collect();
+        member_prefs.push((
+            final_member_id.clone(),
+            protocols.iter().map(|(n, _)| n.clone()).collect(),
+        ));
+        member_prefs.sort_by(|a, b| {
+            let a_is_leader = a.0 == prospective_leader;
+            let b_is_leader = b.0 == prospective_leader;
+            b_is_leader.cmp(&a_is_leader).then_with(|| a.0.cmp(&b.0))
+        });
+        let preference_lists: Vec<Vec<String>> =
+            member_prefs.into_iter().map(|(_, prefs)| prefs).collect();
+
+        let selected_protocol = match select_group_protocol(&preference_lists) {
+            ProtocolSelection::Selected(name) => Some(name),
+            ProtocolSelection::None => None,
+            ProtocolSelection::Inconsistent => {
+                return Ok(GroupJoinOutcome::InconsistentProtocol);
+            }
+        };
+
+        // Add or refresh the member with its full protocol list.
+        group.members.insert(
+            final_member_id.clone(),
+            MockMember {
+                member_id: final_member_id.clone(),
+                metadata: protocols
+                    .first()
+                    .map(|(_, m)| m.clone())
+                    .unwrap_or_default(),
+                protocols: protocols.to_vec(),
+                assignment: Vec::new(),
+                session_timeout_ms,
+                last_heartbeat: Instant::now(),
+            },
+        );
+
+        // Trigger a rebalance.
+        group.generation_id = if group.generation_id == i32::MAX {
+            1
+        } else {
+            group.generation_id + 1
+        };
+        group.state = GroupState::PreparingRebalance;
+        group.protocol_name = selected_protocol.clone();
+
+        if group.leader_id.is_none() {
+            group.leader_id = Some(final_member_id.clone());
+        }
+        let leader_id = group.leader_id.clone().unwrap_or_default();
+        let is_leader = leader_id == final_member_id;
+
+        // Only the leader receives the member roster, each entry carrying
+        // that member's own metadata for the selected protocol.
+        let members: Vec<(String, Vec<u8>)> = if is_leader {
+            let mut described: Vec<(String, Vec<u8>)> = group
+                .members
+                .values()
+                .map(|m| {
+                    let metadata = match selected_protocol.as_deref() {
+                        Some(name) => m
+                            .protocols
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .map(|(_, md)| md.clone())
+                            .unwrap_or_else(|| m.metadata.clone()),
+                        None => m.metadata.clone(),
+                    };
+                    (m.member_id.clone(), metadata)
+                })
+                .collect();
+            described.sort_by(|a, b| a.0.cmp(&b.0));
+            described
+        } else {
+            Vec::new()
+        };
+
+        Ok(GroupJoinOutcome::Joined(GroupJoinResult {
+            generation_id: group.generation_id,
+            member_id: final_member_id,
+            is_leader,
+            leader_id,
+            protocol_name: selected_protocol.unwrap_or_default(),
+            members,
+        }))
+    }
+
+    async fn get_group_protocol(&self, group_id: &str) -> SlateDBResult<Option<String>> {
+        let groups = self.consumer_groups.read().await;
+        Ok(groups.get(group_id).and_then(|g| g.protocol_name.clone()))
     }
 
     async fn complete_rebalance(
@@ -523,6 +667,7 @@ impl ConsumerGroupCoordinator for MockCoordinator {
                 MockMember {
                     member_id: member_id.to_string(),
                     metadata: metadata.to_vec(),
+                    protocols: Vec::new(),
                     assignment: Vec::new(),
                     session_timeout_ms: 30000,
                     last_heartbeat: Instant::now(),
@@ -569,6 +714,23 @@ impl ConsumerGroupCoordinator for MockCoordinator {
             }
         }
         Ok(())
+    }
+
+    async fn leave_group(&self, group_id: &str, member_id: &str) -> SlateDBResult<bool> {
+        // Report whether the member actually existed so LeaveGroup can
+        // answer UNKNOWN_MEMBER_ID; an unknown member must not trigger a
+        // rebalance.
+        {
+            let groups = self.consumer_groups.read().await;
+            let known = groups
+                .get(group_id)
+                .is_some_and(|g| g.members.contains_key(member_id));
+            if !known {
+                return Ok(false);
+            }
+        }
+        self.remove_group_member(group_id, member_id).await?;
+        Ok(true)
     }
 
     async fn update_member_heartbeat_with_generation(

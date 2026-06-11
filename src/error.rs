@@ -226,6 +226,11 @@ pub enum KafkaCode {
     UnsupportedForMessageFormat = 43,
     /// This is not the correct controller for this cluster.
     NotController = 41,
+    /// This most likely occurs because of a request being malformed by the
+    /// client library or the message was sent to an incompatible broker.
+    /// Also used to reject features this broker does not implement
+    /// (e.g. transactional produce).
+    InvalidRequest = 42,
     /// The producer attempted to use a sequence number outside the valid range.
     OutOfOrderSequenceNumber = 45,
     /// The producer attempted to assign a sequence number that was already used.

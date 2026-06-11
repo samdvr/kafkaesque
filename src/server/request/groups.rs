@@ -30,7 +30,7 @@ pub fn parse_find_coordinator_request(
     Ok((
         s,
         FindCoordinatorRequestData {
-            key: String::from_utf8_lossy(&key).to_string(),
+            key: bytes_to_string(&key)?,
             key_type,
         },
     ))
@@ -57,12 +57,27 @@ pub struct JoinGroupProtocolData {
     pub metadata: Bytes,
 }
 
+/// Parse a JoinGroup request.
+///
+/// Per-version wire layout (Kafka protocol spec, JoinGroupRequest):
+/// - v0: `group_id`, `session_timeout_ms`, `member_id`, `protocol_type`,
+///   `[protocols]`
+/// - v1: adds `rebalance_timeout_ms` (INT32) between `session_timeout_ms`
+///   and `member_id` (KIP-62). For v0 clients Kafka uses the session
+///   timeout as the rebalance timeout, mirrored here.
+/// - v2: identical request layout to v1 (v2 only added `throttle_time_ms`
+///   to the *response*).
+/// - v5: adds `group_instance_id` (KIP-345) — NOT parsed here because
+///   `versions.rs` advertises JoinGroup 0..=2 only; v3+ requests are
+///   rejected with UnsupportedVersion before body parsing.
 pub fn parse_join_group_request(
     s: NomBytes,
     version: i16,
 ) -> IResult<NomBytes, JoinGroupRequestData> {
     let (s, group_id) = parse_string(s)?;
     let (s, session_timeout_ms) = be_i32(s)?;
+    // rebalance_timeout_ms: added in v1 (KIP-62); defaults to the session
+    // timeout for v0, matching the Kafka broker's up-conversion.
     let (s, rebalance_timeout_ms) = if version >= 1 {
         be_i32(s)?
     } else {
@@ -79,7 +94,7 @@ pub fn parse_join_group_request(
             session_timeout_ms,
             rebalance_timeout_ms,
             member_id: bytes_to_string(&member_id)?,
-            protocol_type: String::from_utf8_lossy(&protocol_type).to_string(),
+            protocol_type: bytes_to_string(&protocol_type)?,
             protocols,
         },
     ))
@@ -401,6 +416,37 @@ mod tests {
         assert_eq!(request.protocols[0].metadata.as_ref(), b"\x00\x01\x02");
         assert_eq!(request.protocols[1].name, "roundrobin");
         assert_eq!(request.protocols[1].metadata.as_ref(), b"\x03\x04\x05\x06");
+    }
+
+    #[test]
+    fn test_parse_join_group_request_v2_same_layout_as_v1() {
+        // JoinGroup v2 changed only the RESPONSE (added throttle_time_ms);
+        // the request layout is identical to v1 — and in particular there is
+        // NO group_instance_id (that arrived in v5, which is not advertised).
+        let mut data = Vec::new();
+        build_string("g2", &mut data);
+        data.extend_from_slice(&20000i32.to_be_bytes()); // session_timeout_ms
+        data.extend_from_slice(&30000i32.to_be_bytes()); // rebalance_timeout_ms (v1+)
+        build_string("member-x", &mut data); // member_id
+        build_string("consumer", &mut data); // protocol_type
+        data.extend_from_slice(&1i32.to_be_bytes());
+        build_string("range", &mut data);
+        let metadata = b"\x0A\x0B";
+        data.extend_from_slice(&(metadata.len() as i32).to_be_bytes());
+        data.extend_from_slice(metadata);
+
+        let input = create_nom_bytes(&data);
+        let (rest, request) = parse_join_group_request(input, 2).unwrap();
+        assert!(
+            rest.into_bytes().is_empty(),
+            "v2 body must be fully consumed"
+        );
+        assert_eq!(request.group_id, "g2");
+        assert_eq!(request.session_timeout_ms, 20000);
+        assert_eq!(request.rebalance_timeout_ms, 30000);
+        assert_eq!(request.member_id, "member-x");
+        assert_eq!(request.protocols.len(), 1);
+        assert_eq!(request.protocols[0].metadata.as_ref(), b"\x0A\x0B");
     }
 
     #[test]

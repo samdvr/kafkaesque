@@ -29,8 +29,14 @@ fn total_record_bytes(responses: &[FetchTopicResponse]) -> usize {
 /// Without this, consumers would spin at full request rate when no
 /// data is available — driving CPU and S3 GET cost linearly with consumer
 /// count regardless of throughput. Producers signal data availability via
-/// `SlateDBClusterHandler::hwm_advanced`; this handler waits on that notify
-/// up to the client's deadline before re-checking.
+/// per-partition notifies (`SlateDBClusterHandler::hwm_notifier`); this
+/// handler waits on the notifies of exactly the partitions it requested,
+/// up to the client's deadline, before re-checking.
+///
+/// `isolation_level` is accepted but intentionally not branched on:
+/// transactions are rejected at produce time, so the log can never contain
+/// uncommitted data and LSO == HWM always. read_committed and
+/// read_uncommitted are therefore identical here.
 pub(super) async fn handle_fetch(
     handler: &SlateDBClusterHandler,
     ctx: &RequestContext,
@@ -68,25 +74,43 @@ pub(super) async fn handle_fetch(
     // First pass: build the response with whatever's currently available.
     let mut responses = collect_fetch(handler, ctx, &request).await;
 
+    // Resolve the per-partition notifies once: the partition set is fixed
+    // for the lifetime of the request. Waiting on exactly these (instead of
+    // the old broker-wide notify) means a produce to an unrelated partition
+    // no longer wakes this fetcher into a pointless re-scan.
+    let watched: Vec<Arc<tokio::sync::Notify>> = request
+        .topics
+        .iter()
+        .flat_map(|t| {
+            let topic = handler.cached_topic_name(&t.name);
+            t.partitions
+                .iter()
+                .map(|p| handler.hwm_notifier(&topic, p.partition_index))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
     // Long-poll loop: if min_bytes isn't satisfied and we have time left,
-    // wait on the broker-wide HWM-advance notify, then re-check.
+    // wait for any requested partition's HWM to advance, then re-check.
     while min_bytes > 0
         && total_record_bytes(&responses) < min_bytes
         && let Some(deadline) = deadline
+        && !watched.is_empty()
     {
         let now = tokio::time::Instant::now();
         if now >= deadline {
             break;
         }
         // `Notify::notified()` must be created before `notify_waiters()` is
-        // called for it to wake — but we hold the future across the wait so
+        // called for it to wake — but we hold the futures across the wait so
         // any concurrent producer wake counts. Re-acquired each loop so we
         // don't miss notifications between iterations.
-        let notified = handler.hwm_advanced.notified();
+        let any_advanced =
+            futures::future::select_all(watched.iter().map(|n| Box::pin(n.notified())));
         let remaining = deadline - now;
-        match tokio::time::timeout(remaining, notified).await {
-            Ok(()) => {
-                // Some partition advanced — re-fetch.
+        match tokio::time::timeout(remaining, any_advanced).await {
+            Ok(_) => {
+                // A requested partition advanced — re-fetch.
                 responses = collect_fetch(handler, ctx, &request).await;
             }
             Err(_) => {
@@ -122,9 +146,23 @@ async fn collect_fetch(
     request: &FetchRequestData,
 ) -> Vec<FetchTopicResponse> {
     use futures::stream::{self, StreamExt};
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     let mut responses = Vec::with_capacity(request.topics.len());
     let max_concurrent_reads = handler.max_concurrent_partition_reads;
+
+    // Request-level `max_bytes` budget shared by all partitions in the
+    // request (Kafka protocol contract; `<= 0` means no client limit).
+    // Partitions fetch concurrently, so enforcement is approximate: each
+    // partition checks the remaining budget before fetching and debits it
+    // after, so the response can overshoot by at most (concurrency - 1)
+    // partition fetches — the same order of slack as Kafka's own
+    // "first batch is always returned whole" rule.
+    let request_budget = Arc::new(AtomicI64::new(if request.max_bytes > 0 {
+        request.max_bytes as i64
+    } else {
+        i64::MAX
+    }));
 
     for topic in &request.topics {
         // Validate topic name to prevent injection attacks
@@ -192,6 +230,7 @@ async fn collect_fetch(
         let partition_responses: Vec<_> = stream::iter(topic.partitions.clone())
             .map(|partition| {
                 let topic_name = Arc::clone(&topic_name);
+                let request_budget = Arc::clone(&request_budget);
                 async move {
                     match handler
                         .partition_manager
@@ -249,11 +288,41 @@ async fn collect_fetch(
                                 };
                             }
 
-                            match store.fetch_from(effective_offset).await {
+                            // Request-level max_bytes already consumed by
+                            // other partitions: return the HWM with no
+                            // records so the client still makes progress.
+                            let remaining = request_budget.load(Ordering::Relaxed);
+                            if remaining <= 0 {
+                                return FetchPartitionResponse {
+                                    partition_index: partition.partition_index,
+                                    error_code: KafkaCode::None,
+                                    high_watermark: current_hwm,
+                                    last_stable_offset: current_hwm,
+                                    aborted_transactions: vec![],
+                                    records: None,
+                                };
+                            }
+
+                            // Per-partition cap (`partition_max_bytes`, <= 0
+                            // meaning unlimited) further bounded by what's
+                            // left of the request budget. The store applies
+                            // its own broker-wide ceiling on top.
+                            let partition_cap = if partition.partition_max_bytes > 0 {
+                                partition.partition_max_bytes as usize
+                            } else {
+                                usize::MAX
+                            };
+                            let budget = partition_cap.min(remaining as usize);
+
+                            match store.fetch_from_with_budget(effective_offset, budget).await {
                                 Ok((high_watermark, records)) => {
                                     if let Some(ref record_bytes) = records {
                                         let bytes = record_bytes.len() as u64;
-                                        let msg_count = 1u64;
+                                        request_budget.fetch_sub(bytes as i64, Ordering::Relaxed);
+                                        let msg_count = crate::protocol::parse_record_count(
+                                            record_bytes,
+                                        )
+                                        .max(0) as u64;
                                         crate::cluster::metrics::record_fetch(
                                             &topic_name,
                                             partition.partition_index,

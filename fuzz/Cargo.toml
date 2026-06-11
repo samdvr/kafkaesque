@@ -20,5 +20,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "parser_primitives"
+path = "fuzz_targets/parser_primitives.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_batch_header"
+path = "fuzz_targets/record_batch_header.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

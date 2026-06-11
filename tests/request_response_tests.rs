@@ -309,6 +309,7 @@ fn test_parse_offset_commit_request_with_topics() {
     data.extend_from_slice(&1i32.to_be_bytes());
     data.extend_from_slice(&0i32.to_be_bytes()); // partition_index
     data.extend_from_slice(&100i64.to_be_bytes()); // committed_offset
+    data.extend_from_slice(&(-1i64).to_be_bytes()); // commit_timestamp (v1 only)
     data.extend(encode_nullable_string(Some("metadata"))); // committed_metadata
 
     let input = NomBytes::from(&data[..]);
@@ -336,6 +337,7 @@ fn test_parse_offset_commit_request_null_metadata() {
     data.extend_from_slice(&1i32.to_be_bytes());
     data.extend_from_slice(&0i32.to_be_bytes());
     data.extend_from_slice(&50i64.to_be_bytes());
+    data.extend_from_slice(&(-1i64).to_be_bytes()); // commit_timestamp (v1 only)
     data.extend(encode_nullable_string(None)); // null metadata
 
     let input = NomBytes::from(&data[..]);

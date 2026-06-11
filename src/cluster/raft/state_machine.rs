@@ -46,6 +46,58 @@ pub struct CoordinationState {
     /// is exactly what older deployments had implicitly.
     #[serde(default)]
     pub acl_domain: AclDomainState,
+
+    /// Replicated, monotonic lease clock for the partition domain, in ms
+    /// since the UNIX epoch. Advanced to `max(clock, cmd.timestamp_ms)` on
+    /// every timestamp-carrying partition command; all lease grant/renew/
+    /// expiry comparisons use the clamped value so replicas stay
+    /// deterministic and lease time never moves backward.
+    ///
+    /// IMPORTANT: this field must remain the LAST field of this struct.
+    /// Snapshots are encoded with postcard (not self-describing); keeping
+    /// new fields at the tail means (a) old snapshot bytes fail to decode
+    /// here with a clean EOF, which `deserialize_state` handles via the
+    /// legacy fallback, and (b) old binaries can still decode new snapshot
+    /// bytes because postcard ignores trailing bytes.
+    #[serde(default)]
+    pub lease_clock_ms: u64,
+}
+
+/// The pre-`lease_clock_ms` snapshot layout, used as a decode fallback for
+/// snapshots written before the lease clock existed. Field order and types
+/// must mirror `CoordinationState` exactly (minus the trailing clock).
+#[derive(Deserialize)]
+struct LegacyCoordinationState {
+    version: u64,
+    #[serde(default)]
+    broker_domain: BrokerDomainState,
+    #[serde(default)]
+    partition_domain: PartitionDomainState,
+    #[serde(default)]
+    group_domain: GroupDomainState,
+    #[serde(default)]
+    producer_domain: ProducerDomainState,
+    #[serde(default)]
+    transfer_domain: TransferDomainState,
+    #[serde(default)]
+    acl_domain: AclDomainState,
+}
+
+impl From<LegacyCoordinationState> for CoordinationState {
+    fn from(legacy: LegacyCoordinationState) -> Self {
+        Self {
+            version: legacy.version,
+            broker_domain: legacy.broker_domain,
+            partition_domain: legacy.partition_domain,
+            group_domain: legacy.group_domain,
+            producer_domain: legacy.producer_domain,
+            transfer_domain: legacy.transfer_domain,
+            acl_domain: legacy.acl_domain,
+            // Legacy snapshots predate the lease clock; it starts at 0 and
+            // catches up monotonically from the next applied command.
+            lease_clock_ms: 0,
+        }
+    }
 }
 
 /// Type alias for a heartbeat-applied callback. Invoked once per
@@ -142,7 +194,11 @@ impl CoordinationStateMachine {
                         super::domains::PartitionResponse::BrokerNotActive { broker_id },
                     );
                 }
-                CoordinationResponse::PartitionDomainResponse(state.partition_domain.apply(cmd))
+                // Disjoint borrows of `partition_domain` and `lease_clock_ms`.
+                let state = &mut *state;
+                CoordinationResponse::PartitionDomainResponse(
+                    state.partition_domain.apply(cmd, &mut state.lease_clock_ms),
+                )
             }
 
             CoordinationCommand::GroupDomain(cmd) => {
@@ -181,11 +237,64 @@ impl CoordinationStateMachine {
         postcard::to_stdvec(&*state).expect("Failed to serialize state")
     }
 
-    /// Restore state from a snapshot.
+    /// Decode snapshot bytes into a [`CoordinationState`] without mutating
+    /// anything.
+    ///
+    /// Tries the current layout first; on failure falls back to the legacy
+    /// (pre-`lease_clock_ms`) layout. Returns an `InvalidData` error on
+    /// corrupt input — it NEVER panics, so callers can treat a corrupt
+    /// snapshot as an error (storage propagates a `StorageError` to
+    /// openraft) instead of aborting the process.
+    pub fn deserialize_state(snapshot: &[u8]) -> std::io::Result<CoordinationState> {
+        match postcard::from_bytes::<CoordinationState>(snapshot) {
+            Ok(state) => Ok(state),
+            Err(current_err) => match postcard::from_bytes::<LegacyCoordinationState>(snapshot) {
+                Ok(legacy) => {
+                    tracing::info!(
+                        "Loaded legacy (pre-lease-clock) snapshot layout; \
+                         lease clock starts at 0 and catches up monotonically"
+                    );
+                    Ok(legacy.into())
+                }
+                Err(legacy_err) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "snapshot deserialize failed (current layout: {}; legacy layout: {})",
+                        current_err, legacy_err
+                    ),
+                )),
+            },
+        }
+    }
+
+    /// Replace the entire state with an already-validated snapshot state.
+    pub async fn replace_state(&self, new_state: CoordinationState) {
+        *self.state.write().await = new_state;
+    }
+
+    /// Restore state from snapshot bytes, validating BEFORE mutating.
+    ///
+    /// On corrupt input the in-memory state is left untouched and an error
+    /// is returned; the process is never aborted.
+    pub async fn try_restore(&self, snapshot: &[u8]) -> std::io::Result<()> {
+        let restored_state = Self::deserialize_state(snapshot)?;
+        self.replace_state(restored_state).await;
+        Ok(())
+    }
+
+    /// Restore state from a snapshot, ignoring corrupt input.
+    ///
+    /// Kept for callers that cannot handle an error return. On corrupt
+    /// bytes this logs loudly and leaves the state machine unchanged
+    /// (it used to `panic!`). New code should prefer [`Self::try_restore`].
     pub async fn restore(&self, snapshot: &[u8]) {
-        let restored_state: CoordinationState =
-            postcard::from_bytes(snapshot).expect("Failed to deserialize state");
-        *self.state.write().await = restored_state;
+        if let Err(e) = self.try_restore(snapshot).await {
+            tracing::error!(
+                error = %e,
+                "CORRUPTION: snapshot bytes failed to deserialize; \
+                 state machine left unchanged"
+            );
+        }
     }
 }
 

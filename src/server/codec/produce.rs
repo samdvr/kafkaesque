@@ -36,16 +36,6 @@ impl KafkaCodec for ProduceCodec {
         0
     }
 
-    /// Minimum supported version.
-    fn min_version() -> i16 {
-        0
-    }
-
-    /// Maximum supported version.
-    fn max_version() -> i16 {
-        9
-    }
-
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
         use crate::server::request::parse_produce_request;
         let (_, request) = parse_produce_request(bytes, version).map_err(|_| {
@@ -73,24 +63,17 @@ mod tests {
 
     #[test]
     fn test_produce_codec_version_range() {
-        assert_eq!(ProduceCodec::min_version(), 0);
-        assert_eq!(ProduceCodec::max_version(), 9);
+        assert_eq!(ProduceCodec::min_version(), 3);
+        assert_eq!(ProduceCodec::max_version(), 3);
     }
 
     #[test]
     fn test_produce_codec_version_supported() {
-        // Valid versions
-        for v in 0..=9 {
-            assert!(
-                ProduceCodec::is_version_supported(v),
-                "Version {} should be supported",
-                v
-            );
-        }
-
-        // Invalid versions
+        assert!(ProduceCodec::is_version_supported(3));
+        assert!(!ProduceCodec::is_version_supported(0));
+        assert!(!ProduceCodec::is_version_supported(2));
+        assert!(!ProduceCodec::is_version_supported(4));
         assert!(!ProduceCodec::is_version_supported(-1));
-        assert!(!ProduceCodec::is_version_supported(10));
     }
 
     #[test]

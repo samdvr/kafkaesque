@@ -52,14 +52,6 @@ impl KafkaCodec for FindCoordinatorCodec {
         10
     }
 
-    fn min_version() -> i16 {
-        0
-    }
-
-    fn max_version() -> i16 {
-        4
-    }
-
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
         use crate::server::request::parse_find_coordinator_request;
         let (_, request) = parse_find_coordinator_request(bytes, version).map_err(|_| {
@@ -97,14 +89,6 @@ impl KafkaCodec for JoinGroupCodec {
     /// Kafka API key for JoinGroup is 11.
     fn api_key() -> i16 {
         11
-    }
-
-    fn min_version() -> i16 {
-        0
-    }
-
-    fn max_version() -> i16 {
-        7
     }
 
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
@@ -145,14 +129,6 @@ impl KafkaCodec for HeartbeatCodec {
         12
     }
 
-    fn min_version() -> i16 {
-        0
-    }
-
-    fn max_version() -> i16 {
-        4
-    }
-
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
         use crate::server::request::parse_heartbeat_request;
         let (_, request) = parse_heartbeat_request(bytes, version).map_err(|_| {
@@ -189,14 +165,6 @@ impl KafkaCodec for LeaveGroupCodec {
     /// Kafka API key for LeaveGroup is 13.
     fn api_key() -> i16 {
         13
-    }
-
-    fn min_version() -> i16 {
-        0
-    }
-
-    fn max_version() -> i16 {
-        4
     }
 
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
@@ -237,14 +205,6 @@ impl KafkaCodec for SyncGroupCodec {
         14
     }
 
-    fn min_version() -> i16 {
-        0
-    }
-
-    fn max_version() -> i16 {
-        5
-    }
-
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
         use crate::server::request::parse_sync_group_request;
         let (_, request) = parse_sync_group_request(bytes, version).map_err(|_| {
@@ -280,14 +240,6 @@ impl KafkaCodec for DescribeGroupsCodec {
     /// Kafka API key for DescribeGroups is 15.
     fn api_key() -> i16 {
         15
-    }
-
-    fn min_version() -> i16 {
-        0
-    }
-
-    fn max_version() -> i16 {
-        5
     }
 
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
@@ -328,14 +280,6 @@ impl KafkaCodec for ListGroupsCodec {
         16
     }
 
-    fn min_version() -> i16 {
-        0
-    }
-
-    fn max_version() -> i16 {
-        4
-    }
-
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
         use crate::server::request::parse_list_groups_request;
         let (_, request) = parse_list_groups_request(bytes, version).map_err(|_| {
@@ -371,14 +315,6 @@ impl KafkaCodec for DeleteGroupsCodec {
     /// Kafka API key for DeleteGroups is 42.
     fn api_key() -> i16 {
         42
-    }
-
-    fn min_version() -> i16 {
-        0
-    }
-
-    fn max_version() -> i16 {
-        2
     }
 
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
@@ -418,7 +354,7 @@ mod tests {
     #[test]
     fn test_find_coordinator_codec_version_range() {
         assert_eq!(FindCoordinatorCodec::min_version(), 0);
-        assert_eq!(FindCoordinatorCodec::max_version(), 4);
+        assert_eq!(FindCoordinatorCodec::max_version(), 1);
     }
 
     #[test]
@@ -480,7 +416,7 @@ mod tests {
     #[test]
     fn test_join_group_codec_version_range() {
         assert_eq!(JoinGroupCodec::min_version(), 0);
-        assert_eq!(JoinGroupCodec::max_version(), 7);
+        assert_eq!(JoinGroupCodec::max_version(), 2);
     }
 
     #[test]
@@ -584,7 +520,7 @@ mod tests {
     #[test]
     fn test_heartbeat_codec_version_range() {
         assert_eq!(HeartbeatCodec::min_version(), 0);
-        assert_eq!(HeartbeatCodec::max_version(), 4);
+        assert_eq!(HeartbeatCodec::max_version(), 1);
     }
 
     #[test]
@@ -649,7 +585,7 @@ mod tests {
     #[test]
     fn test_leave_group_codec_version_range() {
         assert_eq!(LeaveGroupCodec::min_version(), 0);
-        assert_eq!(LeaveGroupCodec::max_version(), 4);
+        assert_eq!(LeaveGroupCodec::max_version(), 1);
     }
 
     #[test]
@@ -693,7 +629,7 @@ mod tests {
     #[test]
     fn test_sync_group_codec_version_range() {
         assert_eq!(SyncGroupCodec::min_version(), 0);
-        assert_eq!(SyncGroupCodec::max_version(), 5);
+        assert_eq!(SyncGroupCodec::max_version(), 1);
     }
 
     #[test]
@@ -776,7 +712,7 @@ mod tests {
     #[test]
     fn test_describe_groups_codec_version_range() {
         assert_eq!(DescribeGroupsCodec::min_version(), 0);
-        assert_eq!(DescribeGroupsCodec::max_version(), 5);
+        assert_eq!(DescribeGroupsCodec::max_version(), 1);
     }
 
     #[test]
@@ -838,7 +774,7 @@ mod tests {
     #[test]
     fn test_list_groups_codec_version_range() {
         assert_eq!(ListGroupsCodec::min_version(), 0);
-        assert_eq!(ListGroupsCodec::max_version(), 4);
+        assert_eq!(ListGroupsCodec::max_version(), 2);
     }
 
     #[test]
@@ -917,7 +853,7 @@ mod tests {
     #[test]
     fn test_delete_groups_codec_version_range() {
         assert_eq!(DeleteGroupsCodec::min_version(), 0);
-        assert_eq!(DeleteGroupsCodec::max_version(), 2);
+        assert_eq!(DeleteGroupsCodec::max_version(), 1);
     }
 
     #[test]

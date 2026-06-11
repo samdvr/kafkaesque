@@ -163,27 +163,10 @@ impl ApiKey {
         }
     }
 
-    /// Returns the response encoding style for this API.
-    ///
-    /// Most APIs use Standard encoding, but some newer APIs (like InitProducerId)
-    /// use Flexible encoding which includes tagged fields in the header.
-    ///
-    /// This method centralizes the style mapping to avoid manual specification
-    /// in request dispatch code, reducing the risk of errors.
-    ///
-    /// Note: Currently the dispatch code in connection.rs uses hardcoded style
-    /// selection. This method is preserved for future refactoring to use a
-    /// unified dispatch pattern.
+    /// Response encoding style for a specific protocol version.
     #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn response_style(&self) -> super::connection::ResponseStyle {
-        use super::connection::ResponseStyle;
-        match self {
-            // InitProducerId uses flexible encoding (v3+)
-            ApiKey::InitProducerId => ResponseStyle::Flexible,
-            // All other APIs use standard encoding
-            _ => ResponseStyle::Standard,
-        }
+    pub(crate) fn response_style(&self, api_version: i16) -> super::connection::ResponseStyle {
+        super::connection::response_style_for(*self, api_version)
     }
 }
 
@@ -197,21 +180,28 @@ pub struct RequestHeader {
 }
 
 /// Parse a request header from bytes.
-/// Note: ApiVersions v3+ uses a hybrid format per KIP-511:
-/// - client_id uses standard encoding (i16 length, not varint)
-/// - but an empty tagged_fields section follows client_id
+///
+/// Flexible APIs (KIP-482) use request header v2, which keeps `client_id`
+/// as a standard NULLABLE_STRING (i16 length, not varint) but appends a
+/// tagged-fields section after it. ApiVersions v3+ is the KIP-511 special
+/// case of the same shape. Which (api_key, version) pairs are flexible is
+/// centralized in [`crate::server::versions::uses_flexible_encoding`].
 pub fn parse_request_header(s: NomBytes) -> IResult<NomBytes, RequestHeader> {
     let (s, api_key) = be_i16(s)?;
     let (s, api_version) = be_i16(s)?;
     let (s, correlation_id) = be_i32(s)?;
 
-    // Always parse client_id as standard nullable string (i16 length)
-    // This is correct even for ApiVersions v3+ per KIP-511
+    // Always parse client_id as standard nullable string (i16 length).
+    // This is correct even for flexible header v2 (and ApiVersions v3+
+    // per KIP-511): client_id never uses compact encoding in headers.
     let (s, client_id) = parse_nullable_string(s)?;
 
-    // ApiVersions v3+ adds empty tagged_fields after client_id
-    // (hybrid format: standard client_id encoding + tagged_fields)
-    let s = if api_key == 18 && api_version >= 3 {
+    // Flexible request headers (header v2) carry tagged_fields after
+    // client_id. Skipping this for flexible APIs other than ApiVersions
+    // (e.g. InitProducerId v2+) previously left a stray 0x00 in front of
+    // the body, mis-aligning every field after it.
+    let api_key_typed = ApiKey::from(api_key);
+    let s = if crate::server::versions::uses_flexible_encoding(api_key_typed, api_version) {
         let (s, _) = skip_tagged_fields(s)?;
         s
     } else {
@@ -223,7 +213,7 @@ pub fn parse_request_header(s: NomBytes) -> IResult<NomBytes, RequestHeader> {
     Ok((
         s,
         RequestHeader {
-            api_key: ApiKey::from(api_key),
+            api_key: api_key_typed,
             api_version,
             correlation_id,
             client_id,
@@ -254,6 +244,12 @@ pub enum Request {
     DeleteTopics(RequestHeader, DeleteTopicsRequestData),
     InitProducerId(RequestHeader, InitProducerIdRequestData),
     DeleteGroups(RequestHeader, DeleteGroupsRequestData),
+    /// A known API key was sent with a version outside the advertised
+    /// range in [`crate::server::versions::SUPPORTED_VERSIONS`]. The body
+    /// is intentionally NOT parsed (its layout is unknown to us); the
+    /// connection layer answers with `KafkaCode::UnsupportedVersion`
+    /// (error code 35) carrying the request's correlation id.
+    UnsupportedVersion(RequestHeader),
     Unknown(RequestHeader, Bytes),
 }
 
@@ -281,124 +277,169 @@ impl Request {
             Request::DeleteTopics(h, _) => h,
             Request::InitProducerId(h, _) => h,
             Request::DeleteGroups(h, _) => h,
+            Request::UnsupportedVersion(h) => h,
             Request::Unknown(h, _) => h,
         }
     }
 
     /// Parse a request from raw bytes.
+    ///
+    /// After the header is parsed, the api_version is checked against the
+    /// advertised range from [`crate::server::versions::SUPPORTED_VERSIONS`]:
+    /// an unadvertised version yields [`Request::UnsupportedVersion`] instead
+    /// of applying the wrong wire layout to the body bytes. The connection
+    /// layer turns that into an UnsupportedVersion (35) error response —
+    /// not a connection close.
     pub fn parse(data: Bytes) -> Result<Self> {
         let input = NomBytes::new(data.clone());
-        let (remaining, header) =
-            parse_request_header(input).map_err(|_| Error::ParsingError(data.clone()))?;
+        let (remaining, header) = parse_request_header(input).map_err(|_| parsing_error(&data))?;
 
-        match header.api_key {
+        // Enforce the advertised version range BEFORE body parsing. Each
+        // per-API parser only understands the layouts for the advertised
+        // versions; decoding an unadvertised version with the closest known
+        // layout silently mis-frames every field. Unknown API keys are left
+        // to the Unknown arm (the handler answers those itself).
+        if !matches!(header.api_key, ApiKey::Unknown(_))
+            && !crate::server::versions::is_version_supported(header.api_key, header.api_version)
+        {
+            return Ok(Request::UnsupportedVersion(header));
+        }
+
+        let version = header.api_version;
+        let api_key = header.api_key;
+
+        let (rest, request) = match api_key {
             ApiKey::Produce => {
-                let (_, body) = produce::parse_produce_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::Produce(header, body))
+                let (rest, body) = produce::parse_produce_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::Produce(header, body))
             }
             ApiKey::Fetch => {
-                let (_, body) = fetch::parse_fetch_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::Fetch(header, body))
+                let (rest, body) = fetch::parse_fetch_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::Fetch(header, body))
             }
             ApiKey::ListOffsets => {
-                let (_, body) = offsets::parse_list_offsets_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::ListOffsets(header, body))
+                let (rest, body) = offsets::parse_list_offsets_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::ListOffsets(header, body))
             }
             ApiKey::Metadata => {
-                let (_, body) = metadata::parse_metadata_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::Metadata(header, body))
+                let (rest, body) = metadata::parse_metadata_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::Metadata(header, body))
             }
             ApiKey::OffsetCommit => {
-                let (_, body) = offsets::parse_offset_commit_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::OffsetCommit(header, body))
+                let (rest, body) = offsets::parse_offset_commit_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::OffsetCommit(header, body))
             }
             ApiKey::OffsetFetch => {
-                let (_, body) = offsets::parse_offset_fetch_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::OffsetFetch(header, body))
+                let (rest, body) = offsets::parse_offset_fetch_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::OffsetFetch(header, body))
             }
             ApiKey::FindCoordinator => {
-                let (_, body) =
-                    groups::parse_find_coordinator_request(remaining, header.api_version)
-                        .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::FindCoordinator(header, body))
+                let (rest, body) = groups::parse_find_coordinator_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::FindCoordinator(header, body))
             }
             ApiKey::JoinGroup => {
-                let (_, body) = groups::parse_join_group_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::JoinGroup(header, body))
+                let (rest, body) = groups::parse_join_group_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::JoinGroup(header, body))
             }
             ApiKey::Heartbeat => {
-                let (_, body) = groups::parse_heartbeat_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::Heartbeat(header, body))
+                let (rest, body) = groups::parse_heartbeat_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::Heartbeat(header, body))
             }
             ApiKey::LeaveGroup => {
-                let (_, body) = groups::parse_leave_group_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::LeaveGroup(header, body))
+                let (rest, body) = groups::parse_leave_group_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::LeaveGroup(header, body))
             }
             ApiKey::SyncGroup => {
-                let (_, body) = groups::parse_sync_group_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::SyncGroup(header, body))
+                let (rest, body) = groups::parse_sync_group_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::SyncGroup(header, body))
             }
             ApiKey::SaslHandshake => {
-                let (_, body) = auth::parse_sasl_handshake_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::SaslHandshake(header, body))
+                let (rest, body) = auth::parse_sasl_handshake_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::SaslHandshake(header, body))
             }
             ApiKey::SaslAuthenticate => {
-                let (_, body) =
-                    auth::parse_sasl_authenticate_request(remaining, header.api_version)
-                        .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::SaslAuthenticate(header, body))
+                let (rest, body) = auth::parse_sasl_authenticate_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::SaslAuthenticate(header, body))
             }
             ApiKey::ApiVersions => {
-                let (_, body) = versions::parse_api_versions_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::ApiVersions(header, body))
+                let (rest, body) = versions::parse_api_versions_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::ApiVersions(header, body))
             }
             ApiKey::CreateTopics => {
-                let (_, body) = admin::parse_create_topics_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::CreateTopics(header, body))
+                let (rest, body) = admin::parse_create_topics_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::CreateTopics(header, body))
             }
             ApiKey::DeleteTopics => {
-                let (_, body) = admin::parse_delete_topics_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::DeleteTopics(header, body))
+                let (rest, body) = admin::parse_delete_topics_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::DeleteTopics(header, body))
             }
             ApiKey::InitProducerId => {
-                let (_, body) =
-                    admin::parse_init_producer_id_request(remaining, header.api_version)
-                        .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::InitProducerId(header, body))
+                let (rest, body) = admin::parse_init_producer_id_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::InitProducerId(header, body))
             }
             ApiKey::DescribeGroups => {
-                let (_, body) =
-                    groups::parse_describe_groups_request(remaining, header.api_version)
-                        .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::DescribeGroups(header, body))
+                let (rest, body) = groups::parse_describe_groups_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::DescribeGroups(header, body))
             }
             ApiKey::ListGroups => {
-                let (_, body) = groups::parse_list_groups_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::ListGroups(header, body))
+                let (rest, body) = groups::parse_list_groups_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::ListGroups(header, body))
             }
             ApiKey::DeleteGroups => {
-                let (_, body) = groups::parse_delete_groups_request(remaining, header.api_version)
-                    .map_err(|_| Error::ParsingError(data))?;
-                Ok(Request::DeleteGroups(header, body))
+                let (rest, body) = groups::parse_delete_groups_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::DeleteGroups(header, body))
             }
-            _ => Ok(Request::Unknown(header, remaining.into_bytes())),
+            _ => return Ok(Request::Unknown(header, remaining.into_bytes())),
+        };
+
+        // Trailing bytes after a successful body parse are tolerated (some
+        // clients pad frames) but logged so a mis-framed client — or a gap
+        // in one of our per-version layouts — is visible at debug level.
+        let trailing = rest.into_bytes();
+        if !trailing.is_empty() {
+            tracing::debug!(
+                api_key = api_key.as_str(),
+                api_version = version,
+                trailing_bytes = trailing.len(),
+                "Request body parse left trailing bytes"
+            );
         }
+
+        Ok(request)
     }
+}
+
+/// Maximum number of request bytes preserved in a [`Error::ParsingError`].
+///
+/// Errors used to clone the ENTIRE request buffer (up to the 100 MB frame
+/// cap) into the error value on the hot path. A short prefix is all the
+/// debugging value there is; `Bytes::slice` is a cheap refcount bump, not
+/// a copy.
+const PARSING_ERROR_PREFIX_LEN: usize = 256;
+
+/// Build a `ParsingError` carrying only a bounded prefix of the request.
+fn parsing_error(data: &Bytes) -> Error {
+    Error::ParsingError(data.slice(..data.len().min(PARSING_ERROR_PREFIX_LEN)))
 }
 
 #[cfg(test)]
@@ -426,6 +467,20 @@ mod tests {
             }
         }
         data
+    }
+
+    #[test]
+    fn test_api_key_response_style_matches_versions_table() {
+        use crate::server::connection::ResponseStyle;
+        assert_eq!(
+            ApiKey::InitProducerId.response_style(1),
+            ResponseStyle::Standard
+        );
+        assert_eq!(
+            ApiKey::InitProducerId.response_style(2),
+            ResponseStyle::Flexible
+        );
+        assert_eq!(ApiKey::Produce.response_style(3), ResponseStyle::Standard);
     }
 
     #[test]
@@ -739,6 +794,172 @@ mod tests {
                 assert_eq!(body.auth_bytes.as_ref(), &[1, 2, 3]);
             }
             _ => panic!("Expected SaslAuthenticate request"),
+        }
+    }
+
+    // ========================================================================
+    // Advertised-version enforcement
+    // ========================================================================
+
+    #[test]
+    fn test_parse_unsupported_version_returns_typed_variant() {
+        // Produce is advertised as v3..=v3; a v0 request must NOT be parsed
+        // with the v3 layout. The body here is even garbage on purpose —
+        // it must never be touched.
+        let mut data = build_header(0, 0, 7777, Some("legacy-producer"));
+        data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let request = Request::parse(Bytes::from(data)).unwrap();
+        match request {
+            Request::UnsupportedVersion(header) => {
+                assert_eq!(header.api_key, ApiKey::Produce);
+                assert_eq!(header.api_version, 0);
+                assert_eq!(header.correlation_id, 7777);
+                assert_eq!(header.client_id, Some("legacy-producer".to_string()));
+            }
+            other => panic!("Expected UnsupportedVersion, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_unsupported_version_above_max() {
+        // Fetch max is v4; v5 must be refused even though v5's layout is a
+        // superset (we'd silently ignore session fields otherwise).
+        let data = build_header(1, 5, 31337, None);
+        let request = Request::parse(Bytes::from(data)).unwrap();
+        match request {
+            Request::UnsupportedVersion(header) => {
+                assert_eq!(header.api_key, ApiKey::Fetch);
+                assert_eq!(header.api_version, 5);
+                assert_eq!(header.correlation_id, 31337);
+            }
+            other => panic!("Expected UnsupportedVersion, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_unsupported_api_versions_version() {
+        // ApiVersions itself is capped at v3; a v4 request gets the typed
+        // variant so the connection layer can answer with a v0-encoded
+        // ApiVersions response carrying error 35 + supported ranges.
+        // (v4 still uses the flexible header, so include tagged fields.)
+        let data = build_flexible_header(18, 4, 555, Some("newer-client"));
+        let request = Request::parse(Bytes::from(data)).unwrap();
+        match request {
+            Request::UnsupportedVersion(header) => {
+                assert_eq!(header.api_key, ApiKey::ApiVersions);
+                assert_eq!(header.api_version, 4);
+                assert_eq!(header.correlation_id, 555);
+            }
+            other => panic!("Expected UnsupportedVersion, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_supported_version_still_parses() {
+        // A supported version must go through body parsing as before.
+        let mut data = build_header(3, 1, 808, Some("ok-client"));
+        data.extend_from_slice(&(-1i32).to_be_bytes()); // all topics
+
+        let request = Request::parse(Bytes::from(data)).unwrap();
+        match request {
+            Request::Metadata(header, body) => {
+                assert_eq!(header.api_version, 1);
+                assert_eq!(header.correlation_id, 808);
+                assert!(body.topics.is_none());
+            }
+            other => panic!("Expected Metadata, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_negative_version_rejected() {
+        let data = build_header(3, -1, 1, None);
+        let request = Request::parse(Bytes::from(data)).unwrap();
+        assert!(matches!(request, Request::UnsupportedVersion(_)));
+    }
+
+    #[test]
+    fn test_unknown_api_key_bypasses_version_check() {
+        // Unknown API keys keep flowing to Request::Unknown so the handler
+        // can answer them; the version gate only applies to known keys.
+        let data = build_header(999, 42, 2, None);
+        let request = Request::parse(Bytes::from(data)).unwrap();
+        assert!(matches!(request, Request::Unknown(_, _)));
+    }
+
+    #[test]
+    fn test_parse_init_producer_id_v2_flexible_via_request_parse() {
+        // End-to-end through Request::parse: InitProducerId v2 uses request
+        // header v2 (classic client_id + tagged fields) and a flexible body.
+        let mut data = Vec::new();
+        data.extend_from_slice(&22i16.to_be_bytes()); // api_key = InitProducerId
+        data.extend_from_slice(&2i16.to_be_bytes()); // api_version = 2 (flexible)
+        data.extend_from_slice(&99i32.to_be_bytes()); // correlation_id
+        data.extend_from_slice(&6i16.to_be_bytes()); // client_id (classic)
+        data.extend_from_slice(b"prod-1");
+        data.push(0); // header tagged fields
+        data.push(0); // transactional_id = null (compact varint 0)
+        data.extend_from_slice(&60000i32.to_be_bytes()); // timeout
+        data.push(0); // body tagged fields
+
+        let request = Request::parse(Bytes::from(data)).unwrap();
+        match request {
+            Request::InitProducerId(header, body) => {
+                assert_eq!(header.api_version, 2);
+                assert_eq!(header.correlation_id, 99);
+                assert_eq!(header.client_id, Some("prod-1".to_string()));
+                assert!(body.transactional_id.is_none());
+                assert_eq!(body.transaction_timeout_ms, 60000);
+                assert_eq!(body.producer_id, -1);
+                assert_eq!(body.producer_epoch, -1);
+            }
+            other => panic!("Expected InitProducerId, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_init_producer_id_v1_classic_via_request_parse() {
+        // v0-v1 keep the classic header (no tagged fields) and body.
+        let mut data = Vec::new();
+        data.extend_from_slice(&22i16.to_be_bytes()); // api_key
+        data.extend_from_slice(&1i16.to_be_bytes()); // api_version = 1
+        data.extend_from_slice(&44i32.to_be_bytes()); // correlation_id
+        data.extend_from_slice(&(-1i16).to_be_bytes()); // null client_id
+        data.extend_from_slice(&(-1i16).to_be_bytes()); // null transactional_id
+        data.extend_from_slice(&30000i32.to_be_bytes()); // timeout
+
+        let request = Request::parse(Bytes::from(data)).unwrap();
+        match request {
+            Request::InitProducerId(header, body) => {
+                assert_eq!(header.api_version, 1);
+                assert!(body.transactional_id.is_none());
+                assert_eq!(body.transaction_timeout_ms, 30000);
+            }
+            other => panic!("Expected InitProducerId, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parsing_error_payload_is_truncated() {
+        // A large malformed request must not be cloned wholesale into the
+        // error. Build a valid Metadata header followed by a body that
+        // fails to parse (claims 10 topics, provides none) padded to 1 MiB.
+        let mut data = build_header(3, 1, 1, None);
+        data.extend_from_slice(&10i32.to_be_bytes()); // 10 topics, no data
+        data.resize(1024 * 1024, 0xAA);
+        // Make the first "topic" unparseable: negative string length != -1
+        // is rejected, so the array parse fails regardless of the padding.
+        let err = Request::parse(Bytes::from(data)).unwrap_err();
+        match err {
+            Error::ParsingError(prefix) => {
+                assert!(
+                    prefix.len() <= 256,
+                    "ParsingError must carry at most a 256-byte prefix, got {}",
+                    prefix.len()
+                );
+            }
+            other => panic!("Expected ParsingError, got {:?}", other),
         }
     }
 

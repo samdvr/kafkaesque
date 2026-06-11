@@ -35,7 +35,7 @@ use super::SlateDBClusterHandler;
 use crate::cluster::authorizer::{AuthorizeRequest, AuthorizeResult};
 use crate::cluster::error::HeartbeatResult;
 use crate::cluster::raft::{AclOperation, AclResourceType};
-use crate::cluster::traits::{ConsumerGroupCoordinator, PartitionCoordinator};
+use crate::cluster::traits::{ConsumerGroupCoordinator, GroupJoinOutcome, PartitionCoordinator};
 
 /// Run an ACL check for an operation on a consumer-group resource.
 ///
@@ -221,39 +221,49 @@ pub(super) async fn handle_join_group(
         request.member_id.clone()
     };
 
-    // Get protocol metadata
-    let metadata = request
+    // Collect the member's full protocol list. Every (name, metadata)
+    // pair is persisted so the leader's JoinGroup response can carry each
+    // member's OWN subscription bytes for the negotiated protocol.
+    let protocols: Vec<(String, Vec<u8>)> = request
         .protocols
-        .first()
-        .map(|p| p.metadata.to_vec())
-        .unwrap_or_default();
+        .iter()
+        .map(|p| (p.name.clone(), p.metadata.to_vec()))
+        .collect();
 
-    // Validate metadata size
-    if let Err(e) = crate::cluster::coordinator::validate_member_metadata(&metadata) {
-        debug!(group_id = %request.group_id, error = %e, "Member metadata too large");
-        return JoinGroupResponseData {
-            throttle_time_ms: 0,
-            error_code: KafkaCode::Unknown,
-            generation_id: -1,
-            protocol_name: String::new(),
-            leader: String::new(),
-            member_id,
-            members: vec![],
-        };
+    // Validate metadata size for every protocol entry
+    for (protocol_name, metadata) in &protocols {
+        if let Err(e) = crate::cluster::coordinator::validate_member_metadata(metadata) {
+            debug!(
+                group_id = %request.group_id,
+                protocol = %protocol_name,
+                error = %e,
+                "Member metadata too large"
+            );
+            return JoinGroupResponseData {
+                throttle_time_ms: 0,
+                error_code: KafkaCode::Unknown,
+                generation_id: -1,
+                protocol_name: String::new(),
+                leader: String::new(),
+                member_id,
+                members: vec![],
+            };
+        }
     }
 
-    // Atomically join group
-    let (generation_id, final_member_id, _is_leader, leader_id, member_ids) = match handler
+    // Atomically join group, negotiating the protocol across all members.
+    let outcome = match handler
         .coordinator
-        .join_group(
+        .join_group_with_protocols(
             &request.group_id,
             &member_id,
-            &metadata,
+            &protocols,
             request.session_timeout_ms,
+            request.rebalance_timeout_ms,
         )
         .await
     {
-        Ok(result) => result,
+        Ok(outcome) => outcome,
         Err(e) => {
             error!(error = %e, "Failed to join group");
             crate::cluster::metrics::record_group_operation("join", "error");
@@ -269,47 +279,78 @@ pub(super) async fn handle_join_group(
         }
     };
 
-    // Build member list with metadata
-    let default_metadata = Bytes::new();
-    let mut members: Vec<JoinGroupMemberData> = member_ids
-        .iter()
-        .map(|mid| JoinGroupMemberData {
-            member_id: mid.clone(),
-            metadata: request
-                .protocols
-                .first()
-                .map(|p| p.metadata.clone())
-                .unwrap_or_else(|| default_metadata.clone()),
+    let result = match outcome {
+        GroupJoinOutcome::Joined(result) => result,
+        GroupJoinOutcome::InconsistentProtocol => {
+            debug!(
+                group_id = %request.group_id,
+                member_id = %member_id,
+                "Join rejected: no protocol in common with the group"
+            );
+            crate::cluster::metrics::record_group_operation("join", "error");
+            return JoinGroupResponseData {
+                throttle_time_ms: 0,
+                error_code: KafkaCode::InconsistentGroupProtocol,
+                generation_id: -1,
+                protocol_name: String::new(),
+                leader: String::new(),
+                member_id,
+                members: vec![],
+            };
+        }
+    };
+
+    // Build the member list from the coordinator's stored per-member
+    // metadata. Only the leader receives a non-empty roster (Kafka
+    // semantics); each entry carries that member's own subscription
+    // metadata so the leader's assignor sees real subscriptions.
+    let mut members: Vec<JoinGroupMemberData> = result
+        .members
+        .into_iter()
+        .map(|(mid, metadata)| JoinGroupMemberData {
+            member_id: mid,
+            metadata: Bytes::from(metadata),
         })
         .collect();
     members.sort_by(|a, b| a.member_id.cmp(&b.member_id));
 
     debug!(
         group_id = %request.group_id,
-        member_id = %final_member_id,
-        generation_id,
-        leader = %leader_id,
+        member_id = %result.member_id,
+        generation_id = result.generation_id,
+        leader = %result.leader_id,
+        protocol = %result.protocol_name,
         member_count = members.len(),
         "Member joined group"
     );
 
-    // Record metrics
+    // Record metrics. The member roster is only present in the leader's
+    // response, so only the leader path refreshes the member-count gauge.
     crate::cluster::metrics::record_group_operation("join", "success");
-    crate::cluster::metrics::set_group_member_count(&request.group_id, members.len() as i64);
-    crate::cluster::metrics::set_group_generation(&request.group_id, generation_id as i64);
+    if result.is_leader {
+        crate::cluster::metrics::set_group_member_count(&request.group_id, members.len() as i64);
+    }
+    crate::cluster::metrics::set_group_generation(&request.group_id, result.generation_id as i64);
 
     JoinGroupResponseData {
         throttle_time_ms: 0,
         error_code: KafkaCode::None,
-        generation_id,
-        protocol_name: request
-            .protocols
-            .first()
-            .map(|p| p.name.clone())
-            .unwrap_or_default(),
-        leader: leader_id,
-        member_id: final_member_id,
+        generation_id: result.generation_id,
+        protocol_name: result.protocol_name,
+        leader: result.leader_id,
+        member_id: result.member_id,
         members,
+    }
+}
+
+/// Build a SyncGroup error response (empty assignment) and record the
+/// failed sync in metrics.
+fn sync_group_error(error_code: KafkaCode) -> SyncGroupResponseData {
+    crate::cluster::metrics::record_group_operation("sync", "error");
+    SyncGroupResponseData {
+        throttle_time_ms: 0,
+        error_code,
+        assignment: Bytes::new(),
     }
 }
 
@@ -338,11 +379,7 @@ pub(super) async fn handle_sync_group(
         Ok(generation) => generation,
         Err(e) => {
             error!(error = %e, "Failed to get group generation");
-            return SyncGroupResponseData {
-                throttle_time_ms: 0,
-                error_code: KafkaCode::Unknown,
-                assignment: Bytes::new(),
-            };
+            return sync_group_error(e.to_kafka_code());
         }
     };
 
@@ -353,11 +390,31 @@ pub(super) async fn handle_sync_group(
             current_generation,
             "Generation mismatch in SyncGroup"
         );
-        return SyncGroupResponseData {
-            throttle_time_ms: 0,
-            error_code: KafkaCode::IllegalGeneration,
-            assignment: Bytes::new(),
-        };
+        return sync_group_error(KafkaCode::IllegalGeneration);
+    }
+
+    // The caller must be a known member of the group. Without this gate a
+    // consumer that was evicted (or never joined) would get a success
+    // response with an empty assignment instead of UNKNOWN_MEMBER_ID.
+    match handler
+        .coordinator
+        .get_group_members(&request.group_id)
+        .await
+    {
+        Ok(member_ids) => {
+            if !member_ids.iter().any(|m| m == &request.member_id) {
+                debug!(
+                    group_id = %request.group_id,
+                    member_id = %request.member_id,
+                    "SyncGroup from unknown member"
+                );
+                return sync_group_error(KafkaCode::UnknownMemberId);
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to get group members for sync");
+            return sync_group_error(e.to_kafka_code());
+        }
     }
 
     // Leader sends assignments for all members
@@ -393,26 +450,67 @@ pub(super) async fn handle_sync_group(
                         );
                     }
                     Ok(false) => {
+                        // A new rebalance started between storing the
+                        // assignments and completing — the leader must
+                        // rejoin and redo the assignment.
                         debug!(
                             group_id = %request.group_id,
                             generation = request.generation_id,
                             "Rebalance completion rejected - generation changed"
                         );
+                        return sync_group_error(KafkaCode::RebalanceInProgress);
                     }
                     Err(e) => {
                         error!(error = %e, "Failed to complete rebalance");
+                        return sync_group_error(e.to_kafka_code());
                     }
                 }
             }
             Ok(false) => {
+                // The coordinator rejected the assignments. Distinguish why
+                // so the client gets an actionable error instead of a
+                // success with a garbage assignment.
+                let generation_now = handler
+                    .coordinator
+                    .get_generation(&request.group_id)
+                    .await
+                    .unwrap_or(-1);
+                if generation_now != request.generation_id {
+                    debug!(
+                        group_id = %request.group_id,
+                        request_generation = request.generation_id,
+                        current_generation = generation_now,
+                        "Assignments rejected - generation changed"
+                    );
+                    return sync_group_error(KafkaCode::IllegalGeneration);
+                }
+                let still_member = handler
+                    .coordinator
+                    .get_group_members(&request.group_id)
+                    .await
+                    .map(|m| m.iter().any(|id| id == &request.member_id))
+                    .unwrap_or(false);
+                if !still_member {
+                    debug!(
+                        group_id = %request.group_id,
+                        member_id = %request.member_id,
+                        "Assignments rejected - member no longer in group"
+                    );
+                    return sync_group_error(KafkaCode::UnknownMemberId);
+                }
+                // Generation and membership are intact, so the caller is a
+                // non-leader that sent assignments. Kafka only consumes the
+                // assignment field from the leader; ignore it and fall
+                // through to return this member's own assignment.
                 debug!(
                     group_id = %request.group_id,
                     member_id = %request.member_id,
-                    "Assignments rejected - caller is not leader"
+                    "Ignoring assignments from non-leader member"
                 );
             }
             Err(e) => {
                 error!(error = %e, "Failed to store assignments atomically");
+                return sync_group_error(e.to_kafka_code());
             }
         }
     }
@@ -431,7 +529,7 @@ pub(super) async fn handle_sync_group(
                 error = %e,
                 "Failed to get member assignment"
             );
-            Vec::new()
+            return sync_group_error(e.to_kafka_code());
         }
     };
 
@@ -525,20 +623,45 @@ pub(super) async fn handle_leave_group(
         };
     }
 
-    if let Err(e) = handler
+    match handler
         .coordinator
-        .remove_group_member(&request.group_id, &request.member_id)
+        .leave_group(&request.group_id, &request.member_id)
         .await
     {
-        error!(error = %e, "Failed to remove group member");
-        crate::cluster::metrics::record_group_operation("leave", "error");
-    } else {
-        crate::cluster::metrics::record_group_operation("leave", "success");
-    }
-
-    LeaveGroupResponseData {
-        throttle_time_ms: 0,
-        error_code: KafkaCode::None,
+        Ok(true) => {
+            debug!(
+                group_id = %request.group_id,
+                member_id = %request.member_id,
+                "Member left group"
+            );
+            crate::cluster::metrics::record_group_operation("leave", "success");
+            LeaveGroupResponseData {
+                throttle_time_ms: 0,
+                error_code: KafkaCode::None,
+            }
+        }
+        Ok(false) => {
+            // The member (or the whole group) is unknown; Kafka answers
+            // UNKNOWN_MEMBER_ID rather than pretending the leave succeeded.
+            debug!(
+                group_id = %request.group_id,
+                member_id = %request.member_id,
+                "LeaveGroup for unknown member"
+            );
+            crate::cluster::metrics::record_group_operation("leave", "error");
+            LeaveGroupResponseData {
+                throttle_time_ms: 0,
+                error_code: KafkaCode::UnknownMemberId,
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to remove group member");
+            crate::cluster::metrics::record_group_operation("leave", "error");
+            LeaveGroupResponseData {
+                throttle_time_ms: 0,
+                error_code: e.to_kafka_code(),
+            }
+        }
     }
 }
 
@@ -574,10 +697,20 @@ pub(super) async fn handle_describe_groups(
                 } else {
                     "Stable"
                 };
+                // Report the protocol negotiated at the last rebalance
+                // instead of a hardcoded assignor name.
+                let protocol_data = handler
+                    .coordinator
+                    .get_group_protocol(&group_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 groups.push(
                     DescribedGroup::builder(group_id)
                         .group_state(group_state)
                         .protocol_type("consumer")
+                        .protocol_data(protocol_data)
                         .members(
                             member_ids
                                 .into_iter()

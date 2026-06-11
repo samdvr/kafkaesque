@@ -6,12 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
-
-#[cfg(feature = "tls")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(feature = "tls")]
 use tokio_rustls::server::TlsStream;
@@ -31,22 +29,70 @@ use crate::encode::ToByte;
 
 use std::time::Instant;
 
-/// Default maximum allowed message size (100 MB).
-/// This prevents memory exhaustion from malicious or malformed messages.
-/// Can be overridden via KafkaServer configuration.
-pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+/// Re-exported from [`crate::constants`] — single source of truth for the
+/// per-frame size cap.
+pub use crate::constants::DEFAULT_MAX_MESSAGE_SIZE;
 
 /// Default global inflight-bytes budget (1 GiB). Bounds the total memory
 /// the broker is willing to allocate for not-yet-parsed inbound frames so a
 /// burst of large produces (or a coordinated slow-frame attack) can't OOM
-/// the process. Override via `set_global_inflight_byte_budget`.
+/// the process. Override via [`set_global_inflight_byte_budget`] before the
+/// first connection is served.
 const DEFAULT_GLOBAL_INFLIGHT_BUDGET: usize = 1024 * 1024 * 1024;
+
+/// The budget configured via [`set_global_inflight_byte_budget`], if any.
+/// Once `GLOBAL_INFLIGHT` is initialized this cell is filled with the
+/// effective value, so later configuration attempts fail loudly instead of
+/// appearing to succeed while changing nothing.
+static CONFIGURED_INFLIGHT_BUDGET: once_cell::sync::OnceCell<usize> =
+    once_cell::sync::OnceCell::new();
 
 /// Global semaphore measured in bytes. Each inbound frame acquires N permits
 /// (one per byte) before the buffer is allocated and releases them on drop.
-/// Configured at most once per process; later attempts are ignored.
-static GLOBAL_INFLIGHT: once_cell::sync::Lazy<Arc<Semaphore>> =
-    once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(DEFAULT_GLOBAL_INFLIGHT_BUDGET)));
+/// Initialized lazily on the first frame from [`CONFIGURED_INFLIGHT_BUDGET`]
+/// (or the 1 GiB default); immutable afterwards.
+static GLOBAL_INFLIGHT: once_cell::sync::Lazy<Arc<Semaphore>> = once_cell::sync::Lazy::new(|| {
+    let budget = *CONFIGURED_INFLIGHT_BUDGET.get_or_init(|| DEFAULT_GLOBAL_INFLIGHT_BUDGET);
+    Arc::new(Semaphore::new(budget))
+});
+
+/// Configure the process-global inflight-bytes budget.
+///
+/// The budget bounds the total bytes of inbound Kafka frames that may be
+/// buffered (allocated but not yet fully dispatched) across ALL connections
+/// at once; `read_request` reserves against it before allocating each frame
+/// and rejects the frame when the budget is exhausted.
+///
+/// Values above tokio's `Semaphore::MAX_PERMITS` are clamped.
+///
+/// Call once from server startup, BEFORE accepting traffic. Returns `true`
+/// if the value was applied; `false` if a budget was already fixed —
+/// either by an earlier call or because a frame has already been processed
+/// (which freezes the effective budget at its current value).
+///
+/// NOTE: server startup does not yet thread a config value through to this
+/// setter (that wiring lives outside this module); until it does, every
+/// process runs with the 1 GiB default and this function exists for that
+/// startup code (and tests) to call.
+#[allow(dead_code)] // wired from server startup once a config value exists
+pub fn set_global_inflight_byte_budget(bytes: usize) -> bool {
+    CONFIGURED_INFLIGHT_BUDGET
+        .set(bytes.min(Semaphore::MAX_PERMITS))
+        .is_ok()
+}
+
+/// The effective global inflight-bytes budget for this process.
+///
+/// Forces initialization: after calling this, the budget can no longer be
+/// changed via [`set_global_inflight_byte_budget`].
+#[allow(dead_code)] // companion introspection for the setter; used in tests
+pub fn global_inflight_byte_budget() -> usize {
+    // Force the semaphore so the reported value is the one actually used.
+    once_cell::sync::Lazy::force(&GLOBAL_INFLIGHT);
+    *CONFIGURED_INFLIGHT_BUDGET
+        .get()
+        .expect("filled by GLOBAL_INFLIGHT initialization")
+}
 
 /// Permit guard returned by the inflight-bytes acquire helper. Forgotten on
 /// purpose: see `with_inflight_bytes`.
@@ -82,14 +128,255 @@ pub(crate) enum ResponseStyle {
     Flexible,
 }
 
+/// Response header/body style for a specific `(api_key, version)` pair.
+#[inline]
+pub(crate) fn response_style_for(
+    api_key: crate::server::request::ApiKey,
+    api_version: i16,
+) -> ResponseStyle {
+    if crate::server::versions::uses_flexible_encoding(api_key, api_version) {
+        ResponseStyle::Flexible
+    } else {
+        ResponseStyle::Standard
+    }
+}
+
+/// Best-effort correlation id from a request frame body (after the 4-byte
+/// size prefix has been stripped). Needs at least 8 bytes: api_key,
+/// api_version, correlation_id.
+fn peek_correlation_id(data: &Bytes) -> Option<i32> {
+    if data.len() < 8 {
+        return None;
+    }
+    Some(i32::from_be_bytes([data[4], data[5], data[6], data[7]]))
+}
+
+/// Minimal Kafka error response carrying `correlation_id` so clients see a
+/// typed error instead of a connection reset.
+fn encode_wire_error_response(correlation_id: i32, error_code: KafkaCode) -> Result<Vec<u8>> {
+    use crate::server::response::ErrorResponseData;
+    encode_response(correlation_id, &ErrorResponseData { error_code })
+}
+
+/// Encode a version-aware response body with the correct header style.
+fn encode_versioned_raw_response(
+    correlation_id: i32,
+    api_key: crate::server::request::ApiKey,
+    api_version: i16,
+    body: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let response = match api_key.response_style(api_version) {
+        ResponseStyle::Standard => Response::new_raw(correlation_id, body)?,
+        ResponseStyle::Flexible => Response::new_raw_flexible(correlation_id, body)?,
+    };
+    response.encode_with_size()
+}
+
+/// Read one length-prefixed Kafka request frame from any async stream.
+async fn read_kafka_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    max_message_size: usize,
+) -> Result<Bytes> {
+    let mut size_buf = [0u8; 4];
+    stream.read_exact(&mut size_buf).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            Error::MissingData("Connection closed".to_owned())
+        } else {
+            Error::IoError(e.kind())
+        }
+    })?;
+
+    let size = (&size_buf[..]).get_i32();
+    if size < 0 {
+        return Err(Error::MissingData(format!(
+            "Invalid negative message size: {size}"
+        )));
+    }
+    let size = size as usize;
+    if size > max_message_size {
+        return Err(Error::MissingData(format!(
+            "Message size {size} exceeds maximum allowed size {max_message_size}"
+        )));
+    }
+
+    let _budget = match try_reserve_inflight_bytes(size) {
+        Some(p) => p,
+        None => {
+            return Err(Error::MissingData(format!(
+                "Server inflight memory budget exhausted (frame size {size})"
+            )));
+        }
+    };
+
+    let mut data = vec![0u8; size];
+    stream.read_exact(&mut data).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            Error::MissingData("Connection closed mid-message".to_owned())
+        } else {
+            Error::IoError(e.kind())
+        }
+    })?;
+
+    Ok(Bytes::from(data))
+}
+
+/// Write a length-prefixed Kafka response frame.
+async fn write_kafka_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    response: &[u8],
+    client: SocketAddr,
+) -> Result<()> {
+    let write_deadline = Duration::from_secs(DEFAULT_REQUEST_WRITE_TIMEOUT_SECS);
+    match timeout(write_deadline, async {
+        stream
+            .write_all(response)
+            .await
+            .map_err(|e| Error::IoError(e.kind()))?;
+        stream.flush().await.map_err(|e| Error::IoError(e.kind()))
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            tracing::warn!(
+                client = %client,
+                response_len = response.len(),
+                timeout_secs = DEFAULT_REQUEST_WRITE_TIMEOUT_SECS,
+                "Response write timed out (slow / non-reading client)"
+            );
+            Err(Error::MissingData("Response write timeout".to_owned()))
+        }
+    }
+}
+
+/// Shared request loop for plain and TLS connections.
+async fn serve_connection_requests<H, S>(
+    stream: &mut S,
+    client: SocketAddr,
+    max_message_size: usize,
+    handler: Arc<H>,
+    auth_gate: &mut AuthGate,
+    rate_limiter: Option<&Arc<AuthRateLimiter>>,
+    connection_label: &'static str,
+    transport_tls: bool,
+) -> Result<()>
+where
+    H: Handler,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let read_timeout = Duration::from_secs(DEFAULT_REQUEST_READ_TIMEOUT_SECS);
+    let handler_timeout = Duration::from_secs(DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS);
+
+    let result = async {
+    loop {
+        let read_result =
+            match timeout(read_timeout, read_kafka_frame(stream, max_message_size)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        client = %client,
+                        connection = connection_label,
+                        timeout_secs = DEFAULT_REQUEST_READ_TIMEOUT_SECS,
+                        "Request read timeout - closing connection"
+                    );
+                    return Err(Error::MissingData("Request read timeout".to_owned()));
+                }
+            };
+
+        match read_result {
+            Ok(data) => {
+                let correlation_id = peek_correlation_id(&data);
+                let dispatch_result = timeout(handler_timeout, async {
+                        let (result, auth_result) = dispatch_request_common(
+                            handler.as_ref(),
+                            data,
+                            client,
+                            connection_label,
+                            auth_gate,
+                            transport_tls,
+                        )
+                        .await;
+                    if let Some(limiter) = rate_limiter {
+                        match auth_result {
+                            AuthResult::Failure => {
+                                limiter.record_failure(client.ip()).await;
+                            }
+                            AuthResult::Success => {
+                                limiter.record_success(client.ip()).await;
+                            }
+                            AuthResult::NotAuth => {}
+                        }
+                    }
+                    result
+                })
+                .await;
+
+                match dispatch_result {
+                    Ok(Ok(response)) => write_kafka_frame(stream, &response, client).await?,
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            client = %client,
+                            connection = connection_label,
+                            error = ?e,
+                            "Failed to dispatch request"
+                        );
+                        if let Some(cid) = correlation_id
+                            && let Ok(err_resp) =
+                                encode_wire_error_response(cid, KafkaCode::InvalidRequest)
+                        {
+                            let _ = write_kafka_frame(stream, &err_resp, client).await;
+                        }
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            client = %client,
+                            connection = connection_label,
+                            timeout_secs = DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS,
+                            "Request handler timeout - closing connection"
+                        );
+                        if let Some(cid) = correlation_id
+                            && let Ok(err_resp) =
+                                encode_wire_error_response(cid, KafkaCode::InvalidRequest)
+                        {
+                            let _ = write_kafka_frame(stream, &err_resp, client).await;
+                        }
+                        return Err(Error::MissingData("Request handler timeout".to_owned()));
+                    }
+                }
+            }
+            Err(Error::MissingData(_)) => {
+                tracing::debug!(client = %client, "Client disconnected");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::error!(
+                    client = %client,
+                    connection = connection_label,
+                    error = ?e,
+                    "Error reading request"
+                );
+                return Err(e);
+            }
+        }
+    }
+    }.await;
+
+    handler.on_connection_closed(client).await;
+    result
+}
+
 /// Helper to encode a response with size prefix.
 ///
 /// This consolidated function handles both standard and flexible responses.
 /// The `style` parameter controls whether tagged fields are included in the header.
 ///
-/// Note: The `encode_response` and `encode_response_flexible` wrappers
-/// below are intentionally kept for ergonomics - they simplify the 20+ call sites
-/// in `dispatch_request_common` by avoiding repetitive `ResponseStyle::Standard` params.
+/// Note: The `encode_response` wrapper below is intentionally kept for
+/// ergonomics - it simplifies the 20+ call sites in `dispatch_request_common`
+/// by avoiding repetitive `ResponseStyle::Standard` params. (A flexible
+/// counterpart used to exist for InitProducerId; that API is now encoded
+/// version-aware via `encode_versioned` + `Response::new_raw_flexible`.)
 #[inline]
 fn encode_response_with_style<R: ToByte>(
     correlation_id: i32,
@@ -106,12 +393,6 @@ fn encode_response_with_style<R: ToByte>(
 #[inline]
 fn encode_response<R: ToByte>(correlation_id: i32, resp: &R) -> Result<Vec<u8>> {
     encode_response_with_style(correlation_id, resp, ResponseStyle::Standard)
-}
-
-/// Helper to encode a flexible response with size prefix.
-#[inline]
-fn encode_response_flexible<R: ToByte>(correlation_id: i32, resp: &R) -> Result<Vec<u8>> {
-    encode_response_with_style(correlation_id, resp, ResponseStyle::Flexible)
 }
 
 /// Encode an ApiVersions response for standard versions (v0-v2).
@@ -179,6 +460,43 @@ fn encode_api_versions_flexible(
     Ok(result)
 }
 
+/// Encode the error response for a request whose api_version is outside the
+/// advertised range (`Request::UnsupportedVersion`).
+///
+/// - ApiVersions: per KIP-511 / real-broker behavior, an unsupported
+///   ApiVersions version is answered with a **v0-encoded** ApiVersions
+///   response carrying `UnsupportedVersion` (35) AND the full supported
+///   version list, so the client can pick a version we do speak and retry.
+/// - Every other API: a minimal standard-header response whose body is the
+///   INT16 error code 35 (same shape `handle_unknown` uses). The connection
+///   stays open.
+fn encode_unsupported_version_response(
+    api_key: crate::server::request::ApiKey,
+    correlation_id: i32,
+) -> Result<Vec<u8>> {
+    use crate::server::request::ApiKey;
+    use crate::server::response::{ApiVersionsResponseData, ErrorResponseData};
+    use crate::server::versions::default_api_versions;
+
+    if api_key == ApiKey::ApiVersions {
+        let response = ApiVersionsResponseData {
+            error_code: KafkaCode::UnsupportedVersion,
+            api_keys: default_api_versions(),
+            throttle_time_ms: 0,
+        };
+        // Always v0 framing: the client demonstrably speaks a version we
+        // don't, so the lowest common denominator is the only safe choice.
+        encode_api_versions_standard(correlation_id, 0, &response)
+    } else {
+        encode_response(
+            correlation_id,
+            &ErrorResponseData {
+                error_code: KafkaCode::UnsupportedVersion,
+            },
+        )
+    }
+}
+
 /// Trait for connections that support auth rate limiting.
 ///
 /// This provides a unified interface for recording auth results,
@@ -244,6 +562,7 @@ async fn dispatch_request_common<H: Handler>(
     client_addr: SocketAddr,
     _connection_type: &str, // Used for logging to distinguish plain vs TLS
     auth_gate: &mut AuthGate,
+    transport_tls: bool,
 ) -> (Result<Vec<u8>>, AuthResult) {
     let start = Instant::now();
 
@@ -264,6 +583,12 @@ async fn dispatch_request_common<H: Handler>(
                 first_bytes = ?&data[..data.len().min(32)],
                 "Failed to parse request"
             );
+            if let Some(correlation_id) = peek_correlation_id(&data) {
+                return (
+                    encode_wire_error_response(correlation_id, KafkaCode::InvalidRequest),
+                    AuthResult::NotAuth,
+                );
+            }
             return (Err(e), AuthResult::NotAuth);
         }
     };
@@ -283,11 +608,8 @@ async fn dispatch_request_common<H: Handler>(
             "Rejecting unauthenticated request: SASL handshake required first"
         );
         return (
-            Err(Error::Authentication(format!(
-                "SASL authentication required for API key {:?}",
-                header.api_key
-            ))),
-            AuthResult::Failure,
+            encode_wire_error_response(correlation_id, KafkaCode::SaslAuthenticationFailed),
+            AuthResult::NotAuth,
         );
     }
 
@@ -309,6 +631,7 @@ async fn dispatch_request_common<H: Handler>(
         request_id: uuid::Uuid::new_v4(),
         principal,
         client_host,
+        transport_tls,
     };
 
     tracing::debug!(
@@ -343,96 +666,68 @@ async fn dispatch_request_common<H: Handler>(
             encode_response(correlation_id, &handler.handle_produce(&ctx, req).await)
         }
         Request::Fetch(header, req) => {
-            // Fetch v0: responses only, v1+: throttle_time_ms + responses
             let resp = handler.handle_fetch(&ctx, req).await;
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
             }
-            match Response::new_raw(correlation_id, body) {
-                Ok(r) => r.encode_with_size(),
-                Err(e) => return (Err(e), auth_result),
-            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::ListOffsets(header, req) => {
-            // ListOffsets v0: topics only, v1+: throttle_time_ms + topics
             let resp = handler.handle_list_offsets(&ctx, req).await;
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
             }
-            match Response::new_raw(correlation_id, body) {
-                Ok(r) => r.encode_with_size(),
-                Err(e) => return (Err(e), auth_result),
-            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::OffsetCommit(_, req) => encode_response(
             correlation_id,
             &handler.handle_offset_commit(&ctx, req).await,
         ),
         Request::OffsetFetch(header, req) => {
-            // OffsetFetch v0-v1: topics only, v2: +error_code, v3+: +throttle_time_ms
             let resp = handler.handle_offset_fetch(&ctx, req).await;
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
             }
-            match Response::new_raw(correlation_id, body) {
-                Ok(r) => r.encode_with_size(),
-                Err(e) => return (Err(e), auth_result),
-            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::FindCoordinator(_, req) => encode_response(
             correlation_id,
             &handler.handle_find_coordinator(&ctx, req).await,
         ),
         Request::JoinGroup(header, req) => {
-            // JoinGroup v0-v1 has no throttle_time_ms, v2+ has it
             let resp = handler.handle_join_group(&ctx, req).await;
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
             }
-            match Response::new_raw(correlation_id, body) {
-                Ok(r) => r.encode_with_size(),
-                Err(e) => return (Err(e), auth_result),
-            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::Heartbeat(header, req) => {
-            // Heartbeat v0 has no throttle_time_ms, v1+ has it
             let resp = handler.handle_heartbeat(&ctx, req).await;
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
             }
-            match Response::new_raw(correlation_id, body) {
-                Ok(r) => r.encode_with_size(),
-                Err(e) => return (Err(e), auth_result),
-            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::LeaveGroup(header, req) => {
-            // LeaveGroup v0 has no throttle_time_ms, v1+ has it
             let resp = handler.handle_leave_group(&ctx, req).await;
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
             }
-            match Response::new_raw(correlation_id, body) {
-                Ok(r) => r.encode_with_size(),
-                Err(e) => return (Err(e), auth_result),
-            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::SyncGroup(header, req) => {
-            // SyncGroup v0 has no throttle_time_ms, v1+ has it
             let resp = handler.handle_sync_group(&ctx, req).await;
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
             }
-            match Response::new_raw(correlation_id, body) {
-                Ok(r) => r.encode_with_size(),
-                Err(e) => return (Err(e), auth_result),
-            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::DescribeGroups(_, req) => encode_response(
             correlation_id,
@@ -505,12 +800,27 @@ async fn dispatch_request_common<H: Handler>(
             correlation_id,
             &handler.handle_delete_topics(&ctx, req).await,
         ),
-        Request::InitProducerId(_, req) => {
-            // InitProducerId uses flexible encoding
-            encode_response_flexible(
+        Request::InitProducerId(header, req) => {
+            let resp = handler.handle_init_producer_id(&ctx, req).await;
+            let mut body = Vec::new();
+            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
+                return (Err(e), auth_result);
+            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
+        }
+        Request::UnsupportedVersion(h) => {
+            // The client sent a known API key with a version outside the
+            // advertised range. Answer with UnsupportedVersion (35) under
+            // the request's correlation id instead of closing the
+            // connection, so well-behaved clients can downgrade.
+            tracing::warn!(
+                client = %client_addr,
+                api_key = ?h.api_key,
+                api_version = h.api_version,
                 correlation_id,
-                &handler.handle_init_producer_id(&ctx, req).await,
-            )
+                "Rejecting request with unadvertised API version"
+            );
+            encode_unsupported_version_response(h.api_key, correlation_id)
         }
         Request::Unknown(h, body) => encode_response(
             correlation_id,
@@ -676,233 +986,17 @@ impl ClientConnection {
     }
 
     async fn handle_requests_inner<H: Handler>(&mut self, handler: Arc<H>) -> Result<()> {
-        // Per-request read budget; covers both the wait-for-first-byte
-        // (effectively the inter-request idle window — slowloris bound) and
-        // the in-flight read time.
-        let read_timeout = Duration::from_secs(DEFAULT_REQUEST_READ_TIMEOUT_SECS);
-        let handler_timeout = Duration::from_secs(DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS);
-
-        loop {
-            // Apply timeout to request reading to prevent slowloris attacks
-            let read_result = match timeout(read_timeout, self.read_request()).await {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!(
-                        client = %self.addr,
-                        timeout_secs = DEFAULT_REQUEST_READ_TIMEOUT_SECS,
-                        "Request read timeout - closing connection"
-                    );
-                    return Err(Error::MissingData("Request read timeout".to_owned()));
-                }
-            };
-
-            match read_result {
-                Ok(data) => {
-                    // Apply timeout to request processing to prevent runaway handlers
-                    let response =
-                        match timeout(handler_timeout, self.dispatch_request(&handler, data)).await
-                        {
-                            Ok(result) => result?,
-                            Err(_) => {
-                                tracing::error!(
-                                    client = %self.addr,
-                                    timeout_secs = DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS,
-                                    "Request handler timeout - closing connection"
-                                );
-                                return Err(Error::MissingData(
-                                    "Request handler timeout".to_owned(),
-                                ));
-                            }
-                        };
-                    self.write_response(&response).await?;
-                }
-                Err(Error::MissingData(_)) => {
-                    tracing::debug!("Client {} disconnected", self.addr);
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::error!("Error reading request from {}: {:?}", self.addr, e);
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    /// Read a single request from the connection.
-    async fn read_request(&mut self) -> Result<Bytes> {
-        // Read 4-byte size prefix
-        let mut size_buf = [0u8; 4];
-        let mut bytes_read = 0;
-
-        loop {
-            self.stream
-                .readable()
-                .await
-                .map_err(|e| Error::IoError(e.kind()))?;
-
-            match self.stream.try_read(&mut size_buf[bytes_read..]) {
-                Ok(0) => {
-                    return Err(Error::MissingData("Connection closed".to_owned()));
-                }
-                Ok(n) => {
-                    bytes_read += n;
-                    if bytes_read == 4 {
-                        break;
-                    }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(Error::IoError(e.kind()));
-                }
-            }
-        }
-
-        let size = (&size_buf[..]).get_i32();
-
-        // Validate message size bounds
-        if size < 0 {
-            return Err(Error::MissingData(format!(
-                "Invalid negative message size: {}",
-                size
-            )));
-        }
-        let size = size as usize;
-        if size > self.max_message_size {
-            return Err(Error::MissingData(format!(
-                "Message size {} exceeds maximum allowed size {}",
-                size, self.max_message_size
-            )));
-        }
-
-        // Reserve against the global inflight-bytes budget before allocating.
-        // Without this a coordinated slow-frame burst would OOM the broker
-        // even though every individual frame is under `max_message_size`.
-        let _budget = match try_reserve_inflight_bytes(size) {
-            Some(p) => p,
-            None => {
-                return Err(Error::MissingData(format!(
-                    "Server inflight memory budget exhausted (frame size {})",
-                    size
-                )));
-            }
-        };
-
-        tracing::trace!("Reading {} bytes from {}", size, self.addr);
-
-        // Read the actual message
-        let mut data = vec![0u8; size];
-        let mut bytes_read = 0;
-
-        while bytes_read < size {
-            self.stream
-                .readable()
-                .await
-                .map_err(|e| Error::IoError(e.kind()))?;
-
-            match self.stream.try_read(&mut data[bytes_read..]) {
-                Ok(0) => {
-                    return Err(Error::MissingData(
-                        "Connection closed mid-message".to_owned(),
-                    ));
-                }
-                Ok(n) => {
-                    bytes_read += n;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(Error::IoError(e.kind()));
-                }
-            }
-        }
-
-        Ok(Bytes::from(data))
-    }
-
-    /// Dispatch a request to the appropriate handler.
-    ///
-    /// Tracks SASL authentication failures for rate limiting via AuthRateLimited trait.
-    async fn dispatch_request<H: Handler>(
-        &mut self,
-        handler: &Arc<H>,
-        data: Bytes,
-    ) -> Result<Vec<u8>> {
-        let (result, auth_result) = dispatch_request_common(
-            handler.as_ref(),
-            data,
+        serve_connection_requests(
+            &mut self.stream,
             self.addr,
-            "plain",
+            self.max_message_size,
+            handler,
             &mut self.auth_gate,
+            self.rate_limiter.as_ref(),
+            "plain",
+            false,
         )
-        .await;
-
-        // Track auth result for rate limiting (unified via trait)
-        self.record_auth_result(auth_result).await;
-
-        result
-    }
-
-    /// Write a response to the connection.
-    async fn write_response(&mut self, response: &[u8]) -> Result<()> {
-        tracing::debug!(
-            client = %self.addr,
-            response_len = response.len(),
-            first_bytes = ?&response[..response.len().min(32)],
-            "Writing response"
-        );
-
-        let write_deadline = Duration::from_secs(DEFAULT_REQUEST_WRITE_TIMEOUT_SECS);
-        let mut bytes_written = 0;
-
-        let result = timeout(write_deadline, async {
-            while bytes_written < response.len() {
-                self.stream
-                    .writable()
-                    .await
-                    .map_err(|e| Error::IoError(e.kind()))?;
-
-                match self.stream.try_write(&response[bytes_written..]) {
-                    Ok(n) => {
-                        bytes_written += n;
-                        tracing::trace!("Wrote {} bytes to {}", n, self.addr);
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        continue;
-                    }
-                    Err(e) => {
-                        return Err(Error::IoError(e.kind()));
-                    }
-                }
-            }
-            Ok::<(), Error>(())
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                tracing::warn!(
-                    client = %self.addr,
-                    bytes_written,
-                    response_len = response.len(),
-                    timeout_secs = DEFAULT_REQUEST_WRITE_TIMEOUT_SECS,
-                    "Response write timed out (slow / non-reading client)"
-                );
-                return Err(Error::MissingData("Response write timeout".to_owned()));
-            }
-        }
-
-        tracing::debug!(
-            client = %self.addr,
-            bytes_written,
-            "Response write complete"
-        );
-
-        Ok(())
+        .await
     }
 }
 
@@ -987,168 +1081,17 @@ impl TlsClientConnection {
     }
 
     async fn handle_requests_inner<H: Handler>(&mut self, handler: Arc<H>) -> Result<()> {
-        let read_timeout = Duration::from_secs(DEFAULT_REQUEST_READ_TIMEOUT_SECS);
-        let handler_timeout = Duration::from_secs(DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS);
-
-        loop {
-            // Apply timeout to request reading to prevent slowloris attacks
-            let read_result = match timeout(read_timeout, self.read_request()).await {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!(
-                        client = %self.addr,
-                        timeout_secs = DEFAULT_REQUEST_READ_TIMEOUT_SECS,
-                        "TLS request read timeout - closing connection"
-                    );
-                    return Err(Error::MissingData("Request read timeout".to_owned()));
-                }
-            };
-
-            match read_result {
-                Ok(data) => {
-                    // Apply timeout to request processing to prevent runaway handlers
-                    let response =
-                        match timeout(handler_timeout, self.dispatch_request(&handler, data)).await
-                        {
-                            Ok(result) => result?,
-                            Err(_) => {
-                                tracing::error!(
-                                    client = %self.addr,
-                                    timeout_secs = DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS,
-                                    "TLS request handler timeout - closing connection"
-                                );
-                                return Err(Error::MissingData(
-                                    "Request handler timeout".to_owned(),
-                                ));
-                            }
-                        };
-                    self.write_response(&response).await?;
-                }
-                Err(Error::MissingData(_)) => {
-                    tracing::debug!("TLS client {} disconnected", self.addr);
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Error reading request from TLS client {}: {:?}",
-                        self.addr,
-                        e
-                    );
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    /// Read a single request from the TLS connection.
-    async fn read_request(&mut self) -> Result<Bytes> {
-        // Read 4-byte size prefix
-        let mut size_buf = [0u8; 4];
-        if let Err(e) = self.stream.read_exact(&mut size_buf).await {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                return Err(Error::MissingData("Connection closed".to_owned()));
-            }
-            return Err(Error::IoError(e.kind()));
-        }
-
-        let size = (&size_buf[..]).get_i32();
-
-        // Validate message size bounds
-        if size < 0 {
-            return Err(Error::MissingData(format!(
-                "Invalid negative message size: {}",
-                size
-            )));
-        }
-        let size = size as usize;
-        if size > self.max_message_size {
-            return Err(Error::MissingData(format!(
-                "Message size {} exceeds maximum allowed size {}",
-                size, self.max_message_size
-            )));
-        }
-
-        // Reserve against the global inflight-bytes budget before allocating.
-        let _budget = match try_reserve_inflight_bytes(size) {
-            Some(p) => p,
-            None => {
-                return Err(Error::MissingData(format!(
-                    "Server inflight memory budget exhausted (frame size {})",
-                    size
-                )));
-            }
-        };
-
-        tracing::trace!("Reading {} bytes from TLS client {}", size, self.addr);
-
-        // Read the actual message
-        let mut data = vec![0u8; size];
-        if let Err(e) = self.stream.read_exact(&mut data).await {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                return Err(Error::MissingData(
-                    "Connection closed mid-message".to_owned(),
-                ));
-            }
-            return Err(Error::IoError(e.kind()));
-        }
-
-        Ok(Bytes::from(data))
-    }
-
-    /// Dispatch a request to the appropriate handler.
-    ///
-    /// Tracks SASL authentication failures for rate limiting via AuthRateLimited trait.
-    async fn dispatch_request<H: Handler>(
-        &mut self,
-        handler: &Arc<H>,
-        data: Bytes,
-    ) -> Result<Vec<u8>> {
-        let (result, auth_result) = dispatch_request_common(
-            handler.as_ref(),
-            data,
+        serve_connection_requests(
+            &mut self.stream,
             self.addr,
-            "tls",
+            self.max_message_size,
+            handler,
             &mut self.auth_gate,
+            self.rate_limiter.as_ref(),
+            "tls",
+            true,
         )
-        .await;
-
-        // Track auth result for rate limiting (unified via trait)
-        self.record_auth_result(auth_result).await;
-
-        result
-    }
-
-    /// Write a response to the TLS connection.
-    async fn write_response(&mut self, response: &[u8]) -> Result<()> {
-        let write_deadline = Duration::from_secs(DEFAULT_REQUEST_WRITE_TIMEOUT_SECS);
-        match timeout(write_deadline, async {
-            self.stream
-                .write_all(response)
-                .await
-                .map_err(|e| Error::IoError(e.kind()))?;
-            self.stream
-                .flush()
-                .await
-                .map_err(|e| Error::IoError(e.kind()))?;
-            Ok::<(), Error>(())
-        })
         .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                tracing::warn!(
-                    client = %self.addr,
-                    response_len = response.len(),
-                    timeout_secs = DEFAULT_REQUEST_WRITE_TIMEOUT_SECS,
-                    "TLS response write timed out (slow / non-reading client)"
-                );
-                return Err(Error::MissingData("Response write timeout".to_owned()));
-            }
-        }
-
-        tracing::trace!("Wrote {} bytes to TLS client {}", response.len(), self.addr);
-        Ok(())
     }
 }
 
@@ -1414,7 +1357,7 @@ mod tests {
 
     #[test]
     fn test_encode_response_helper_functions() {
-        // Test the convenience helper functions
+        // Test the convenience helper against the style-parameterized form
         use crate::server::response::ApiVersionsResponseData;
 
         let response = ApiVersionsResponseData {
@@ -1424,7 +1367,7 @@ mod tests {
         };
 
         let standard = encode_response(1, &response).unwrap();
-        let flexible = encode_response_flexible(1, &response).unwrap();
+        let flexible = encode_response_with_style(1, &response, ResponseStyle::Flexible).unwrap();
 
         // Flexible should be larger due to header tagged fields
         assert!(flexible.len() > standard.len());
@@ -1556,6 +1499,193 @@ mod tests {
     fn test_default_max_message_size() {
         // 100 MB limit
         assert_eq!(DEFAULT_MAX_MESSAGE_SIZE, 100 * 1024 * 1024);
+    }
+
+    // ========================================================================
+    // InitProducerId versioned response framing Tests
+    // ========================================================================
+
+    #[test]
+    fn test_init_producer_id_response_v1_classic_framing() {
+        // v0-v1: response header v0 (no tagged fields) + classic body
+        use crate::server::response::InitProducerIdResponseData;
+        let resp = InitProducerIdResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::None,
+            producer_id: 9000,
+            producer_epoch: 1,
+        };
+
+        let mut body = Vec::new();
+        resp.encode_versioned(&mut body, 1).unwrap();
+        // throttle (4) + error (2) + producer_id (8) + epoch (2) = 16, NO tag byte
+        assert_eq!(body.len(), 16);
+
+        let framed = Response::new_raw(7, body)
+            .unwrap()
+            .encode_with_size()
+            .unwrap();
+        // size (4) + correlation (4) + body (16) = 24
+        assert_eq!(framed.len(), 24);
+        assert_eq!(&framed[4..8], &7i32.to_be_bytes());
+        // Body starts immediately at byte 8 (no header tagged fields):
+        assert_eq!(&framed[8..12], &0i32.to_be_bytes()); // throttle_time_ms
+        assert_eq!(&framed[12..14], &[0x00, 0x00]); // error_code
+        assert_eq!(&framed[14..22], &9000i64.to_be_bytes()); // producer_id
+        assert_eq!(&framed[22..24], &1i16.to_be_bytes()); // producer_epoch
+    }
+
+    #[test]
+    fn test_init_producer_id_response_v2_flexible_framing() {
+        // v2+: response header v1 (tagged fields) + flexible body
+        use crate::server::response::InitProducerIdResponseData;
+        let resp = InitProducerIdResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::None,
+            producer_id: 9000,
+            producer_epoch: 1,
+        };
+
+        let mut body = Vec::new();
+        resp.encode_versioned(&mut body, 2).unwrap();
+        // 16 fixed bytes + trailing tagged-fields byte
+        assert_eq!(body.len(), 17);
+        assert_eq!(*body.last().unwrap(), 0x00);
+
+        let framed = Response::new_raw_flexible(7, body)
+            .unwrap()
+            .encode_with_size()
+            .unwrap();
+        // size (4) + correlation (4) + header tag (1) + body (17) = 26
+        assert_eq!(framed.len(), 26);
+        assert_eq!(&framed[4..8], &7i32.to_be_bytes());
+        assert_eq!(framed[8], 0x00, "header v1 must carry empty tagged fields");
+        assert_eq!(&framed[9..13], &0i32.to_be_bytes()); // throttle_time_ms
+        assert_eq!(&framed[15..23], &9000i64.to_be_bytes()); // producer_id
+    }
+
+    // ========================================================================
+    // UnsupportedVersion response Tests
+    // ========================================================================
+
+    #[test]
+    fn test_encode_unsupported_version_response_generic_api() {
+        // Produce v0 (unadvertised) must produce: size prefix, the request's
+        // correlation id, and the INT16 error code 35 — nothing else, and
+        // definitely not a closed connection.
+        let result = encode_unsupported_version_response(ApiKey::Produce, 7777).unwrap();
+
+        // size (4) + correlation_id (4) + error_code (2) = 10 bytes
+        assert_eq!(result.len(), 10);
+        // Size prefix = 6
+        assert_eq!(&result[0..4], &[0x00, 0x00, 0x00, 0x06]);
+        // correlation_id = 7777 (0x00001E61)
+        assert_eq!(&result[4..8], &7777i32.to_be_bytes());
+        // error_code = 35 (UnsupportedVersion)
+        assert_eq!(&result[8..10], &[0x00, 0x23]);
+    }
+
+    #[test]
+    fn test_encode_unsupported_version_response_correlation_id_passthrough() {
+        for correlation_id in [0i32, -1, i32::MAX, i32::MIN, 123456] {
+            let result =
+                encode_unsupported_version_response(ApiKey::Fetch, correlation_id).unwrap();
+            assert_eq!(&result[4..8], &correlation_id.to_be_bytes());
+            assert_eq!(&result[8..10], &[0x00, 0x23]);
+        }
+    }
+
+    #[test]
+    fn test_encode_unsupported_version_response_api_versions() {
+        // ApiVersions gets the richer treatment: a v0-encoded ApiVersions
+        // response with error 35 AND the advertised ranges, so the client
+        // can downgrade and retry.
+        let result = encode_unsupported_version_response(ApiKey::ApiVersions, 555).unwrap();
+
+        // correlation_id passthrough
+        assert_eq!(&result[4..8], &555i32.to_be_bytes());
+        // error_code = 35 right after the header (v0 body layout)
+        assert_eq!(&result[8..10], &[0x00, 0x23]);
+        // api_keys array length must match the advertised table
+        let count = i32::from_be_bytes(result[10..14].try_into().unwrap());
+        assert_eq!(
+            count as usize,
+            crate::server::versions::SUPPORTED_VERSIONS.len()
+        );
+        // v0 layout: no throttle_time_ms after the array.
+        // size (4) + correlation (4) + error (2) + len (4) + count * 6
+        assert_eq!(result.len(), 14 + count as usize * 6);
+    }
+
+    #[test]
+    fn test_peek_correlation_id_from_request_body() {
+        let mut body = Vec::new();
+        // api_key Produce = 0, api_version 3, correlation_id 4242
+        body.extend_from_slice(&0i16.to_be_bytes());
+        body.extend_from_slice(&3i16.to_be_bytes());
+        body.extend_from_slice(&4242i32.to_be_bytes());
+        let data = Bytes::from(body);
+        assert_eq!(peek_correlation_id(&data), Some(4242));
+    }
+
+    #[test]
+    fn test_peek_correlation_id_too_short() {
+        assert_eq!(
+            peek_correlation_id(&Bytes::from_static(&[0, 1, 2, 3])),
+            None
+        );
+    }
+
+    #[test]
+    fn test_encode_wire_error_response_carries_correlation_id() {
+        let result = encode_wire_error_response(9001, KafkaCode::InvalidRequest).unwrap();
+        assert_eq!(result.len(), 10);
+        assert_eq!(&result[4..8], &9001i32.to_be_bytes());
+        assert_eq!(&result[8..10], &42i16.to_be_bytes()); // InvalidRequest
+    }
+
+    #[test]
+    fn test_response_style_for_init_producer_id_versions() {
+        use crate::server::request::ApiKey;
+        assert_eq!(
+            response_style_for(ApiKey::InitProducerId, 1),
+            ResponseStyle::Standard
+        );
+        assert_eq!(
+            response_style_for(ApiKey::InitProducerId, 2),
+            ResponseStyle::Flexible
+        );
+    }
+
+    // ========================================================================
+    // Global inflight budget Tests
+    // ========================================================================
+
+    #[test]
+    fn test_inflight_budget_reserve_and_release() {
+        // Reserving must succeed for a small frame and permits must come
+        // back when the guard drops.
+        let before = GLOBAL_INFLIGHT.available_permits();
+        {
+            let permit = try_reserve_inflight_bytes(1024).expect("reservation should succeed");
+            assert_eq!(permit.bytes, 1024);
+            assert_eq!(GLOBAL_INFLIGHT.available_permits(), before - 1024);
+        }
+        assert_eq!(GLOBAL_INFLIGHT.available_permits(), before);
+    }
+
+    #[test]
+    fn test_set_global_inflight_byte_budget_is_one_shot() {
+        // Force initialization (any earlier test or frame may already have);
+        // from then on the budget is frozen and the setter must say so.
+        let effective = global_inflight_byte_budget();
+        assert!(effective > 0);
+        assert!(
+            !set_global_inflight_byte_budget(123),
+            "setter must refuse once the budget is frozen"
+        );
+        // The effective budget is unchanged by the refused call.
+        assert_eq!(global_inflight_byte_budget(), effective);
     }
 
     // ========================================================================

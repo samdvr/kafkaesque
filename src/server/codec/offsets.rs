@@ -44,16 +44,6 @@ impl KafkaCodec for ListOffsetsCodec {
         2
     }
 
-    /// Minimum supported version.
-    fn min_version() -> i16 {
-        0
-    }
-
-    /// Maximum supported version.
-    fn max_version() -> i16 {
-        5
-    }
-
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
         use crate::server::request::parse_list_offsets_request;
         let (_, request) = parse_list_offsets_request(bytes, version).map_err(|_| {
@@ -90,16 +80,6 @@ impl KafkaCodec for OffsetCommitCodec {
 
     /// Kafka API key for OffsetCommit is 8.
     fn api_key() -> i16 {
-        8
-    }
-
-    /// Minimum supported version.
-    fn min_version() -> i16 {
-        0
-    }
-
-    /// Maximum supported version.
-    fn max_version() -> i16 {
         8
     }
 
@@ -142,16 +122,6 @@ impl KafkaCodec for OffsetFetchCodec {
         9
     }
 
-    /// Minimum supported version.
-    fn min_version() -> i16 {
-        0
-    }
-
-    /// Maximum supported version.
-    fn max_version() -> i16 {
-        8
-    }
-
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
         use crate::server::request::parse_offset_fetch_request;
         let (_, request) = parse_offset_fetch_request(bytes, version).map_err(|_| {
@@ -184,7 +154,7 @@ mod tests {
     #[test]
     fn test_list_offsets_codec_version_range() {
         assert_eq!(ListOffsetsCodec::min_version(), 0);
-        assert_eq!(ListOffsetsCodec::max_version(), 5);
+        assert_eq!(ListOffsetsCodec::max_version(), 2);
     }
 
     #[test]
@@ -240,7 +210,7 @@ mod tests {
     #[test]
     fn test_offset_commit_codec_version_range() {
         assert_eq!(OffsetCommitCodec::min_version(), 0);
-        assert_eq!(OffsetCommitCodec::max_version(), 8);
+        assert_eq!(OffsetCommitCodec::max_version(), 2);
     }
 
     #[test]
@@ -256,6 +226,8 @@ mod tests {
         // member_id: "member-1"
         request_bytes.put_i16(8);
         request_bytes.put_slice(b"member-1");
+        // retention_time_ms: -1 (v2-v4 only; broker uses its own retention)
+        request_bytes.put_i64(-1);
         // topics: 1
         request_bytes.put_i32(1);
         // topic name: "test"
@@ -302,7 +274,7 @@ mod tests {
     #[test]
     fn test_offset_fetch_codec_version_range() {
         assert_eq!(OffsetFetchCodec::min_version(), 0);
-        assert_eq!(OffsetFetchCodec::max_version(), 8);
+        assert_eq!(OffsetFetchCodec::max_version(), 1);
     }
 
     #[test]

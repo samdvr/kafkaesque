@@ -128,6 +128,7 @@ fn create_test_context() -> RequestContext {
         request_id: uuid::Uuid::new_v4(),
         principal: "User:ANONYMOUS".to_string(),
         client_host: "127.0.0.1".to_string(),
+        transport_tls: false,
     }
 }
 
@@ -148,6 +149,7 @@ async fn test_metadata_request_specific_topics() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -185,6 +187,7 @@ async fn test_metadata_request_all_topics() {
             },
         ],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -301,6 +304,7 @@ async fn test_metadata_isr_nodes_contains_leader_to_prevent_not_leader_error() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let create_resp = handler.handle_create_topics(&ctx, create_req).await;
     assert_eq!(
@@ -405,6 +409,7 @@ async fn test_create_topics_success() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
 
     let response = handler.handle_create_topics(&ctx, request).await;
@@ -426,12 +431,48 @@ async fn test_create_topics_invalid_name() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
 
     let response = handler.handle_create_topics(&ctx, request).await;
 
     assert_eq!(response.topics.len(), 1);
     assert_eq!(response.topics[0].error_code, KafkaCode::InvalidTopic);
+}
+
+#[tokio::test]
+async fn test_create_topics_validate_only_dry_run() {
+    let handler = create_test_handler().await;
+    let ctx = create_test_context();
+
+    let request = CreateTopicsRequestData {
+        topics: vec![CreateTopicData {
+            name: "dry-run-topic".to_string(),
+            num_partitions: 3,
+            replication_factor: 1,
+        }],
+        timeout_ms: 5000,
+        validate_only: true,
+    };
+
+    let response = handler.handle_create_topics(&ctx, request).await;
+
+    assert_eq!(response.topics.len(), 1);
+    assert_eq!(response.topics[0].error_code, KafkaCode::None);
+    assert_eq!(response.topics[0].name, "dry-run-topic");
+
+    // Dry-run must not register the topic. List-all metadata avoids
+    // auto-create-on-named-request (enabled in the default test handler).
+    let metadata = handler
+        .handle_metadata(&ctx, MetadataRequestData { topics: None })
+        .await;
+    assert!(
+        !metadata
+            .topics
+            .iter()
+            .any(|t| t.name == "dry-run-topic"),
+        "validate_only must not register topic in coordinator"
+    );
 }
 
 #[tokio::test]
@@ -447,6 +488,7 @@ async fn test_create_topics_zero_partitions() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
 
     let response = handler.handle_create_topics(&ctx, request).await;
@@ -467,6 +509,7 @@ async fn test_delete_topics_success() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -537,6 +580,7 @@ async fn test_produce_request_with_acks_1() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -578,6 +622,7 @@ async fn test_produce_request_with_acks_0() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -641,6 +686,7 @@ async fn test_produce_multiple_partitions() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -693,6 +739,7 @@ async fn test_fetch_request_success() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -750,6 +797,7 @@ async fn test_fetch_offset_out_of_range() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -820,6 +868,7 @@ async fn test_fetch_nonexistent_partition() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -865,6 +914,7 @@ async fn test_list_offsets_earliest() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -900,6 +950,7 @@ async fn test_list_offsets_latest() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -949,6 +1000,7 @@ async fn test_offset_commit_and_fetch() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -1159,7 +1211,7 @@ async fn test_init_producer_id_new_producer() {
 }
 
 #[tokio::test]
-async fn test_init_producer_id_with_transactional_id() {
+async fn test_init_producer_id_with_transactional_id_rejected() {
     let handler = create_test_handler().await;
     let ctx = create_test_context();
 
@@ -1172,9 +1224,12 @@ async fn test_init_producer_id_with_transactional_id() {
 
     let response = handler.handle_init_producer_id(&ctx, request).await;
 
-    assert_eq!(response.error_code, KafkaCode::None);
-    assert!(response.producer_id >= 0); // Changed from > 0 to >= 0
-    assert!(response.producer_epoch >= 0);
+    // Transactions are not implemented: a transactional InitProducerId must
+    // be rejected loudly rather than silently downgrading the producer's
+    // exactly-once guarantees to mere idempotence.
+    assert_eq!(response.error_code, KafkaCode::InvalidRequest);
+    assert_eq!(response.producer_id, -1);
+    assert_eq!(response.producer_epoch, -1);
 }
 
 // ============================================================================
@@ -1220,6 +1275,7 @@ async fn test_list_offsets_nonexistent_partition() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -1257,6 +1313,7 @@ async fn test_list_offsets_multiple_partitions() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -1361,6 +1418,7 @@ async fn test_offset_commit_multiple_topics() {
             },
         ],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
@@ -1495,6 +1553,7 @@ async fn test_list_offsets_multiple_topics() {
             },
         ],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 

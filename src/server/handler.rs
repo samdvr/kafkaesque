@@ -58,6 +58,8 @@ pub struct RequestContext {
     /// Client host string used for ACL host matching. Mirrors the IP from
     /// `client_addr`; ACL bindings can wildcard with `*`.
     pub client_host: String,
+    /// True when the request arrived over a TLS-wrapped transport.
+    pub transport_tls: bool,
 }
 
 impl RequestContext {
@@ -412,6 +414,10 @@ pub trait Handler: Send + Sync {
     async fn take_sasl_post_auth(&self, _client_addr: SocketAddr) -> Option<SaslPostAuth> {
         None
     }
+
+    /// Called when a client connection closes (clean or error). Handlers can
+    /// drop per-connection auth state keyed by `client_addr`.
+    async fn on_connection_closed(&self, _client_addr: SocketAddr) {}
 
     /// Handle a SaslAuthenticate request.
     async fn handle_sasl_authenticate(

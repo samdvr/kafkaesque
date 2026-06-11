@@ -874,6 +874,16 @@ pub static BATCH_INDEX_WARM_ENTRIES: Lazy<IntGauge> = Lazy::new(|| {
     )
 });
 
+/// Record batches deleted by time-based retention.
+pub static RETENTION_DELETED_BATCHES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec_safe(
+        &REGISTRY,
+        "retention_deleted_batches_total",
+        "Record batches deleted by time-based log retention",
+        &["topic", "partition"],
+    )
+});
+
 // ============================================================================
 // Fast Failover and Auto-Balancing metrics
 // ============================================================================
@@ -1891,6 +1901,13 @@ pub fn record_batch_index_eviction(topic: &str, partition: i32, count: u64) {
 /// into the batch index cache.
 pub fn record_batch_index_warm_entries(count: i64) {
     BATCH_INDEX_WARM_ENTRIES.add(count);
+}
+
+/// Record batches deleted by the retention task for a partition.
+pub fn record_retention_deleted_batches(topic: &str, partition: i32, count: u64) {
+    RETENTION_DELETED_BATCHES
+        .with_label_values(&[topic, &partition.to_string()])
+        .inc_by(count);
 }
 
 // --- SASL Authentication metrics ---

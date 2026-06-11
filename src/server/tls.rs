@@ -33,6 +33,19 @@ pub struct TlsConfig {
     acceptor: TlsAcceptor,
 }
 
+/// Ensure a process-level rustls `CryptoProvider` is installed.
+///
+/// Our dependency graph compiles rustls with *both* the `aws-lc-rs`
+/// provider (via tokio-rustls defaults) and the `ring` provider (pulled in
+/// transitively by `object_store` → `reqwest`). When more than one provider
+/// feature is enabled, rustls refuses to pick one automatically and
+/// `ServerConfig::builder()` panics at runtime. Installing an explicit
+/// default before building any config avoids that. Idempotent: if another
+/// component already installed a provider, that one wins and we keep it.
+fn ensure_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 impl TlsConfig {
     /// Create a TLS configuration from PEM-encoded certificate and key files.
     ///
@@ -58,6 +71,7 @@ impl TlsConfig {
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self> {
+        ensure_crypto_provider();
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
@@ -80,6 +94,7 @@ impl TlsConfig {
         key_path: P,
         ca_cert_path: P,
     ) -> Result<Self> {
+        ensure_crypto_provider();
         let certs = load_certs(cert_path.as_ref())?;
         let key = load_private_key(key_path.as_ref())?;
         let ca_certs = load_certs(ca_cert_path.as_ref())?;
@@ -245,8 +260,15 @@ mod tests {
 
         let result = load_private_key(file.path());
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("No private key found"));
+        let err = result.unwrap_err().to_string();
+        // Depending on the rustls-pemfile version, the embedded (fake)
+        // certificate body either parses as a non-key PEM item ("No private
+        // key found") or is rejected as malformed base64 ("Failed to parse
+        // key file"). Both are correct: the load must fail.
+        assert!(
+            err.contains("No private key found") || err.contains("Failed to parse key file"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

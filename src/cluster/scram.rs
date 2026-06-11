@@ -301,13 +301,10 @@ fn fail(msg: &str) -> (ScramServerState, Vec<u8>) {
 
 fn random_nonce() -> String {
     // RFC 5802 allows printable ASCII excluding `,` for nonces. We use
-    // base64 of random bytes which is alphanumeric + `+/=` — standard
-    // SCRAM clients accept this.
-    let mut buf = [0u8; NONCE_LEN];
-    for byte in &mut buf {
-        *byte = fastrand::u8(..);
-    }
-    B64.encode(buf).replace([',', '='], "")
+    // base64 of OS-random bytes (via uuid v4) which is alphanumeric +
+    // `+/=` — standard SCRAM clients accept this.
+    let nonce = uuid::Uuid::new_v4();
+    B64.encode(nonce.as_bytes()).replace([',', '='], "")
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; SHA256_LEN] {

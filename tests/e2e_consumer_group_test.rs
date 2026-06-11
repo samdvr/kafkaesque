@@ -20,6 +20,7 @@ fn create_test_context() -> RequestContext {
         request_id: uuid::Uuid::new_v4(),
         principal: "User:ANONYMOUS".to_string(),
         client_host: "127.0.0.1".to_string(),
+        transport_tls: false,
     }
 }
 
@@ -280,6 +281,7 @@ async fn test_consumer_group_protocol_debug() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let create_resp = handler.handle_create_topics(&ctx, create_req).await;
     println!(

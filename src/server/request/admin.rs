@@ -2,12 +2,13 @@
 
 use nom::{
     IResult,
-    number::complete::{be_i16, be_i32, be_i64},
+    number::complete::{be_i8, be_i16, be_i32, be_i64},
 };
 use nombytes::NomBytes;
 
 use crate::parser::{
-    bytes_to_string, bytes_to_string_opt, parse_array, parse_nullable_string, parse_string,
+    bytes_to_string, bytes_to_string_opt, parse_array, parse_compact_nullable_string,
+    parse_nullable_string, parse_string, skip_tagged_fields,
 };
 
 // ============================================================================
@@ -15,10 +16,13 @@ use crate::parser::{
 // ============================================================================
 
 /// CreateTopics request data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CreateTopicsRequestData {
     pub topics: Vec<CreateTopicData>,
     pub timeout_ms: i32,
+    /// When true (CreateTopics v1+), validate the request without creating
+    /// topics. Defaults to false for v0 and for struct literals that omit it.
+    pub validate_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -30,12 +34,28 @@ pub struct CreateTopicData {
 
 pub fn parse_create_topics_request(
     s: NomBytes,
-    _version: i16,
+    version: i16,
 ) -> IResult<NomBytes, CreateTopicsRequestData> {
     let (s, topics) = parse_array(parse_create_topic)(s)?;
     let (s, timeout_ms) = be_i32(s)?;
+    // `validate_only` (BOOLEAN) was added in CreateTopics v1, after
+    // `timeout_ms`. When true the handler validates ACLs and topic names
+    // but does not register metadata or acquire partitions.
+    let (s, validate_only) = if version >= 1 {
+        let (s, v) = be_i8(s)?;
+        (s, v != 0)
+    } else {
+        (s, false)
+    };
 
-    Ok((s, CreateTopicsRequestData { topics, timeout_ms }))
+    Ok((
+        s,
+        CreateTopicsRequestData {
+            topics,
+            timeout_ms,
+            validate_only,
+        },
+    ))
 }
 
 fn parse_create_topic(s: NomBytes) -> IResult<NomBytes, CreateTopicData> {
@@ -81,7 +101,7 @@ pub fn parse_delete_topics_request(
 ) -> IResult<NomBytes, DeleteTopicsRequestData> {
     let (s, topic_names) = parse_array(|s| {
         let (s, name) = parse_string(s)?;
-        Ok((s, String::from_utf8_lossy(&name).to_string()))
+        Ok((s, bytes_to_string(&name)?))
     })(s)?;
     let (s, timeout_ms) = be_i32(s)?;
 
@@ -107,15 +127,38 @@ pub struct InitProducerIdRequestData {
     pub producer_epoch: i16,
 }
 
+/// Parse an InitProducerId request.
+///
+/// Per-version wire layout (Kafka protocol spec, InitProducerIdRequest;
+/// flexible from v2 per `"flexibleVersions": "2+"`):
+/// - v0–v1 (classic): `transactional_id` NULLABLE_STRING (INT16 length),
+///   `transaction_timeout_ms` INT32
+/// - v2 (flexible): `transactional_id` COMPACT_NULLABLE_STRING (varint),
+///   `transaction_timeout_ms` INT32, tagged fields
+/// - v3–v4 (flexible, KIP-360): adds `producer_id` INT64 and
+///   `producer_epoch` INT16 before the tagged fields
 pub fn parse_init_producer_id_request(
     s: NomBytes,
     version: i16,
 ) -> IResult<NomBytes, InitProducerIdRequestData> {
-    let (s, transactional_id) = parse_nullable_string(s)?;
+    let flexible = version >= 2;
+
+    let (s, transactional_id) = if flexible {
+        parse_compact_nullable_string(s)?
+    } else {
+        parse_nullable_string(s)?
+    };
     let (s, transaction_timeout_ms) = be_i32(s)?;
-    // Version 3+ has producer_id and producer_epoch
+    // producer_id / producer_epoch: added in v3 (KIP-360) for safe epoch
+    // bumping of an existing producer.
     let (s, producer_id) = if version >= 3 { be_i64(s)? } else { (s, -1i64) };
     let (s, producer_epoch) = if version >= 3 { be_i16(s)? } else { (s, -1i16) };
+    // Flexible versions terminate the body with a tagged-fields section.
+    let (s, ()) = if flexible {
+        skip_tagged_fields(s)?
+    } else {
+        (s, ())
+    };
 
     Ok((
         s,
@@ -255,6 +298,46 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_create_topics_request_v1_validate_only() {
+        // CreateTopics v1 appends `validate_only` (BOOLEAN) after timeout_ms.
+        // It must be consumed so the body is fully parsed.
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i32.to_be_bytes()); // 1 topic
+        data.extend_from_slice(&5i16.to_be_bytes());
+        data.extend_from_slice(b"t-one");
+        data.extend_from_slice(&2i32.to_be_bytes()); // partitions
+        data.extend_from_slice(&1i16.to_be_bytes()); // replication
+        data.extend_from_slice(&0i32.to_be_bytes()); // empty replica assignments
+        data.extend_from_slice(&0i32.to_be_bytes()); // empty configs
+        data.extend_from_slice(&30000i32.to_be_bytes()); // timeout_ms
+        data.push(1); // validate_only = true (v1+)
+
+        let input = create_nom_bytes(&data);
+        let (rest, request) = parse_create_topics_request(input, 1).unwrap();
+        assert!(
+            rest.into_bytes().is_empty(),
+            "validate_only byte must be consumed for v1"
+        );
+        assert_eq!(request.topics.len(), 1);
+        assert_eq!(request.topics[0].name, "t-one");
+        assert_eq!(request.timeout_ms, 30000);
+        assert!(request.validate_only);
+    }
+
+    #[test]
+    fn test_parse_create_topics_request_v0_has_no_validate_only() {
+        // The same body WITHOUT the trailing boolean must parse fully at v0.
+        let mut data = Vec::new();
+        data.extend_from_slice(&0i32.to_be_bytes()); // 0 topics
+        data.extend_from_slice(&1000i32.to_be_bytes()); // timeout_ms
+
+        let input = create_nom_bytes(&data);
+        let (rest, request) = parse_create_topics_request(input, 0).unwrap();
+        assert!(rest.into_bytes().is_empty());
+        assert_eq!(request.timeout_ms, 1000);
+    }
+
+    #[test]
     fn test_create_topics_request_data_debug() {
         let data = CreateTopicsRequestData {
             topics: vec![CreateTopicData {
@@ -263,6 +346,7 @@ mod tests {
                 replication_factor: 1,
             }],
             timeout_ms: 5000,
+            validate_only: false,
         };
         let debug = format!("{:?}", data);
         assert!(debug.contains("CreateTopicsRequestData"));
@@ -278,6 +362,7 @@ mod tests {
                 replication_factor: 1,
             }],
             timeout_ms: 10000,
+            validate_only: false,
         };
         let cloned = original.clone();
         assert_eq!(cloned.topics.len(), 1);
@@ -351,15 +436,15 @@ mod tests {
 
     #[test]
     fn test_parse_init_producer_id_request_v3() {
-        // Build an InitProducerId request v3:
-        // transactional_id: "my-txn" (6 chars)
+        // Build an InitProducerId request v3 (flexible per spec, v2+):
+        // transactional_id: "my-txn" as COMPACT_NULLABLE_STRING
         // transaction_timeout_ms: 60000
         // producer_id: 12345
         // producer_epoch: 0
+        // tagged fields: empty
         let mut data = Vec::new();
-        // String length: 6
-        data.extend_from_slice(&6i16.to_be_bytes());
-        // String: "my-txn"
+        // Compact string: varint length+1 = 7
+        data.push(7);
         data.extend_from_slice(b"my-txn");
         // Transaction timeout: 60000
         data.extend_from_slice(&60000i32.to_be_bytes());
@@ -367,12 +452,15 @@ mod tests {
         data.extend_from_slice(&12345i64.to_be_bytes());
         // Producer epoch: 0
         data.extend_from_slice(&0i16.to_be_bytes());
+        // Empty tagged fields
+        data.push(0);
 
         let input = create_nom_bytes(&data);
         let result = parse_init_producer_id_request(input, 3);
 
         assert!(result.is_ok());
-        let (_, request) = result.unwrap();
+        let (rest, request) = result.unwrap();
+        assert!(rest.into_bytes().is_empty(), "must consume entire body");
         assert_eq!(request.transactional_id, Some("my-txn".to_string()));
         assert_eq!(request.transaction_timeout_ms, 60000);
         assert_eq!(request.producer_id, 12345);
@@ -463,23 +551,81 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_init_producer_id_request_v3_with_existing_producer() {
-        // Build an InitProducerId request v3 with existing producer (bump epoch)
+    fn test_parse_init_producer_id_request_v2_flexible() {
+        // v2 is the first flexible version (per spec). Layout:
+        // COMPACT_NULLABLE_STRING transactional_id, INT32 timeout,
+        // tagged fields. There is NO producer_id/epoch before v3.
         let mut data = Vec::new();
-        // Null transactional_id
-        data.extend_from_slice(&(-1i16).to_be_bytes());
+        // Null compact string: varint 0
+        data.push(0);
+        // Transaction timeout: 45000
+        data.extend_from_slice(&45000i32.to_be_bytes());
+        // Empty tagged fields
+        data.push(0);
+
+        let input = create_nom_bytes(&data);
+        let (rest, request) = parse_init_producer_id_request(input, 2).unwrap();
+        assert!(rest.into_bytes().is_empty(), "must consume entire body");
+        assert!(request.transactional_id.is_none());
+        assert_eq!(request.transaction_timeout_ms, 45000);
+        assert_eq!(request.producer_id, -1, "v2 has no producer_id field");
+        assert_eq!(request.producer_epoch, -1, "v2 has no producer_epoch field");
+    }
+
+    #[test]
+    fn test_parse_init_producer_id_request_v2_with_transactional_id() {
+        let mut data = Vec::new();
+        // Compact string "txn-a": varint length+1 = 6
+        data.push(6);
+        data.extend_from_slice(b"txn-a");
+        data.extend_from_slice(&30000i32.to_be_bytes());
+        data.push(0); // empty tagged fields
+
+        let input = create_nom_bytes(&data);
+        let (rest, request) = parse_init_producer_id_request(input, 2).unwrap();
+        assert!(rest.into_bytes().is_empty());
+        assert_eq!(request.transactional_id, Some("txn-a".to_string()));
+        assert_eq!(request.transaction_timeout_ms, 30000);
+    }
+
+    #[test]
+    fn test_parse_init_producer_id_request_v1_is_classic() {
+        // v0-v1 are NOT flexible: classic NULLABLE_STRING and no tagged
+        // fields. A null id is -1 as INT16, not a varint 0.
+        let mut data = Vec::new();
+        data.extend_from_slice(&3i16.to_be_bytes());
+        data.extend_from_slice(b"txn");
+        data.extend_from_slice(&15000i32.to_be_bytes());
+
+        let input = create_nom_bytes(&data);
+        let (rest, request) = parse_init_producer_id_request(input, 1).unwrap();
+        assert!(rest.into_bytes().is_empty());
+        assert_eq!(request.transactional_id, Some("txn".to_string()));
+        assert_eq!(request.transaction_timeout_ms, 15000);
+    }
+
+    #[test]
+    fn test_parse_init_producer_id_request_v3_with_existing_producer() {
+        // Build an InitProducerId request v3 (flexible) with an existing
+        // producer (epoch bump per KIP-360)
+        let mut data = Vec::new();
+        // Null transactional_id: compact varint 0
+        data.push(0);
         // Transaction timeout: 60000
         data.extend_from_slice(&60000i32.to_be_bytes());
         // Existing producer ID: 54321
         data.extend_from_slice(&54321i64.to_be_bytes());
         // Current epoch: 5
         data.extend_from_slice(&5i16.to_be_bytes());
+        // Empty tagged fields
+        data.push(0);
 
         let input = create_nom_bytes(&data);
         let result = parse_init_producer_id_request(input, 3);
 
         assert!(result.is_ok());
-        let (_, request) = result.unwrap();
+        let (rest, request) = result.unwrap();
+        assert!(rest.into_bytes().is_empty());
         assert!(request.transactional_id.is_none());
         assert_eq!(request.transaction_timeout_ms, 60000);
         assert_eq!(request.producer_id, 54321);
@@ -488,10 +634,10 @@ mod tests {
 
     #[test]
     fn test_parse_init_producer_id_request_v4() {
-        // Build an InitProducerId request v4
+        // Build an InitProducerId request v4 (flexible)
         let mut data = Vec::new();
-        // transactional_id: "tx-1234" (7 chars)
-        data.extend_from_slice(&7i16.to_be_bytes());
+        // transactional_id: "tx-1234" as compact string (length+1 = 8)
+        data.push(8);
         data.extend_from_slice(b"tx-1234");
         // Transaction timeout: 120000
         data.extend_from_slice(&120000i32.to_be_bytes());
@@ -499,12 +645,15 @@ mod tests {
         data.extend_from_slice(&(-1i64).to_be_bytes());
         // Producer epoch: -1 (new producer)
         data.extend_from_slice(&(-1i16).to_be_bytes());
+        // Empty tagged fields
+        data.push(0);
 
         let input = create_nom_bytes(&data);
         let result = parse_init_producer_id_request(input, 4);
 
         assert!(result.is_ok());
-        let (_, request) = result.unwrap();
+        let (rest, request) = result.unwrap();
+        assert!(rest.into_bytes().is_empty());
         assert_eq!(request.transactional_id, Some("tx-1234".to_string()));
         assert_eq!(request.transaction_timeout_ms, 120000);
         assert_eq!(request.producer_id, -1);

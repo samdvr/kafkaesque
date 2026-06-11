@@ -78,6 +78,21 @@ pub const LEADER_EPOCH_KEY: &[u8] = b"_epoch";
 /// absent. Future migrations branch on this number; the current format is 1.
 pub const FORMAT_VERSION_KEY: &[u8] = b"_fmt";
 
+/// Key for storing the log start offset (LSO).
+///
+/// Value format: 8-byte big-endian i64.
+///
+/// The log start offset is the lowest offset still present in the log. It
+/// starts at 0 and only moves forward when retention deletes a prefix of the
+/// log. Fetches below this offset return `OffsetOutOfRange`, and
+/// `ListOffsets(earliest)` reports it.
+///
+/// Written durably *before* the record keys below it are deleted, so a crash
+/// mid-retention can never leave the LSO pointing below surviving data —
+/// the worst case is an LSO above already-deleted records, which just means
+/// retention re-runs are no-ops for that range.
+pub const LOG_START_OFFSET_KEY: &[u8] = b"_lso";
+
 /// Current on-disk format version. Bump only when the layout of records,
 /// metadata keys, or value-frame encoding changes incompatibly.
 pub const CURRENT_FORMAT_VERSION: u32 = 1;
@@ -132,27 +147,90 @@ pub fn decode_producer_id(key: &[u8]) -> Option<i64> {
     }
 }
 
+/// Producer state as persisted in SlateDB.
+///
+/// The retry-dedup pair (`last_first_sequence`, `last_base_offset`) is
+/// persisted alongside the sequence tracking so that an exact network retry
+/// of the most recent batch is re-acked with its original base offset even
+/// across a broker restart or producer-state cache eviction — Kafka's
+/// idempotent-producer contract. Legacy 6-byte values (pre-retry-dedup)
+/// decode with the retry fields set to the "unknown" sentinel (-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedProducerState {
+    /// Last successfully written sequence number for this producer.
+    pub last_sequence: i32,
+    /// Producer epoch for fencing zombie producers.
+    pub producer_epoch: i16,
+    /// First sequence of the most recent successfully appended batch
+    /// (-1 if unknown, e.g. decoded from a legacy value).
+    pub last_first_sequence: i32,
+    /// Base offset assigned to the most recent successfully appended batch
+    /// (-1 if unknown).
+    pub last_base_offset: i64,
+}
+
 /// Encode producer state value.
 ///
-/// Format: `[last_sequence:4][producer_epoch:2]` (6 bytes total).
-pub fn encode_producer_state_value(last_sequence: i32, producer_epoch: i16) -> [u8; 6] {
-    let mut value = [0u8; 6];
-    value[0..4].copy_from_slice(&last_sequence.to_be_bytes());
-    value[4..6].copy_from_slice(&producer_epoch.to_be_bytes());
+/// Format (v2): `[last_sequence:4][producer_epoch:2][last_first_sequence:4][last_base_offset:8]`
+/// (18 bytes total). Decoders accept the legacy 6-byte prefix-only form.
+pub fn encode_producer_state_value(state: &PersistedProducerState) -> [u8; 18] {
+    let mut value = [0u8; 18];
+    value[0..4].copy_from_slice(&state.last_sequence.to_be_bytes());
+    value[4..6].copy_from_slice(&state.producer_epoch.to_be_bytes());
+    value[6..10].copy_from_slice(&state.last_first_sequence.to_be_bytes());
+    value[10..18].copy_from_slice(&state.last_base_offset.to_be_bytes());
     value
 }
 
 /// Decode producer state from a value.
 ///
-/// Returns (last_sequence, producer_epoch) if valid.
-pub fn decode_producer_state_value(value: &[u8]) -> Option<(i32, i16)> {
-    if value.len() >= 6 {
-        let last_sequence = i32::from_be_bytes(value[0..4].try_into().ok()?);
-        let producer_epoch = i16::from_be_bytes(value[4..6].try_into().ok()?);
-        Some((last_sequence, producer_epoch))
-    } else {
-        None
+/// Accepts both the current 18-byte format and the legacy 6-byte format
+/// (in which case the retry-dedup fields are -1 / unknown).
+pub fn decode_producer_state_value(value: &[u8]) -> Option<PersistedProducerState> {
+    if value.len() < 6 {
+        return None;
     }
+    let last_sequence = i32::from_be_bytes(value[0..4].try_into().ok()?);
+    let producer_epoch = i16::from_be_bytes(value[4..6].try_into().ok()?);
+    let (last_first_sequence, last_base_offset) = if value.len() >= 18 {
+        (
+            i32::from_be_bytes(value[6..10].try_into().ok()?),
+            i64::from_be_bytes(value[10..18].try_into().ok()?),
+        )
+    } else {
+        (-1, -1)
+    };
+    Some(PersistedProducerState {
+        last_sequence,
+        producer_epoch,
+        last_first_sequence,
+        last_base_offset,
+    })
+}
+
+// =============================================================================
+// Record batch timestamp extraction (for time-based retention / ListOffsets)
+// =============================================================================
+
+/// Byte offset of `max_timestamp` (INT64) in a Kafka v2 record batch header.
+///
+/// Layout: base_offset(0..8) batch_length(8..12) partition_leader_epoch(12..16)
+/// magic(16) crc(17..21) attributes(21..23) last_offset_delta(23..27)
+/// base_timestamp(27..35) **max_timestamp(35..43)** ...
+const BATCH_MAX_TIMESTAMP_OFFSET: usize = 35;
+
+/// Extract `max_timestamp` (epoch millis) from a v2 record batch.
+///
+/// Returns `None` for batches too short to contain the field. A value of -1
+/// means the producer did not set timestamps (CreateTime with no records or
+/// pre-v2 formats) — callers should treat such batches as "no timestamp".
+pub fn parse_batch_max_timestamp(batch: &[u8]) -> Option<i64> {
+    let end = BATCH_MAX_TIMESTAMP_OFFSET + 8;
+    if batch.len() < end {
+        return None;
+    }
+    let bytes: [u8; 8] = batch[BATCH_MAX_TIMESTAMP_OFFSET..end].try_into().ok()?;
+    Some(i64::from_be_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -283,36 +361,75 @@ mod tests {
         assert!(key3 < key1);
     }
 
+    fn pstate(
+        last_sequence: i32,
+        producer_epoch: i16,
+        last_first_sequence: i32,
+        last_base_offset: i64,
+    ) -> PersistedProducerState {
+        PersistedProducerState {
+            last_sequence,
+            producer_epoch,
+            last_first_sequence,
+            last_base_offset,
+        }
+    }
+
     #[test]
     fn test_producer_state_value_encoding() {
-        let last_sequence = 42i32;
-        let producer_epoch = 3i16;
-        let value = encode_producer_state_value(last_sequence, producer_epoch);
-
-        let (decoded_seq, decoded_epoch) = decode_producer_state_value(&value).unwrap();
-        assert_eq!(decoded_seq, last_sequence);
-        assert_eq!(decoded_epoch, producer_epoch);
+        let state = pstate(42, 3, 40, 1234);
+        let value = encode_producer_state_value(&state);
+        assert_eq!(decode_producer_state_value(&value), Some(state));
     }
 
     #[test]
     fn test_producer_state_value_edge_cases() {
         // Test with max values
-        let value = encode_producer_state_value(i32::MAX, i16::MAX);
-        let (seq, epoch) = decode_producer_state_value(&value).unwrap();
-        assert_eq!(seq, i32::MAX);
-        assert_eq!(epoch, i16::MAX);
+        let state = pstate(i32::MAX, i16::MAX, i32::MAX, i64::MAX);
+        assert_eq!(
+            decode_producer_state_value(&encode_producer_state_value(&state)),
+            Some(state)
+        );
 
         // Test with negative values
-        let value = encode_producer_state_value(-1, -1);
-        let (seq, epoch) = decode_producer_state_value(&value).unwrap();
-        assert_eq!(seq, -1);
-        assert_eq!(epoch, -1);
+        let state = pstate(-1, -1, -1, -1);
+        assert_eq!(
+            decode_producer_state_value(&encode_producer_state_value(&state)),
+            Some(state)
+        );
 
         // Test with zero
-        let value = encode_producer_state_value(0, 0);
-        let (seq, epoch) = decode_producer_state_value(&value).unwrap();
-        assert_eq!(seq, 0);
-        assert_eq!(epoch, 0);
+        let state = pstate(0, 0, 0, 0);
+        assert_eq!(
+            decode_producer_state_value(&encode_producer_state_value(&state)),
+            Some(state)
+        );
+    }
+
+    #[test]
+    fn test_producer_state_value_legacy_6_byte_decode() {
+        // Legacy format: [last_sequence:4][producer_epoch:2] only.
+        // Retry-dedup fields must decode as -1 (unknown).
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&42i32.to_be_bytes());
+        legacy.extend_from_slice(&3i16.to_be_bytes());
+        assert_eq!(
+            decode_producer_state_value(&legacy),
+            Some(pstate(42, 3, -1, -1))
+        );
+    }
+
+    #[test]
+    fn test_parse_batch_max_timestamp() {
+        // Build a minimal v2 batch header (61 bytes) with a known max_timestamp.
+        let mut batch = vec![0u8; 61];
+        let ts: i64 = 1_700_000_000_123;
+        batch[35..43].copy_from_slice(&ts.to_be_bytes());
+        assert_eq!(parse_batch_max_timestamp(&batch), Some(ts));
+
+        // Too short to contain the field
+        assert_eq!(parse_batch_max_timestamp(&batch[..42]), None);
+        assert_eq!(parse_batch_max_timestamp(&[]), None);
     }
 
     #[test]
@@ -352,11 +469,13 @@ mod tests {
     #[test]
     fn test_decode_producer_state_value_extra_bytes() {
         // Extra bytes should be ignored
-        let mut value = encode_producer_state_value(100, 5).to_vec();
+        let mut value = encode_producer_state_value(&pstate(100, 5, 98, 7)).to_vec();
         value.extend_from_slice(&[0xFF, 0xFF]); // Add extra bytes
-        let (seq, epoch) = decode_producer_state_value(&value).unwrap();
-        assert_eq!(seq, 100);
-        assert_eq!(epoch, 5);
+        let state = decode_producer_state_value(&value).unwrap();
+        assert_eq!(state.last_sequence, 100);
+        assert_eq!(state.producer_epoch, 5);
+        assert_eq!(state.last_first_sequence, 98);
+        assert_eq!(state.last_base_offset, 7);
     }
 
     // ==========================================================================
@@ -428,9 +547,20 @@ mod tests {
         }
 
         #[test]
-        fn producer_state_value_roundtrip(seq in any::<i32>(), epoch in any::<i16>()) {
-            let v = encode_producer_state_value(seq, epoch);
-            prop_assert_eq!(decode_producer_state_value(&v), Some((seq, epoch)));
+        fn producer_state_value_roundtrip(
+            seq in any::<i32>(),
+            epoch in any::<i16>(),
+            first_seq in any::<i32>(),
+            base_offset in any::<i64>(),
+        ) {
+            let state = PersistedProducerState {
+                last_sequence: seq,
+                producer_epoch: epoch,
+                last_first_sequence: first_seq,
+                last_base_offset: base_offset,
+            };
+            let v = encode_producer_state_value(&state);
+            prop_assert_eq!(decode_producer_state_value(&v), Some(state));
         }
 
         #[test]

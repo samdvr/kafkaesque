@@ -161,6 +161,7 @@ fn create_test_context() -> RequestContext {
         request_id: uuid::Uuid::new_v4(),
         principal: "User:ANONYMOUS".to_string(),
         client_host: "127.0.0.1".to_string(),
+        transport_tls: false,
     }
 }
 
@@ -293,6 +294,7 @@ async fn test_e2e_produce_and_consume_with_verification() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let create_response = handler.handle_create_topics(&ctx, create_req).await;
     assert_eq!(create_response.topics[0].error_code, KafkaCode::None);
@@ -391,6 +393,7 @@ async fn test_e2e_slatedb_persistence_across_restart() {
                 replication_factor: 1,
             }],
             timeout_ms: 5000,
+        validate_only: false,
         };
         handler.handle_create_topics(&ctx, create_req).await;
 
@@ -518,6 +521,7 @@ async fn test_e2e_message_ordering_preserved() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     handler.handle_create_topics(&ctx, create_req).await;
 
@@ -618,6 +622,7 @@ async fn test_e2e_large_messages() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     handler.handle_create_topics(&ctx, create_req).await;
 
@@ -706,6 +711,7 @@ async fn test_e2e_multiple_produce_cycles_with_persistence() {
                     replication_factor: 1,
                 }],
                 timeout_ms: 5000,
+        validate_only: false,
             };
             handler.handle_create_topics(&ctx, create_req).await;
         }
@@ -794,6 +800,7 @@ async fn test_e2e_slatedb_data_persistence() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     handler.handle_create_topics(&ctx, create_req).await;
 
@@ -938,6 +945,7 @@ async fn test_e2e_produce_consume_with_advertised_host() {
             replication_factor: 1,
         }],
         timeout_ms: 5000,
+        validate_only: false,
     };
     let create_resp = handler.handle_create_topics(&ctx, create_req).await;
     assert_eq!(create_resp.topics[0].error_code, KafkaCode::None);

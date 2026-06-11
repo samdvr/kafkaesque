@@ -71,6 +71,15 @@ pub trait PartitionCoordinator: Send + Sync {
     /// Get list of live brokers.
     async fn get_live_brokers(&self) -> SlateDBResult<Vec<BrokerInfo>>;
 
+    /// Get the broker ID of the current cluster controller (the Raft
+    /// leader for Raft-backed coordinators).
+    ///
+    /// Returns `Ok(None)` when no leader is currently known (e.g. during
+    /// an election); callers should map that to `-1` per Kafka convention.
+    async fn current_leader_id(&self) -> SlateDBResult<Option<i32>> {
+        Ok(None)
+    }
+
     /// Unregister this broker (on shutdown).
     async fn unregister_broker(&self) -> SlateDBResult<()>;
 
@@ -261,6 +270,41 @@ pub trait PartitionCoordinator: Send + Sync {
     async fn get_partition_owners(&self, topic: &str) -> SlateDBResult<Vec<(i32, Option<i32>)>>;
 }
 
+/// Result of a successful consumer-group join.
+///
+/// Unlike the tuple returned by [`ConsumerGroupCoordinator::join_group`],
+/// this carries the per-member protocol metadata the leader needs to run
+/// its assignor, plus the protocol negotiated across all members.
+#[derive(Debug, Clone)]
+pub struct GroupJoinResult {
+    /// Generation after this join (every join triggers a rebalance).
+    pub generation_id: i32,
+    /// The member id assigned to (or confirmed for) the caller.
+    pub member_id: String,
+    /// Whether the caller is the group leader for this generation.
+    pub is_leader: bool,
+    /// The current group leader's member id.
+    pub leader_id: String,
+    /// The protocol negotiated across all members (e.g. "range").
+    /// Empty when no member declared any protocols.
+    pub protocol_name: String,
+    /// `(member_id, metadata)` for every member, where `metadata` is the
+    /// opaque subscription blob that member sent for the selected protocol.
+    /// Populated only for the leader; followers receive an empty list
+    /// (matching Kafka's JoinGroup response semantics).
+    pub members: Vec<(String, Vec<u8>)>,
+}
+
+/// Outcome of a consumer-group join attempt.
+#[derive(Debug, Clone)]
+pub enum GroupJoinOutcome {
+    /// The member joined; a rebalance is now in progress.
+    Joined(GroupJoinResult),
+    /// The member's protocol list has no protocol in common with the
+    /// rest of the group (Kafka: INCONSISTENT_GROUP_PROTOCOL).
+    InconsistentProtocol,
+}
+
 /// Coordinator for consumer group state.
 ///
 /// This trait handles:
@@ -283,6 +327,61 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
         protocol_metadata: &[u8],
         session_timeout_ms: i32,
     ) -> SlateDBResult<(i32, String, bool, String, Vec<String>)>;
+
+    /// Join a consumer group with the member's full protocol list.
+    ///
+    /// This is the protocol-aware variant of [`join_group`](Self::join_group):
+    /// it persists every `(protocol_name, metadata)` pair the member sent so
+    /// the JoinGroup response to the group leader can carry each member's own
+    /// subscription metadata, and it negotiates the group protocol across all
+    /// members (the first protocol, by member preference order, that every
+    /// member supports — ties broken by member vote like Kafka).
+    ///
+    /// The default implementation delegates to [`join_group`](Self::join_group)
+    /// with the first protocol's metadata, performing no negotiation and
+    /// returning empty per-member metadata. Real coordinators should override
+    /// it.
+    async fn join_group_with_protocols(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        protocols: &[(String, Vec<u8>)],
+        session_timeout_ms: i32,
+        rebalance_timeout_ms: i32,
+    ) -> SlateDBResult<GroupJoinOutcome> {
+        let _ = rebalance_timeout_ms;
+        let metadata = protocols
+            .first()
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default();
+        let (generation_id, member_id, is_leader, leader_id, member_ids) = self
+            .join_group(group_id, member_id, &metadata, session_timeout_ms)
+            .await?;
+        Ok(GroupJoinOutcome::Joined(GroupJoinResult {
+            generation_id,
+            member_id,
+            is_leader,
+            leader_id,
+            protocol_name: protocols
+                .first()
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default(),
+            members: if is_leader {
+                member_ids.into_iter().map(|m| (m, Vec::new())).collect()
+            } else {
+                Vec::new()
+            },
+        }))
+    }
+
+    /// Get the protocol negotiated for a group at its last rebalance.
+    ///
+    /// Returns `Ok(None)` when the group doesn't exist or no protocol has
+    /// been negotiated yet.
+    async fn get_group_protocol(&self, group_id: &str) -> SlateDBResult<Option<String>> {
+        let _ = group_id;
+        Ok(None)
+    }
 
     /// Complete a rebalance (called after sync_group from leader).
     ///
@@ -313,6 +412,22 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
 
     /// Remove a member from a consumer group and trigger rebalance.
     async fn remove_group_member(&self, group_id: &str, member_id: &str) -> SlateDBResult<()>;
+
+    /// Remove a member from a consumer group, reporting whether the member
+    /// was actually part of the group.
+    ///
+    /// Returns `Ok(true)` when the member existed and was removed (a
+    /// rebalance is triggered for the remaining members) and `Ok(false)`
+    /// when the group or member was unknown, so LeaveGroup can answer with
+    /// `UNKNOWN_MEMBER_ID` per Kafka semantics.
+    ///
+    /// The default implementation delegates to
+    /// [`remove_group_member`](Self::remove_group_member) and assumes the
+    /// member existed.
+    async fn leave_group(&self, group_id: &str, member_id: &str) -> SlateDBResult<bool> {
+        self.remove_group_member(group_id, member_id).await?;
+        Ok(true)
+    }
 
     /// Update member heartbeat with generation verification.
     ///

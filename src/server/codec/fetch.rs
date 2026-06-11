@@ -32,16 +32,6 @@ impl KafkaCodec for FetchCodec {
         1
     }
 
-    /// Minimum supported version.
-    fn min_version() -> i16 {
-        0
-    }
-
-    /// Maximum supported version.
-    fn max_version() -> i16 {
-        11
-    }
-
     fn decode_request(bytes: NomBytes, version: i16) -> Result<Self::Request> {
         use crate::server::request::parse_fetch_request;
         let (_, request) = parse_fetch_request(bytes, version).map_err(|_| {
@@ -69,21 +59,17 @@ mod tests {
 
     #[test]
     fn test_fetch_codec_version_range() {
-        assert_eq!(FetchCodec::min_version(), 0);
-        assert_eq!(FetchCodec::max_version(), 11);
+        assert_eq!(FetchCodec::min_version(), 4);
+        assert_eq!(FetchCodec::max_version(), 4);
     }
 
     #[test]
     fn test_fetch_codec_version_supported() {
-        for v in 0..=11 {
-            assert!(
-                FetchCodec::is_version_supported(v),
-                "Version {} should be supported",
-                v
-            );
-        }
+        assert!(FetchCodec::is_version_supported(4));
+        assert!(!FetchCodec::is_version_supported(0));
+        assert!(!FetchCodec::is_version_supported(3));
+        assert!(!FetchCodec::is_version_supported(5));
         assert!(!FetchCodec::is_version_supported(-1));
-        assert!(!FetchCodec::is_version_supported(12));
     }
 
     #[test]

@@ -193,6 +193,19 @@ impl RaftCoordinator {
                         let tick_jitter = jitter_duration(check_interval, 0.2);
                         tokio::time::sleep(tick_jitter).await;
 
+                        // Leader-only sweep: every broker runs this task,
+                        // but only the current Raft leader proposes the
+                        // ExpireLeases command. Non-leaders skip the tick
+                        // entirely, so the sweep neither multiplies write
+                        // load by the cluster size nor stalls on proposal
+                        // forwarding during partitions. The sweep itself is
+                        // expire-by-deadline and therefore idempotent: a
+                        // duplicate proposal from a just-deposed leader is
+                        // a cheap no-op at the state machine.
+                        if !node.is_leader().await {
+                            continue;
+                        }
+
                         // Subtract the configured skew tolerance from the
                         // expiry comparison so a leader whose clock jumps
                         // forward doesn't mass-expire valid leases. P2-5.
@@ -243,8 +256,9 @@ impl RaftCoordinator {
 
     /// Join a Raft cluster.
     ///
-    /// This initiates the cluster join process by contacting the leader
-    /// and requesting to be added as a learner, then promoted to voter.
+    /// This initiates the cluster join process by contacting the leader:
+    /// first as a learner ([`JoinCluster`], join HMAC), then promoted to
+    /// voter ([`PromoteMember`], cluster HMAC).
     pub async fn join_cluster(&self, leader_addr: &str) -> SlateDBResult<()> {
         use super::network::request_cluster_join;
         request_cluster_join(

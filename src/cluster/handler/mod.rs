@@ -104,14 +104,17 @@ pub struct SlateDBClusterHandler {
     /// the call sites don't need to special-case the disabled path.
     pub(crate) authorizer: Arc<dyn crate::cluster::authorizer::Authorizer>,
 
-    /// Broker-wide notify that fires after every successful append.
-    /// Fetch handlers waiting under `max_wait_ms` / `min_bytes`
-    /// listen on this; producing on any partition wakes them. We use a
-    /// single broker-wide notify rather than per-partition because a
-    /// long-poll fetch typically targets multiple partitions and selecting
-    /// across N notifies is significantly more code for no real benefit —
-    /// the wakeup just re-checks HWM, which is cheap.
-    pub(crate) hwm_advanced: Arc<tokio::sync::Notify>,
+    /// Per-partition notifies that fire after every successful append.
+    /// Fetch handlers waiting under `max_wait_ms` / `min_bytes` listen on
+    /// the notifies of exactly the partitions they requested.
+    ///
+    /// This used to be a single broker-wide `Notify`: every produce woke
+    /// *every* long-polling fetcher, each of which re-checked all of its
+    /// partitions — a thundering herd that scaled with consumers x
+    /// partitions. Entries are created lazily and are tiny (an `Arc<Notify>`
+    /// per partition this broker has served), so the map is bounded by the
+    /// partition count.
+    pub(crate) hwm_notifiers: dashmap::DashMap<(Arc<str>, i32), Arc<tokio::sync::Notify>>,
 
     /// SASL provider. Holds the in-memory user table when the
     /// `sasl` feature is compiled in. `None` when the feature is off.
@@ -176,6 +179,14 @@ impl SlateDBClusterHandler {
             config.circuit_breaker_threshold,
             config.circuit_breaker_base_reset_window_ms,
             config.circuit_breaker_max_reset_window_ms,
+        );
+
+        // Wire metrics cardinality settings. Without this call the
+        // `enable_partition_metrics` / `max_metric_cardinality` knobs were
+        // parsed, validated... and silently ignored.
+        super::metrics::configure_metrics(
+            config.enable_partition_metrics,
+            config.max_metric_cardinality,
         );
 
         // Create Raft coordinator with object store for snapshot persistence
@@ -443,7 +454,7 @@ impl SlateDBClusterHandler {
             data_runtime: runtime_handles.data,
             sasl_required: config.sasl_required,
             authorizer,
-            hwm_advanced: Arc::new(tokio::sync::Notify::new()),
+            hwm_notifiers: dashmap::DashMap::new(),
             #[cfg(feature = "sasl")]
             sasl_provider: crate::cluster::sasl_provider::SaslProvider::from_config(&config)
                 .await
@@ -488,6 +499,21 @@ impl SlateDBClusterHandler {
     pub(crate) fn cached_topic_name(&self, topic: &str) -> Arc<str> {
         self.topic_name_cache
             .get_with(topic.to_string(), || Arc::from(topic))
+    }
+
+    /// The HWM-advance notify for one partition, created lazily.
+    ///
+    /// Producers call `notify_waiters()` on it after a successful append;
+    /// long-poll fetches wait on the notifies of their requested partitions.
+    pub(crate) fn hwm_notifier(
+        &self,
+        topic: &Arc<str>,
+        partition: i32,
+    ) -> Arc<tokio::sync::Notify> {
+        self.hwm_notifiers
+            .entry((Arc::clone(topic), partition))
+            .or_default()
+            .clone()
     }
 
     /// Cluster-level ACL gate, driven by the
@@ -721,10 +747,12 @@ impl SlateDBClusterHandler {
                 let bytes = partition.records.len() as u64;
                 super::metrics::record_produce(topic, partition.partition_index, 1, bytes);
 
-                // Wake any fetch handlers blocked under max_wait_ms / min_bytes.
-                // Cheap broadcast — `Notify::notify_waiters` is
-                // a no-op when no one is waiting.
-                self.hwm_advanced.notify_waiters();
+                // Wake fetch handlers long-polling THIS partition under
+                // max_wait_ms / min_bytes. `Notify::notify_waiters` is a
+                // no-op when no one is waiting.
+                let topic_arc = self.cached_topic_name(topic);
+                self.hwm_notifier(&topic_arc, partition.partition_index)
+                    .notify_waiters();
 
                 ProducePartitionResponse {
                     partition_index: partition.partition_index,
@@ -829,7 +857,12 @@ impl Handler for SlateDBClusterHandler {
             &request.auth_bytes,
         );
         let (ok, principal, response_bytes) = provider
-            .authenticate_with_session(ctx.client_addr, mechanism, &request.auth_bytes)
+            .authenticate_with_session(
+                ctx.client_addr,
+                mechanism,
+                &request.auth_bytes,
+                ctx.transport_tls,
+            )
             .await;
 
         // Decide whether the handshake is complete. SCRAM has two stages:
@@ -872,6 +905,16 @@ impl Handler for SlateDBClusterHandler {
         client_addr: std::net::SocketAddr,
     ) -> Option<crate::server::SaslPostAuth> {
         self.sasl_post_auth.remove(&client_addr).map(|(_k, v)| v)
+    }
+
+    async fn on_connection_closed(&self, client_addr: std::net::SocketAddr) {
+        #[cfg(feature = "sasl")]
+        {
+            self.sasl_post_auth.remove(&client_addr);
+            if let Some(provider) = &self.sasl_provider {
+                provider.clear_session(client_addr).await;
+            }
+        }
     }
 
     #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]

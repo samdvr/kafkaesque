@@ -60,23 +60,22 @@ where
     E: nom::error::ParseError<NomBytes>,
 {
     move |input: NomBytes| {
-        let i = input.clone();
-        let (i, length) = be_i32(i)?;
+        let (input, length) = be_i32(input)?;
 
         // Null array
         if length == -1 {
-            return Ok((i, vec![]));
+            return Ok((input, vec![]));
         }
 
         // Validate array size bounds
         if !(0..=MAX_PROTOCOL_ARRAY_SIZE).contains(&length) {
             return Err(nom::Err::Failure(E::from_error_kind(
-                i,
+                input,
                 nom::error::ErrorKind::TooLarge,
             )));
         }
 
-        many_m_n(length as usize, length as usize, f)(i)
+        many_m_n(length as usize, length as usize, f)(input)
     }
 }
 

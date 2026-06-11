@@ -242,6 +242,14 @@ pub enum RaftRpcMessage {
         node_id: RaftNodeId,
         raft_addr: String,
     },
+    /// Promote an existing learner to a voting member.
+    ///
+    /// Must be sent under the **cluster** HMAC purpose (not the join purpose).
+    /// Splitting promotion from [`JoinCluster`] means a holder of the join
+    /// token alone cannot gain voter status and take over the cluster.
+    PromoteMember {
+        node_id: RaftNodeId,
+    },
 }
 
 /// Structured RPC error type that preserves retry semantics.
@@ -329,6 +337,8 @@ pub enum RaftRpcResponse {
     ErrorV2(RpcErrorInfo),
     /// Response to join cluster request
     JoinClusterOk,
+    /// Response to promote-member request
+    PromoteMemberOk,
 }
 
 /// Factory for creating Raft network connections.
@@ -459,13 +469,11 @@ pub async fn forward_client_write_with_term(
 
 /// Request to join a Raft cluster via a peer node.
 ///
-/// This sends a JoinCluster message to the specified peer, asking to be added
-/// as a learner and then promoted to voter. The peer will forward the request
-/// to the leader if necessary.
-///
-/// The frame is signed with the join key (or the cluster secret as a fallback)
-/// — see [`RaftAuthKeys`]. A peer that requires authentication and does not
-/// recognize the signature will refuse the join.
+/// Two-phase join:
+/// 1. [`JoinCluster`] under the **join** HMAC purpose adds this node as a
+///    learner only.
+/// 2. [`PromoteMember`] under the **cluster** HMAC purpose promotes it to a
+///    voter. A holder of the join token alone cannot complete phase 2.
 pub async fn request_cluster_join(
     peer_addr: &str,
     node_id: RaftNodeId,
@@ -475,27 +483,18 @@ pub async fn request_cluster_join(
 ) -> Result<(), std::io::Error> {
     let mut stream = connect_raft(peer_addr, tls).await?;
 
-    // Wrap the entire operation in a timeout
-    let result = timeout(RPC_OPERATION_TIMEOUT, async {
-        // Serialize the message
+    // Phase 1: learner membership (join purpose tag).
+    let join_result = timeout(RPC_OPERATION_TIMEOUT, async {
         let message = RaftRpcMessage::JoinCluster {
             node_id,
             raft_addr: raft_addr.to_string(),
         };
         let data = postcard::to_stdvec(&message)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        // Send signed message under the Join purpose tag.
         write_rpc_frame(&mut stream, auth_keys, true, &data).await?;
-
-        // Read response (length-prefixed and HMAC-verified).
         let (_purpose, response_buf) = read_rpc_frame(&mut stream, auth_keys).await?;
-
-        // Deserialize response
-        let response: RaftRpcResponse = postcard::from_bytes(&response_buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        Ok::<_, std::io::Error>(response)
+        postcard::from_bytes(&response_buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })
     .await
     .map_err(|_| {
@@ -505,27 +504,73 @@ pub async fn request_cluster_join(
         )
     })??;
 
-    match result {
-        RaftRpcResponse::JoinClusterOk => Ok(()),
-        RaftRpcResponse::Error(e) => Err(std::io::Error::other(e)),
-        // Handle structured error for join cluster response
-        RaftRpcResponse::ErrorV2(info) => {
-            let kind = match info.kind {
-                RpcErrorKind::LeadershipChanged => std::io::ErrorKind::NotConnected,
-                RpcErrorKind::NotLeader { .. } => std::io::ErrorKind::NotConnected,
-                RpcErrorKind::ForwardLoopDetected => std::io::ErrorKind::ConnectionRefused,
-                RpcErrorKind::InvalidRequest => std::io::ErrorKind::InvalidInput,
-                RpcErrorKind::Internal => std::io::ErrorKind::Other,
-                RpcErrorKind::Timeout => std::io::ErrorKind::TimedOut,
-                RpcErrorKind::Network => std::io::ErrorKind::ConnectionAborted,
-            };
-            Err(std::io::Error::new(kind, info.message))
+    match join_result {
+        RaftRpcResponse::JoinClusterOk => {}
+        RaftRpcResponse::Error(e) => return Err(std::io::Error::other(e)),
+        RaftRpcResponse::ErrorV2(info) => return Err(rpc_error_to_io(info)),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Unexpected response type to JoinCluster",
+            ));
         }
+    }
+
+    // Phase 2: voter promotion (cluster purpose tag). Reuse the same TCP
+    // connection when the server supports a read loop; open a fresh one
+    // otherwise so cached-client quirks don't block promotion.
+    request_cluster_promote(peer_addr, node_id, auth_keys, tls).await
+}
+
+/// Promote a learner to a voting member. Requires the cluster HMAC purpose.
+pub async fn request_cluster_promote(
+    peer_addr: &str,
+    node_id: RaftNodeId,
+    auth_keys: &RaftAuthKeys,
+    tls: Option<&RaftTlsConfig>,
+) -> Result<(), std::io::Error> {
+    let mut stream = connect_raft(peer_addr, tls).await?;
+
+    let response: RaftRpcResponse = timeout(RPC_OPERATION_TIMEOUT, async {
+        let message = RaftRpcMessage::PromoteMember { node_id };
+        let data = postcard::to_stdvec(&message)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Cluster purpose (join = false).
+        write_rpc_frame(&mut stream, auth_keys, false, &data).await?;
+        let (_purpose, response_buf) = read_rpc_frame(&mut stream, auth_keys).await?;
+        postcard::from_bytes(&response_buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Promote member operation timeout",
+        )
+    })??;
+
+    match response {
+        RaftRpcResponse::PromoteMemberOk => Ok(()),
+        RaftRpcResponse::Error(e) => Err(std::io::Error::other(e)),
+        RaftRpcResponse::ErrorV2(info) => Err(rpc_error_to_io(info)),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Unexpected response type",
+            "Unexpected response type to PromoteMember",
         )),
     }
+}
+
+fn rpc_error_to_io(info: RpcErrorInfo) -> std::io::Error {
+    let kind = match info.kind {
+        RpcErrorKind::LeadershipChanged => std::io::ErrorKind::NotConnected,
+        RpcErrorKind::NotLeader { .. } => std::io::ErrorKind::NotConnected,
+        RpcErrorKind::ForwardLoopDetected => std::io::ErrorKind::ConnectionRefused,
+        RpcErrorKind::InvalidRequest => std::io::ErrorKind::InvalidInput,
+        RpcErrorKind::Internal => std::io::ErrorKind::Other,
+        RpcErrorKind::Timeout => std::io::ErrorKind::TimedOut,
+        RpcErrorKind::Network => std::io::ErrorKind::ConnectionAborted,
+    };
+    std::io::Error::new(kind, info.message)
 }
 
 impl Default for RaftNetworkFactoryImpl {
@@ -933,42 +978,79 @@ impl RaftRpcServer {
         Ok(MaybeTlsStreamServer::Plain(stream))
     }
 
-    /// Handle a single connection.
+    /// Handle a connection, processing one or more RPC frames until EOF.
+    ///
+    /// The outbound client caches TCP connections; a one-shot read loop here
+    /// caused every second RPC on a cached socket to time out. Keep reading
+    /// until the peer closes the connection.
     async fn handle_connection(
         raft: Arc<openraft::Raft<TypeConfig>>,
         mut stream: MaybeTlsStreamServer,
         auth_keys: Arc<RaftAuthKeys>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Read message (length-prefixed, HMAC-verified, size-capped). The
-        // verification step closes both S3 (unauth control plane) and S4
-        // (allocation amplification on attacker-controlled length).
-        let (frame_purpose, msg_buf) = read_rpc_frame(&mut stream, &auth_keys).await?;
+        loop {
+            let (frame_purpose, msg_buf) = match read_rpc_frame(&mut stream, &auth_keys).await {
+                Ok(v) => v,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof
+                        || e.kind() == std::io::ErrorKind::ConnectionReset
+                        || e.kind() == std::io::ErrorKind::BrokenPipe =>
+                {
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            };
 
-        // Deserialize message
-        let message: RaftRpcMessage = postcard::from_bytes(&msg_buf)?;
+            let response = Self::dispatch_rpc_message(&raft, &auth_keys, frame_purpose, &msg_buf)
+                .await?;
+
+            let response_data = postcard::to_stdvec(&response)?;
+            write_rpc_frame(&mut stream, &auth_keys, false, &response_data).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn dispatch_rpc_message(
+        raft: &Arc<openraft::Raft<TypeConfig>>,
+        auth_keys: &RaftAuthKeys,
+        frame_purpose: super::auth::FramePurpose,
+        msg_buf: &[u8],
+    ) -> Result<RaftRpcResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let message: RaftRpcMessage = postcard::from_bytes(msg_buf)?;
 
         // Cross-check the wire purpose tag against the deserialized variant.
-        // Without this, a holder of the join token could submit
-        // arbitrary `ClientWriteWithTerm` commands; with the check, the join
-        // key only opens the door for `JoinCluster`.
+        // Join purpose → JoinCluster only. PromoteMember and ClientWrite
+        // require the cluster purpose (or unauthenticated in dev).
         let is_join_message = matches!(message, RaftRpcMessage::JoinCluster { .. });
+        let is_promote_message = matches!(message, RaftRpcMessage::PromoteMember { .. });
         let join_frame = matches!(frame_purpose, super::auth::FramePurpose::Join);
         if is_join_message != join_frame {
             tracing::warn!(
                 purpose = ?frame_purpose,
                 "Rejecting Raft RPC: wire purpose tag does not match message variant"
             );
-            let response = RaftRpcResponse::ErrorV2(RpcErrorInfo::new(
+            return Ok(RaftRpcResponse::ErrorV2(RpcErrorInfo::new(
                 RpcErrorKind::InvalidRequest,
                 "Wire purpose tag does not match message variant",
-            ));
-            let response_data = postcard::to_stdvec(&response)?;
-            write_rpc_frame(&mut stream, &auth_keys, false, &response_data).await?;
-            return Ok(());
+            )));
         }
+        if is_promote_message && join_frame {
+            tracing::warn!(
+                node_id = ?match message {
+                    RaftRpcMessage::PromoteMember { node_id } => Some(node_id),
+                    _ => None,
+                },
+                "Rejecting PromoteMember sent under join purpose tag"
+            );
+            return Ok(RaftRpcResponse::ErrorV2(RpcErrorInfo::new(
+                RpcErrorKind::InvalidRequest,
+                "PromoteMember requires cluster HMAC purpose",
+            )));
+        }
+        let _ = auth_keys; // used by read_rpc_frame on the caller side
 
-        // Handle the message
-        let response = match message {
+        Ok(match message {
             RaftRpcMessage::AppendEntries(req) => match raft.append_entries(req).await {
                 Ok(resp) => RaftRpcResponse::AppendEntries(resp),
                 Err(e) => RaftRpcResponse::Error(e.to_string()),
@@ -1057,63 +1139,69 @@ impl RaftRpcServer {
                 }
             }
             RaftRpcMessage::JoinCluster { node_id, raft_addr } => {
-                // Handle join cluster request
-                // First add as learner, then promote to voter
                 tracing::info!(
                     node_id = node_id,
                     raft_addr = %raft_addr,
-                    "Received join cluster request"
+                    "Received join cluster request (learner only)"
                 );
 
-                match Self::handle_join_cluster(&raft, node_id, raft_addr).await {
+                match Self::handle_join_cluster(raft, node_id, raft_addr).await {
                     Ok(()) => RaftRpcResponse::JoinClusterOk,
                     Err(e) => RaftRpcResponse::Error(e),
                 }
             }
-        };
+            RaftRpcMessage::PromoteMember { node_id } => {
+                tracing::info!(node_id = node_id, "Received promote member request");
 
-        // Serialize and send signed response.
-        let response_data = postcard::to_stdvec(&response)?;
-        write_rpc_frame(&mut stream, &auth_keys, false, &response_data).await?;
-
-        Ok(())
+                match Self::handle_promote_member(raft, node_id).await {
+                    Ok(()) => RaftRpcResponse::PromoteMemberOk,
+                    Err(e) => RaftRpcResponse::Error(e),
+                }
+            }
+        })
     }
 
-    /// Handle a join cluster request by adding the node as a learner and promoting to voter.
+    /// Add a node as a learner. Voter promotion is a separate
+    /// [`Self::handle_promote_member`] step gated on the cluster secret.
     async fn handle_join_cluster(
         raft: &Arc<openraft::Raft<TypeConfig>>,
         node_id: RaftNodeId,
         raft_addr: String,
     ) -> Result<(), String> {
-        // Add the node as a learner first
         let node = BasicNode { addr: raft_addr };
 
-        // Add learner (blocking=true waits for it to catch up)
         match raft.add_learner(node_id, node, true).await {
             Ok(_) => {
                 tracing::info!(node_id = node_id, "Added node as learner");
+                Ok(())
             }
             Err(e) => {
                 let err_str = e.to_string();
-                // If already a member, that's fine
                 if err_str.contains("already") {
                     tracing::info!(node_id = node_id, "Node already in cluster");
+                    Ok(())
                 } else {
                     tracing::warn!(node_id = node_id, error = %e, "Failed to add learner");
-                    return Err(format!("Failed to add learner: {}", e));
+                    Err(format!("Failed to add learner: {}", e))
                 }
             }
         }
+    }
 
-        // Get current voters and add this node
+    /// Promote a learner to a voting member. Leader-only.
+    async fn handle_promote_member(
+        raft: &Arc<openraft::Raft<TypeConfig>>,
+        node_id: RaftNodeId,
+    ) -> Result<(), String> {
         let metrics = raft.metrics().borrow().clone();
+        if metrics.current_leader != Some(metrics.id) {
+            return Err("PromoteMember rejected: this node is not the Raft leader".to_string());
+        }
+
         let mut voters: std::collections::BTreeSet<RaftNodeId> =
             metrics.membership_config.membership().voter_ids().collect();
-
-        // Add the new node to voters
         voters.insert(node_id);
 
-        // Change membership to include the new voter
         match raft.change_membership(voters, false).await {
             Ok(_) => {
                 tracing::info!(node_id = node_id, "Promoted node to voter");
@@ -1121,7 +1209,6 @@ impl RaftRpcServer {
             }
             Err(e) => {
                 let err_str = e.to_string();
-                // If already a voter, that's fine
                 if err_str.contains("already") {
                     tracing::info!(node_id = node_id, "Node already a voter");
                     Ok(())

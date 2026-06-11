@@ -641,6 +641,7 @@ mod tests {
             client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
             principal: "User:ANONYMOUS".to_string(),
             client_host: "127.0.0.1".to_string(),
+            transport_tls: false,
         }
     }
 
@@ -935,6 +936,7 @@ mod tests {
                 replication_factor: 1,
             }],
             timeout_ms: 30000,
+            validate_only: false,
         };
 
         let response = AdminHandler::handle_create_topics(&handler, &ctx, request).await;

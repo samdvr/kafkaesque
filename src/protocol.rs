@@ -25,43 +25,31 @@
 
 use crate::constants::{
     BATCH_BASE_OFFSET, BATCH_CRC_DATA_START, BATCH_CRC_OFFSET, BATCH_FIRST_SEQUENCE_END,
-    BATCH_FIRST_SEQUENCE_OFFSET, BATCH_LAST_OFFSET_DELTA_END, BATCH_LAST_OFFSET_DELTA_OFFSET,
-    BATCH_PRODUCER_EPOCH_END, BATCH_PRODUCER_EPOCH_OFFSET, BATCH_PRODUCER_ID_END,
-    BATCH_PRODUCER_ID_OFFSET, MIN_BATCH_HEADER_SIZE,
+    BATCH_FIRST_SEQUENCE_OFFSET, BATCH_LAST_OFFSET_DELTA_OFFSET, BATCH_PRODUCER_EPOCH_END,
+    BATCH_PRODUCER_EPOCH_OFFSET, BATCH_PRODUCER_ID_END, BATCH_PRODUCER_ID_OFFSET,
+    MIN_BATCH_HEADER_SIZE,
 };
 
-// CRC-32C polynomial used by Kafka (Castagnoli)
-// Using a simple implementation since we don't want to add dependencies
-const CRC32C_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0x82F63B78; // CRC-32C polynomial
-            } else {
-                crc >>= 1;
-            }
-            j += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-};
+/// Byte offset of the explicit `records_count` (INT32) field in a v2
+/// RecordBatch header. See the module-level layout table.
+const BATCH_RECORDS_COUNT_OFFSET: usize = 57;
+/// End (exclusive) of the `records_count` field; also the minimum size of a
+/// well-formed v2 RecordBatch header.
+const BATCH_RECORDS_COUNT_END: usize = 61;
 
 /// Compute CRC-32C checksum (Castagnoli polynomial).
 ///
 /// Kafka uses CRC-32C for record batch integrity verification.
-fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in data {
-        let index = ((crc ^ byte as u32) & 0xFF) as usize;
-        crc = (crc >> 8) ^ CRC32C_TABLE[index];
-    }
-    !crc
+///
+/// Backed by the `crc32c` crate, which uses hardware CRC instructions
+/// (SSE 4.2 / ARMv8 CRC) when available and a fast slicing-by-8 software
+/// fallback otherwise. The byte-at-a-time table implementation this
+/// replaced is kept in the test module as a reference oracle.
+///
+/// Public so integration tests and embedders can compute the checksum a
+/// batch is expected to carry at bytes 17–20 (covering bytes 21+).
+pub fn crc32c(data: &[u8]) -> u32 {
+    ::crc32c::crc32c(data)
 }
 
 /// Result of CRC validation.
@@ -146,49 +134,149 @@ pub async fn validate_batch_crc_async(batch: &[u8]) -> CrcValidationResult {
     }
 }
 
+/// Why a RecordBatch's record count could not be determined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCountError {
+    /// The batch is shorter than the 61-byte v2 RecordBatch header, so the
+    /// explicit `records_count` field (bytes 57-60) is not present.
+    TooShort {
+        /// Actual batch length in bytes.
+        len: usize,
+    },
+    /// The explicit `records_count` field disagrees with
+    /// `last_offset_delta + 1`. A well-formed v2 batch always satisfies
+    /// `records_count == last_offset_delta + 1`; a mismatch indicates a
+    /// corrupt or forged header.
+    Mismatch {
+        /// Value of the explicit `records_count` field (bytes 57-60).
+        records_count: i32,
+        /// Value of the `last_offset_delta` field (bytes 23-26).
+        last_offset_delta: i32,
+    },
+    /// The explicit `records_count` field is zero or negative; a produced
+    /// batch must contain at least one record.
+    NonPositive {
+        /// Value of the explicit `records_count` field.
+        records_count: i32,
+    },
+}
+
+impl std::fmt::Display for RecordCountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecordCountError::TooShort { len } => {
+                write!(f, "batch too short for v2 header: {} < 61 bytes", len)
+            }
+            RecordCountError::Mismatch {
+                records_count,
+                last_offset_delta,
+            } => write!(
+                f,
+                "records_count {} != last_offset_delta {} + 1",
+                records_count, last_offset_delta
+            ),
+            RecordCountError::NonPositive { records_count } => {
+                write!(f, "records_count {} is not >= 1", records_count)
+            }
+        }
+    }
+}
+
+impl std::error::Error for RecordCountError {}
+
+/// Parse and validate the record count of a Kafka v2 RecordBatch.
+///
+/// The v2 RecordBatch header carries an explicit `records_count` INT32 at
+/// bytes 57-60. This reads that field directly (instead of deriving the
+/// count from `last_offset_delta`, which a malformed batch can set
+/// independently) and cross-checks it:
+///
+/// - the batch must be at least 61 bytes (a full v2 header),
+/// - `records_count` must be >= 1,
+/// - `records_count` must equal `last_offset_delta + 1`.
+///
+/// Returns the validated count, or a [`RecordCountError`] describing the
+/// inconsistency. Callers on the produce path map errors to a corrupt-batch
+/// rejection (`KafkaCode::CorruptMessage`-class produce error) rather than
+/// accepting an attacker-controlled count.
+pub fn parse_record_count_checked(batch: &[u8]) -> std::result::Result<i32, RecordCountError> {
+    if batch.len() < BATCH_RECORDS_COUNT_END {
+        return Err(RecordCountError::TooShort { len: batch.len() });
+    }
+
+    let records_count = i32::from_be_bytes([
+        batch[BATCH_RECORDS_COUNT_OFFSET],
+        batch[BATCH_RECORDS_COUNT_OFFSET + 1],
+        batch[BATCH_RECORDS_COUNT_OFFSET + 2],
+        batch[BATCH_RECORDS_COUNT_OFFSET + 3],
+    ]);
+    let last_offset_delta = i32::from_be_bytes([
+        batch[BATCH_LAST_OFFSET_DELTA_OFFSET],
+        batch[BATCH_LAST_OFFSET_DELTA_OFFSET + 1],
+        batch[BATCH_LAST_OFFSET_DELTA_OFFSET + 2],
+        batch[BATCH_LAST_OFFSET_DELTA_OFFSET + 3],
+    ]);
+
+    if records_count < 1 {
+        return Err(RecordCountError::NonPositive { records_count });
+    }
+    // checked_add: last_offset_delta == i32::MAX would otherwise overflow.
+    if last_offset_delta.checked_add(1) != Some(records_count) {
+        return Err(RecordCountError::Mismatch {
+            records_count,
+            last_offset_delta,
+        });
+    }
+
+    Ok(records_count)
+}
+
 /// Parse record count from a Kafka RecordBatch.
 ///
-/// The `last_offset_delta` field is at bytes 23-26 and indicates the highest
-/// relative offset in the batch. Record count = last_offset_delta + 1.
+/// Reads the explicit `records_count` INT32 at bytes 57-60 of the v2
+/// RecordBatch header and validates it via [`parse_record_count_checked`].
 ///
 /// # Arguments
 /// * `batch` - The raw bytes of a RecordBatch
 ///
 /// # Returns
-/// The number of records in the batch, or 1 if the batch is too small to parse.
+/// The validated number of records (always >= 1), or `0` if the batch is
+/// malformed: shorter than the 61-byte v2 header, `records_count < 1`, or
+/// `records_count != last_offset_delta + 1`. Existing callers treat a
+/// non-positive count as a corrupt batch and surface a typed produce error
+/// instead of appending.
 ///
 /// # Example
 /// ```
 /// use kafkaesque::protocol::parse_record_count;
 ///
-/// // A minimal batch header (would need at least 27 bytes for real data)
-/// let batch = vec![0u8; 27];
-/// let count = parse_record_count(&batch);
-/// assert_eq!(count, 1); // last_offset_delta=0 means 1 record
+/// // A minimal, consistent v2 batch header: 5 records.
+/// let mut batch = vec![0u8; 61];
+/// batch[23..27].copy_from_slice(&4i32.to_be_bytes()); // last_offset_delta
+/// batch[57..61].copy_from_slice(&5i32.to_be_bytes()); // records_count
+/// assert_eq!(parse_record_count(&batch), 5);
+///
+/// // Truncated batches are rejected (0 = invalid), not defaulted to 1.
+/// assert_eq!(parse_record_count(&[0u8; 27]), 0);
 /// ```
 pub fn parse_record_count(batch: &[u8]) -> i32 {
-    if batch.len() >= BATCH_LAST_OFFSET_DELTA_END {
-        let last_offset_delta = i32::from_be_bytes([
-            batch[BATCH_LAST_OFFSET_DELTA_OFFSET],
-            batch[BATCH_LAST_OFFSET_DELTA_OFFSET + 1],
-            batch[BATCH_LAST_OFFSET_DELTA_OFFSET + 2],
-            batch[BATCH_LAST_OFFSET_DELTA_OFFSET + 3],
-        ]);
-        last_offset_delta + 1
-    } else {
-        1 // Assume 1 record if we can't parse
-    }
+    parse_record_count_checked(batch).unwrap_or(0)
 }
 
-/// Patch the base offset in a RecordBatch header and recalculate CRC.
+/// Patch the base offset in a RecordBatch header.
 ///
 /// The first 8 bytes of a RecordBatch contain the base offset (big-endian i64).
 /// Kafka producers send batches with base_offset=0, and the broker must patch
 /// this to the actual offset where the batch will be stored.
 ///
-/// **IMPORTANT**: After modifying the base offset, the CRC (bytes 17-20) is
-/// recalculated to maintain batch integrity. Kafka clients validate CRC on
-/// fetch and will reject batches with invalid CRCs.
+/// The CRC is intentionally **not** touched: the Kafka v2 batch CRC (stored
+/// at bytes 17-20) covers bytes 21 to the end of the batch only — the base
+/// offset (bytes 0-7), batch length, partition leader epoch, magic, and the
+/// CRC field itself are all outside the checksummed range. Rewriting the
+/// base offset therefore cannot invalidate a batch's CRC, and recomputing
+/// it here would burn a full pass over the batch on every produce append
+/// for no effect (the produce path validates the CRC *before* this point,
+/// so the stored value is already correct).
 ///
 /// # Arguments
 /// * `batch` - Mutable slice of the RecordBatch bytes
@@ -201,21 +289,12 @@ pub fn parse_record_count(batch: &[u8]) -> i32 {
 /// let mut batch = vec![0u8; 100];
 /// patch_base_offset(&mut batch, 12345);
 /// assert_eq!(&batch[0..8], &12345i64.to_be_bytes());
-/// // CRC is also updated if batch is large enough
 /// ```
 pub fn patch_base_offset(batch: &mut [u8], base_offset: i64) {
     const BASE_OFFSET_SIZE: usize = 8;
     if batch.len() >= BASE_OFFSET_SIZE {
         batch[BATCH_BASE_OFFSET..BATCH_BASE_OFFSET + BASE_OFFSET_SIZE]
             .copy_from_slice(&base_offset.to_be_bytes());
-    }
-
-    // Recalculate and update CRC after modifying base offset
-    // CRC covers bytes from BATCH_CRC_DATA_START to end of batch
-    // CRC is stored at BATCH_CRC_OFFSET (4 bytes, big-endian u32)
-    if batch.len() >= BATCH_CRC_DATA_START {
-        let new_crc = crc32c(&batch[BATCH_CRC_DATA_START..]);
-        batch[BATCH_CRC_OFFSET..BATCH_CRC_OFFSET + 4].copy_from_slice(&new_crc.to_be_bytes());
     }
 }
 
@@ -262,6 +341,9 @@ impl ProducerBatchInfo {
 ///
 /// # Returns
 /// ProducerBatchInfo if the batch is large enough to parse, None otherwise.
+/// `record_count` is the validated count from [`parse_record_count`]; it is
+/// `0` when the batch header is internally inconsistent, in which case
+/// [`ProducerBatchInfo::last_sequence`] returns `None`.
 ///
 /// # Layout (bytes 43-56):
 /// - producer_id: i64 at bytes 43-50
@@ -304,18 +386,180 @@ mod tests {
     // to verify that the constants are correctly defined. This provides independent
     // verification of the protocol layout.
 
+    /// Reference byte-at-a-time CRC-32C implementation (the one the
+    /// production path used before switching to the hardware-accelerated
+    /// `crc32c` crate). Kept as an oracle: `crc32c_matches_reference_table`
+    /// asserts the new implementation produces identical values.
+    const REFERENCE_CRC32C_TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut crc = i as u32;
+            let mut j = 0;
+            while j < 8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0x82F63B78; // CRC-32C polynomial
+                } else {
+                    crc >>= 1;
+                }
+                j += 1;
+            }
+            table[i] = crc;
+            i += 1;
+        }
+        table
+    };
+
+    fn reference_crc32c(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in data {
+            let index = ((crc ^ byte as u32) & 0xFF) as usize;
+            crc = (crc >> 8) ^ REFERENCE_CRC32C_TABLE[index];
+        }
+        !crc
+    }
+
+    /// Build a minimal, internally consistent 61-byte v2 batch header with
+    /// the given record count (last_offset_delta = count - 1).
+    fn consistent_batch(record_count: i32) -> Vec<u8> {
+        let mut batch = vec![0u8; 61];
+        batch[16] = 2; // magic
+        batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes());
+        batch[57..61].copy_from_slice(&record_count.to_be_bytes());
+        batch
+    }
+
+    #[test]
+    fn crc32c_matches_reference_table() {
+        let inputs: [&[u8]; 6] = [
+            b"",
+            b"a",
+            b"123456789",
+            b"\x00\x00\x00\x00",
+            b"The quick brown fox jumps over the lazy dog",
+            &[0xFFu8; 300],
+        ];
+        for input in inputs {
+            assert_eq!(
+                crc32c(input),
+                reference_crc32c(input),
+                "crate-backed CRC-32C diverges from reference table for {:?}",
+                input
+            );
+        }
+
+        // A pseudo-random buffer larger than any internal block size.
+        let mut data = vec![0u8; 8192];
+        let mut state = 0x12345678u32;
+        for byte in data.iter_mut() {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *byte = (state >> 24) as u8;
+        }
+        assert_eq!(crc32c(&data), reference_crc32c(&data));
+    }
+
     #[test]
     fn test_parse_record_count_valid() {
-        // Create a batch with last_offset_delta = 4 (meaning 5 records)
-        let mut batch = vec![0u8; 27];
-        batch[23..27].copy_from_slice(&4i32.to_be_bytes());
+        // A consistent batch: last_offset_delta = 4, records_count = 5.
+        let batch = consistent_batch(5);
         assert_eq!(parse_record_count(&batch), 5);
+        assert_eq!(parse_record_count_checked(&batch), Ok(5));
     }
 
     #[test]
     fn test_parse_record_count_too_small() {
+        // Shorter than the 61-byte v2 header: malformed, not "1 record".
         let batch = vec![0u8; 10];
-        assert_eq!(parse_record_count(&batch), 1);
+        assert_eq!(parse_record_count(&batch), 0);
+        assert_eq!(
+            parse_record_count_checked(&batch),
+            Err(RecordCountError::TooShort { len: 10 })
+        );
+
+        // 27 bytes is enough for last_offset_delta but NOT for the explicit
+        // records_count field — still malformed.
+        let mut batch = vec![0u8; 27];
+        batch[23..27].copy_from_slice(&4i32.to_be_bytes());
+        assert_eq!(parse_record_count(&batch), 0);
+        assert_eq!(
+            parse_record_count_checked(&batch),
+            Err(RecordCountError::TooShort { len: 27 })
+        );
+    }
+
+    #[test]
+    fn test_parse_record_count_mismatch_rejected() {
+        // records_count says 100 but last_offset_delta says 5 records.
+        let mut batch = consistent_batch(5);
+        batch[57..61].copy_from_slice(&100i32.to_be_bytes());
+        assert_eq!(parse_record_count(&batch), 0);
+        assert_eq!(
+            parse_record_count_checked(&batch),
+            Err(RecordCountError::Mismatch {
+                records_count: 100,
+                last_offset_delta: 4
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_record_count_non_positive_rejected() {
+        // records_count = 0 (and consistent delta = -1) is still rejected:
+        // a produced batch must contain at least one record.
+        let mut batch = vec![0u8; 61];
+        batch[23..27].copy_from_slice(&(-1i32).to_be_bytes());
+        batch[57..61].copy_from_slice(&0i32.to_be_bytes());
+        assert_eq!(parse_record_count(&batch), 0);
+        assert_eq!(
+            parse_record_count_checked(&batch),
+            Err(RecordCountError::NonPositive { records_count: 0 })
+        );
+
+        // Negative counts likewise.
+        batch[57..61].copy_from_slice(&(-7i32).to_be_bytes());
+        assert_eq!(
+            parse_record_count_checked(&batch),
+            Err(RecordCountError::NonPositive { records_count: -7 })
+        );
+    }
+
+    #[test]
+    fn test_parse_record_count_delta_overflow_rejected() {
+        // last_offset_delta = i32::MAX would overflow `+ 1`; must be a
+        // clean mismatch error, not a panic.
+        let mut batch = vec![0u8; 61];
+        batch[23..27].copy_from_slice(&i32::MAX.to_be_bytes());
+        batch[57..61].copy_from_slice(&1i32.to_be_bytes());
+        assert_eq!(
+            parse_record_count_checked(&batch),
+            Err(RecordCountError::Mismatch {
+                records_count: 1,
+                last_offset_delta: i32::MAX
+            })
+        );
+        assert_eq!(parse_record_count(&batch), 0);
+    }
+
+    #[test]
+    fn test_record_count_error_display() {
+        assert!(
+            RecordCountError::TooShort { len: 5 }
+                .to_string()
+                .contains("5 < 61")
+        );
+        assert!(
+            RecordCountError::Mismatch {
+                records_count: 2,
+                last_offset_delta: 7
+            }
+            .to_string()
+            .contains("2 != last_offset_delta 7"),
+        );
+        assert!(
+            RecordCountError::NonPositive { records_count: -1 }
+                .to_string()
+                .contains("-1")
+        );
     }
 
     #[test]
@@ -388,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_base_offset_updates_crc() {
+    fn test_patch_base_offset_keeps_crc_valid() {
         // Create a valid batch with correct CRC
         let mut batch = vec![0u8; 61];
 
@@ -414,10 +658,37 @@ mod tests {
         let patched_offset = i64::from_be_bytes(batch[0..8].try_into().unwrap());
         assert_eq!(patched_offset, 99999);
 
-        // Verify CRC is still valid after patching
-        // Note: Base offset is NOT covered by CRC (only bytes 21+ are covered),
-        // so CRC should remain valid. But we recalculate it anyway for safety.
+        // The base offset (bytes 0-7) is NOT covered by the v2 batch CRC
+        // (which covers bytes 21+ only), so the stored CRC must remain
+        // valid — and the stored CRC bytes must be untouched.
         assert_eq!(validate_batch_crc(&batch), CrcValidationResult::Valid);
+        assert_eq!(&batch[17..21], &initial_crc.to_be_bytes());
+    }
+
+    #[test]
+    fn test_patch_base_offset_does_not_rewrite_crc() {
+        // patch_base_offset must NOT recompute/repair the CRC: a batch
+        // arriving with a bogus CRC stays bogus after the offset is
+        // patched. (The produce path validates CRC before patching, so
+        // silently "blessing" corrupt batches here would mask corruption.)
+        let mut batch = vec![0u8; 61];
+        batch[30] = 0xAB;
+        batch[17..21].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        assert!(matches!(
+            validate_batch_crc(&batch),
+            CrcValidationResult::Invalid { .. }
+        ));
+
+        patch_base_offset(&mut batch, 42);
+
+        // Offset patched, CRC bytes untouched and still invalid.
+        assert_eq!(i64::from_be_bytes(batch[0..8].try_into().unwrap()), 42);
+        assert_eq!(&batch[17..21], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(matches!(
+            validate_batch_crc(&batch),
+            CrcValidationResult::Invalid { .. }
+        ));
     }
 
     #[test]
@@ -438,9 +709,11 @@ mod tests {
         let first_sequence: i32 = 100;
         batch[53..57].copy_from_slice(&first_sequence.to_be_bytes());
 
-        // last_offset_delta at bytes 23-26 (means record_count = last_offset_delta + 1)
+        // last_offset_delta at bytes 23-26 and the explicit records_count at
+        // bytes 57-60 must agree (record_count = last_offset_delta + 1)
         let record_count = 10;
         batch[23..27].copy_from_slice(&(record_count - 1i32).to_be_bytes());
+        batch[57..61].copy_from_slice(&record_count.to_be_bytes());
 
         let info = parse_producer_info(&batch).unwrap();
         assert_eq!(info.producer_id, 12345);
@@ -638,6 +911,7 @@ mod tests {
         batch[51..53].copy_from_slice(&i16::MAX.to_be_bytes());
         batch[53..57].copy_from_slice(&i32::MAX.to_be_bytes());
         batch[23..27].copy_from_slice(&0i32.to_be_bytes()); // 1 record
+        batch[57..61].copy_from_slice(&1i32.to_be_bytes()); // records_count = 1
 
         let info = parse_producer_info(&batch).unwrap();
         assert_eq!(info.producer_id, i64::MAX);
@@ -655,6 +929,7 @@ mod tests {
         batch[51..53].copy_from_slice(&0i16.to_be_bytes());
         batch[53..57].copy_from_slice(&0i32.to_be_bytes());
         batch[23..27].copy_from_slice(&0i32.to_be_bytes());
+        batch[57..61].copy_from_slice(&1i32.to_be_bytes());
 
         let info = parse_producer_info(&batch).unwrap();
         assert_eq!(info.producer_id, -1);
@@ -663,19 +938,18 @@ mod tests {
 
     #[test]
     fn test_parse_record_count_edge_cases() {
-        // Exactly 27 bytes (minimum for record count)
-        let mut batch = vec![0u8; 27];
-        batch[23..27].copy_from_slice(&99i32.to_be_bytes());
-        assert_eq!(parse_record_count(&batch), 100); // last_offset_delta + 1
+        // Exactly 61 bytes (minimum for the explicit records_count field)
+        let batch = consistent_batch(100);
+        assert_eq!(parse_record_count(&batch), 100);
 
-        // Large batch
+        // Large batch: records beyond the header don't affect the count
         let mut large_batch = vec![0u8; 1000];
         large_batch[23..27].copy_from_slice(&999i32.to_be_bytes());
+        large_batch[57..61].copy_from_slice(&1000i32.to_be_bytes());
         assert_eq!(parse_record_count(&large_batch), 1000);
 
-        // Zero last_offset_delta means 1 record
-        let mut single = vec![0u8; 27];
-        single[23..27].copy_from_slice(&0i32.to_be_bytes());
+        // Zero last_offset_delta + records_count 1 means a single record
+        let single = consistent_batch(1);
         assert_eq!(parse_record_count(&single), 1);
     }
 

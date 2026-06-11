@@ -76,6 +76,39 @@ pub(super) async fn handle_produce(
         "PRODUCE request received"
     );
 
+    // Transactions are not implemented: there is no transaction coordinator,
+    // no commit/abort markers, and fetch has no aborted-transaction
+    // filtering. Accepting a transactional produce would silently downgrade
+    // an EOS producer's guarantees, so reject it explicitly instead.
+    if let Some(ref txn_id) = request.transactional_id {
+        warn!(
+            client = %ctx.client_addr,
+            transactional_id = %txn_id,
+            "Rejecting transactional produce: transactions are not supported"
+        );
+        let responses = request
+            .topics
+            .into_iter()
+            .map(|topic| ProduceTopicResponse {
+                partitions: topic
+                    .partitions
+                    .iter()
+                    .map(|p| ProducePartitionResponse {
+                        partition_index: p.partition_index,
+                        error_code: KafkaCode::InvalidRequest,
+                        base_offset: -1,
+                        log_append_time: -1,
+                    })
+                    .collect(),
+                name: topic.name,
+            })
+            .collect();
+        return ProduceResponseData {
+            responses,
+            throttle_time_ms: 0,
+        };
+    }
+
     // A-1: Handle acks=0 (fire-and-forget)
     // For acks=0, we spawn the writes but don't wait for results.
     // This provides maximum throughput at the cost of durability guarantees.
@@ -133,7 +166,7 @@ pub(super) async fn handle_produce(
 
                 let topic_name = Arc::clone(&topic_name);
                 let partition_manager = partition_manager.clone();
-                let hwm_advanced = handler.hwm_advanced.clone();
+                let hwm_notify = handler.hwm_notifier(&topic_name, partition.partition_index);
                 handler.data_runtime.spawn(async move {
                     let _permit = permit;
                     if fire_and_forget_produce(
@@ -149,7 +182,7 @@ pub(super) async fn handle_produce(
                         // Without this, consumers using
                         // min_bytes>0 only see records after `max_wait_ms`
                         // expires.
-                        hwm_advanced.notify_waiters();
+                        hwm_notify.notify_waiters();
                     }
                 });
             }

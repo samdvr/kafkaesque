@@ -877,11 +877,22 @@ mod tests {
             // Verify HWM was recovered
             assert_eq!(store.high_watermark(), 15);
 
-            // Duplicate batch should be rejected (proves state was recovered)
+            // Exact retry of the LAST batch is re-acked with its original
+            // base offset (Kafka idempotent-producer contract) — the
+            // retry-dedup pair is persisted with the batch, so this works
+            // across a reopen (proves state was recovered).
             let duplicate_batch = create_test_batch(producer_id, producer_epoch, 10, 5);
-            let result = store.append_batch(&duplicate_batch).await;
+            let offset = store
+                .append_batch(&duplicate_batch)
+                .await
+                .expect("Exact retry of last batch should be re-acked after reopen");
+            assert_eq!(offset, 10, "Retry must return the ORIGINAL base offset");
+            assert_eq!(store.high_watermark(), 15, "Retry must not re-append");
 
-            match result {
+            // An OLDER duplicate (not the most recent batch) is still
+            // rejected as a DuplicateSequence.
+            let older_duplicate = create_test_batch(producer_id, producer_epoch, 5, 5);
+            match store.append_batch(&older_duplicate).await {
                 Err(super::super::error::SlateDBError::DuplicateSequence {
                     producer_id: pid,
                     expected_sequence,
@@ -889,9 +900,9 @@ mod tests {
                 }) => {
                     assert_eq!(pid, producer_id);
                     assert_eq!(expected_sequence, 15); // last_sequence was 14, so next is 15
-                    assert_eq!(received_sequence, 10);
+                    assert_eq!(received_sequence, 5);
                 }
-                Ok(_) => panic!("Duplicate batch should have been rejected after reopen"),
+                Ok(_) => panic!("Older duplicate should have been rejected after reopen"),
                 Err(e) => panic!("Expected DuplicateSequence error, got {:?}", e),
             }
 
@@ -954,11 +965,25 @@ mod tests {
                     .await
                     .expect("Failed to reopen partition store");
 
-            // Producer 1: next sequence should be 10
+            // Each producer's exact retry of its LAST batch is re-acked with
+            // the original base offset (proves per-producer retry-dedup
+            // state was recovered). Layout from phase 1:
+            //   P1 batch1a @0, P1 batch1b @5, P2 batch @10, P3 batch @15.
             let dup1 = create_test_batch(producer1, 0, 5, 5);
+            assert_eq!(
+                store
+                    .append_batch(&dup1)
+                    .await
+                    .expect("P1 exact retry should be re-acked"),
+                5,
+                "P1 retry must return its original base offset"
+            );
+
+            // An OLDER P1 duplicate is still rejected.
+            let old_dup1 = create_test_batch(producer1, 0, 0, 5);
             assert!(
-                store.append_batch(&dup1).await.is_err(),
-                "P1 duplicate should fail"
+                store.append_batch(&old_dup1).await.is_err(),
+                "P1 older duplicate should fail"
             );
 
             let next1 = create_test_batch(producer1, 0, 10, 5);
@@ -967,11 +992,15 @@ mod tests {
                 .await
                 .expect("P1 next sequence should succeed");
 
-            // Producer 2: next sequence should be 5
+            // Producer 2: exact retry re-acked at original offset, then next.
             let dup2 = create_test_batch(producer2, 0, 0, 5);
-            assert!(
-                store.append_batch(&dup2).await.is_err(),
-                "P2 duplicate should fail"
+            assert_eq!(
+                store
+                    .append_batch(&dup2)
+                    .await
+                    .expect("P2 exact retry should be re-acked"),
+                10,
+                "P2 retry must return its original base offset"
             );
 
             let next2 = create_test_batch(producer2, 0, 5, 5);
@@ -980,11 +1009,15 @@ mod tests {
                 .await
                 .expect("P2 next sequence should succeed");
 
-            // Producer 3: next sequence should be 3
+            // Producer 3: exact retry re-acked at original offset, then next.
             let dup3 = create_test_batch(producer3, 0, 0, 3);
-            assert!(
-                store.append_batch(&dup3).await.is_err(),
-                "P3 duplicate should fail"
+            assert_eq!(
+                store
+                    .append_batch(&dup3)
+                    .await
+                    .expect("P3 exact retry should be re-acked"),
+                15,
+                "P3 retry must return its original base offset"
             );
 
             let next3 = create_test_batch(producer3, 0, 3, 3);
@@ -1115,11 +1148,22 @@ mod tests {
                 "Records should be recoverable after crash"
             );
 
-            // Producer state should also be recovered
+            // Producer state should also be recovered: the exact retry of
+            // the last batch is re-acked with its original base offset, and
+            // an older duplicate is rejected.
             let duplicate = create_test_batch(producer_id, producer_epoch, 5, 5);
+            assert_eq!(
+                store
+                    .append_batch(&duplicate)
+                    .await
+                    .expect("Exact retry should be re-acked after crash recovery"),
+                5,
+                "Retry must return the original base offset"
+            );
+            let older_duplicate = create_test_batch(producer_id, producer_epoch, 0, 5);
             assert!(
-                store.append_batch(&duplicate).await.is_err(),
-                "Duplicate detection should work after crash recovery"
+                store.append_batch(&older_duplicate).await.is_err(),
+                "Older duplicate detection should work after crash recovery"
             );
 
             // Next sequential batch should succeed
@@ -1182,19 +1226,37 @@ mod tests {
             // HWM should reflect all written batches: 5*(2+3) = 25
             assert_eq!(store.high_watermark(), 25);
 
-            // Both producers' states should be recovered
-            // Producer 100: last sequence was 9 (sequences 0-9)
+            // Both producers' states should be recovered.
+            // Producer 100: last batch was sequences 8-9 at base offset 20;
+            // its exact retry is re-acked at the original offset, an older
+            // duplicate is rejected.
             let dup100 = create_test_batch(100, 0, 8, 2);
-            assert!(store.append_batch(&dup100).await.is_err());
+            assert_eq!(
+                store
+                    .append_batch(&dup100)
+                    .await
+                    .expect("P100 exact retry should be re-acked"),
+                20
+            );
+            let old_dup100 = create_test_batch(100, 0, 6, 2);
+            assert!(store.append_batch(&old_dup100).await.is_err());
             let next100 = create_test_batch(100, 0, 10, 2);
             store
                 .append_batch(&next100)
                 .await
                 .expect("P100 next should work");
 
-            // Producer 200: last sequence was 14 (sequences 0-14)
+            // Producer 200: last batch was sequences 12-14 at base offset 22.
             let dup200 = create_test_batch(200, 0, 12, 3);
-            assert!(store.append_batch(&dup200).await.is_err());
+            assert_eq!(
+                store
+                    .append_batch(&dup200)
+                    .await
+                    .expect("P200 exact retry should be re-acked"),
+                22
+            );
+            let old_dup200 = create_test_batch(200, 0, 9, 3);
+            assert!(store.append_batch(&old_dup200).await.is_err());
             let next200 = create_test_batch(200, 0, 15, 3);
             store
                 .append_batch(&next200)

@@ -94,14 +94,31 @@ pub(super) async fn handle_list_offsets(
                 .get_for_read(&topic.name, partition.partition_index)
                 .await
             {
-                Ok(store) => {
-                    let offset = match partition.timestamp {
-                        -2 => store.earliest_offset().await.unwrap_or(0), // Earliest
-                        -1 => store.high_watermark(),                     // Latest
-                        _ => store.high_watermark(),                      // Timestamp not supported
-                    };
-                    (KafkaCode::None, offset)
-                }
+                Ok(store) => match partition.timestamp {
+                    // Earliest (-2): log start offset.
+                    -2 => (KafkaCode::None, store.earliest_offset().await.unwrap_or(0)),
+                    // Latest (-1): high watermark.
+                    -1 => (KafkaCode::None, store.high_watermark()),
+                    // Actual timestamp: first offset whose batch timestamp
+                    // is >= the target. Previously this silently returned
+                    // the HWM, which made timestamp-based seeks
+                    // (`offsetsForTimes`) skip ALL existing data.
+                    ts => match store.offset_for_timestamp(ts).await {
+                        // No batch at/after the timestamp: Kafka returns -1
+                        // ("no offset") rather than an error.
+                        Ok(Some(offset)) => (KafkaCode::None, offset),
+                        Ok(None) => (KafkaCode::None, -1),
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                topic = %topic.name,
+                                partition = partition.partition_index,
+                                "Timestamp offset lookup failed"
+                            );
+                            (e.to_kafka_code(), -1)
+                        }
+                    },
+                },
                 Err(_) => (KafkaCode::NotLeaderForPartition, -1),
             };
 
@@ -175,9 +192,19 @@ pub(super) async fn handle_offset_commit(
     }
 
     // Validate member and generation before allowing any commits.
-    // This prevents stale consumers (from before a rebalance) from committing offsets.
-    // Skip validation if member_id is empty (anonymous consumers don't have generation).
-    if !request.member_id.is_empty() {
+    // This prevents stale consumers (from before a rebalance) from clobbering
+    // offsets.
+    //
+    // Kafka fencing rules:
+    // - generation_id == -1 with an empty member_id is a "simple consumer"
+    //   commit (manual offset management outside group membership) and is
+    //   allowed WITHOUT fencing.
+    // - Any commit with a non-negative generation_id OR a non-empty
+    //   member_id claims group membership and MUST be validated against the
+    //   group's current generation/membership (IllegalGeneration /
+    //   UnknownMemberId on mismatch).
+    let is_simple_consumer_commit = request.generation_id < 0 && request.member_id.is_empty();
+    if !is_simple_consumer_commit {
         match handler
             .coordinator
             .validate_member_for_commit(

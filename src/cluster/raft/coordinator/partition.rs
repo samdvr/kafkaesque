@@ -28,6 +28,14 @@ impl PartitionCoordinator for RaftCoordinator {
         self.broker_id
     }
 
+    // Raft node IDs are broker IDs (`config.broker_id as u64` at join
+    // time), so the current Raft leader's node id IS the controller's
+    // broker id. Returns None during elections, which callers report as
+    // controller_id = -1 per Kafka convention.
+    async fn current_leader_id(&self) -> SlateDBResult<Option<i32>> {
+        Ok(self.node.current_leader().await.map(|id| id as i32))
+    }
+
     async fn register_broker(&self) -> SlateDBResult<()> {
         // Retry with backoff since non-leaders need to forward to leader
         // and the leader may not be ready immediately after election

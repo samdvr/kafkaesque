@@ -24,7 +24,9 @@ use super::commands::CoordinationResponse;
 use super::state_machine::CoordinationStateMachine;
 use super::types::{RaftNodeId, TypeConfig};
 
-/// Snapshot metadata stored alongside the snapshot data.
+/// Legacy snapshot metadata layout (pre-pointer scheme), stored alongside a
+/// data object at `current.snapshot`. Still understood on read for
+/// backward compatibility; never written anymore.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SnapshotMetadata {
     /// The last log ID included in this snapshot.
@@ -33,6 +35,61 @@ struct SnapshotMetadata {
     last_membership: StoredMembership<RaftNodeId, BasicNode>,
     /// Unique identifier for this snapshot.
     snapshot_id: String,
+}
+
+/// One snapshot generation referenced by the pointer object.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SnapshotPointerEntry {
+    /// The last log ID included in this snapshot.
+    last_log_id: Option<LogId<RaftNodeId>>,
+    /// The membership configuration at the time of the snapshot.
+    last_membership: StoredMembership<RaftNodeId, BasicNode>,
+    /// Unique identifier for this snapshot.
+    snapshot_id: String,
+    /// Name of the immutable data object (relative to the snapshot prefix)
+    /// holding this generation's serialized state machine.
+    data_object: String,
+}
+
+/// The snapshot pointer object stored at `current.meta`.
+///
+/// # Why a pointer scheme instead of rename?
+///
+/// `object_store::rename` on S3 (and the copy+delete fallback) is NOT
+/// atomic: a crash mid-copy could leave metadata pointing at missing or
+/// mismatched data. Here every snapshot's data is written to a fresh,
+/// immutable, uniquely-named generation object FIRST; only then is this
+/// single small pointer object overwritten (a single PUT, which is atomic
+/// on S3/GCS/Azure and the local filesystem implementation). A reader
+/// therefore always observes a pointer whose `current.data_object` was
+/// fully written before the pointer itself.
+///
+/// The previous generation is retained until the new pointer is durably
+/// written (it is referenced by `previous` and only the generation *before
+/// that* is deleted), so even if the current data object is lost or
+/// corrupted out-of-band, readers can fall back one generation instead of
+/// failing.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SnapshotPointer {
+    /// The committed snapshot.
+    current: SnapshotPointerEntry,
+    /// The immediately preceding snapshot generation, kept as a fallback.
+    previous: Option<SnapshotPointerEntry>,
+}
+
+/// Durable bounds for the on-disk Raft log, stored at `log_meta.bin` in the
+/// log directory and written with atomic-rename + fsync.
+///
+/// `recover_from_disk` treats this file as authoritative: any `log/*.bin`
+/// file with an index above `last_log_index` is a leftover from a
+/// conflict-truncation whose file deletes did not complete before a crash,
+/// and is skipped (and removed). A missing file means the legacy layout —
+/// recovery behaves as before, and the file is written on the next append
+/// or truncation.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct LogMeta {
+    /// Highest valid log index, or `None` when the log is empty.
+    last_log_index: Option<u64>,
 }
 
 /// Persisted snapshot data (cached in memory).
@@ -60,6 +117,10 @@ pub struct RaftStore {
     last_membership: Arc<RwLock<StoredMembership<RaftNodeId, BasicNode>>>,
     /// Cached snapshot (in-memory cache of what's in object store).
     cached_snapshot: Arc<RwLock<Option<CachedSnapshot>>>,
+    /// In-memory copy of the last durably written snapshot pointer.
+    /// Written under this lock so concurrent persists serialize on the
+    /// commit-point PUT.
+    snapshot_pointer: Arc<RwLock<Option<SnapshotPointer>>>,
     /// Object store for durable snapshot persistence.
     object_store: Arc<dyn ObjectStore>,
     /// Path prefix for snapshots in the object store.
@@ -88,6 +149,7 @@ impl RaftStore {
             last_applied_log: Arc::new(RwLock::new(None)),
             last_membership: Arc::new(RwLock::new(StoredMembership::default())),
             cached_snapshot: Arc::new(RwLock::new(None)),
+            snapshot_pointer: Arc::new(RwLock::new(None)),
             object_store,
             snapshot_path: ObjectPath::from(snapshot_prefix),
             log_dir: None,
@@ -111,6 +173,7 @@ impl RaftStore {
             last_applied_log: Arc::new(RwLock::new(None)),
             last_membership: Arc::new(RwLock::new(StoredMembership::default())),
             cached_snapshot: Arc::new(RwLock::new(None)),
+            snapshot_pointer: Arc::new(RwLock::new(None)),
             object_store,
             snapshot_path: ObjectPath::from(snapshot_prefix),
             log_dir: Some(log_dir),
@@ -122,6 +185,25 @@ impl RaftStore {
     /// WAL files this is a no-op; on a restart it loads the durable vote,
     /// every persisted log entry, and the purged-up-to marker so openraft
     /// resumes with the same state it had at crash time.
+    ///
+    /// # Stale-file filtering (crash safety)
+    ///
+    /// File deletion during `purge_logs_upto` and
+    /// `delete_conflict_logs_since` is best-effort, so a crash between the
+    /// (durable, ordered-first) metadata write and the file deletes can
+    /// leave stale `log/*.bin` files behind. Recovery is authoritative on
+    /// the metadata, never the file listing:
+    ///
+    /// - entries with `index <= purged.bin` are skipped: purged entries can
+    ///   never resurrect (openraft invariant: nothing below the purge floor
+    ///   may reappear);
+    /// - entries with `index > log_meta.last_log_index` are skipped:
+    ///   conflict-truncated (forked) entries can never resurrect.
+    ///
+    /// Stale files are deleted (best-effort) during the scan. A missing
+    /// `log_meta.bin` means the legacy on-disk layout: no upper-bound
+    /// filter is applied (matching old behavior) and the file is created
+    /// by the next append or truncation.
     ///
     /// Failures here are fatal — see `RaftNode::new` for the fail-closed
     /// wrapping. A corrupt WAL is treated the same way a corrupt snapshot
@@ -147,8 +229,11 @@ impl RaftStore {
             *self.vote.write().await = Some(vote);
         }
 
-        // Purged marker — used to validate log file ranges.
+        // Purged marker — the durable purge floor. Persisted BEFORE log
+        // files are deleted, so it is always >= the highest purged index
+        // whose file delete may have failed.
         let purged_path = dir.join("purged.bin");
+        let mut purged_index: Option<u64> = None;
         if purged_path.exists() {
             let bytes = std::fs::read(&purged_path)?;
             let purged: LogId<RaftNodeId> = postcard::from_bytes(&bytes).map_err(|e| {
@@ -157,19 +242,78 @@ impl RaftStore {
                     format!("purged.bin deserialize: {}", e),
                 )
             })?;
+            purged_index = Some(purged.index);
             *self.last_purged_log_id.write().await = Some(purged);
         }
 
-        // Log entries — every log/{index:020}.bin under the dir.
+        // Log bound metadata — the durable truncation point. Persisted
+        // BEFORE conflict-truncation file deletes. `None` = legacy layout
+        // (no upper-bound filter); `Some(meta)` = authoritative bound.
+        let log_meta_path = dir.join("log_meta.bin");
+        let log_bound: Option<LogMeta> = if log_meta_path.exists() {
+            let bytes = std::fs::read(&log_meta_path)?;
+            let meta: LogMeta = postcard::from_bytes(&bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("log_meta.bin deserialize: {}", e),
+                )
+            })?;
+            Some(meta)
+        } else {
+            None
+        };
+
+        // Clean up any leftover atomic-write temp files (crash between
+        // temp-file write and rename). Best-effort.
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("tmp") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+
+        // Log entries — every log/{index:020}.bin under the dir, filtered
+        // against the purge floor and the truncation bound.
         let log_subdir = dir.join("log");
         if log_subdir.exists() {
             let mut log = self.log.write().await;
             for entry in std::fs::read_dir(&log_subdir)? {
                 let entry = entry?;
                 let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+                let ext = path.extension().and_then(|s| s.to_str());
+                if ext == Some("tmp") {
+                    let _ = std::fs::remove_file(&path);
                     continue;
                 }
+                if ext != Some("bin") {
+                    continue;
+                }
+                // The filename encodes the index; it is what purge/truncate
+                // deletes key on, so it is what recovery filters on.
+                let Some(idx) = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+
+                let below_purge_floor = purged_index.is_some_and(|floor| idx <= floor);
+                let above_truncation =
+                    log_bound.is_some_and(|meta| meta.last_log_index.is_none_or(|last| idx > last));
+                if below_purge_floor || above_truncation {
+                    info!(
+                        index = idx,
+                        below_purge_floor,
+                        above_truncation,
+                        "Removing stale Raft log file left behind by an \
+                         interrupted purge/truncate"
+                    );
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+
                 let bytes = std::fs::read(&path)?;
                 let log_entry: Entry<TypeConfig> = postcard::from_bytes(&bytes).map_err(|e| {
                     std::io::Error::new(
@@ -275,6 +419,25 @@ impl RaftStore {
         Self::atomic_write_fsync(&dir.join("purged.bin"), &bytes)
     }
 
+    /// Persist the durable log bound (`log_meta.bin`).
+    ///
+    /// Written AFTER appends (raising the bound only once the entries are
+    /// durable) and BEFORE conflict-truncation file deletes (lowering the
+    /// bound so a crash mid-delete cannot resurrect forked entries).
+    fn persist_log_meta(&self, last_log_index: Option<u64>) -> std::io::Result<()> {
+        let Some(dir) = self.log_dir.as_ref() else {
+            return Ok(());
+        };
+        let meta = LogMeta { last_log_index };
+        let bytes = postcard::to_stdvec(&meta).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("log_meta serialize: {}", e),
+            )
+        })?;
+        Self::atomic_write_fsync(&dir.join("log_meta.bin"), &bytes)
+    }
+
     /// Get the state machine for reading.
     pub fn state_machine(&self) -> Arc<RwLock<CoordinationStateMachine>> {
         self.sm.clone()
@@ -283,36 +446,34 @@ impl RaftStore {
     /// Load the latest snapshot from object store on startup.
     ///
     /// This should be called after creating the store to restore state.
-    /// Also cleans up any orphaned temp files from crashed snapshot writes.
+    /// Also cleans up orphaned temp files and unreferenced snapshot
+    /// generations from crashed snapshot writes.
     ///
     /// # Returns
     /// - `Ok(true)` if a snapshot was successfully loaded
     /// - `Ok(false)` if no snapshot exists (clean start)
-    /// - `Err(...)` if a snapshot exists but is corrupted (should fail startup)
+    /// - `Err(...)` if snapshot metadata exists but no loadable snapshot
+    ///   generation remains (should fail startup)
     ///
-    /// # Corruption Detection
-    /// The following conditions are treated as corruption and cause an error:
-    /// - Metadata file exists but can't be read (I/O error)
-    /// - Metadata file exists but can't be deserialized (format corruption)
-    /// - Metadata exists but data file is missing (incomplete write/corruption)
-    /// - Data file exists but can't be deserialized (format corruption)
+    /// # Corruption handling
+    /// The pointer object (`current.meta`) names the current generation's
+    /// data object and, as a fallback, the previous generation's. If the
+    /// current generation is missing or fails to deserialize, this falls
+    /// back to the previous generation (logging loudly). Only when no
+    /// referenced generation is loadable does this return an error — the
+    /// caller fails closed rather than starting with silent amnesia.
     ///
-    /// This is critical for safety: starting with corrupted state could lead to
-    /// data loss or inconsistent cluster state.
+    /// Legacy layouts (metadata at `current.meta` in the pre-pointer
+    /// format, data at `current.snapshot`) are still read transparently.
     pub async fn load_snapshot_from_store(&self) -> Result<bool, StorageError<RaftNodeId>> {
-        // Clean up any orphaned temp files from previous crashes
-        self.cleanup_temp_files().await;
-
-        let snapshot_data_path =
-            ObjectPath::from(format!("{}/current.snapshot", self.snapshot_path));
         let snapshot_meta_path = ObjectPath::from(format!("{}/current.meta", self.snapshot_path));
 
-        // Try to load snapshot metadata
+        // Try to load the pointer object.
         let meta_bytes = match self.object_store.get(&snapshot_meta_path).await {
             Ok(result) => match result.bytes().await {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    // Metadata file exists but couldn't be read - this is corruption
+                    // Pointer exists but couldn't be read - this is corruption
                     error!(
                         error = %e,
                         path = %snapshot_meta_path,
@@ -331,6 +492,8 @@ impl RaftStore {
             Err(object_store::Error::NotFound { .. }) => {
                 // No snapshot exists - this is OK, clean start
                 debug!("No existing snapshot found in object store (clean start)");
+                self.cleanup_stale_snapshot_files(&std::collections::HashSet::new())
+                    .await;
                 return Ok(false);
             }
             Err(e) => {
@@ -344,201 +507,268 @@ impl RaftStore {
             }
         };
 
-        // Metadata file exists - deserialize it
-        let metadata: SnapshotMetadata = postcard::from_bytes(&meta_bytes).map_err(|e| {
-            // Metadata exists but can't be deserialized - this is corruption
-            error!(
-                error = %e,
-                path = %snapshot_meta_path,
-                bytes_len = meta_bytes.len(),
-                "CORRUPTION: Snapshot metadata file is corrupted (deserialization failed)"
-            );
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Snapshot(None),
-                openraft::ErrorVerb::Read,
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Snapshot metadata deserialization failed (corruption): {}",
-                        e
-                    ),
-                ),
-            )
-        })?;
-
-        // Load snapshot data - at this point we expect it to exist since metadata exists
-        let data_bytes = match self.object_store.get(&snapshot_data_path).await {
-            Ok(result) => match result.bytes().await {
-                Ok(bytes) => bytes.to_vec(),
-                Err(e) => {
-                    // Data file exists but couldn't be read - this is corruption
+        // Decode the pointer. New format first; legacy bytes fail with a
+        // clean EOF (they lack the trailing fields) and fall through to the
+        // legacy decode, which maps to a synthetic single-candidate pointer
+        // whose data lives at `current.snapshot`.
+        let candidates: Vec<SnapshotPointerEntry> = match postcard::from_bytes::<SnapshotPointer>(
+            &meta_bytes,
+        ) {
+            Ok(pointer) => {
+                let mut v = vec![pointer.current];
+                v.extend(pointer.previous);
+                v
+            }
+            Err(pointer_err) => match postcard::from_bytes::<SnapshotMetadata>(&meta_bytes) {
+                Ok(legacy) => {
+                    info!("Loading legacy (pre-pointer) snapshot layout");
+                    vec![SnapshotPointerEntry {
+                        last_log_id: legacy.last_log_id,
+                        last_membership: legacy.last_membership,
+                        snapshot_id: legacy.snapshot_id,
+                        data_object: "current.snapshot".to_string(),
+                    }]
+                }
+                Err(legacy_err) => {
                     error!(
-                        error = %e,
-                        path = %snapshot_data_path,
-                        "CORRUPTION: Snapshot data file exists but failed to read bytes"
+                        pointer_error = %pointer_err,
+                        legacy_error = %legacy_err,
+                        path = %snapshot_meta_path,
+                        bytes_len = meta_bytes.len(),
+                        "CORRUPTION: Snapshot metadata file is corrupted (deserialization failed)"
                     );
                     return Err(StorageError::from_io_error(
                         openraft::ErrorSubject::Snapshot(None),
                         openraft::ErrorVerb::Read,
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Snapshot data corruption: {}", e),
+                            format!(
+                                "Snapshot metadata deserialization failed (corruption): \
+                                     pointer: {}; legacy: {}",
+                                pointer_err, legacy_err
+                            ),
                         ),
                     ));
                 }
             },
-            Err(object_store::Error::NotFound { .. }) => {
-                // Metadata exists but data is missing - this indicates corruption or incomplete write
+        };
+
+        // Try each referenced generation, newest first.
+        let mut failures: Vec<String> = Vec::new();
+        for (idx, entry) in candidates.iter().enumerate() {
+            let data_bytes = match self.read_snapshot_generation(entry).await {
+                Ok(bytes) => bytes,
+                Err(reason) => {
+                    error!(
+                        snapshot_id = %entry.snapshot_id,
+                        data_object = %entry.data_object,
+                        reason = %reason,
+                        "CORRUPTION: snapshot generation unusable"
+                    );
+                    failures.push(reason);
+                    continue;
+                }
+            };
+
+            // Validate BEFORE mutating the state machine.
+            let state = match CoordinationStateMachine::deserialize_state(&data_bytes) {
+                Ok(state) => state,
+                Err(e) => {
+                    let reason = format!(
+                        "snapshot {} data object {} failed to deserialize: {}",
+                        entry.snapshot_id, entry.data_object, e
+                    );
+                    error!(
+                        snapshot_id = %entry.snapshot_id,
+                        data_object = %entry.data_object,
+                        error = %e,
+                        "CORRUPTION: snapshot data failed to deserialize"
+                    );
+                    failures.push(reason);
+                    continue;
+                }
+            };
+
+            if idx > 0 {
                 error!(
-                    meta_path = %snapshot_meta_path,
-                    data_path = %snapshot_data_path,
-                    snapshot_id = %metadata.snapshot_id,
-                    "CORRUPTION: Snapshot metadata exists but data file is missing"
+                    snapshot_id = %entry.snapshot_id,
+                    "FALLBACK: current snapshot generation was unusable; \
+                     restored the previous generation instead. State will be \
+                     caught up from the Raft log / leader snapshot."
                 );
-                return Err(StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Snapshot metadata exists but data file is missing (incomplete write or corruption)",
-                    ),
-                ));
             }
-            Err(e) => {
-                error!(error = %e, "Failed to access snapshot data from object store");
-                return Err(StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::other(e.to_string()),
-                ));
-            }
-        };
 
-        // Restore state machine from raw bytes
-        self.sm.write().await.restore(&data_bytes).await;
-        *self.last_applied_log.write().await = metadata.last_log_id;
-        *self.last_membership.write().await = metadata.last_membership.clone();
+            // Install: state machine, applied indices, caches, pointer.
+            self.sm.write().await.replace_state(state).await;
+            *self.last_applied_log.write().await = entry.last_log_id;
+            *self.last_membership.write().await = entry.last_membership.clone();
 
-        // Cache the snapshot in memory
-        let meta = SnapshotMeta {
-            last_log_id: metadata.last_log_id,
-            last_membership: metadata.last_membership,
-            snapshot_id: metadata.snapshot_id,
-        };
-        *self.cached_snapshot.write().await = Some(CachedSnapshot {
-            meta: meta.clone(),
-            data: data_bytes,
-        });
+            let meta = SnapshotMeta {
+                last_log_id: entry.last_log_id,
+                last_membership: entry.last_membership.clone(),
+                snapshot_id: entry.snapshot_id.clone(),
+            };
+            *self.cached_snapshot.write().await = Some(CachedSnapshot {
+                meta: meta.clone(),
+                data: data_bytes,
+            });
 
-        info!(
-            snapshot_id = %meta.snapshot_id,
-            last_log_index = ?meta.last_log_id.map(|l| l.index),
-            "Restored snapshot from object store"
-        );
+            // Record the loaded pointer so the next persist keeps this
+            // generation as the fallback. When we fell back to `previous`
+            // there is no older generation left to reference.
+            let referenced: std::collections::HashSet<String> =
+                candidates.iter().map(|c| c.data_object.clone()).collect();
+            *self.snapshot_pointer.write().await = Some(SnapshotPointer {
+                current: entry.clone(),
+                previous: candidates.get(idx + 1).cloned(),
+            });
 
-        Ok(true)
+            // Best-effort cleanup of temp files and unreferenced
+            // generations from crashed writes.
+            self.cleanup_stale_snapshot_files(&referenced).await;
+
+            info!(
+                snapshot_id = %meta.snapshot_id,
+                last_log_index = ?meta.last_log_id.map(|l| l.index),
+                "Restored snapshot from object store"
+            );
+
+            return Ok(true);
+        }
+
+        // Metadata exists but no referenced generation is loadable.
+        Err(StorageError::from_io_error(
+            openraft::ErrorSubject::Snapshot(None),
+            openraft::ErrorVerb::Read,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Snapshot metadata exists but no referenced snapshot \
+                     generation is loadable: {}",
+                    failures.join("; ")
+                ),
+            ),
+        ))
     }
 
-    /// Clean up orphaned temporary files from previous crashed snapshot writes.
-    ///
-    /// This scans for files matching `temp-*.snapshot` and `temp-*.meta` patterns
-    /// and deletes them. Safe to call at any time as temp files are never
-    /// referenced by valid snapshots.
-    async fn cleanup_temp_files(&self) {
-        // List all files in the snapshot directory
+    /// Read one snapshot generation's data object, returning a description
+    /// of the failure instead of an error type so the caller can fall back.
+    async fn read_snapshot_generation(
+        &self,
+        entry: &SnapshotPointerEntry,
+    ) -> Result<Vec<u8>, String> {
+        let data_path = ObjectPath::from(format!("{}/{}", self.snapshot_path, entry.data_object));
+        match self.object_store.get(&data_path).await {
+            Ok(result) => match result.bytes().await {
+                Ok(bytes) => Ok(bytes.to_vec()),
+                Err(e) => Err(format!(
+                    "snapshot {} data object {} read failed: {}",
+                    entry.snapshot_id, entry.data_object, e
+                )),
+            },
+            Err(object_store::Error::NotFound { .. }) => Err(format!(
+                "snapshot {} data object {} is missing",
+                entry.snapshot_id, entry.data_object
+            )),
+            Err(e) => Err(format!(
+                "snapshot {} data object {} access failed: {}",
+                entry.snapshot_id, entry.data_object, e
+            )),
+        }
+    }
+
+    /// Clean up stale snapshot objects: legacy `temp-*` files from the old
+    /// rename-based scheme, and generation data objects no longer referenced
+    /// by the pointer. Best-effort; never deletes `current.meta` or any
+    /// object named in `referenced`.
+    async fn cleanup_stale_snapshot_files(&self, referenced: &std::collections::HashSet<String>) {
         let prefix = self.snapshot_path.clone();
-        let list_result = self.object_store.list(Some(&prefix));
+        let mut stale: Vec<ObjectPath> = Vec::new();
 
-        // Collect temp files to delete
-        let mut temp_files: Vec<ObjectPath> = Vec::new();
-
-        // Use a stream to iterate over files
         use futures::StreamExt;
-        let mut stream = list_result;
+        let mut stream = self.object_store.list(Some(&prefix));
         while let Some(result) = stream.next().await {
             match result {
                 Ok(meta) => {
-                    let path_str = meta.location.to_string();
-                    // Check if this is a temp file
-                    if path_str.contains("/temp-")
-                        && (path_str.ends_with(".snapshot") || path_str.ends_with(".meta"))
-                    {
-                        temp_files.push(meta.location);
+                    let Some(name) = meta.location.filename().map(str::to_string) else {
+                        continue;
+                    };
+                    if name == "current.meta" || referenced.contains(&name) {
+                        continue;
+                    }
+                    // `current.snapshot` is never deleted: it is either the
+                    // legacy layout's data object or the post-commit legacy
+                    // mirror; both are refreshed/superseded in place.
+                    if name == "current.snapshot" {
+                        continue;
+                    }
+                    let is_temp = name.starts_with("temp-")
+                        && (name.ends_with(".snapshot") || name.ends_with(".meta"));
+                    let is_unreferenced_generation =
+                        name.starts_with("gen-") && name.ends_with(".snapshot");
+                    if is_temp || is_unreferenced_generation {
+                        stale.push(meta.location);
                     }
                 }
                 Err(e) => {
-                    debug!(error = %e, "Error listing files during temp cleanup");
+                    debug!(error = %e, "Error listing files during snapshot cleanup");
                     // Continue - best effort cleanup
                 }
             }
         }
 
-        // Delete temp files
-        for path in temp_files {
+        for path in stale {
             match self.object_store.delete(&path).await {
                 Ok(()) => {
-                    info!(path = %path, "Cleaned up orphaned temp snapshot file");
+                    info!(path = %path, "Cleaned up stale snapshot object");
                 }
                 Err(e) => {
-                    debug!(error = %e, path = %path, "Failed to delete temp file (may already be gone)");
+                    debug!(error = %e, path = %path, "Failed to delete stale snapshot object (may already be gone)");
                 }
             }
         }
     }
 
-    /// Persist a snapshot to the object store.
+    /// Persist a snapshot to the object store using the generation/pointer
+    /// scheme.
     ///
-    /// # Atomicity
+    /// # Crash ordering
     ///
-    /// This uses a two-phase commit pattern to ensure crash safety:
-    /// 1. Write snapshot data to a temporary path with unique ID
-    /// 2. Write metadata to a temporary path
-    /// 3. Atomically rename both to final locations (data first, then meta)
+    /// 1. Write the snapshot data to a fresh, immutable, uniquely named
+    ///    generation object (`gen-<id>-<uuid>.snapshot`).
+    /// 2. Overwrite the single small pointer object (`current.meta`) with a
+    ///    pointer naming the new generation as `current` and the outgoing
+    ///    generation as `previous`. This single PUT is the commit point —
+    ///    object-store PUTs are atomic, so readers observe either the old
+    ///    or the new pointer, never a torn state, and the data a pointer
+    ///    names is always fully written before the pointer itself.
+    /// 3. Only after the pointer is durable, refresh the legacy
+    ///    `current.snapshot` mirror (for pre-pointer binaries/tooling) and
+    ///    best-effort delete the generation that fell off the end (older
+    ///    than `previous`).
     ///
-    /// If we crash at any point:
-    /// - Before step 3: Old snapshot remains valid, temp files are orphaned (cleanup on next write)
-    /// - After data rename but before meta rename: Old metadata still points to old data (safe)
-    /// - After both renames: New snapshot is complete
-    ///
-    /// The metadata file acts as the commit marker - a snapshot is only valid
-    /// if its metadata exists and points to valid data.
+    /// A crash after step 1 leaves an orphaned generation (cleaned up at
+    /// next startup); a crash after step 2 leaves a stale mirror and/or the
+    /// now-unreferenced oldest generation behind (also harmless — new
+    /// readers only follow the pointer). At no point can metadata reference
+    /// missing data.
     async fn persist_snapshot(
         &self,
         meta: &SnapshotMeta<RaftNodeId, BasicNode>,
         data: &[u8],
     ) -> Result<(), StorageError<RaftNodeId>> {
-        // Use snapshot_id in temp paths to avoid collisions
-        let temp_data_path = ObjectPath::from(format!(
-            "{}/temp-{}.snapshot",
-            self.snapshot_path, meta.snapshot_id
-        ));
-        let temp_meta_path = ObjectPath::from(format!(
-            "{}/temp-{}.meta",
-            self.snapshot_path, meta.snapshot_id
-        ));
-        let final_data_path = ObjectPath::from(format!("{}/current.snapshot", self.snapshot_path));
-        let final_meta_path = ObjectPath::from(format!("{}/current.meta", self.snapshot_path));
+        // Unique per write: snapshot_id alone can repeat (it is derived from
+        // the last applied index), and the referenced data object must be
+        // immutable for the pointer scheme to be crash-safe.
+        let data_object = format!("gen-{}-{}.snapshot", meta.snapshot_id, uuid::Uuid::new_v4());
+        let data_path = ObjectPath::from(format!("{}/{}", self.snapshot_path, data_object));
 
-        // Serialize metadata
-        let metadata = SnapshotMetadata {
-            last_log_id: meta.last_log_id,
-            last_membership: meta.last_membership.clone(),
-            snapshot_id: meta.snapshot_id.clone(),
-        };
-        let meta_bytes = postcard::to_stdvec(&metadata).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Snapshot(None),
-                openraft::ErrorVerb::Write,
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-            )
-        })?;
-
-        // Step 1: Write snapshot data to temp path
+        // Step 1: write the new generation's data object.
         self.object_store
-            .put(&temp_data_path, Bytes::copy_from_slice(data).into())
+            .put(&data_path, Bytes::copy_from_slice(data).into())
             .await
             .map_err(|e| {
-                error!(error = %e, "Failed to write snapshot data to temp path");
+                error!(error = %e, "Failed to write snapshot data object");
                 StorageError::from_io_error(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
@@ -546,81 +776,82 @@ impl RaftStore {
                 )
             })?;
 
-        // Step 2: Write metadata to temp path
+        // Step 2: commit by overwriting the pointer. Hold the pointer lock
+        // across the PUT so concurrent persists serialize.
+        let mut pointer_guard = self.snapshot_pointer.write().await;
+        let previous = pointer_guard.as_ref().map(|p| p.current.clone());
+        let evicted = pointer_guard.as_ref().and_then(|p| p.previous.clone());
+
+        let new_pointer = SnapshotPointer {
+            current: SnapshotPointerEntry {
+                last_log_id: meta.last_log_id,
+                last_membership: meta.last_membership.clone(),
+                snapshot_id: meta.snapshot_id.clone(),
+                data_object: data_object.clone(),
+            },
+            previous,
+        };
+        let pointer_bytes = postcard::to_stdvec(&new_pointer).map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::Snapshot(None),
+                openraft::ErrorVerb::Write,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            )
+        })?;
+
+        let pointer_path = ObjectPath::from(format!("{}/current.meta", self.snapshot_path));
         if let Err(e) = self
             .object_store
-            .put(&temp_meta_path, Bytes::copy_from_slice(&meta_bytes).into())
+            .put(&pointer_path, Bytes::from(pointer_bytes).into())
             .await
         {
-            error!(error = %e, "Failed to write snapshot metadata to temp path");
-            // Clean up temp data file on failure
-            let _ = self.object_store.delete(&temp_data_path).await;
+            error!(error = %e, "Failed to write snapshot pointer (commit point)");
+            drop(pointer_guard);
+            // The new generation was never referenced; remove it.
+            let _ = self.object_store.delete(&data_path).await;
             return Err(StorageError::from_io_error(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Write,
                 std::io::Error::other(e.to_string()),
             ));
         }
+        *pointer_guard = Some(new_pointer.clone());
+        drop(pointer_guard);
 
-        // Step 3a: Atomically rename data file
-        // Note: object_store rename is atomic on most backends (S3, GCS, Azure)
-        // For backends that don't support rename, this kafkaesques back to copy+delete
+        // Step 3: AFTER the commit point, refresh the legacy mirror at
+        // `current.snapshot`. New readers never consult it (the pointer
+        // references the immutable generation object), so a crash before or
+        // during this write is harmless; it exists so pre-pointer binaries
+        // and tooling that expect `{prefix}/current.snapshot` keep working.
+        // Best-effort by design.
+        let legacy_mirror_path =
+            ObjectPath::from(format!("{}/current.snapshot", self.snapshot_path));
         if let Err(e) = self
             .object_store
-            .rename(&temp_data_path, &final_data_path)
+            .put(&legacy_mirror_path, Bytes::copy_from_slice(data).into())
             .await
         {
-            // Fallback: copy + delete for backends without native rename
-            if let Err(copy_err) = self
-                .object_store
-                .copy(&temp_data_path, &final_data_path)
-                .await
-            {
-                error!(error = %copy_err, "Failed to copy snapshot data to final path");
-                // Clean up temp files
-                let _ = self.object_store.delete(&temp_data_path).await;
-                let _ = self.object_store.delete(&temp_meta_path).await;
-                return Err(StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(copy_err.to_string()),
-                ));
-            }
-            // Delete temp after successful copy
-            let _ = self.object_store.delete(&temp_data_path).await;
-            debug!(error = %e, "Used copy+delete fallback for snapshot data (rename not supported)");
+            debug!(error = %e, "Failed to refresh legacy snapshot mirror (non-fatal)");
         }
 
-        // Step 3b: Atomically rename metadata file (commit point)
-        if let Err(e) = self
-            .object_store
-            .rename(&temp_meta_path, &final_meta_path)
-            .await
+        // Step 4: best-effort delete of the generation that fell off the
+        // retention window (we keep current + previous).
+        if let Some(evicted) = evicted
+            && evicted.data_object != data_object
+            && Some(&evicted.data_object) != new_pointer.previous.as_ref().map(|p| &p.data_object)
+            && evicted.data_object != "current.snapshot"
         {
-            // Fallback: copy + delete
-            if let Err(copy_err) = self
-                .object_store
-                .copy(&temp_meta_path, &final_meta_path)
-                .await
-            {
-                error!(error = %copy_err, "Failed to copy snapshot metadata to final path");
-                // Clean up temp meta file
-                let _ = self.object_store.delete(&temp_meta_path).await;
-                return Err(StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(copy_err.to_string()),
-                ));
-            }
-            let _ = self.object_store.delete(&temp_meta_path).await;
-            debug!(error = %e, "Used copy+delete fallback for snapshot metadata (rename not supported)");
+            let evicted_path =
+                ObjectPath::from(format!("{}/{}", self.snapshot_path, evicted.data_object));
+            let _ = self.object_store.delete(&evicted_path).await;
         }
 
         info!(
             snapshot_id = %meta.snapshot_id,
             last_log_index = ?meta.last_log_id.map(|l| l.index),
             size_bytes = data.len(),
-            "Persisted snapshot to object store (atomic commit)"
+            data_object = %data_object,
+            "Persisted snapshot to object store (generation/pointer commit)"
         );
 
         Ok(())
@@ -640,6 +871,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             last_applied_log: self.last_applied_log.clone(),
             last_membership: self.last_membership.clone(),
             cached_snapshot: self.cached_snapshot.clone(),
+            snapshot_pointer: self.snapshot_pointer.clone(),
             object_store: self.object_store.clone(),
             snapshot_path: self.snapshot_path.clone(),
             log_dir: self.log_dir.clone(),
@@ -691,6 +923,16 @@ impl RaftStorage<TypeConfig> for RaftStore {
             }
             log.insert(entry.log_id.index, entry);
         }
+        // Raise the durable log bound AFTER the entries themselves are
+        // durable. A crash in between simply drops the (un-acked) tail of
+        // this batch on recovery; it can never drop acked entries because
+        // the bound only moves forward here.
+        let last_log_index = log.keys().next_back().copied();
+        if let Err(e) = self.persist_log_meta(last_log_index) {
+            return Err(StorageError::IO {
+                source: StorageIOError::write_logs(&e),
+            });
+        }
         Ok(())
     }
 
@@ -698,14 +940,32 @@ impl RaftStorage<TypeConfig> for RaftStore {
         &mut self,
         log_id: LogId<RaftNodeId>,
     ) -> Result<(), StorageError<RaftNodeId>> {
+        let purged = *self.last_purged_log_id.read().await;
         let mut log = self.log.write().await;
         let keys_to_remove: Vec<u64> = log.range(log_id.index..).map(|(k, _)| *k).collect();
+
+        // Persist the truncation intent (lowered log bound) BEFORE mutating
+        // anything. File deletes below are best-effort, so the durable
+        // bound is what guarantees a crash mid-delete cannot resurrect the
+        // forked entries on recovery. This must succeed or the truncation
+        // must fail wholesale.
+        let new_last_log_index = log
+            .range(..log_id.index)
+            .next_back()
+            .map(|(k, _)| *k)
+            .or(purged.map(|p| p.index));
+        if let Err(e) = self.persist_log_meta(new_last_log_index) {
+            return Err(StorageError::IO {
+                source: StorageIOError::write_logs(&e),
+            });
+        }
+
         for key in &keys_to_remove {
             log.remove(key);
         }
-        // Mirror the deletion on disk. Failures here are not fatal — the
-        // in-memory state is the source of truth for what openraft sees and
-        // we've already removed from there.
+        // Mirror the deletion on disk. Failures here are tolerable — the
+        // durable log bound written above makes recovery skip (and remove)
+        // any file we fail to delete here.
         if let Some(dir) = self.log_dir.as_ref() {
             for key in &keys_to_remove {
                 let path = dir.join("log").join(format!("{:020}.bin", key));
@@ -719,19 +979,22 @@ impl RaftStorage<TypeConfig> for RaftStore {
         &mut self,
         log_id: LogId<RaftNodeId>,
     ) -> Result<(), StorageError<RaftNodeId>> {
-        *self.last_purged_log_id.write().await = Some(log_id);
+        // Persist the purge floor BEFORE deleting anything (in memory or on
+        // disk). File deletes are best-effort; the durable floor is what
+        // guarantees purged entries can never resurrect on recovery.
         if let Err(e) = self.persist_purged(&log_id) {
             return Err(StorageError::IO {
                 source: StorageIOError::write_logs(&e),
             });
         }
+        *self.last_purged_log_id.write().await = Some(log_id);
 
         let mut log = self.log.write().await;
         let keys_to_remove: Vec<u64> = log.range(..=log_id.index).map(|(k, _)| *k).collect();
         for key in keys_to_remove {
             log.remove(&key);
         }
-        // Best-effort on-disk purge.
+        // Best-effort on-disk purge; recovery filters against purged.bin.
         let _ = self.purge_log_files(log_id.index);
         Ok(())
     }
@@ -788,6 +1051,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
             last_applied_log: self.last_applied_log.clone(),
             last_membership: self.last_membership.clone(),
             cached_snapshot: self.cached_snapshot.clone(),
+            snapshot_pointer: self.snapshot_pointer.clone(),
             object_store: self.object_store.clone(),
             snapshot_path: self.snapshot_path.clone(),
             log_dir: self.log_dir.clone(),
@@ -807,14 +1071,33 @@ impl RaftStorage<TypeConfig> for RaftStore {
     ) -> Result<(), StorageError<RaftNodeId>> {
         let data = snapshot.into_inner();
 
-        // Restore state machine from raw bytes
-        self.sm.write().await.restore(&data).await;
+        // Step 1: validate BEFORE touching anything. Corrupt bytes (e.g.
+        // damaged in transit) produce a StorageError instead of a panic or
+        // a half-applied install.
+        let new_state = CoordinationStateMachine::deserialize_state(&data).map_err(|e| {
+            error!(
+                snapshot_id = %meta.snapshot_id,
+                error = %e,
+                "Received snapshot failed to deserialize; rejecting install"
+            );
+            StorageError::from_io_error(
+                openraft::ErrorSubject::Snapshot(Some(meta.signature())),
+                openraft::ErrorVerb::Write,
+                e,
+            )
+        })?;
+
+        // Step 2: persist durably FIRST. If this fails (or we crash here),
+        // the in-memory state machine and applied indices are untouched, so
+        // a restart resumes from the previous snapshot — state never
+        // regresses relative to what openraft was told.
+        self.persist_snapshot(meta, &data).await?;
+
+        // Step 3: only now swap the in-memory state machine and indices.
+        self.sm.write().await.replace_state(new_state).await;
         *self.last_applied_log.write().await = meta.last_log_id;
         *self.last_membership.write().await =
             StoredMembership::new(meta.last_log_id, meta.last_membership.membership().clone());
-
-        // Persist to object store for durability
-        self.persist_snapshot(meta, &data).await?;
 
         // Update in-memory cache
         *self.cached_snapshot.write().await = Some(CachedSnapshot {
@@ -1344,6 +1627,177 @@ mod tests {
 
         // Verify metadata matches
         assert_eq!(retrieved.meta.snapshot_id, snapshot.meta.snapshot_id);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_snapshot_layout_still_loads() {
+        // Simulate a deployment that wrote snapshots with the old
+        // rename-based scheme: legacy metadata at current.meta, data at
+        // current.snapshot.
+        let object_store = Arc::new(InMemory::new());
+        let prefix = "legacy-test/snapshots";
+
+        let state = CoordinationState {
+            version: 7,
+            ..Default::default()
+        };
+        let data = postcard::to_stdvec(&state).unwrap();
+        let legacy_meta = SnapshotMetadata {
+            last_log_id: Some(make_log_id(1, 0, 9)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "legacy-snap".to_string(),
+        };
+        let meta_bytes = postcard::to_stdvec(&legacy_meta).unwrap();
+
+        object_store
+            .put(
+                &ObjectPath::from(format!("{}/current.snapshot", prefix)),
+                Bytes::from(data).into(),
+            )
+            .await
+            .unwrap();
+        object_store
+            .put(
+                &ObjectPath::from(format!("{}/current.meta", prefix)),
+                Bytes::from(meta_bytes).into(),
+            )
+            .await
+            .unwrap();
+
+        let store = RaftStore::new(object_store.clone(), prefix);
+        let loaded = store.load_snapshot_from_store().await.unwrap();
+        assert!(loaded, "legacy snapshot layout should load");
+
+        let sm = store.sm.read().await;
+        assert_eq!(sm.state().await.version, 7);
+        drop(sm);
+        assert_eq!(store.last_applied_log.read().await.unwrap().index, 9);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_falls_back_to_previous_generation() {
+        let object_store = Arc::new(InMemory::new());
+        let prefix = "fallback-test/snapshots";
+
+        // Build two snapshot generations with distinguishable state.
+        let mut store = RaftStore::new(object_store.clone(), prefix);
+        let cmd1 = CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
+            broker_id: 1,
+            host: "gen1-host".to_string(),
+            port: 9092,
+            timestamp_ms: 1000,
+        });
+        store
+            .apply_to_state_machine(&[make_entry(1, 0, 1, EntryPayload::Normal(cmd1))])
+            .await
+            .unwrap();
+        use openraft::RaftSnapshotBuilder;
+        store.build_snapshot().await.unwrap();
+
+        let cmd2 = CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
+            broker_id: 2,
+            host: "gen2-host".to_string(),
+            port: 9093,
+            timestamp_ms: 2000,
+        });
+        store
+            .apply_to_state_machine(&[make_entry(1, 0, 2, EntryPayload::Normal(cmd2))])
+            .await
+            .unwrap();
+        store.build_snapshot().await.unwrap();
+
+        // Sabotage: delete the CURRENT generation's data object out-of-band.
+        let current_object = store
+            .snapshot_pointer
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .current
+            .data_object
+            .clone();
+        object_store
+            .delete(&ObjectPath::from(format!("{}/{}", prefix, current_object)))
+            .await
+            .unwrap();
+
+        // A fresh store must fall back to the previous generation instead
+        // of failing (and must not panic).
+        let store2 = RaftStore::new(object_store.clone(), prefix);
+        let loaded = store2.load_snapshot_from_store().await.unwrap();
+        assert!(loaded, "should fall back to the previous generation");
+
+        let sm = store2.sm.read().await;
+        let state = sm.state().await;
+        assert!(
+            state.broker_domain.brokers.contains_key(&1),
+            "previous generation state should be restored"
+        );
+        assert!(
+            !state.broker_domain.brokers.contains_key(&2),
+            "current (lost) generation state should not appear"
+        );
+        drop(state);
+        drop(sm);
+        // Applied index regressed to the previous snapshot's — the log /
+        // leader snapshot will catch the node up.
+        assert_eq!(store2.last_applied_log.read().await.unwrap().index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_snapshot_meta_errors_without_panic() {
+        let object_store = Arc::new(InMemory::new());
+        let prefix = "corrupt-meta-test/snapshots";
+
+        object_store
+            .put(
+                &ObjectPath::from(format!("{}/current.meta", prefix)),
+                Bytes::from_static(b"\xff\xfe definitely not postcard").into(),
+            )
+            .await
+            .unwrap();
+
+        let store = RaftStore::new(object_store.clone(), prefix);
+        let result = store.load_snapshot_from_store().await;
+        assert!(result.is_err(), "corrupt metadata must error, not panic");
+    }
+
+    #[tokio::test]
+    async fn test_install_snapshot_rejects_corrupt_bytes_without_mutating() {
+        let mut store = create_test_store();
+
+        // Seed some state.
+        let cmd = CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
+            broker_id: 1,
+            host: "host1".to_string(),
+            port: 9092,
+            timestamp_ms: 1000,
+        });
+        store
+            .apply_to_state_machine(&[make_entry(1, 0, 1, EntryPayload::Normal(cmd))])
+            .await
+            .unwrap();
+
+        let meta = SnapshotMeta {
+            last_log_id: Some(make_log_id(1, 0, 10)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "corrupt-install".to_string(),
+        };
+        let garbage = Box::new(Cursor::new(b"\x00\x01garbage that is not a state".to_vec()));
+
+        let result = store.install_snapshot(&meta, garbage).await;
+        assert!(result.is_err(), "corrupt snapshot must be rejected");
+
+        // In-memory state untouched.
+        let sm = store.sm.read().await;
+        assert!(sm.state().await.broker_domain.brokers.contains_key(&1));
+        drop(sm);
+        assert_eq!(
+            store.last_applied_log.read().await.unwrap().index,
+            1,
+            "last_applied must not advance on a failed install"
+        );
+        assert!(store.cached_snapshot.read().await.is_none());
     }
 
     #[tokio::test]

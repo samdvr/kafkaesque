@@ -298,6 +298,10 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             fail_on_recovery_gap: self.config.fail_on_recovery_gap,
             lease_cache: self.lease_cache.clone(),
             min_lease_ttl_for_write_secs: self.config.min_lease_ttl_for_write_secs,
+            batch_index_max_size: self.config.batch_index_max_size,
+            slatedb_max_unflushed_bytes: self.config.slatedb_max_unflushed_bytes,
+            slatedb_l0_sst_size_bytes: self.config.slatedb_l0_sst_size_bytes,
+            slatedb_flush_interval_ms: self.config.slatedb_flush_interval_ms,
         }
     }
 
@@ -330,6 +334,11 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         handles.push(lease_handle);
         handles.push(ownership_handle);
         handles.push(session_handle);
+
+        // Time-based log retention (only when enabled; see ClusterConfig docs)
+        if self.config.log_retention_ms > 0 {
+            handles.push(self.start_retention_loop());
+        }
 
         // Start rebalance coordinator background tasks if enabled
         if let Some(ref rebalance_coord) = self.rebalance_coordinator {
@@ -458,6 +467,91 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                             );
                         }
                     }
+                }
+            }
+        })
+    }
+
+    /// Start the time-based log retention loop.
+    ///
+    /// Periodically walks the partitions this broker owns and deletes record
+    /// batches older than `log_retention_ms`, advancing each partition's log
+    /// start offset. Only owned partitions are processed — the owner is the
+    /// single writer, so retention deletes can't race another broker's
+    /// appends. Without this loop object-store usage grows without bound
+    /// (there is no other delete path for record data).
+    fn start_retention_loop(&self) -> JoinHandle<()> {
+        let partition_states = self.partition_states.clone();
+        let retention_ms = self.config.log_retention_ms;
+        let interval = Duration::from_secs(self.config.log_retention_check_interval_secs);
+        let broker_id = self.broker_id;
+        let zombie_state = self.zombie_state.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        self.control_runtime.spawn(async move {
+            info!(
+                broker_id,
+                retention_ms,
+                check_interval_secs = interval.as_secs(),
+                "Log retention loop started"
+            );
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(with_jitter(interval)) => {},
+                    _ = shutdown_rx.recv() => {
+                        info!(broker_id, "Retention loop received shutdown signal");
+                        break;
+                    }
+                }
+
+                // Skip the pass entirely in zombie mode: ownership is in
+                // doubt, so we must not delete anything.
+                if zombie_state.is_active() {
+                    continue;
+                }
+
+                // Snapshot owned stores first so we don't hold DashMap
+                // guards across awaits.
+                let stores: Vec<(PartitionKey, Arc<PartitionStore>)> = partition_states
+                    .iter()
+                    .filter_map(|e| {
+                        if e.value().is_owned() {
+                            e.value().store().map(|s| (e.key().clone(), s))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+
+                let mut total_deleted: u64 = 0;
+                for ((topic, partition), store) in stores {
+                    match store.apply_retention(retention_ms, now_ms).await {
+                        Ok(deleted) => total_deleted += deleted,
+                        Err(e) => {
+                            // Non-fatal: retention re-runs next cycle. Fenced
+                            // errors mean we lost the partition mid-pass; the
+                            // ownership loop will clean up.
+                            warn!(
+                                topic = &*topic,
+                                partition,
+                                error = %e,
+                                "Retention pass failed for partition"
+                            );
+                        }
+                    }
+                }
+
+                if total_deleted > 0 {
+                    info!(
+                        broker_id,
+                        deleted_batches = total_deleted,
+                        "Retention pass deleted expired batches"
+                    );
                 }
             }
         })
@@ -1058,7 +1152,19 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             Ok(ttl) => ttl,
             Err(e) => {
                 warn!(topic, partition, error = %e, "Ownership verification failed during write - releasing partition");
-                self.partition_states.remove(&cache_key);
+                // Close the store too: removing the entry without close()
+                // leaks SlateDB memtables, object-store connections, and
+                // background tasks every time ownership is lost mid-write.
+                if let Some(store) = self
+                    .partition_states
+                    .remove(&cache_key)
+                    .and_then(|(_, s)| s.store())
+                {
+                    store.clear_load_metrics().await;
+                    if let Err(close_err) = store.close().await {
+                        warn!(topic, partition, error = %close_err, "Failed to close partition store after ownership loss");
+                    }
+                }
                 self.lease_cache.remove(&cache_key);
                 return Err(SlateDBError::NotOwned {
                     topic: topic.to_string(),
@@ -1224,6 +1330,31 @@ struct OwnershipContext<C: ClusterCoordinator> {
     fail_on_recovery_gap: bool,
     lease_cache: Arc<DashMap<PartitionKey, Instant>>,
     min_lease_ttl_for_write_secs: u64,
+    // SlateDB / index tuning. These were previously configured on
+    // `ClusterConfig` but never reached the stores — operators believed
+    // they had set memory limits that were silently ignored.
+    batch_index_max_size: usize,
+    slatedb_max_unflushed_bytes: usize,
+    slatedb_l0_sst_size_bytes: usize,
+    slatedb_flush_interval_ms: u64,
+}
+
+/// Apply the SlateDB / batch-index tuning from `ClusterConfig` to a store
+/// builder. Centralized so every open path (acquire, zombie reopen) gets the
+/// same effective configuration.
+fn apply_store_tuning<C: ClusterCoordinator>(
+    builder: crate::cluster::partition_store::PartitionStoreBuilder,
+    ctx: &OwnershipContext<C>,
+) -> crate::cluster::partition_store::PartitionStoreBuilder {
+    builder
+        .max_fetch_response_size(ctx.max_fetch_response_size)
+        .producer_state_cache_ttl_secs(ctx.producer_state_cache_ttl_secs)
+        .fail_on_recovery_gap(ctx.fail_on_recovery_gap)
+        .min_lease_ttl_for_write_secs(ctx.min_lease_ttl_for_write_secs)
+        .batch_index_max_size(ctx.batch_index_max_size)
+        .slatedb_max_unflushed_bytes(ctx.slatedb_max_unflushed_bytes)
+        .slatedb_l0_sst_size_bytes(ctx.slatedb_l0_sst_size_bytes)
+        .slatedb_flush_interval_ms(ctx.slatedb_flush_interval_ms)
 }
 
 /// Helper macro to check if zombie mode was re-entered during verification.
@@ -1434,17 +1565,53 @@ async fn try_exit_zombie_mode<C: ClusterCoordinator>(
             }
         }
 
-        // Open fresh SlateDB instance - lease is verified and extended
-        match PartitionStore::builder()
+        // Re-acquire to bump the leader epoch. The fresh epoch both fences
+        // any stale handle (including our own pre-zombie one) and is REQUIRED
+        // for the reopen below: opening without `.leader_epoch(...)` would
+        // disable per-write epoch validation entirely, leaving SlateDB
+        // single-writer fencing as the only guard on a broker that was just
+        // suspected dead — exactly when epoch fencing matters most.
+        let reacquired_epoch = match ctx
+            .coordinator
+            .acquire_partition_with_epoch(&topic, partition, ctx.lease_secs)
+            .await
+        {
+            Ok(Some(epoch)) => {
+                check_zombie_reentry!(ctx, entered_at_start, "epoch re-acquisition");
+                epoch
+            }
+            Ok(None) => {
+                warn!(
+                    topic = &*topic,
+                    partition,
+                    "Lost partition to another broker during zombie recovery - cannot re-open"
+                );
+                super::metrics::OWNED_PARTITIONS
+                    .with_label_values(&[&topic])
+                    .dec();
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    topic = &*topic, partition, error = %e,
+                    "Failed to re-acquire epoch during zombie recovery - cannot re-open"
+                );
+                super::metrics::OWNED_PARTITIONS
+                    .with_label_values(&[&topic])
+                    .dec();
+                continue;
+            }
+        };
+
+        // Open fresh SlateDB instance - lease is verified and extended,
+        // epoch validation armed with the freshly bumped epoch.
+        match apply_store_tuning(PartitionStore::builder(), ctx)
             .object_store(ctx.object_store.clone())
             .base_path(&ctx.base_path)
             .topic(&topic)
             .partition(partition)
-            .max_fetch_response_size(ctx.max_fetch_response_size)
-            .producer_state_cache_ttl_secs(ctx.producer_state_cache_ttl_secs)
             .zombie_mode(ctx.zombie_state.clone())
-            .fail_on_recovery_gap(ctx.fail_on_recovery_gap)
-            .min_lease_ttl_for_write_secs(ctx.min_lease_ttl_for_write_secs)
+            .leader_epoch(reacquired_epoch)
             .build()
             .await
         {
@@ -1526,16 +1693,12 @@ async fn acquire_partition_core<C: ClusterCoordinator>(
         }
     };
 
-    match PartitionStore::builder()
+    match apply_store_tuning(PartitionStore::builder(), ctx)
         .object_store(ctx.object_store.clone())
         .base_path(&ctx.base_path)
         .topic(topic)
         .partition(partition)
-        .max_fetch_response_size(ctx.max_fetch_response_size)
-        .producer_state_cache_ttl_secs(ctx.producer_state_cache_ttl_secs)
         .zombie_mode(ctx.zombie_state.clone())
-        .fail_on_recovery_gap(ctx.fail_on_recovery_gap)
-        .min_lease_ttl_for_write_secs(ctx.min_lease_ttl_for_write_secs)
         .leader_epoch(leader_epoch) // Pass epoch for TOCTOU prevention
         .build()
         .await
@@ -1604,7 +1767,17 @@ async fn verify_ownership<C: ClusterCoordinator>(
         Ok(true) => {}
         Ok(false) => {
             warn!(topic, partition, "Lost partition ownership unexpectedly");
-            ctx.partition_states.remove(&key);
+            // Close the store on this loss path too — see release_partition.
+            if let Some(store) = ctx
+                .partition_states
+                .remove(&key)
+                .and_then(|(_, s)| s.store())
+            {
+                store.clear_load_metrics().await;
+                if let Err(e) = store.close().await {
+                    warn!(topic, partition, error = %e, "Failed to close partition store after ownership loss");
+                }
+            }
             ctx.lease_cache.remove(&key);
             super::metrics::OWNED_PARTITIONS
                 .with_label_values(&[topic])

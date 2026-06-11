@@ -70,6 +70,11 @@ fn frame_message(data: &[u8]) -> BytesMut {
 }
 
 /// Create a minimal record batch with configurable fields.
+///
+/// The CRC at bytes 17-20 is computed over bytes 21.. like a real producer
+/// would: `patch_base_offset` no longer recomputes it (base_offset is
+/// outside the CRC-covered range per the Kafka v2 batch spec), so the batch
+/// must carry a correct checksum from the start.
 fn create_record_batch(
     base_offset: i64,
     num_records: i32,
@@ -87,7 +92,7 @@ fn create_record_batch(
     batch.put_i32(1);
     // magic (1 byte) - must be 2 for v2 format
     batch.put_i8(2);
-    // crc (4 bytes) - placeholder, will compute later
+    // crc (4 bytes) - placeholder, patched below
     batch.put_u32(0);
     // attributes (2 bytes)
     batch.put_i16(0);
@@ -105,6 +110,10 @@ fn create_record_batch(
     batch.put_i32(first_sequence);
     // numRecords (4 bytes)
     batch.put_i32(num_records);
+
+    // Stamp the real CRC-32C over the covered range (bytes 21..).
+    let crc = kafkaesque::protocol::crc32c(&batch[21..]);
+    batch[17..21].copy_from_slice(&crc.to_be_bytes());
 
     batch
 }
@@ -299,11 +308,13 @@ fn test_parse_metadata_request_v0() {
 }
 
 #[test]
-fn test_parse_produce_request_v0() {
+fn test_parse_produce_request_v3() {
+    // Produce is advertised as v3..=v3 (versions.rs); the body below is the
+    // v3 layout: transactional_id, acks, timeout_ms, [topics].
     let mut buf = BytesMut::new();
     // Header
     buf.put_i16(0); // Produce
-    buf.put_i16(0); // version 0
+    buf.put_i16(3); // version 3 (the advertised version)
     buf.put_i32(2); // correlation_id
     buf.put_i16(-1); // null client_id
 
@@ -325,11 +336,11 @@ fn test_parse_produce_request_v0() {
     buf.put_i32(0); // records length = 0 (empty)
 
     let bytes = Bytes::from(buf.to_vec());
-    let request = Request::parse(bytes).expect("Should parse Produce v0");
+    let request = Request::parse(bytes).expect("Should parse Produce v3");
 
     match request {
         Request::Produce(header, data) => {
-            assert_eq!(header.api_version, 0);
+            assert_eq!(header.api_version, 3);
             assert_eq!(data.acks, 1);
             assert_eq!(data.timeout_ms, 5000);
             assert_eq!(data.topics.len(), 1);
@@ -339,11 +350,34 @@ fn test_parse_produce_request_v0() {
 }
 
 #[test]
-fn test_parse_fetch_request_v0() {
+fn test_parse_produce_request_v0_rejected() {
+    // v0 is below the advertised minimum (v3) — the body must not be
+    // parsed; the typed UnsupportedVersion variant comes back instead.
+    let mut buf = BytesMut::new();
+    buf.put_i16(0); // Produce
+    buf.put_i16(0); // version 0 (unadvertised)
+    buf.put_i32(2); // correlation_id
+    buf.put_i16(-1); // null client_id
+    buf.put_slice(&[0xAA, 0xBB]); // garbage body, must never be decoded
+
+    let request = Request::parse(Bytes::from(buf.to_vec())).expect("header should parse");
+    match request {
+        Request::UnsupportedVersion(header) => {
+            assert_eq!(header.api_version, 0);
+            assert_eq!(header.correlation_id, 2);
+        }
+        other => panic!("Expected UnsupportedVersion, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_parse_fetch_request_v4() {
+    // Fetch is advertised as v4..=v4 (versions.rs); the body below is the
+    // v4 layout (isolation_level was added in v4).
     let mut buf = BytesMut::new();
     // Header
     buf.put_i16(1); // Fetch
-    buf.put_i16(0); // version 0
+    buf.put_i16(4); // version 4 (the advertised version)
     buf.put_i32(3); // correlation_id
     buf.put_i16(-1); // null client_id
 
@@ -366,14 +400,16 @@ fn test_parse_fetch_request_v0() {
     buf.put_i32(1048576); // partition_max_bytes
 
     let bytes = Bytes::from(buf.to_vec());
-    let request = Request::parse(bytes).expect("Should parse Fetch v0");
+    let request = Request::parse(bytes).expect("Should parse Fetch v4");
 
     match request {
         Request::Fetch(header, data) => {
-            assert_eq!(header.api_version, 0);
+            assert_eq!(header.api_version, 4);
             assert_eq!(data.max_wait_ms, 500);
             assert_eq!(data.min_bytes, 1);
+            assert_eq!(data.max_bytes, 1048576);
             assert_eq!(data.topics.len(), 1);
+            assert_eq!(data.topics[0].partitions[0].partition_max_bytes, 1048576);
         }
         _ => panic!("Expected Fetch request"),
     }
@@ -447,7 +483,9 @@ fn test_record_batch_patch_base_offset() {
     let patched_offset = i64::from_be_bytes(batch[0..8].try_into().unwrap());
     assert_eq!(patched_offset, 12345);
 
-    // CRC should be valid after patching
+    // The CRC stays valid WITHOUT being recomputed: base_offset (bytes
+    // 0-7) is outside the CRC-covered range (bytes 21..) in the Kafka v2
+    // batch format, which is what lets the broker patch offsets cheaply.
     assert_eq!(validate_batch_crc(&batch), CrcValidationResult::Valid);
 }
 
@@ -455,15 +493,17 @@ fn test_record_batch_patch_base_offset() {
 fn test_record_batch_crc_validation() {
     let mut batch = create_record_batch(0, 1, -1, -1, -1);
 
-    // Initially CRC is 0 (placeholder), so should be invalid
+    // The helper stamps a correct producer-side CRC.
+    assert_eq!(validate_batch_crc(&batch), CrcValidationResult::Valid);
+
+    // Zeroing the stored CRC must be detected.
+    let real_crc = batch[17..21].to_vec();
+    batch[17..21].fill(0);
     match validate_batch_crc(&batch) {
         CrcValidationResult::Invalid { .. } => {}
-        other => panic!("Expected Invalid, got {:?}", other),
+        other => panic!("Expected Invalid with zeroed CRC, got {:?}", other),
     }
-
-    // After patching, CRC should be valid
-    patch_base_offset(&mut batch, 0);
-    assert_eq!(validate_batch_crc(&batch), CrcValidationResult::Valid);
+    batch[17..21].copy_from_slice(&real_crc);
 
     // Corrupt a byte in the CRC-covered region
     batch[25] ^= 0xFF;
@@ -887,11 +927,12 @@ fn test_crc_after_multiple_patches() {
         let patched = i64::from_be_bytes(batch[0..8].try_into().unwrap());
         assert_eq!(patched, offset, "Offset should be patched to {}", offset);
 
-        // CRC should always be valid after patching
+        // The producer-stamped CRC stays valid across every patch because
+        // base_offset is outside the CRC-covered range — no recompute.
         assert_eq!(
             validate_batch_crc(&batch),
             CrcValidationResult::Valid,
-            "CRC should be valid after patching to offset {}",
+            "CRC should remain valid after patching to offset {}",
             offset
         );
     }

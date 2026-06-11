@@ -1,7 +1,7 @@
 //! Admin request handling (create/delete topics).
 
 use futures::stream::{self, StreamExt};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::constants::DEFAULT_NUM_PARTITIONS;
 use crate::error::KafkaCode;
@@ -25,6 +25,7 @@ pub(super) async fn handle_create_topics(
     request: CreateTopicsRequestData,
 ) -> CreateTopicsResponseData {
     let mut topics = Vec::new();
+    let validate_only = request.validate_only;
 
     for topic in request.topics {
         // Validate topic name to prevent injection attacks
@@ -72,6 +73,48 @@ pub(super) async fn handle_create_topics(
             topic.num_partitions
         };
 
+        // Kafka returns TOPIC_ALREADY_EXISTS for duplicate creates. The
+        // coordinator's `register_topic` collapses "created" and "already
+        // exists" into Ok(()), so detect the condition here with an
+        // existence check first. Two racing creates may both pass this
+        // check; the Raft CreateTopic command is idempotent so the only
+        // consequence is that both callers see success, matching the
+        // pre-existing behavior for true ties.
+        match handler.coordinator.topic_exists(&topic.name).await {
+            Ok(true) => {
+                debug!(topic = %topic.name, "CreateTopics for existing topic");
+                topics.push(CreateTopicResponseData {
+                    name: topic.name,
+                    error_code: KafkaCode::TopicAlreadyExists,
+                    error_message: Some("Topic already exists".to_string()),
+                });
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                error!(error = %e, "Failed to check topic existence");
+                topics.push(CreateTopicResponseData {
+                    name: topic.name,
+                    error_code: KafkaCode::Unknown,
+                    error_message: Some(e.to_string()),
+                });
+                continue;
+            }
+        }
+
+        // validate_only (CreateTopics v1+): dry-run — report success without
+        // mutating cluster state. Previously the flag was parsed off the wire
+        // and dropped, so clients got a real create when they asked for a
+        // validation pass.
+        if validate_only {
+            topics.push(CreateTopicResponseData {
+                name: topic.name,
+                error_code: KafkaCode::None,
+                error_message: None,
+            });
+            continue;
+        }
+
         // Register topic in coordinator
         if let Err(e) = handler
             .coordinator
@@ -91,21 +134,43 @@ pub(super) async fn handle_create_topics(
         // topic into a minutes-long admin call; cap concurrency at
         // `max_concurrent_partition_writes` so create-topic latency tracks the
         // configured write parallelism instead of partition count.
+        //
+        // Acquisition failures do NOT fail the request: the topic metadata is
+        // already registered (Kafka returns success once metadata exists) and
+        // the ownership loop retries acquisition in the background. They are
+        // collected and logged so operators can see which partitions start
+        // out unowned.
         let topic_name = topic.name.clone();
         let max_concurrent = handler.max_concurrent_partition_writes.max(1);
-        stream::iter(0..num_partitions)
+        let failed_partitions: Vec<(i32, String)> = stream::iter(0..num_partitions)
             .map(|p| {
                 let topic_name = topic_name.clone();
                 async move {
-                    let _ = handler
+                    match handler
                         .partition_manager
                         .acquire_partition(&topic_name, p)
-                        .await;
+                        .await
+                    {
+                        Ok(_) => None,
+                        Err(e) => Some((p, e.to_string())),
+                    }
                 }
             })
             .buffer_unordered(max_concurrent)
-            .for_each(|_| async {})
+            .filter_map(|res| async move { res })
+            .collect()
             .await;
+
+        if !failed_partitions.is_empty() {
+            warn!(
+                topic = %topic.name,
+                failed_count = failed_partitions.len(),
+                total = num_partitions,
+                failures = ?failed_partitions,
+                "Some partitions could not be acquired at create time; \
+                 ownership loop will retry"
+            );
+        }
 
         topics.push(CreateTopicResponseData {
             name: topic.name,

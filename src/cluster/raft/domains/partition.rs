@@ -1,10 +1,55 @@
 //! Partition domain for the Raft state machine.
 //!
 //! Handles topic management and partition ownership.
+//!
+//! # Lease-clock invariants
+//!
+//! Lease lifecycle decisions (grant / renew / expire) must be deterministic
+//! across replicas, so they can never read a local wall clock at apply time.
+//! Instead, every timestamp-carrying command brings the *proposer's*
+//! `timestamp_ms` through the Raft log (one agreed value for all replicas),
+//! and the domain maintains a replicated, monotonic lease clock:
+//!
+//! 1. **Monotonicity**: the effective time used by a command is
+//!    `max(lease_clock, command.timestamp_ms)`, and the clock is advanced to
+//!    that value. The lease clock never moves backward, so a proposer with a
+//!    slow (backdated) wall clock can neither shrink an existing lease nor
+//!    un-expire one. The clock is part of the snapshotted state.
+//! 2. **Symmetric skew tolerance**: a forward-skewed proposer is tolerated by
+//!    [`LEASE_TAKEOVER_GRACE_MS`]: another broker may only take over an owned
+//!    partition, and an owner may only renew its own lease, while
+//!    `now < lease_expires_at_ms + grace` (takeover) /
+//!    `now < lease_expires_at_ms + grace` (renew). Past that point the lease
+//!    is dead and ownership must be re-acquired, which bumps `leader_epoch`
+//!    and fences stale writers. The sweep side already subtracts the
+//!    configured skew tolerance at the propose site.
+//! 3. **Idempotency**: `ExpireLeases` is expire-by-deadline; re-applying the
+//!    same sweep (or sweeps from multiple brokers) is a no-op after the first
+//!    application.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Grace window in milliseconds applied symmetrically to lease-expiry
+/// comparisons on the grant (takeover) and renew paths.
+///
+/// This mirrors the default `clock_skew_tolerance_ms` (5s). It is a
+/// compile-time constant — NOT a config value — because it participates in
+/// replicated state transitions: if two replicas used different values they
+/// would diverge. The `ExpireLeases` sweep applies the configured tolerance
+/// at the propose site instead (the proposed `current_time_ms` is already
+/// skew-adjusted), which is safe because the proposed value itself is
+/// replicated.
+pub const LEASE_TAKEOVER_GRACE_MS: u64 = 5_000;
+
+/// Advance the replicated lease clock to `timestamp_ms` if it is ahead, and
+/// return the effective (clamped, monotonic) time for this command.
+#[inline]
+fn advance_lease_clock(lease_clock_ms: &mut u64, timestamp_ms: u64) -> u64 {
+    *lease_clock_ms = (*lease_clock_ms).max(timestamp_ms);
+    *lease_clock_ms
+}
 
 /// State of a topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,7 +191,12 @@ impl PartitionDomainState {
     }
 
     /// Apply a partition command and return the response.
-    pub fn apply(&mut self, cmd: PartitionCommand) -> PartitionResponse {
+    ///
+    /// `lease_clock_ms` is the replicated, monotonic lease clock owned by the
+    /// enclosing `CoordinationState`. All lease-lifecycle comparisons use the
+    /// clamped value `max(*lease_clock_ms, cmd.timestamp_ms)` — see the
+    /// module docs for the invariants this enforces.
+    pub fn apply(&mut self, cmd: PartitionCommand, lease_clock_ms: &mut u64) -> PartitionResponse {
         match cmd {
             PartitionCommand::CreateTopic {
                 name,
@@ -154,6 +204,9 @@ impl PartitionDomainState {
                 config,
                 timestamp_ms,
             } => {
+                // Advance the clock; `created_at_ms` keeps the raw proposer
+                // timestamp since it is informational metadata, not a lease.
+                advance_lease_clock(lease_clock_ms, timestamp_ms);
                 let name: Arc<str> = Arc::from(name);
 
                 if self.topics.contains_key(&name) {
@@ -231,14 +284,21 @@ impl PartitionDomainState {
                 lease_duration_ms,
                 timestamp_ms,
             } => {
+                let now = advance_lease_clock(lease_clock_ms, timestamp_ms);
                 let topic: Arc<str> = Arc::from(topic);
                 let key = (Arc::clone(&topic), partition);
 
                 if let Some(partition_state) = self.partitions.get_mut(&key) {
-                    // Check if currently owned by another broker with active lease
+                    // Check if currently owned by another broker with an
+                    // active lease. The grace window tolerates a
+                    // forward-skewed acquirer clock: takeover is only allowed
+                    // once the lease is expired *beyond* the skew tolerance.
                     if let Some(owner) = partition_state.owner_broker_id
                         && owner != broker_id
-                        && partition_state.lease_expires_at_ms > timestamp_ms
+                        && partition_state
+                            .lease_expires_at_ms
+                            .saturating_add(LEASE_TAKEOVER_GRACE_MS)
+                            > now
                     {
                         return PartitionResponse::PartitionOwnedByOther {
                             topic: topic.to_string(),
@@ -250,7 +310,7 @@ impl PartitionDomainState {
                     // Acquire the partition
                     partition_state.owner_broker_id = Some(broker_id);
                     partition_state.leader_epoch += 1;
-                    partition_state.lease_expires_at_ms = timestamp_ms + lease_duration_ms;
+                    partition_state.lease_expires_at_ms = now.saturating_add(lease_duration_ms);
 
                     PartitionResponse::PartitionAcquired {
                         topic: topic.to_string(),
@@ -265,7 +325,7 @@ impl PartitionDomainState {
                         partition,
                         owner_broker_id: Some(broker_id),
                         leader_epoch: 1,
-                        lease_expires_at_ms: timestamp_ms + lease_duration_ms,
+                        lease_expires_at_ms: now.saturating_add(lease_duration_ms),
                     };
                     let leader_epoch = partition_state.leader_epoch;
                     let lease_expires_at_ms = partition_state.lease_expires_at_ms;
@@ -287,6 +347,7 @@ impl PartitionDomainState {
                 lease_duration_ms,
                 timestamp_ms,
             } => {
+                let now = advance_lease_clock(lease_clock_ms, timestamp_ms);
                 let topic: Arc<str> = Arc::from(topic);
                 let key = (Arc::clone(&topic), partition);
 
@@ -298,7 +359,26 @@ impl PartitionDomainState {
                         };
                     }
 
-                    partition_state.lease_expires_at_ms = timestamp_ms + lease_duration_ms;
+                    // Symmetric skew tolerance on renew: a lease that is
+                    // expired beyond the grace window is dead — the owner
+                    // (which may have been paused/partitioned past its lease)
+                    // must re-acquire, bumping `leader_epoch` so stale
+                    // writers are fenced. Renewal must not resurrect it.
+                    if now
+                        >= partition_state
+                            .lease_expires_at_ms
+                            .saturating_add(LEASE_TAKEOVER_GRACE_MS)
+                    {
+                        return PartitionResponse::PartitionNotOwned {
+                            topic: topic.to_string(),
+                            partition,
+                        };
+                    }
+
+                    // `now` is monotonic (clamped against the lease clock),
+                    // so a backdated renewal can never move the expiry
+                    // earlier than `lease_clock + duration`.
+                    partition_state.lease_expires_at_ms = now.saturating_add(lease_duration_ms);
 
                     PartitionResponse::LeaseRenewed {
                         topic: topic.to_string(),
@@ -335,10 +415,14 @@ impl PartitionDomainState {
             }
 
             PartitionCommand::ExpireLeases { current_time_ms } => {
+                // Expire-by-deadline is naturally idempotent: a second sweep
+                // with the same (or earlier, clamped) timestamp finds no
+                // owned partitions past their deadline and is a no-op.
+                let now = advance_lease_clock(lease_clock_ms, current_time_ms);
                 let mut count = 0;
                 for partition_state in self.partitions.values_mut() {
                     if partition_state.owner_broker_id.is_some()
-                        && partition_state.lease_expires_at_ms <= current_time_ms
+                        && partition_state.lease_expires_at_ms <= now
                     {
                         partition_state.owner_broker_id = None;
                         partition_state.lease_expires_at_ms = 0;
@@ -386,9 +470,37 @@ impl PartitionDomainState {
 mod tests {
     use super::*;
 
+    /// Test harness pairing a `PartitionDomainState` with the replicated
+    /// lease clock that `CoordinationState` owns in production.
+    struct TestState {
+        state: PartitionDomainState,
+        lease_clock_ms: u64,
+    }
+
+    impl TestState {
+        fn new() -> Self {
+            Self {
+                state: PartitionDomainState::new(),
+                lease_clock_ms: 0,
+            }
+        }
+
+        fn apply(&mut self, cmd: PartitionCommand) -> PartitionResponse {
+            self.state.apply(cmd, &mut self.lease_clock_ms)
+        }
+    }
+
+    impl std::ops::Deref for TestState {
+        type Target = PartitionDomainState;
+
+        fn deref(&self) -> &PartitionDomainState {
+            &self.state
+        }
+    }
+
     #[test]
     fn test_create_topic() {
-        let mut state = PartitionDomainState::new();
+        let mut state = TestState::new();
 
         let response = state.apply(PartitionCommand::CreateTopic {
             name: "test-topic".to_string(),
@@ -413,7 +525,7 @@ mod tests {
 
     #[test]
     fn test_create_duplicate_topic() {
-        let mut state = PartitionDomainState::new();
+        let mut state = TestState::new();
 
         state.apply(PartitionCommand::CreateTopic {
             name: "test-topic".to_string(),
@@ -437,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_delete_topic() {
-        let mut state = PartitionDomainState::new();
+        let mut state = TestState::new();
 
         state.apply(PartitionCommand::CreateTopic {
             name: "test-topic".to_string(),
@@ -456,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_acquire_partition() {
-        let mut state = PartitionDomainState::new();
+        let mut state = TestState::new();
 
         state.apply(PartitionCommand::CreateTopic {
             name: "test".to_string(),
@@ -490,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_acquire_partition_owned_by_other() {
-        let mut state = PartitionDomainState::new();
+        let mut state = TestState::new();
 
         state.apply(PartitionCommand::CreateTopic {
             name: "test".to_string(),
@@ -524,7 +636,7 @@ mod tests {
 
     #[test]
     fn test_renew_lease() {
-        let mut state = PartitionDomainState::new();
+        let mut state = TestState::new();
 
         state.apply(PartitionCommand::CreateTopic {
             name: "test".to_string(),
@@ -562,7 +674,7 @@ mod tests {
 
     #[test]
     fn test_expire_leases() {
-        let mut state = PartitionDomainState::new();
+        let mut state = TestState::new();
 
         state.apply(PartitionCommand::CreateTopic {
             name: "test".to_string(),
@@ -604,7 +716,7 @@ mod tests {
 
     #[test]
     fn test_partitions_owned_by() {
-        let mut state = PartitionDomainState::new();
+        let mut state = TestState::new();
 
         state.apply(PartitionCommand::CreateTopic {
             name: "test".to_string(),
@@ -631,5 +743,185 @@ mod tests {
 
         let owned = state.partitions_owned_by(1);
         assert_eq!(owned.len(), 2);
+    }
+
+    #[test]
+    fn test_backdated_renew_cannot_shrink_lease() {
+        let mut state = TestState::new();
+
+        state.apply(PartitionCommand::AcquirePartition {
+            topic: "t".to_string(),
+            partition: 0,
+            broker_id: 1,
+            lease_duration_ms: 10_000,
+            timestamp_ms: 100_000,
+        });
+        assert_eq!(
+            state.get_partition("t", 0).unwrap().lease_expires_at_ms,
+            110_000
+        );
+
+        // A renewal with a badly backdated timestamp (e.g. proposer's wall
+        // clock jumped backward) is clamped to the lease clock: the expiry
+        // stays at clock + duration instead of regressing to 50k + 10k.
+        let response = state.apply(PartitionCommand::RenewLease {
+            topic: "t".to_string(),
+            partition: 0,
+            broker_id: 1,
+            lease_duration_ms: 10_000,
+            timestamp_ms: 50_000,
+        });
+        match response {
+            PartitionResponse::LeaseRenewed {
+                lease_expires_at_ms,
+                ..
+            } => assert_eq!(lease_expires_at_ms, 110_000),
+            other => panic!("Expected LeaseRenewed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_backdated_sweep_is_clamped_and_noop() {
+        let mut state = TestState::new();
+
+        state.apply(PartitionCommand::AcquirePartition {
+            topic: "t".to_string(),
+            partition: 0,
+            broker_id: 1,
+            lease_duration_ms: 10_000,
+            timestamp_ms: 100_000,
+        });
+
+        // Sweep proposed with an ancient timestamp: clamped to the lease
+        // clock (100_000), which is still before the expiry (110_000).
+        let response = state.apply(PartitionCommand::ExpireLeases {
+            current_time_ms: 1_000,
+        });
+        assert!(matches!(
+            response,
+            PartitionResponse::LeasesExpired { count: 0 }
+        ));
+        assert_eq!(state.get_owner("t", 0), Some(1));
+        // The clock itself never moved backward.
+        assert_eq!(state.lease_clock_ms, 100_000);
+    }
+
+    #[test]
+    fn test_takeover_blocked_within_grace_window() {
+        let mut state = TestState::new();
+
+        state.apply(PartitionCommand::AcquirePartition {
+            topic: "t".to_string(),
+            partition: 0,
+            broker_id: 1,
+            lease_duration_ms: 10_000,
+            timestamp_ms: 100_000,
+        });
+
+        // Lease expires at 110_000. A takeover attempt inside the grace
+        // window (expiry + LEASE_TAKEOVER_GRACE_MS) is refused, tolerating a
+        // forward-skewed acquirer clock.
+        let response = state.apply(PartitionCommand::AcquirePartition {
+            topic: "t".to_string(),
+            partition: 0,
+            broker_id: 2,
+            lease_duration_ms: 10_000,
+            timestamp_ms: 110_000 + LEASE_TAKEOVER_GRACE_MS - 1,
+        });
+        assert!(matches!(
+            response,
+            PartitionResponse::PartitionOwnedByOther { owner: 1, .. }
+        ));
+
+        // At expiry + grace, takeover succeeds and bumps the epoch.
+        let response = state.apply(PartitionCommand::AcquirePartition {
+            topic: "t".to_string(),
+            partition: 0,
+            broker_id: 2,
+            lease_duration_ms: 10_000,
+            timestamp_ms: 110_000 + LEASE_TAKEOVER_GRACE_MS,
+        });
+        match response {
+            PartitionResponse::PartitionAcquired { leader_epoch, .. } => {
+                assert_eq!(leader_epoch, 2)
+            }
+            other => panic!("Expected PartitionAcquired, got {:?}", other),
+        }
+        assert_eq!(state.get_owner("t", 0), Some(2));
+    }
+
+    #[test]
+    fn test_renewal_of_long_expired_lease_rejected() {
+        let mut state = TestState::new();
+
+        state.apply(PartitionCommand::AcquirePartition {
+            topic: "t".to_string(),
+            partition: 0,
+            broker_id: 1,
+            lease_duration_ms: 1_000,
+            timestamp_ms: 100_000,
+        });
+
+        // Expiry is 101_000. Renewal at expiry + grace is refused — the
+        // owner slept past its lease and must re-acquire (epoch bump).
+        let response = state.apply(PartitionCommand::RenewLease {
+            topic: "t".to_string(),
+            partition: 0,
+            broker_id: 1,
+            lease_duration_ms: 1_000,
+            timestamp_ms: 101_000 + LEASE_TAKEOVER_GRACE_MS,
+        });
+        assert!(matches!(
+            response,
+            PartitionResponse::PartitionNotOwned { .. }
+        ));
+
+        // Re-acquiring (same broker) works and bumps the epoch.
+        let response = state.apply(PartitionCommand::AcquirePartition {
+            topic: "t".to_string(),
+            partition: 0,
+            broker_id: 1,
+            lease_duration_ms: 1_000,
+            timestamp_ms: 101_000 + LEASE_TAKEOVER_GRACE_MS,
+        });
+        match response {
+            PartitionResponse::PartitionAcquired { leader_epoch, .. } => {
+                assert_eq!(leader_epoch, 2)
+            }
+            other => panic!("Expected PartitionAcquired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_expire_leases_is_idempotent() {
+        let mut state = TestState::new();
+
+        state.apply(PartitionCommand::AcquirePartition {
+            topic: "t".to_string(),
+            partition: 0,
+            broker_id: 1,
+            lease_duration_ms: 1_000,
+            timestamp_ms: 1_000,
+        });
+
+        let response = state.apply(PartitionCommand::ExpireLeases {
+            current_time_ms: 10_000,
+        });
+        assert!(matches!(
+            response,
+            PartitionResponse::LeasesExpired { count: 1 }
+        ));
+
+        // Duplicate sweeps (same or earlier timestamp, e.g. from a broker
+        // that still believed it was leader) are cheap no-ops.
+        for ts in [10_000, 9_000, 10_000] {
+            let response = state.apply(PartitionCommand::ExpireLeases {
+                current_time_ms: ts,
+            });
+            assert!(matches!(
+                response,
+                PartitionResponse::LeasesExpired { count: 0 }
+            ));
+        }
     }
 }

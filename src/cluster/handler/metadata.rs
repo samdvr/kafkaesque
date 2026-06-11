@@ -205,9 +205,21 @@ pub(super) async fn handle_metadata(
         }
     };
 
+    // Report the actual controller (Raft leader) rather than claiming
+    // every broker is the controller. -1 means "no controller known"
+    // (e.g. mid-election), per Kafka convention.
+    let controller_id = match handler.coordinator.current_leader_id().await {
+        Ok(Some(id)) => id,
+        Ok(None) => -1,
+        Err(e) => {
+            error!(error = %e, "Failed to get controller id from coordinator");
+            -1
+        }
+    };
+
     MetadataResponseData {
         brokers,
-        controller_id: handler.broker_id.value(),
+        controller_id,
         topics,
     }
 }

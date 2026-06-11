@@ -25,25 +25,37 @@ use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 
 use super::keys::{
-    PRODUCER_STATE_KEY_PREFIX, RECORD_KEY_PREFIX, decode_producer_id, decode_producer_state_value,
-    decode_record_offset, parse_record_count,
+    PRODUCER_STATE_KEY_PREFIX, PersistedProducerState, RECORD_KEY_PREFIX, decode_producer_id,
+    decode_producer_state_value, decode_record_offset, encode_record_key, parse_record_count,
 };
+
+/// Result of the recovery scan over record keys.
+pub struct RecoveryOutcome {
+    /// The recovered high watermark.
+    pub high_watermark: i64,
+    /// `(base_offset, record_count)` of every batch seen by the scan, in
+    /// offset order. Reused by the caller to warm the batch index so opening
+    /// a partition needs only one pass over the record keyspace instead of
+    /// two (recovery + warm) — a 2x open/failover latency win on large logs.
+    pub batches: Vec<(i64, i32)>,
+}
 
 /// Recover the high watermark by scanning records.
 ///
 /// This handles the case where `await_durable=false` writes may not have
-/// persisted the HWM key before a crash. We scan all records to find
-/// the actual highest committed offset.
+/// persisted the HWM key before a crash. We scan records at or above
+/// `scan_floor` to find the actual highest committed offset.
 ///
-/// # Recovery Strategy
+/// # Bounded Recovery Scan
 ///
-/// 1. Start with the persisted HWM as a baseline
-/// 2. Scan all records from offset 0
-/// 3. For each record batch:
-///    - Extract HWM from metadata (atomically written with batch)
-///    - Compute batch end offset (base_offset + record_count)
-///    - Track the maximum found
-/// 4. Validate offset continuity
+/// `scan_floor` should be `max(log_start_offset, checkpointed_hwm)`:
+/// - Records below the log start offset were deleted by retention.
+/// - Records below a *checkpointed* HWM were durable at checkpoint time
+///   (the checkpoint is written with the batch in one atomic `WriteBatch`),
+///   so re-validating them on every open is wasted I/O. The scan only needs
+///   to cover the window where unflushed writes could have landed.
+///
+/// Passing `scan_floor = 0` performs the legacy full-log scan.
 ///
 /// # Gap Detection
 ///
@@ -52,37 +64,42 @@ use super::keys::{
 /// - **Potential gaps**: At/after persisted HWM - may be unflushed writes
 ///
 /// Only confirmed gaps trigger errors when `fail_on_gap` is true.
+/// Continuity is validated from `scan_floor` (offsets below it are covered
+/// by the checkpoint invariant).
 ///
 /// # Arguments
 ///
 /// * `db` - The SlateDB instance
 /// * `persisted_hwm` - The HWM stored in the database
 /// * `fail_on_gap` - If true, return an error when confirmed gaps are detected
+/// * `scan_floor` - Lowest offset the scan must cover (see above)
 ///
 /// # Returns
 ///
-/// The recovered high watermark, or an error if confirmed gaps detected
-/// and `fail_on_gap` is true.
+/// The recovered high watermark and the scanned batch boundaries, or an
+/// error if confirmed gaps are detected and `fail_on_gap` is true.
 pub async fn recover_hwm_from_records(
     db: &Db,
     persisted_hwm: i64,
     fail_on_gap: bool,
-) -> Result<i64, slatedb::Error> {
+    scan_floor: i64,
+) -> Result<RecoveryOutcome, slatedb::Error> {
     let mut highest_found = persisted_hwm;
+    let scan_floor = scan_floor.max(0);
 
     // Track batches for continuity validation
     // Vec of (base_offset, record_count) sorted by offset
     let mut batches: Vec<(i64, i32)> = Vec::new();
 
-    // Create range from 0 to max possible record key for full scan
-    // This allows us to validate continuity from the beginning
-    let start_key = [RECORD_KEY_PREFIX];
+    let start_key = encode_record_key(scan_floor);
     let end_key = [RECORD_KEY_PREFIX + 1];
 
-    // Scan all records
+    // Scan records from the floor. Errors propagate: a mid-scan storage
+    // failure must fail the open, not silently truncate recovery (which
+    // would under-recover the HWM and overwrite committed offsets).
     let mut iter = db.scan(start_key.as_slice()..end_key.as_slice()).await?;
 
-    while let Ok(Some(item)) = iter.next().await {
+    while let Some(item) = iter.next().await? {
         // Decode offset from key
         if let Some(offset) = decode_record_offset(&item.key) {
             // Extract HWM from metadata if present
@@ -122,25 +139,75 @@ pub async fn recover_hwm_from_records(
         }
     }
 
-    // Validate offset continuity
-    validate_offset_continuity(&batches, persisted_hwm, fail_on_gap, highest_found)?;
+    // Validate offset continuity from the scan floor
+    validate_offset_continuity_from(
+        &batches,
+        persisted_hwm,
+        fail_on_gap,
+        highest_found,
+        scan_floor,
+    )?;
 
-    Ok(highest_found)
+    // The bounded scan can legitimately come back empty (no writes since the
+    // checkpoint), so the "empty log but non-zero HWM" truncation check moves
+    // to a single cheap existence probe over the full record range.
+    if batches.is_empty() && persisted_hwm > scan_floor.max(0) && scan_floor > 0 {
+        let probe_start = [RECORD_KEY_PREFIX];
+        let probe_end = [RECORD_KEY_PREFIX + 1];
+        let mut probe = db
+            .scan(probe_start.as_slice()..probe_end.as_slice())
+            .await?;
+        if probe.next().await?.is_none() {
+            error!(
+                persisted_hwm,
+                scan_floor, "Empty record log with non-zero persisted HWM - undetected truncation"
+            );
+            if fail_on_gap {
+                return Err(slatedb::Error::invalid(format!(
+                    "Empty record log but persisted HWM = {}; refusing to open. \
+                     Set FAIL_ON_RECOVERY_GAP=false to override.",
+                    persisted_hwm
+                )));
+            }
+        }
+    }
+
+    Ok(RecoveryOutcome {
+        high_watermark: highest_found,
+        batches,
+    })
 }
 
-/// Validate that record batches form a continuous offset sequence.
+/// Validate that record batches form a continuous offset sequence,
+/// starting at offset 0 (full-log scan semantics).
 ///
 /// This detects gaps that could indicate data loss.
+#[cfg(test)]
 fn validate_offset_continuity(
     batches: &[(i64, i32)],
     persisted_hwm: i64,
     fail_on_gap: bool,
     highest_found: i64,
 ) -> Result<(), slatedb::Error> {
-    // Invariant: a non-zero persisted HWM with no records means the log was
-    // truncated under us. Before this check the partition would have come back
-    // online empty and silently advertised HWM=0.
-    if batches.is_empty() && persisted_hwm > 0 {
+    validate_offset_continuity_from(batches, persisted_hwm, fail_on_gap, highest_found, 0)
+}
+
+/// Validate that record batches form a continuous offset sequence from
+/// `start_offset` onward. Offsets below `start_offset` are covered by the
+/// HWM-checkpoint / log-start-offset invariants and are not re-validated.
+fn validate_offset_continuity_from(
+    batches: &[(i64, i32)],
+    persisted_hwm: i64,
+    fail_on_gap: bool,
+    highest_found: i64,
+    start_offset: i64,
+) -> Result<(), slatedb::Error> {
+    // Invariant (full scans only): a non-zero persisted HWM with no records
+    // means the log was truncated under us. Before this check the partition
+    // would have come back online empty and silently advertised HWM=0.
+    // For bounded scans (start_offset > 0) the caller performs a cheap
+    // existence probe instead, since an empty window is normal.
+    if start_offset == 0 && batches.is_empty() && persisted_hwm > 0 {
         error!(
             persisted_hwm,
             "Empty record log with non-zero persisted HWM - undetected truncation"
@@ -158,7 +225,7 @@ fn validate_offset_continuity(
     let mut sorted_batches = batches.to_vec();
     sorted_batches.sort_by_key(|(offset, _)| *offset);
 
-    let mut expected_offset: i64 = 0;
+    let mut expected_offset: i64 = start_offset.max(0);
     let mut gap_count = 0;
     let mut total_gap_records: i64 = 0;
     let mut overlap_count = 0;
@@ -291,12 +358,14 @@ fn log_gap_summary(
 /// # Producer State Format
 ///
 /// - Key: `[PRODUCER_STATE_KEY_PREFIX][producer_id: i64 big-endian]`
-/// - Value: `[last_sequence: i32 big-endian][producer_epoch: i16 big-endian]`
+/// - Value: see [`PersistedProducerState`] (legacy 6-byte values accepted)
 ///
 /// # Returns
 ///
-/// A map of `producer_id -> (last_sequence, producer_epoch)`
-pub async fn load_producer_states(db: &Db) -> Result<HashMap<i64, (i32, i16)>, slatedb::Error> {
+/// A map of `producer_id -> PersistedProducerState`
+pub async fn load_producer_states(
+    db: &Db,
+) -> Result<HashMap<i64, PersistedProducerState>, slatedb::Error> {
     let mut states = HashMap::new();
 
     // Scan all producer state keys
@@ -305,15 +374,19 @@ pub async fn load_producer_states(db: &Db) -> Result<HashMap<i64, (i32, i16)>, s
 
     let mut iter = db.scan(start_key.as_slice()..end_key.as_slice()).await?;
 
-    while let Ok(Some(item)) = iter.next().await {
+    // Propagate scan errors: silently stopping mid-scan would drop producer
+    // states and accept duplicate batches as new after restart.
+    while let Some(item) = iter.next().await? {
         if let Some(producer_id) = decode_producer_id(&item.key)
-            && let Some((last_sequence, producer_epoch)) = decode_producer_state_value(&item.value)
+            && let Some(state) = decode_producer_state_value(&item.value)
         {
             debug!(
                 producer_id,
-                last_sequence, producer_epoch, "Loaded producer state"
+                last_sequence = state.last_sequence,
+                producer_epoch = state.producer_epoch,
+                "Loaded producer state"
             );
-            states.insert(producer_id, (last_sequence, producer_epoch));
+            states.insert(producer_id, state);
         }
     }
 

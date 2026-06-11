@@ -47,7 +47,7 @@
 //! | CreateTopics     | 0   | 1   |                                                |
 //! | DeleteTopics     | 0   | 1   |                                                |
 //! | SaslAuthenticate | 0   | 1   |                                                |
-//! | InitProducerId   | 0   | 4   | v3+ uses flexible encoding                     |
+//! | InitProducerId   | 0   | 4   | v2+ uses flexible encoding (per spec)          |
 //! | DeleteGroups     | 0   | 1   |                                                |
 
 use super::request::ApiKey;
@@ -147,8 +147,13 @@ pub fn is_version_supported(api_key: ApiKey, version: i16) -> bool {
 /// Flexible encoding was introduced in KIP-482 and affects wire format.
 pub fn uses_flexible_encoding(api_key: ApiKey, version: i16) -> bool {
     match api_key {
+        // ApiVersions: flexible from v3 (KIP-511 hybrid header).
         ApiKey::ApiVersions => version >= 3,
-        ApiKey::InitProducerId => version >= 3,
+        // InitProducerId: flexible from v2 per the Kafka spec
+        // (InitProducerIdRequest.json: "flexibleVersions": "2+").
+        // This was previously (incorrectly) gated at v3, which mis-framed
+        // every v2 request and response.
+        ApiKey::InitProducerId => version >= 2,
         // Add other APIs as needed when flexible versions are implemented
         _ => false,
     }
@@ -274,9 +279,10 @@ mod tests {
         assert!(!uses_flexible_encoding(ApiKey::ApiVersions, 2));
         assert!(uses_flexible_encoding(ApiKey::ApiVersions, 3));
 
-        // InitProducerId uses flexible encoding from v3
+        // InitProducerId uses flexible encoding from v2 (per spec)
         assert!(!uses_flexible_encoding(ApiKey::InitProducerId, 0));
-        assert!(!uses_flexible_encoding(ApiKey::InitProducerId, 2));
+        assert!(!uses_flexible_encoding(ApiKey::InitProducerId, 1));
+        assert!(uses_flexible_encoding(ApiKey::InitProducerId, 2));
         assert!(uses_flexible_encoding(ApiKey::InitProducerId, 3));
         assert!(uses_flexible_encoding(ApiKey::InitProducerId, 4));
     }

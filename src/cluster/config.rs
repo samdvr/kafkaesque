@@ -350,6 +350,12 @@ pub struct ClusterConfig {
     /// Default: 100 MB
     pub max_message_size: usize,
 
+    /// Process-wide budget for bytes of inbound Kafka frames buffered across
+    /// all connections before dispatch. Bounds coordinated slow-frame attacks
+    /// that would otherwise allocate up to `max_message_size` per connection.
+    /// Default: 1 GiB
+    pub global_inflight_byte_budget: usize,
+
     /// Maximum size of a fetch response in bytes.
     /// Limits memory usage per fetch request.
     /// Default: 1 MB
@@ -724,6 +730,23 @@ pub struct ClusterConfig {
     /// Default: 100ms
     pub slatedb_flush_interval_ms: u64,
 
+    // --- Log Retention ---
+    /// Time-based log retention in milliseconds (`retention.ms` analogue).
+    ///
+    /// Record batches whose `max_timestamp` is older than this are deleted
+    /// from owned partitions by a periodic background task, and the log
+    /// start offset advances past them. `<= 0` disables retention (data is
+    /// kept forever) — the conservative default, since enabling deletion by
+    /// default would be a destructive surprise for existing deployments.
+    ///
+    /// Env: `LOG_RETENTION_MS`. Default: -1 (disabled)
+    pub log_retention_ms: i64,
+
+    /// How often the retention task scans owned partitions, in seconds.
+    ///
+    /// Env: `LOG_RETENTION_CHECK_INTERVAL_SECS`. Default: 300 (5 minutes)
+    pub log_retention_check_interval_secs: u64,
+
     // --- Runtime Configuration ---
     /// Number of worker threads for the control plane runtime.
     ///
@@ -767,6 +790,7 @@ impl Default for ClusterConfig {
             max_auto_created_topics: 10_000, // Reasonable limit to prevent DoS
             // Network tuning
             max_message_size: 100 * 1024 * 1024,  // 100 MB
+            global_inflight_byte_budget: 1024 * 1024 * 1024, // 1 GiB
             max_fetch_response_size: 1024 * 1024, // 1 MB
             max_concurrent_partition_writes: 16,
             max_concurrent_partition_reads: 16,
@@ -828,6 +852,9 @@ impl Default for ClusterConfig {
             slatedb_max_unflushed_bytes: 256 * 1024 * 1024, // 256 MB
             slatedb_l0_sst_size_bytes: 64 * 1024 * 1024,    // 64 MB
             slatedb_flush_interval_ms: 100,
+            // Log retention (disabled by default — see field docs)
+            log_retention_ms: -1,
+            log_retention_check_interval_secs: 300,
             // Runtime configuration
             control_plane_threads: 2,
             data_plane_threads: std::thread::available_parallelism()
@@ -1180,6 +1207,12 @@ impl ClusterConfig {
             errors.push("batch_index_max_size must be greater than 0".to_string());
         }
 
+        // Retention check interval must be positive (the interval drives a
+        // tokio::time::interval, which panics on zero)
+        if self.log_retention_check_interval_secs == 0 {
+            errors.push("log_retention_check_interval_secs must be greater than 0".to_string());
+        }
+
         // Min lease TTL for write validation
         if self.min_lease_ttl_for_write_secs < 5 {
             errors.push(format!(
@@ -1401,6 +1434,12 @@ impl ClusterConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.max_message_size);
 
+        let global_inflight_byte_budget: usize =
+            std::env::var("GLOBAL_INFLIGHT_BYTE_BUDGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.global_inflight_byte_budget);
+
         let max_fetch_response_size: usize = std::env::var("MAX_FETCH_RESPONSE_SIZE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1571,6 +1610,18 @@ impl ClusterConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.slatedb_flush_interval_ms);
 
+        // Log retention
+        let log_retention_ms: i64 = std::env::var("LOG_RETENTION_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.log_retention_ms);
+
+        let log_retention_check_interval_secs: u64 =
+            std::env::var("LOG_RETENTION_CHECK_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.log_retention_check_interval_secs);
+
         // Runtime configuration
         let control_plane_threads: usize = std::env::var("CONTROL_PLANE_THREADS")
             .ok()
@@ -1596,6 +1647,7 @@ impl ClusterConfig {
             auto_create_topics,
             default_num_partitions,
             max_message_size,
+            global_inflight_byte_budget,
             max_fetch_response_size,
             max_concurrent_partition_writes,
             max_concurrent_partition_reads,
@@ -1619,6 +1671,8 @@ impl ClusterConfig {
             slatedb_max_unflushed_bytes,
             slatedb_l0_sst_size_bytes,
             slatedb_flush_interval_ms,
+            log_retention_ms,
+            log_retention_check_interval_secs,
             control_plane_threads,
             data_plane_threads,
             ..defaults
@@ -1648,10 +1702,25 @@ impl ClusterConfig {
         eprintln!("Auto Create Topics: {}", auto_create_topics);
         eprintln!("Default Num Partitions: {}", default_num_partitions);
         eprintln!("Max Message Size: {} bytes", max_message_size);
+        eprintln!(
+            "Global Inflight Byte Budget: {} bytes",
+            global_inflight_byte_budget
+        );
         eprintln!("Max Fetch Response Size: {} bytes", max_fetch_response_size);
         eprintln!("Broker Heartbeat TTL: {}s", broker_heartbeat_ttl_secs);
         eprintln!("SASL Enabled: {}", sasl_enabled);
         eprintln!("Fail on Recovery Gap: {}", fail_on_recovery_gap);
+        eprintln!(
+            "Log Retention: {}",
+            if log_retention_ms > 0 {
+                format!(
+                    "{} ms (checked every {}s)",
+                    log_retention_ms, log_retention_check_interval_secs
+                )
+            } else {
+                "disabled (infinite)".to_string()
+            }
+        );
         eprintln!(
             "Runtime: control_plane={} threads, data_plane={} threads",
             control_plane_threads, data_plane_threads

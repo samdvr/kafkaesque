@@ -4,7 +4,7 @@ use bytes::Bytes;
 use nom::{IResult, number::complete::be_i32};
 use nombytes::NomBytes;
 
-use crate::parser::parse_string;
+use crate::parser::{bytes_to_string, parse_string};
 
 /// SaslHandshake request data.
 #[derive(Debug, Clone)]
@@ -21,7 +21,7 @@ pub fn parse_sasl_handshake_request(
     Ok((
         s,
         SaslHandshakeRequestData {
-            mechanism: String::from_utf8_lossy(&mechanism).to_string(),
+            mechanism: bytes_to_string(&mechanism)?,
         },
     ))
 }

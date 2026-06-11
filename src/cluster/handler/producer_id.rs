@@ -37,6 +37,24 @@ pub(super) async fn handle_init_producer_id(
         };
     }
 
+    // Transactions are not implemented (no transaction coordinator, no
+    // commit/abort markers). A producer configured with `transactional.id`
+    // expects exactly-once semantics this broker cannot provide — reject
+    // loudly rather than silently downgrading its guarantees to idempotence.
+    if let Some(ref txn_id) = request.transactional_id {
+        error!(
+            client = %ctx.client_addr,
+            transactional_id = %txn_id,
+            "Rejecting InitProducerId with transactional_id: transactions are not supported"
+        );
+        return InitProducerIdResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::InvalidRequest,
+            producer_id: -1,
+            producer_epoch: -1,
+        };
+    }
+
     // Use the coordinator's init_producer_id which handles:
     // - New producers: assigns new ID with epoch 0
     // - Recovering transactional producers: bumps epoch

@@ -283,6 +283,15 @@ fn test_to_kafka_code_flush_failed() {
 fn test_is_not_leader() {
     assert!(SlateDBError::Fenced.is_not_leader());
     assert!(
+        SlateDBError::EpochMismatch {
+            topic: "t".to_string(),
+            partition: 0,
+            expected_epoch: 2,
+            stored_epoch: 1,
+        }
+        .is_not_leader()
+    );
+    assert!(
         SlateDBError::NotOwned {
             topic: "t".to_string(),
             partition: 0
@@ -475,18 +484,18 @@ fn test_detect_fencing_safe_patterns() {
 
 #[test]
 fn test_detect_fencing_unknown_patterns() {
-    // Unknown patterns should trigger fail-closed
+    // Unknown patterns must NOT auto-fence — propagate as a normal storage error.
     assert_eq!(
         detect_fencing_from_message("Some completely random error XYZ123"),
-        FencingDetectionMethod::FailClosed
+        FencingDetectionMethod::NotFencing
     );
     assert_eq!(
         detect_fencing_from_message("Unexpected state: ABC"),
-        FencingDetectionMethod::FailClosed
+        FencingDetectionMethod::NotFencing
     );
     assert_eq!(
         detect_fencing_from_message(""),
-        FencingDetectionMethod::FailClosed
+        FencingDetectionMethod::NotFencing
     );
 }
 

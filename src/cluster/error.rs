@@ -56,7 +56,8 @@
 //!
 //! 1. **Typed detection** (highest confidence): `ErrorKind::Closed(CloseReason::Fenced)`
 //! 2. **Pattern matching** (medium confidence): Known fencing error message patterns
-//! 3. **Fail-closed** (lowest confidence): Unknown errors treated as potential fencing
+//! 3. **Propagate** (unknown): Unrecognized errors are returned as storage errors
+//!    (no auto-fencing — avoids mass partition release on transient glitches)
 //!
 //! See [`FencingDetection`] for detection results and [`detect_fencing`] for the detector.
 
@@ -331,6 +332,7 @@ impl SlateDBError {
             SlateDBError::Fenced
                 | SlateDBError::NotOwned { .. }
                 | SlateDBError::LeaseTooShort { .. }
+                | SlateDBError::EpochMismatch { .. }
         )
     }
 
@@ -521,7 +523,7 @@ enum ErrorCategory {
     Fenced,
     /// Safe/recoverable error - transient or expected
     Safe,
-    /// Unknown error - treat as potential fencing (fail-closed)
+    /// Unknown error — propagate without auto-fencing (see audit 5.7).
     Unknown,
 }
 
@@ -557,6 +559,9 @@ fn classify_error_message(msg: &str) -> ErrorCategory {
         // Generic conflict indicators that likely mean fencing
         "already exists with different",
         "concurrent modification",
+        // Leader epoch / writer generation conflicts
+        "stale epoch",
+        "epoch mismatch",
     ];
 
     // Known non-fencing errors that are safe to propagate
@@ -628,7 +633,7 @@ fn classify_error_message(msg: &str) -> ErrorCategory {
 /// # Returns
 /// * `FencingDetectionMethod::PatternMatch` - Known fencing pattern detected
 /// * `FencingDetectionMethod::NotFencing` - Known safe pattern detected
-/// * `FencingDetectionMethod::FailClosed` - Unknown error, treated as fencing
+/// * `FencingDetectionMethod::NotFencing` - Unknown or safe pattern (propagate)
 ///
 /// # Example
 /// ```
@@ -644,7 +649,7 @@ pub fn detect_fencing_from_message(error_msg: &str) -> FencingDetectionMethod {
     match classify_error_message(error_msg) {
         ErrorCategory::Fenced => FencingDetectionMethod::PatternMatch,
         ErrorCategory::Safe => FencingDetectionMethod::NotFencing,
-        ErrorCategory::Unknown => FencingDetectionMethod::FailClosed,
+        ErrorCategory::Unknown => FencingDetectionMethod::NotFencing,
     }
 }
 
@@ -1173,14 +1178,14 @@ mod tests {
 
     #[test]
     fn test_detect_fencing_from_message_unknown() {
-        // Unknown patterns should trigger fail-closed
+        // Unknown patterns propagate without auto-fencing.
         assert_eq!(
             detect_fencing_from_message("Some completely random error XYZ123"),
-            FencingDetectionMethod::FailClosed
+            FencingDetectionMethod::NotFencing
         );
         assert_eq!(
             detect_fencing_from_message("Unexpected state: ABC"),
-            FencingDetectionMethod::FailClosed
+            FencingDetectionMethod::NotFencing
         );
     }
 
@@ -1361,23 +1366,20 @@ mod tests {
 
     #[test]
     fn test_detect_fencing_empty_and_edge_cases() {
-        // Empty string should fail-closed
         assert_eq!(
             detect_fencing_from_message(""),
-            FencingDetectionMethod::FailClosed
+            FencingDetectionMethod::NotFencing
         );
 
-        // Very long message should still work
         let long_msg = format!("Some error with lots of context: {}", "x".repeat(10000));
         assert_eq!(
             detect_fencing_from_message(&long_msg),
-            FencingDetectionMethod::FailClosed
+            FencingDetectionMethod::NotFencing
         );
 
-        // Message with only whitespace should fail-closed
         assert_eq!(
             detect_fencing_from_message("   \n\t   "),
-            FencingDetectionMethod::FailClosed
+            FencingDetectionMethod::NotFencing
         );
     }
 
@@ -1813,10 +1815,9 @@ mod tests {
 
     #[test]
     fn test_is_fenced_unknown_slatedb_message() {
-        // Unknown patterns in SlateDB errors should be treated as fencing (fail-closed)
+        // Unknown patterns must not auto-fence (audit 5.7 — avoid mass release on glitches)
         let err = SlateDBError::SlateDB("Some completely unknown error xyz".to_string());
-        // This will trigger fail-closed behavior
-        assert!(err.is_fenced());
+        assert!(!err.is_fenced());
     }
 
     #[test]

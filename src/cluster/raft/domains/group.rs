@@ -23,9 +23,97 @@ pub struct MemberInfo {
     pub client_id: String,
     pub client_host: String,
     pub metadata: Vec<u8>,
+    /// Full `(protocol_name, metadata)` list this member sent in its last
+    /// JoinGroup, in the member's preference order. Needed so the leader's
+    /// JoinGroup response can carry each member's own subscription bytes
+    /// for the negotiated protocol, and so the protocol can be re-selected
+    /// when membership changes.
+    #[serde(default)]
+    pub protocols: Vec<(String, Vec<u8>)>,
     pub session_timeout_ms: i32,
     pub rebalance_timeout_ms: i32,
     pub last_heartbeat_ms: u64,
+}
+
+impl MemberInfo {
+    /// The metadata this member sent for `protocol`, falling back to the
+    /// member's first-protocol metadata when the protocol is unknown
+    /// (e.g. legacy members that joined without a protocol list).
+    pub fn metadata_for_protocol(&self, protocol: Option<&str>) -> Vec<u8> {
+        match protocol {
+            Some(name) => self
+                .protocols
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, m)| m.clone())
+                .unwrap_or_else(|| self.metadata.clone()),
+            None => self.metadata.clone(),
+        }
+    }
+}
+
+/// Outcome of negotiating a group protocol across members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolSelection {
+    /// No member declared any protocols (legacy/simple clients).
+    None,
+    /// Every protocol-declaring member supports this protocol.
+    Selected(String),
+    /// Members declared protocols but have none in common.
+    Inconsistent,
+}
+
+/// Select the group protocol the way Kafka's coordinator does.
+///
+/// `preference_lists` holds each member's protocol names in that member's
+/// preference order. Members with empty lists (legacy clients) don't
+/// constrain the choice. The candidate set is the intersection of all
+/// participating members' protocols; each member then "votes" for its
+/// most-preferred candidate and the candidate with the most votes wins.
+///
+/// The first list should be the group leader's: candidate ordering (and
+/// therefore tie-breaking) follows it, which keeps the selection
+/// deterministic across Raft replicas regardless of map iteration order.
+pub fn select_group_protocol(preference_lists: &[Vec<String>]) -> ProtocolSelection {
+    let participants: Vec<&Vec<String>> = preference_lists
+        .iter()
+        .filter(|prefs| !prefs.is_empty())
+        .collect();
+    if participants.is_empty() {
+        return ProtocolSelection::None;
+    }
+
+    // Candidates: protocols every participant supports, ordered by the
+    // first participant's (leader's) preference.
+    let mut candidates: Vec<&String> = Vec::new();
+    for name in participants[0].iter() {
+        if !candidates.contains(&name) && participants.iter().all(|prefs| prefs.contains(name)) {
+            candidates.push(name);
+        }
+    }
+    if candidates.is_empty() {
+        return ProtocolSelection::Inconsistent;
+    }
+
+    // Each participant votes for the first of its own protocols that made
+    // the candidate set; most votes wins, ties go to the candidate the
+    // leader prefers (earliest in `candidates`).
+    let mut votes = vec![0usize; candidates.len()];
+    for prefs in &participants {
+        if let Some(idx) = prefs
+            .iter()
+            .find_map(|name| candidates.iter().position(|c| *c == name))
+        {
+            votes[idx] += 1;
+        }
+    }
+    let mut best = 0;
+    for (idx, count) in votes.iter().enumerate() {
+        if *count > votes[best] {
+            best = idx;
+        }
+    }
+    ProtocolSelection::Selected(candidates[best].clone())
 }
 
 /// Member description for JoinGroup response.
@@ -195,6 +283,10 @@ pub enum GroupResponse {
         actual: i32,
     },
 
+    /// A joining member's protocol list has no protocol in common with the
+    /// rest of the group (Kafka: INCONSISTENT_GROUP_PROTOCOL).
+    InconsistentProtocol { group_id: String, member_id: String },
+
     /// Generic success.
     Ok,
 }
@@ -254,17 +346,60 @@ impl GroupDomainState {
                     member_id
                 };
 
-                // Get metadata from first protocol
+                // Negotiate the group protocol across the existing members
+                // plus the joiner, BEFORE mutating any state: an incompatible
+                // joiner is rejected without disturbing the group.
+                //
+                // The prospective leader's preferences go first (they drive
+                // tie-breaking); remaining members are sorted by member id so
+                // every Raft replica computes the same result.
+                let prospective_leader = group
+                    .leader_id
+                    .clone()
+                    .unwrap_or_else(|| final_member_id.clone());
+                let joiner_protocol_names: Vec<String> =
+                    protocols.iter().map(|(n, _)| n.clone()).collect();
+                let mut member_prefs: Vec<(String, Vec<String>)> = group
+                    .members
+                    .iter()
+                    .filter(|(id, _)| **id != final_member_id)
+                    .map(|(id, m)| {
+                        (
+                            id.clone(),
+                            m.protocols.iter().map(|(n, _)| n.clone()).collect(),
+                        )
+                    })
+                    .collect();
+                member_prefs.push((final_member_id.clone(), joiner_protocol_names));
+                member_prefs.sort_by(|a, b| {
+                    let a_is_leader = a.0 == prospective_leader;
+                    let b_is_leader = b.0 == prospective_leader;
+                    b_is_leader.cmp(&a_is_leader).then_with(|| a.0.cmp(&b.0))
+                });
+                let preference_lists: Vec<Vec<String>> =
+                    member_prefs.into_iter().map(|(_, prefs)| prefs).collect();
+
+                let selected_protocol = match select_group_protocol(&preference_lists) {
+                    ProtocolSelection::Selected(name) => Some(name),
+                    ProtocolSelection::None => None,
+                    ProtocolSelection::Inconsistent => {
+                        return GroupResponse::InconsistentProtocol {
+                            group_id,
+                            member_id: final_member_id,
+                        };
+                    }
+                };
+
+                // The member's `metadata` field keeps its first-protocol
+                // blob for backwards compatibility; per-protocol metadata
+                // lives in `protocols` and is resolved against the selected
+                // protocol when building responses.
                 let metadata = protocols
                     .first()
                     .map(|(_, m)| m.clone())
                     .unwrap_or_default();
-                let protocol_name = protocols
-                    .first()
-                    .map(|(n, _)| n.clone())
-                    .unwrap_or_default();
 
-                // Add member
+                // Add (or refresh) the member
                 group.members.insert(
                     final_member_id.clone(),
                     MemberInfo {
@@ -272,6 +407,7 @@ impl GroupDomainState {
                         client_id,
                         client_host,
                         metadata,
+                        protocols,
                         session_timeout_ms,
                         rebalance_timeout_ms,
                         last_heartbeat_ms: timestamp_ms,
@@ -279,31 +415,38 @@ impl GroupDomainState {
                 );
 
                 // Set leader if this is the first member
-                let is_leader = group.leader_id.is_none();
-                if is_leader {
+                if group.leader_id.is_none() {
                     group.leader_id = Some(final_member_id.clone());
                 }
 
                 // Trigger rebalance
                 group.increment_generation();
                 group.state = GroupStateEnum::PreparingRebalance;
-                group.protocol_name = Some(protocol_name.clone());
+                group.protocol_name = selected_protocol.clone();
                 group.assignments.clear();
 
                 let leader_id = group.leader_id.clone().unwrap_or_default();
 
-                // Build member descriptions (only for leader)
-                let members: Vec<MemberDescription> = if is_leader {
-                    group
+                // Build member descriptions for the leader's response. Each
+                // entry carries that member's OWN metadata for the selected
+                // protocol — the leader's assignor computes assignments from
+                // these subscriptions. Followers get an empty list, matching
+                // Kafka. Note this keys off the joiner being the leader (not
+                // "first member ever") so a rejoining leader also gets the
+                // full roster.
+                let members: Vec<MemberDescription> = if final_member_id == leader_id {
+                    let mut described: Vec<MemberDescription> = group
                         .members
                         .values()
                         .map(|m| MemberDescription {
                             member_id: m.member_id.clone(),
                             client_id: m.client_id.clone(),
                             client_host: m.client_host.clone(),
-                            metadata: m.metadata.clone(),
+                            metadata: m.metadata_for_protocol(selected_protocol.as_deref()),
                         })
-                        .collect()
+                        .collect();
+                    described.sort_by(|a, b| a.member_id.cmp(&b.member_id));
+                    described
                 } else {
                     Vec::new()
                 };
@@ -313,7 +456,7 @@ impl GroupDomainState {
                     leader_id,
                     member_id: final_member_id,
                     members,
-                    protocol_name,
+                    protocol_name: selected_protocol.unwrap_or_default(),
                 }
             }
 
@@ -402,6 +545,16 @@ impl GroupDomainState {
                 member_id,
             } => {
                 if let Some(group) = self.groups.get_mut(&group_id) {
+                    // Kafka answers LeaveGroup from a non-member with
+                    // UNKNOWN_MEMBER_ID; don't bump the generation or
+                    // disturb group state for a member that isn't there.
+                    if !group.members.contains_key(&member_id) {
+                        return GroupResponse::UnknownMember {
+                            group_id,
+                            member_id,
+                        };
+                    }
+
                     group.members.remove(&member_id);
                     group.assignments.remove(&member_id);
 
@@ -657,6 +810,236 @@ mod tests {
 
         assert!(matches!(response, GroupResponse::OffsetCommitted));
         assert_eq!(state.get_offset("test-group", "test-topic", 0), Some(100));
+    }
+
+    /// Build a JoinGroup command with the given protocols.
+    fn join_cmd(
+        group_id: &str,
+        member_id: &str,
+        protocols: Vec<(String, Vec<u8>)>,
+        timestamp_ms: u64,
+    ) -> GroupCommand {
+        GroupCommand::JoinGroup {
+            group_id: group_id.to_string(),
+            member_id: member_id.to_string(),
+            client_id: format!("client-{}", member_id),
+            client_host: "localhost".to_string(),
+            protocol_type: "consumer".to_string(),
+            protocols,
+            session_timeout_ms: 30000,
+            rebalance_timeout_ms: 60000,
+            timestamp_ms,
+        }
+    }
+
+    #[test]
+    fn test_select_group_protocol_picks_common_protocol() {
+        // Leader prefers roundrobin, but only range is supported by all.
+        let prefs = vec![
+            vec!["roundrobin".to_string(), "range".to_string()],
+            vec!["range".to_string()],
+        ];
+        assert_eq!(
+            select_group_protocol(&prefs),
+            ProtocolSelection::Selected("range".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_group_protocol_majority_vote_wins() {
+        // Both protocols are supported by everyone; two members prefer
+        // roundrobin so it wins the vote despite the leader preferring range.
+        let prefs = vec![
+            vec!["range".to_string(), "roundrobin".to_string()],
+            vec!["roundrobin".to_string(), "range".to_string()],
+            vec!["roundrobin".to_string(), "range".to_string()],
+        ];
+        assert_eq!(
+            select_group_protocol(&prefs),
+            ProtocolSelection::Selected("roundrobin".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_group_protocol_tie_breaks_by_leader_preference() {
+        let prefs = vec![
+            vec!["range".to_string(), "roundrobin".to_string()],
+            vec!["roundrobin".to_string(), "range".to_string()],
+        ];
+        // One vote each; the leader's preference (range) wins.
+        assert_eq!(
+            select_group_protocol(&prefs),
+            ProtocolSelection::Selected("range".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_group_protocol_inconsistent() {
+        let prefs = vec![vec!["range".to_string()], vec!["sticky".to_string()]];
+        assert_eq!(
+            select_group_protocol(&prefs),
+            ProtocolSelection::Inconsistent
+        );
+    }
+
+    #[test]
+    fn test_select_group_protocol_no_protocols() {
+        let prefs: Vec<Vec<String>> = vec![vec![], vec![]];
+        assert_eq!(select_group_protocol(&prefs), ProtocolSelection::None);
+        assert_eq!(select_group_protocol(&[]), ProtocolSelection::None);
+    }
+
+    #[test]
+    fn test_join_group_negotiates_common_protocol() {
+        let mut state = GroupDomainState::new();
+
+        state.apply(join_cmd(
+            "g",
+            "m1",
+            vec![
+                ("roundrobin".to_string(), vec![1]),
+                ("range".to_string(), vec![2]),
+            ],
+            1000,
+        ));
+        let response = state.apply(join_cmd(
+            "g",
+            "m2",
+            vec![("range".to_string(), vec![3])],
+            2000,
+        ));
+
+        match response {
+            GroupResponse::JoinGroupResponse { protocol_name, .. } => {
+                assert_eq!(protocol_name, "range");
+            }
+            other => panic!("Expected JoinGroupResponse, got {:?}", other),
+        }
+        let group = state.get_group("g").unwrap();
+        assert_eq!(group.protocol_name.as_deref(), Some("range"));
+    }
+
+    #[test]
+    fn test_join_group_inconsistent_protocol_rejected_without_state_change() {
+        let mut state = GroupDomainState::new();
+
+        state.apply(join_cmd(
+            "g",
+            "m1",
+            vec![("range".to_string(), vec![])],
+            1000,
+        ));
+        let generation_before = state.get_group("g").unwrap().generation;
+
+        let response = state.apply(join_cmd(
+            "g",
+            "m2",
+            vec![("sticky".to_string(), vec![])],
+            2000,
+        ));
+
+        assert!(matches!(
+            response,
+            GroupResponse::InconsistentProtocol { ref member_id, .. } if member_id == "m2"
+        ));
+        let group = state.get_group("g").unwrap();
+        assert_eq!(
+            group.members.len(),
+            1,
+            "incompatible joiner must not be added"
+        );
+        assert_eq!(
+            group.generation, generation_before,
+            "no rebalance triggered"
+        );
+    }
+
+    #[test]
+    fn test_join_group_leader_receives_each_members_own_metadata() {
+        let mut state = GroupDomainState::new();
+
+        // m1 (leader) joins first, then m2 with different metadata.
+        state.apply(join_cmd(
+            "g",
+            "m1",
+            vec![("range".to_string(), vec![0xAA])],
+            1000,
+        ));
+        let follower_response = state.apply(join_cmd(
+            "g",
+            "m2",
+            vec![("range".to_string(), vec![0xBB])],
+            2000,
+        ));
+
+        // Followers don't get the member roster.
+        match &follower_response {
+            GroupResponse::JoinGroupResponse { members, .. } => {
+                assert!(members.is_empty(), "non-leader must not receive members");
+            }
+            other => panic!("Expected JoinGroupResponse, got {:?}", other),
+        }
+
+        // Leader rejoins (normal rebalance flow) and must see every
+        // member's OWN metadata, not its own blob duplicated.
+        let leader_response = state.apply(join_cmd(
+            "g",
+            "m1",
+            vec![("range".to_string(), vec![0xAA])],
+            3000,
+        ));
+        match leader_response {
+            GroupResponse::JoinGroupResponse {
+                members, leader_id, ..
+            } => {
+                assert_eq!(leader_id, "m1");
+                assert_eq!(members.len(), 2);
+                assert_eq!(members[0].member_id, "m1");
+                assert_eq!(members[0].metadata, vec![0xAA]);
+                assert_eq!(members[1].member_id, "m2");
+                assert_eq!(members[1].metadata, vec![0xBB]);
+            }
+            other => panic!("Expected JoinGroupResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_leave_group_unknown_member_returns_unknown_member() {
+        let mut state = GroupDomainState::new();
+
+        state.apply(join_cmd(
+            "g",
+            "m1",
+            vec![("range".to_string(), vec![])],
+            1000,
+        ));
+        let generation_before = state.get_group("g").unwrap().generation;
+
+        let response = state.apply(GroupCommand::LeaveGroup {
+            group_id: "g".to_string(),
+            member_id: "not-a-member".to_string(),
+        });
+
+        assert!(matches!(
+            response,
+            GroupResponse::UnknownMember { ref member_id, .. } if member_id == "not-a-member"
+        ));
+        let group = state.get_group("g").unwrap();
+        assert_eq!(group.members.len(), 1);
+        assert_eq!(
+            group.generation, generation_before,
+            "unknown-member leave must not trigger a rebalance"
+        );
+    }
+
+    #[test]
+    fn test_leave_group_unknown_group_returns_group_not_found() {
+        let mut state = GroupDomainState::new();
+        let response = state.apply(GroupCommand::LeaveGroup {
+            group_id: "missing".to_string(),
+            member_id: "m1".to_string(),
+        });
+        assert!(matches!(response, GroupResponse::GroupNotFound { .. }));
     }
 
     #[test]

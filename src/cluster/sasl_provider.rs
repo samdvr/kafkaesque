@@ -66,6 +66,8 @@ pub struct SaslProvider {
     mechanisms: Vec<String>,
     /// Whether authentication is required.
     required: bool,
+    /// Reject PLAIN on non-TLS transports (credentials are cleartext on the wire).
+    plain_require_tls: bool,
 }
 
 #[allow(dead_code)]
@@ -77,6 +79,7 @@ impl SaslProvider {
             scram_sessions: Arc::new(RwLock::new(HashMap::new())),
             mechanisms: vec!["SCRAM-SHA-256".to_string(), "PLAIN".to_string()],
             required,
+            plain_require_tls: true,
         }
     }
 
@@ -210,6 +213,13 @@ impl SaslProvider {
     /// the bytes themselves don't say "I am SCRAM".
     pub async fn has_scram_session(&self, client_addr: SocketAddr) -> bool {
         self.scram_sessions.read().await.contains_key(&client_addr)
+    }
+
+    /// Drop per-connection SCRAM state when a client disconnects.
+    pub async fn clear_session(&self, client_addr: SocketAddr) {
+        if self.scram_sessions.write().await.remove(&client_addr).is_some() {
+            debug!(client = %client_addr, "Cleared abandoned SCRAM session");
+        }
     }
 
     /// Authenticate using PLAIN mechanism.
@@ -360,10 +370,18 @@ impl SaslProvider {
         client_addr: SocketAddr,
         mechanism: &str,
         auth_data: &[u8],
+        transport_tls: bool,
     ) -> (bool, Option<String>, Vec<u8>) {
         let mechanism_upper = mechanism.to_uppercase();
         match mechanism_upper.as_str() {
             "PLAIN" => {
+                if self.plain_require_tls && !transport_tls {
+                    warn!(
+                        client = %client_addr,
+                        "Rejecting PLAIN SASL on non-TLS connection"
+                    );
+                    return (false, None, Vec::new());
+                }
                 let (success, principal) = self.authenticate_plain(auth_data).await;
                 (success, principal, Vec::new())
             }
@@ -413,6 +431,39 @@ mod tests {
 
         assert!(provider.remove_user("alice").await);
         assert!(!provider.has_user("alice").await);
+    }
+
+    #[tokio::test]
+    async fn test_plain_rejected_without_tls() {
+        let provider = SaslProvider::new(false);
+        provider.add_user("alice", "secret").await;
+        let addr: SocketAddr = "127.0.0.1:49999".parse().unwrap();
+
+        let (ok, principal, _) = provider
+            .authenticate_with_session(addr, "PLAIN", b"\0alice\0secret", false)
+            .await;
+        assert!(!ok);
+        assert!(principal.is_none());
+
+        let (ok, principal, _) = provider
+            .authenticate_with_session(addr, "PLAIN", b"\0alice\0secret", true)
+            .await;
+        assert!(ok);
+        assert_eq!(principal.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn test_clear_session_drops_scram_state() {
+        let provider = SaslProvider::new(false);
+        provider.add_user("alice", "hunter2").await;
+        let addr: SocketAddr = "127.0.0.1:49998".parse().unwrap();
+        let client_first = b"n,,n=alice,r=AAAAAAAAAAAAAAAAAAAA";
+        let _ = provider
+            .authenticate_with_session(addr, "SCRAM-SHA-256", client_first, false)
+            .await;
+        assert!(provider.has_scram_session(addr).await);
+        provider.clear_session(addr).await;
+        assert!(!provider.has_scram_session(addr).await);
     }
 
     #[tokio::test]
@@ -498,7 +549,7 @@ mod tests {
 
         // Step 1: client-first → server-first.
         let (ok, principal, server_first_bytes) = provider
-            .authenticate_with_session(addr, "SCRAM-SHA-256", client_first.as_bytes())
+            .authenticate_with_session(addr, "SCRAM-SHA-256", client_first.as_bytes(), false)
             .await;
         assert!(!ok, "intermediate step should not be 'ok' yet");
         assert!(principal.is_none());
@@ -581,7 +632,7 @@ mod tests {
 
         // Step 2: client-final → server-final.
         let (ok, principal, server_final_bytes) = provider
-            .authenticate_with_session(addr, "SCRAM-SHA-256", client_final.as_bytes())
+            .authenticate_with_session(addr, "SCRAM-SHA-256", client_final.as_bytes(), false)
             .await;
         assert!(ok, "client-final with valid proof should succeed");
         assert_eq!(principal.as_deref(), Some("User:alice"));
@@ -603,7 +654,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
         let client_first = b"n,,n=alice,r=AAAAAAAAAAAAAAAAAAAA";
         let (ok, _, _) = provider
-            .authenticate_with_session(addr, "SCRAM-SHA-256", client_first)
+            .authenticate_with_session(addr, "SCRAM-SHA-256", client_first, false)
             .await;
         assert!(!ok);
 
@@ -611,7 +662,7 @@ mod tests {
         let bogus_final =
             b"c=biws,r=AAAAAAAAAAAAAAAAAAAAfake-server-nonce,p=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let (ok, principal, _) = provider
-            .authenticate_with_session(addr, "SCRAM-SHA-256", bogus_final)
+            .authenticate_with_session(addr, "SCRAM-SHA-256", bogus_final, false)
             .await;
         assert!(!ok);
         assert!(principal.is_none());

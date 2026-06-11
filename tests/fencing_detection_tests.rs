@@ -348,10 +348,8 @@ fn test_safe_pattern_network() {
 
 #[test]
 fn test_safe_pattern_throttle() {
-    // Note: Rate limiting and throttling are NOT currently in SAFE_PATTERNS.
-    // They would be treated as unknown errors and potentially fenced via fail_closed.
-    // This test verifies the current behavior - if this needs to change,
-    // add "rate limit", "throttle", "too many requests" to SAFE_PATTERNS.
+    // Rate limiting and throttling are not in SAFE_PATTERNS; unknown messages
+    // propagate without fencing. Add explicit patterns here if needed.
 
     // These patterns ARE in SAFE_PATTERNS and should not fence
     assert!(!detect_fencing_from_message("service unavailable").is_fenced());

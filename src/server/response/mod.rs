@@ -93,6 +93,20 @@ impl Response {
         })
     }
 
+    /// Create a new flexible response with pre-encoded body bytes.
+    ///
+    /// Like [`Response::new_raw`], but emits response header v1
+    /// (correlation id followed by empty tagged fields). Use for APIs whose
+    /// body needs version-specific encoding at a flexible version (e.g.
+    /// InitProducerId v2+).
+    pub fn new_raw_flexible(correlation_id: i32, body: Vec<u8>) -> Result<Self> {
+        Ok(Self {
+            correlation_id,
+            body,
+            flexible: true,
+        })
+    }
+
     /// Encode the response to a buffer with the size prefix.
     pub fn encode_with_size(&self) -> Result<Vec<u8>> {
         let mut header = Vec::new();

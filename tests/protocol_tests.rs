@@ -4,7 +4,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use kafkaesque::protocol::{
-    CrcValidationResult, parse_record_count, patch_base_offset, validate_batch_crc,
+    CrcValidationResult, crc32c, parse_record_count, patch_base_offset, validate_batch_crc,
 };
 
 // ============================================================================
@@ -38,7 +38,7 @@ fn create_minimal_record_batch(base_offset: i64, num_records: i32) -> BytesMut {
     batch.put_i32(1);
     // magic (1 byte)
     batch.put_i8(2);
-    // crc (4 bytes) - placeholder, will compute later
+    // crc (4 bytes) - placeholder, patched with the real value below
     batch.put_u32(0);
     // attributes (2 bytes)
     batch.put_i16(0);
@@ -56,6 +56,12 @@ fn create_minimal_record_batch(base_offset: i64, num_records: i32) -> BytesMut {
     batch.put_i32(-1);
     // numRecords (4 bytes)
     batch.put_i32(num_records);
+
+    // Write the real CRC (covers bytes 21+). The broker no longer
+    // recomputes CRCs on its own — batches must arrive valid, exactly like
+    // ones produced by a real Kafka client.
+    let crc = crc32c(&batch[21..]);
+    batch[17..21].copy_from_slice(&crc.to_be_bytes());
 
     batch
 }
@@ -92,27 +98,41 @@ fn test_parse_record_count_large_count() {
 
 #[test]
 fn test_parse_record_count_empty_bytes() {
+    // A batch shorter than the 61-byte v2 header is malformed: the count
+    // is 0 (invalid), NOT defaulted to 1 like the old behavior.
     let bytes = Bytes::new();
     let count = parse_record_count(&bytes);
-    assert_eq!(count, 1); // Default when too short
+    assert_eq!(count, 0);
 }
 
 #[test]
 fn test_parse_record_count_too_short() {
-    // Less than 27 bytes (need at least through last_offset_delta)
+    // Shorter than the 61-byte v2 header: malformed, count = 0.
     let bytes = Bytes::from(vec![0u8; 20]);
     let count = parse_record_count(&bytes);
-    assert_eq!(count, 1); // Default when too short
+    assert_eq!(count, 0);
 }
 
 #[test]
 fn test_parse_record_count_exact_27_bytes() {
+    // 27 bytes reaches last_offset_delta but NOT the explicit records_count
+    // field at bytes 57-60 — the batch is still malformed. The old code
+    // trusted last_offset_delta here and returned 5.
     let mut batch = vec![0u8; 27];
-    // Set last_offset_delta at bytes 23-26
     batch[23..27].copy_from_slice(&4i32.to_be_bytes());
     let bytes = Bytes::from(batch);
     let count = parse_record_count(&bytes);
-    assert_eq!(count, 5); // last_offset_delta + 1
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_parse_record_count_mismatch_is_rejected() {
+    // The explicit records_count must agree with last_offset_delta + 1; a
+    // forged delta cannot inflate the count anymore.
+    let batch = create_minimal_record_batch(0, 5);
+    let mut bytes = batch.to_vec();
+    bytes[23..27].copy_from_slice(&100i32.to_be_bytes()); // forged delta
+    assert_eq!(parse_record_count(&bytes), 0);
 }
 
 // ============================================================================
@@ -167,11 +187,14 @@ fn test_patch_base_offset_too_short() {
 }
 
 #[test]
-fn test_patch_base_offset_updates_crc() {
-    // Create a valid batch
+fn test_patch_base_offset_preserves_crc() {
+    // Create a valid batch (helper writes a correct CRC)
     let mut batch = create_minimal_record_batch(0, 1);
+    let crc_before = batch[17..21].to_vec();
+    assert_eq!(validate_batch_crc(&batch), CrcValidationResult::Valid);
 
-    // Patch the offset - this should also update the CRC
+    // Patch the offset. The v2 batch CRC covers bytes 21+ only, so the
+    // stored CRC stays valid — and must not be rewritten.
     patch_base_offset(&mut batch, 99999);
 
     // Verify base offset was patched
@@ -180,9 +203,25 @@ fn test_patch_base_offset_updates_crc() {
     ]);
     assert_eq!(patched_offset, 99999);
 
-    // Verify CRC is valid after patching
-    let result = validate_batch_crc(&batch);
-    assert_eq!(result, CrcValidationResult::Valid);
+    // CRC bytes untouched and still valid after patching
+    assert_eq!(&batch[17..21], &crc_before[..]);
+    assert_eq!(validate_batch_crc(&batch), CrcValidationResult::Valid);
+}
+
+#[test]
+fn test_patch_base_offset_does_not_repair_bad_crc() {
+    // A batch arriving with a corrupt CRC must still be corrupt after
+    // patching: the broker no longer recomputes ("blesses") checksums.
+    let mut batch = create_minimal_record_batch(0, 1);
+    batch[17..21].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+    patch_base_offset(&mut batch, 7);
+
+    assert_eq!(&batch[17..21], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    assert!(matches!(
+        validate_batch_crc(&batch),
+        CrcValidationResult::Invalid { .. }
+    ));
 }
 
 // ============================================================================
@@ -199,7 +238,8 @@ fn test_validate_batch_crc_too_small() {
 
 #[test]
 fn test_validate_batch_crc_valid_after_patch() {
-    // Create batch and patch it (which updates CRC)
+    // A batch that arrives with a valid CRC stays valid after patching
+    // (base offset is outside the checksummed range).
     let mut batch = create_minimal_record_batch(0, 1);
     patch_base_offset(&mut batch, 12345);
 

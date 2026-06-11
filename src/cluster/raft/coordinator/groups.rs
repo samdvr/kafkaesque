@@ -12,7 +12,7 @@ use super::super::domains::{GroupCommand, GroupResponse};
 use super::{RaftCoordinator, current_time_ms};
 
 use crate::cluster::error::{HeartbeatResult, SlateDBError, SlateDBResult};
-use crate::cluster::traits::ConsumerGroupCoordinator;
+use crate::cluster::traits::{ConsumerGroupCoordinator, GroupJoinOutcome, GroupJoinResult};
 
 #[async_trait]
 impl ConsumerGroupCoordinator for RaftCoordinator {
@@ -23,15 +23,55 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         protocol_metadata: &[u8],
         session_timeout_ms: i32,
     ) -> SlateDBResult<(i32, String, bool, String, Vec<String>)> {
+        // Legacy single-protocol entry point: callers that don't negotiate
+        // protocols join under "range". The protocol-aware path is
+        // `join_group_with_protocols`.
+        let protocols = vec![("range".to_string(), protocol_metadata.to_vec())];
+        match self
+            .join_group_with_protocols(
+                group_id,
+                member_id,
+                &protocols,
+                session_timeout_ms,
+                session_timeout_ms,
+            )
+            .await?
+        {
+            GroupJoinOutcome::Joined(result) => {
+                let member_ids: Vec<String> =
+                    result.members.into_iter().map(|(id, _)| id).collect();
+                Ok((
+                    result.generation_id,
+                    result.member_id,
+                    result.is_leader,
+                    result.leader_id,
+                    member_ids,
+                ))
+            }
+            GroupJoinOutcome::InconsistentProtocol => Err(SlateDBError::Storage(format!(
+                "Group {} rejected join: inconsistent group protocol",
+                group_id
+            ))),
+        }
+    }
+
+    async fn join_group_with_protocols(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        protocols: &[(String, Vec<u8>)],
+        session_timeout_ms: i32,
+        rebalance_timeout_ms: i32,
+    ) -> SlateDBResult<GroupJoinOutcome> {
         let command = CoordinationCommand::GroupDomain(GroupCommand::JoinGroup {
             group_id: group_id.to_string(),
             member_id: member_id.to_string(),
             client_id: "".to_string(),
             client_host: "".to_string(),
             protocol_type: "consumer".to_string(),
-            protocols: vec![("range".to_string(), protocol_metadata.to_vec())],
+            protocols: protocols.to_vec(),
             session_timeout_ms,
-            rebalance_timeout_ms: session_timeout_ms,
+            rebalance_timeout_ms,
             timestamp_ms: current_time_ms(),
         });
 
@@ -42,17 +82,41 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
                 leader_id,
                 member_id,
                 members,
-                protocol_name: _,
+                protocol_name,
             }) => {
                 let is_leader = leader_id == member_id;
-                let member_ids: Vec<String> = members.iter().map(|m| m.member_id.clone()).collect();
-                Ok((generation, member_id, is_leader, leader_id, member_ids))
+                Ok(GroupJoinOutcome::Joined(GroupJoinResult {
+                    generation_id: generation,
+                    member_id,
+                    is_leader,
+                    leader_id,
+                    protocol_name,
+                    members: members
+                        .into_iter()
+                        .map(|m| (m.member_id, m.metadata))
+                        .collect(),
+                }))
             }
+            CoordinationResponse::GroupDomainResponse(GroupResponse::InconsistentProtocol {
+                ..
+            }) => Ok(GroupJoinOutcome::InconsistentProtocol),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
             ))),
         }
+    }
+
+    async fn get_group_protocol(&self, group_id: &str) -> SlateDBResult<Option<String>> {
+        let state_machine = self.node.state_machine();
+        let state = state_machine.read().await;
+        let inner_state = state.state().await;
+
+        Ok(inner_state
+            .group_domain
+            .groups
+            .get(group_id)
+            .and_then(|g| g.protocol_name.clone()))
     }
 
     async fn complete_rebalance(
@@ -136,6 +200,25 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
 
         self.node.write(command).await?;
         Ok(())
+    }
+
+    async fn leave_group(&self, group_id: &str, member_id: &str) -> SlateDBResult<bool> {
+        let command = CoordinationCommand::GroupDomain(GroupCommand::LeaveGroup {
+            group_id: group_id.to_string(),
+            member_id: member_id.to_string(),
+        });
+
+        let response = self.node.write(command).await?;
+        match response {
+            CoordinationResponse::GroupDomainResponse(GroupResponse::LeftGroup) => Ok(true),
+            CoordinationResponse::GroupDomainResponse(
+                GroupResponse::UnknownMember { .. } | GroupResponse::GroupNotFound { .. },
+            ) => Ok(false),
+            other => Err(SlateDBError::Storage(format!(
+                "Unexpected response: {:?}",
+                other
+            ))),
+        }
     }
 
     async fn update_member_heartbeat_with_generation(

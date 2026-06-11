@@ -20,8 +20,13 @@ use crate::cluster::raft::{AclOperation, AclResourceType};
 use crate::cluster::traits::ConsumerGroupCoordinator;
 
 /// Handle a list offsets request.
+///
+/// ListOffsets requires `Describe` on each topic (per Kafka):
+/// without this gate any client can probe high watermarks — i.e. message
+/// volume and activity — for every topic in the cluster.
 pub(super) async fn handle_list_offsets(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: ListOffsetsRequestData,
 ) -> ListOffsetsResponseData {
     let mut topics = Vec::with_capacity(request.topics.len());
@@ -36,6 +41,40 @@ pub(super) async fn handle_list_offsets(
                 .map(|p| ListOffsetsPartitionResponse {
                     partition_index: p.partition_index,
                     error_code: KafkaCode::InvalidTopic,
+                    timestamp: -1,
+                    offset: -1,
+                })
+                .collect();
+            topics.push(ListOffsetsTopicResponse {
+                name: topic.name,
+                partitions,
+            });
+            continue;
+        }
+
+        if handler
+            .authorizer
+            .authorize(AuthorizeRequest {
+                principal: &ctx.principal,
+                host: &ctx.client_host,
+                operation: AclOperation::Describe,
+                resource_type: AclResourceType::Topic,
+                resource_name: &topic.name,
+            })
+            .await
+            == AuthorizeResult::Denied
+        {
+            debug!(
+                topic = %topic.name,
+                principal = %ctx.principal,
+                "Denied ListOffsets by ACL"
+            );
+            let partitions: Vec<_> = topic
+                .partitions
+                .iter()
+                .map(|p| ListOffsetsPartitionResponse {
+                    partition_index: p.partition_index,
+                    error_code: KafkaCode::TopicAuthorizationFailed,
                     timestamp: -1,
                     offset: -1,
                 })

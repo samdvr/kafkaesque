@@ -379,7 +379,9 @@ mod tests {
         let payload = b"vote-request";
         let mut tag = keys.sign(FramePurpose::Cluster, payload);
         tag[0] ^= 0xff;
-        let err = keys.verify(FramePurpose::Cluster, &tag, payload).unwrap_err();
+        let err = keys
+            .verify(FramePurpose::Cluster, &tag, payload)
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 

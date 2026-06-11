@@ -52,6 +52,9 @@ const ALL_CONFIG_ENV_VARS: &[&str] = &[
     "SASL_REQUIRED",
     "SASL_USERS_FILE",
     "FAIL_ON_RECOVERY_GAP",
+    "CLUSTER_PROFILE",
+    "RAFT_CLUSTER_SECRET",
+    "RAFT_JOIN_TOKEN",
 ];
 
 /// Helper to run a test with specific environment variables set.
@@ -75,6 +78,12 @@ where
     for key in ALL_CONFIG_ENV_VARS {
         unsafe { env::remove_var(key) };
     }
+
+    // Baseline: run as the development profile so the secure-by-default
+    // gate (RAFT_CLUSTER_SECRET required outside dev) doesn't reject
+    // tests that exercise unrelated config parsing. Tests for the gate
+    // itself override CLUSTER_PROFILE explicitly.
+    unsafe { env::set_var("CLUSTER_PROFILE", "development") };
 
     // Set the test-specific values
     for (key, value) in vars {
@@ -642,6 +651,162 @@ fn test_from_env_validates_config() {
         || {
             let result = ClusterConfig::from_env();
             assert!(result.is_err());
+        },
+    );
+}
+
+// ============================================================================
+// Security Posture Tests (secure-by-default startup gate)
+// ============================================================================
+
+#[test]
+fn test_from_env_default_profile_requires_raft_cluster_secret() {
+    // No CLUSTER_PROFILE => production posture => secret required.
+    with_env_vars(
+        &[
+            ("BROKER_ID", "1"),
+            ("HOST", "localhost"),
+            ("PORT", "9092"),
+            ("CLUSTER_PROFILE", "production"),
+        ],
+        || {
+            let result = ClusterConfig::from_env();
+            assert!(
+                result.is_err(),
+                "production profile without secret must fail"
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("RAFT_CLUSTER_SECRET"),
+                "error should name the missing variable, got: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_from_env_unset_profile_defaults_to_production_gate() {
+    with_env_vars(
+        &[
+            ("BROKER_ID", "1"),
+            ("HOST", "localhost"),
+            ("PORT", "9092"),
+            // Override the test-harness development baseline by clearing it.
+        ],
+        || {
+            unsafe { env::remove_var("CLUSTER_PROFILE") };
+            let result = ClusterConfig::from_env();
+            assert!(
+                result.is_err(),
+                "unset CLUSTER_PROFILE must default to the production gate"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_from_env_production_profile_with_secret_succeeds() {
+    with_env_vars(
+        &[
+            ("BROKER_ID", "1"),
+            ("HOST", "localhost"),
+            ("PORT", "9092"),
+            ("CLUSTER_PROFILE", "production"),
+            ("RAFT_CLUSTER_SECRET", "test-secret-value"),
+        ],
+        || {
+            let config = ClusterConfig::from_env().expect("Should parse config");
+            assert_eq!(config.broker_id, 1);
+        },
+    );
+}
+
+#[test]
+fn test_from_env_production_profile_whitespace_secret_rejected() {
+    // Whitespace-only secrets are normalized to "unset" by the RPC layer,
+    // so they must not satisfy the startup gate either.
+    with_env_vars(
+        &[
+            ("BROKER_ID", "1"),
+            ("HOST", "localhost"),
+            ("PORT", "9092"),
+            ("CLUSTER_PROFILE", "production"),
+            ("RAFT_CLUSTER_SECRET", "   "),
+        ],
+        || {
+            let result = ClusterConfig::from_env();
+            assert!(result.is_err(), "whitespace-only secret must be rejected");
+        },
+    );
+}
+
+#[test]
+fn test_from_env_development_profile_allows_missing_secret() {
+    with_env_vars(
+        &[
+            ("BROKER_ID", "1"),
+            ("HOST", "localhost"),
+            ("PORT", "9092"),
+            ("CLUSTER_PROFILE", "development"),
+        ],
+        || {
+            let config = ClusterConfig::from_env().expect("Should parse config");
+            assert_eq!(config.broker_id, 1);
+        },
+    );
+}
+
+#[test]
+fn test_from_env_invalid_profile_rejected() {
+    with_env_vars(
+        &[
+            ("BROKER_ID", "1"),
+            ("HOST", "localhost"),
+            ("PORT", "9092"),
+            ("CLUSTER_PROFILE", "yolo"),
+        ],
+        || {
+            let result = ClusterConfig::from_env();
+            assert!(result.is_err(), "unknown profile must fail loudly");
+        },
+    );
+}
+
+#[test]
+fn test_from_env_sasl_required_without_enabled_rejected() {
+    with_env_vars(
+        &[
+            ("BROKER_ID", "1"),
+            ("HOST", "localhost"),
+            ("PORT", "9092"),
+            ("SASL_REQUIRED", "true"),
+        ],
+        || {
+            let result = ClusterConfig::from_env();
+            assert!(
+                result.is_err(),
+                "SASL_REQUIRED without SASL_ENABLED must fail validation"
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("sasl_required"), "got: {err}");
+        },
+    );
+}
+
+#[test]
+fn test_from_env_sasl_required_with_enabled_succeeds() {
+    with_env_vars(
+        &[
+            ("BROKER_ID", "1"),
+            ("HOST", "localhost"),
+            ("PORT", "9092"),
+            ("SASL_ENABLED", "true"),
+            ("SASL_REQUIRED", "true"),
+        ],
+        || {
+            let config = ClusterConfig::from_env().expect("Should parse config");
+            assert!(config.sasl_enabled);
+            assert!(config.sasl_required);
         },
     );
 }

@@ -75,10 +75,42 @@ fn compute_crc32c(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Atomic port counter so each test's Raft RPC listener binds a unique port.
+static RAFT_PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(21000);
+
+/// Build an isolated `ClusterConfig` for an in-process test handler.
+///
+/// Two pieces of cross-test isolation are required:
+/// - `object_store_path` must be unique because the Raft WAL and snapshot
+///   directories are derived from it on the *local* filesystem (the
+///   in-memory object store does not isolate them). Reusing a path makes
+///   every test after the first fail `initialize_cluster` with "not
+///   allowed to initialize due to current raft state".
+/// - `raft_listen_addr` must be unique because tests run concurrently in
+///   one process and each handler binds a real TCP listener.
+///
+/// Also enables `RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE`: the production guard
+/// against two fresh peerless brokers racing to bootstrap is irrelevant
+/// here since every test uses an isolated store.
+fn isolated_test_config(broker_id: i32) -> ClusterConfig {
+    // SAFETY: setting a process-global env var; all tests in this binary
+    // want the same value, so concurrent writers are not a hazard.
+    unsafe { std::env::set_var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE", "true") };
+
+    let tmp = tempfile::tempdir().expect("create test temp dir");
+    let root = tmp.keep();
+    let raft_port = RAFT_PORT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let mut config = ClusterConfig::default();
+    config.broker_id = broker_id;
+    config.object_store_path = root.to_string_lossy().into_owned();
+    config.raft_listen_addr = format!("127.0.0.1:{}", raft_port);
+    config
+}
+
 /// Create a test handler with in-memory storage.
 async fn create_test_handler() -> SlateDBClusterHandler {
-    let mut config = ClusterConfig::default();
-    config.broker_id = 1;
+    let mut config = isolated_test_config(1);
     config.auto_create_topics = true;
 
     let object_store = Arc::new(InMemory::new());
@@ -182,8 +214,7 @@ async fn test_metadata_request_invalid_topic_name() {
 
 #[tokio::test]
 async fn test_metadata_auto_create_disabled() {
-    let mut config = ClusterConfig::default();
-    config.broker_id = 2;
+    let mut config = isolated_test_config(2);
     config.auto_create_topics = false;
 
     let object_store = Arc::new(InMemory::new());
@@ -211,8 +242,7 @@ async fn test_metadata_returns_advertised_host_not_bind_host() {
     // This test ensures that metadata responses return the advertised_host
     // (routable address for clients) not the bind host (e.g., 0.0.0.0).
     // This is critical for consumers to connect back to the broker.
-    let mut config = ClusterConfig::default();
-    config.broker_id = 5;
+    let mut config = isolated_test_config(5);
     config.host = "0.0.0.0".to_string(); // Bind to all interfaces
     config.advertised_host = "192.168.1.50".to_string(); // But advertise specific IP
 
@@ -330,8 +360,7 @@ async fn test_metadata_isr_nodes_contains_leader_to_prevent_not_leader_error() {
 #[tokio::test]
 async fn test_find_coordinator_returns_advertised_host() {
     // FindCoordinator must also return the advertised_host for consumer groups
-    let mut config = ClusterConfig::default();
-    config.broker_id = 6;
+    let mut config = isolated_test_config(6);
     config.host = "0.0.0.0".to_string();
     config.advertised_host = "10.0.0.100".to_string();
 
@@ -1600,11 +1629,13 @@ async fn test_describe_groups() {
     let response = handler.handle_describe_groups(&ctx, request).await;
 
     assert_eq!(response.groups.len(), 1);
-    // Non-existent group should return error or empty state
+    // Kafka semantics: a non-existent group is reported as "Dead" with no
+    // error (or with an explicit error code).
     assert!(
         response.groups[0].error_code != KafkaCode::None
-            || response.groups[0].group_state.is_empty()
+            || response.groups[0].group_state == "Dead"
     );
+    assert!(response.groups[0].members.is_empty());
 }
 
 #[tokio::test]

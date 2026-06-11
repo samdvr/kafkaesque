@@ -34,7 +34,6 @@ use std::time::{Duration, Instant};
 use bytes::{BufMut, Bytes, BytesMut};
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
-use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 

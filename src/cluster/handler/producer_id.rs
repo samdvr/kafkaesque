@@ -1,19 +1,42 @@
 //! Producer ID initialization request handling.
 
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::error::KafkaCode;
-use crate::server::request::InitProducerIdRequestData;
+use crate::server::RequestContext;
+use crate::server::request::{ApiKey, InitProducerIdRequestData};
 use crate::server::response::InitProducerIdResponseData;
 
 use super::SlateDBClusterHandler;
 use crate::cluster::traits::ProducerCoordinator;
 
 /// Handle an init producer ID request.
+///
+/// Producer-id allocation consumes a global counter, so it is gated on
+/// `IdempotentWrite` against the cluster resource (per Kafka) via the
+/// `cluster_operation_for_api` table. Without this gate any unauthenticated
+/// client could exhaust or churn the producer-id space.
 pub(super) async fn handle_init_producer_id(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: InitProducerIdRequestData,
 ) -> InitProducerIdResponseData {
+    if !handler
+        .authorize_cluster_api(ctx, ApiKey::InitProducerId)
+        .await
+    {
+        debug!(
+            principal = %ctx.principal,
+            "Denied InitProducerId by ACL (cluster IdempotentWrite)"
+        );
+        return InitProducerIdResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::ClusterAuthorizationFailed,
+            producer_id: -1,
+            producer_epoch: -1,
+        };
+    }
+
     // Use the coordinator's init_producer_id which handles:
     // - New producers: assigns new ID with epoch 0
     // - Recovering transactional producers: bumps epoch

@@ -16,10 +16,7 @@ use super::error::{SlateDBError, SlateDBResult};
 /// prefix so two Kafkaesque clusters pointed at the same bucket/path can't
 /// interleave SlateDB files. When `cluster_id` is empty we keep
 /// the legacy unprefixed layout for backwards compatibility but warn loudly.
-fn wrap_with_cluster_prefix(
-    store: Arc<dyn ObjectStore>,
-    cluster_id: &str,
-) -> Arc<dyn ObjectStore> {
+fn wrap_with_cluster_prefix(store: Arc<dyn ObjectStore>, cluster_id: &str) -> Arc<dyn ObjectStore> {
     if cluster_id.is_empty() {
         warn!(
             "cluster_id is empty; object-store layout is unscoped. Two clusters \
@@ -28,7 +25,10 @@ fn wrap_with_cluster_prefix(
         );
         return store;
     }
-    info!(cluster_id, "Namespacing object store under cluster_id prefix");
+    info!(
+        cluster_id,
+        "Namespacing object store under cluster_id prefix"
+    );
     Arc::new(PrefixStore::new(store, cluster_id.to_string()))
 }
 

@@ -350,11 +350,7 @@ impl PartitionStore {
         self.append_batch_inner(records, true).await
     }
 
-    async fn append_batch_inner(
-        &self,
-        records: &Bytes,
-        durable: bool,
-    ) -> SlateDBResult<i64> {
+    async fn append_batch_inner(&self, records: &Bytes, durable: bool) -> SlateDBResult<i64> {
         use super::keys::{LEADER_EPOCH_KEY, decode_leader_epoch};
 
         // Check zombie mode BEFORE acquiring write lock
@@ -584,9 +580,7 @@ impl PartitionStore {
                     }
                 }
 
-                if idempotent_dup_offset.is_none()
-                    && producer_info.first_sequence != expected_seq
-                {
+                if idempotent_dup_offset.is_none() && producer_info.first_sequence != expected_seq {
                     warn!(
                         topic = %self.topic,
                         partition = self.partition,
@@ -632,7 +626,9 @@ impl PartitionStore {
         // producer; otherwise an OOM-kill or rolling restart inside the WAL
         // flush window silently loses already-acknowledged data.
         let write_options = if durable {
-            WriteOptions { await_durable: true }
+            WriteOptions {
+                await_durable: true,
+            }
         } else {
             FAST_WRITE_OPTIONS
         };
@@ -646,9 +642,7 @@ impl PartitionStore {
         let pending_producer_state = parse_producer_info(records)
             .filter(|info| info.is_idempotent())
             .map(|info| {
-                let last_sequence = info
-                    .last_sequence()
-                    .unwrap_or(info.first_sequence);
+                let last_sequence = info.last_sequence().unwrap_or(info.first_sequence);
                 let key = encode_producer_state_key(info.producer_id);
                 let value = encode_producer_state_value(last_sequence, info.producer_epoch);
                 (info, last_sequence, key, value)
@@ -1008,7 +1002,7 @@ impl PartitionStore {
         use std::collections::VecDeque;
 
         let start = std::time::Instant::now();
-        let window_cap = self.batch_index_max_size as usize;
+        let window_cap = self.batch_index_max_size;
         if window_cap == 0 {
             return;
         }
@@ -1419,150 +1413,149 @@ impl PartitionStoreBuilder {
                 .build()
                 .await?;
 
-                // ==================================================================
-                // FORMAT VERSION: write on first open; reject newer-than-known
-                // ==================================================================
-                // Future migrations branch on this value. Writing it at the first
-                // open of a fresh partition means we never need to forensically
-                // guess "is this v0 or v1?" — a missing key uniquely identifies
-                // pre-versioning partitions and is treated as v1 (the current).
-                match db.get(FORMAT_VERSION_KEY).await? {
-                    Some(bytes) if bytes.len() >= 4 => {
-                        let stored = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                        if stored > CURRENT_FORMAT_VERSION {
-                            error!(
-                                stored_format_version = stored,
-                                supported_format_version = CURRENT_FORMAT_VERSION,
-                                "Partition was written by a newer broker; refusing to open"
-                            );
-                            return Err(slatedb::Error::invalid(format!(
-                                "Partition format version {} is newer than supported {}",
-                                stored, CURRENT_FORMAT_VERSION
-                            )));
-                        }
-                    }
-                    Some(_) | None => {
-                        db.put_with_options(
-                            FORMAT_VERSION_KEY,
-                            &CURRENT_FORMAT_VERSION.to_be_bytes(),
-                            &PutOptions::default(),
-                            &WriteOptions { await_durable: true },
-                        )
-                        .await?;
-                    }
-                }
-
-                // ==================================================================
-                // EPOCH-BASED FENCING: Validate and store leader epoch
-                // ==================================================================
-                // This prevents TOCTOU races where we might write to a partition
-                // that another broker has already acquired.
-                let stored_epoch = match db.get(LEADER_EPOCH_KEY).await? {
-                    Some(bytes) => decode_leader_epoch(&bytes).unwrap_or(0),
-                    None => 0,
-                };
-
-                // If we have a non-zero expected epoch, validate it
-                if expected_epoch > 0 {
-                    if stored_epoch > expected_epoch {
-                        // Another broker has already acquired this partition with
-                        // a higher epoch. We must not proceed.
+            // ==================================================================
+            // FORMAT VERSION: write on first open; reject newer-than-known
+            // ==================================================================
+            // Future migrations branch on this value. Writing it at the first
+            // open of a fresh partition means we never need to forensically
+            // guess "is this v0 or v1?" — a missing key uniquely identifies
+            // pre-versioning partitions and is treated as v1 (the current).
+            match db.get(FORMAT_VERSION_KEY).await? {
+                Some(bytes) if bytes.len() >= 4 => {
+                    let stored = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    if stored > CURRENT_FORMAT_VERSION {
                         error!(
-                            expected_epoch,
-                            stored_epoch,
-                            "EPOCH FENCING: Stored epoch is higher than expected - another broker owns this partition"
+                            stored_format_version = stored,
+                            supported_format_version = CURRENT_FORMAT_VERSION,
+                            "Partition was written by a newer broker; refusing to open"
                         );
                         return Err(slatedb::Error::invalid(format!(
-                            "Epoch mismatch: expected {}, found {}",
-                            expected_epoch, stored_epoch
+                            "Partition format version {} is newer than supported {}",
+                            stored, CURRENT_FORMAT_VERSION
                         )));
                     }
-
-                    // Store our epoch to claim ownership
-                    // This must be durable before we proceed with any writes
+                }
+                Some(_) | None => {
                     db.put_with_options(
-                        LEADER_EPOCH_KEY,
-                        &encode_leader_epoch(expected_epoch),
+                        FORMAT_VERSION_KEY,
+                        &CURRENT_FORMAT_VERSION.to_be_bytes(),
                         &PutOptions::default(),
-                        &WriteOptions { await_durable: true }, // MUST be durable
+                        &WriteOptions {
+                            await_durable: true,
+                        },
                     )
                     .await?;
+                }
+            }
 
-                    info!(
+            // ==================================================================
+            // EPOCH-BASED FENCING: Validate and store leader epoch
+            // ==================================================================
+            // This prevents TOCTOU races where we might write to a partition
+            // that another broker has already acquired.
+            let stored_epoch = match db.get(LEADER_EPOCH_KEY).await? {
+                Some(bytes) => decode_leader_epoch(&bytes).unwrap_or(0),
+                None => 0,
+            };
+
+            // If we have a non-zero expected epoch, validate it
+            if expected_epoch > 0 {
+                if stored_epoch > expected_epoch {
+                    // Another broker has already acquired this partition with
+                    // a higher epoch. We must not proceed.
+                    error!(
                         expected_epoch,
                         stored_epoch,
-                        "Epoch fencing: Stored new epoch to SlateDB"
+                        "EPOCH FENCING: Stored epoch is higher than expected - another broker owns this partition"
                     );
+                    return Err(slatedb::Error::invalid(format!(
+                        "Epoch mismatch: expected {}, found {}",
+                        expected_epoch, stored_epoch
+                    )));
                 }
 
-                // Use the expected epoch if provided, otherwise use stored epoch
-                let final_epoch = if expected_epoch > 0 {
-                    expected_epoch
-                } else {
-                    stored_epoch
-                };
+                // Store our epoch to claim ownership
+                // This must be durable before we proceed with any writes
+                db.put_with_options(
+                    LEADER_EPOCH_KEY,
+                    &encode_leader_epoch(expected_epoch),
+                    &PutOptions::default(),
+                    &WriteOptions {
+                        await_durable: true,
+                    }, // MUST be durable
+                )
+                .await?;
 
-                // Load persisted high watermark from DB
-                let persisted_hwm = match db.get(HIGH_WATERMARK_KEY).await? {
-                    Some(bytes) => {
-                        if bytes.len() >= 8 {
-                            // Use expect() with descriptive message instead of unwrap().
-                            // The length check above guarantees we have 8 bytes.
-                            i64::from_be_bytes(
-                                bytes[..8]
-                                    .try_into()
-                                    .expect("slice of exactly 8 bytes should convert to [u8; 8]"),
-                            )
-                        } else {
-                            0
-                        }
+                info!(
+                    expected_epoch,
+                    stored_epoch, "Epoch fencing: Stored new epoch to SlateDB"
+                );
+            }
+
+            // Use the expected epoch if provided, otherwise use stored epoch
+            let final_epoch = if expected_epoch > 0 {
+                expected_epoch
+            } else {
+                stored_epoch
+            };
+
+            // Load persisted high watermark from DB
+            let persisted_hwm = match db.get(HIGH_WATERMARK_KEY).await? {
+                Some(bytes) => {
+                    if bytes.len() >= 8 {
+                        // Use expect() with descriptive message instead of unwrap().
+                        // The length check above guarantees we have 8 bytes.
+                        i64::from_be_bytes(
+                            bytes[..8]
+                                .try_into()
+                                .expect("slice of exactly 8 bytes should convert to [u8; 8]"),
+                        )
+                    } else {
+                        0
                     }
-                    None => 0,
-                };
-
-                // Scan for highest record to recover from crash
-                let recovered_hwm =
-                    recover_hwm_from_records(&db, persisted_hwm, fail_on_gap)
-                        .await?;
-
-                // If we recovered a higher HWM, persist it
-                if recovered_hwm > persisted_hwm {
-                    warn!(
-                        persisted_hwm,
-                        recovered_hwm, "Recovered higher HWM from record scan - persisting"
-                    );
-                    db.put_with_options(
-                        HIGH_WATERMARK_KEY,
-                        &recovered_hwm.to_be_bytes(),
-                        &PutOptions::default(),
-                        &FAST_WRITE_OPTIONS,
-                    )
-                    .await?;
                 }
+                None => 0,
+            };
 
-                // Load persisted producer states for idempotency
-                let producer_states = load_producer_states(&db).await?;
+            // Scan for highest record to recover from crash
+            let recovered_hwm = recover_hwm_from_records(&db, persisted_hwm, fail_on_gap).await?;
 
-                Ok::<_, slatedb::Error>((db, recovered_hwm, producer_states, final_epoch))
+            // If we recovered a higher HWM, persist it
+            if recovered_hwm > persisted_hwm {
+                warn!(
+                    persisted_hwm,
+                    recovered_hwm, "Recovered higher HWM from record scan - persisting"
+                );
+                db.put_with_options(
+                    HIGH_WATERMARK_KEY,
+                    &recovered_hwm.to_be_bytes(),
+                    &PutOptions::default(),
+                    &FAST_WRITE_OPTIONS,
+                )
+                .await?;
+            }
+
+            // Load persisted producer states for idempotency
+            let producer_states = load_producer_states(&db).await?;
+
+            Ok::<_, slatedb::Error>((db, recovered_hwm, producer_states, final_epoch))
         };
 
-        let (db, hwm, persisted_states, validated_epoch) = open_future
-            .await
-            .map_err(|e| {
-                // Convert slatedb::Error to SlateDBError, checking for epoch mismatch
-                let err_str = e.to_string();
-                if err_str.contains("Epoch mismatch") {
-                    // Parse out the epochs from the error message
-                    SlateDBError::EpochMismatch {
-                        topic: topic_for_epoch_error.clone(),
-                        partition,
-                        expected_epoch: self.leader_epoch,
-                        stored_epoch: 0, // We don't have the exact stored value here
-                    }
-                } else {
-                    SlateDBError::from(e)
+        let (db, hwm, persisted_states, validated_epoch) = open_future.await.map_err(|e| {
+            // Convert slatedb::Error to SlateDBError, checking for epoch mismatch
+            let err_str = e.to_string();
+            if err_str.contains("Epoch mismatch") {
+                // Parse out the epochs from the error message
+                SlateDBError::EpochMismatch {
+                    topic: topic_for_epoch_error.clone(),
+                    partition,
+                    expected_epoch: self.leader_epoch,
+                    stored_epoch: 0, // We don't have the exact stored value here
                 }
-            })?;
+            } else {
+                SlateDBError::from(e)
+            }
+        })?;
 
         if !persisted_states.is_empty() {
             info!(

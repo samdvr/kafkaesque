@@ -15,16 +15,25 @@
 use tracing::{debug, error, warn};
 
 use crate::error::KafkaCode;
+use crate::server::RequestContext;
 use crate::server::request::MetadataRequestData;
 use crate::server::response::{BrokerData, MetadataResponseData, TopicMetadata};
 
 use super::SlateDBClusterHandler;
 use crate::cluster::coordinator::validate_topic_name;
+use crate::cluster::raft::AclOperation;
 use crate::cluster::traits::PartitionCoordinator;
 
 /// Handle a metadata request.
+///
+/// Authorization follows real Kafka semantics: each topic requires
+/// `Describe`. Explicitly named topics the principal cannot describe get a
+/// `TopicAuthorizationFailed` entry; in the list-all case unauthorized
+/// topics are silently filtered so the response doesn't leak topic names.
+/// Auto-creation additionally requires `Create` on the topic.
 pub(super) async fn handle_metadata(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: MetadataRequestData,
 ) -> MetadataResponseData {
     let topics: Vec<TopicMetadata> = match request.topics {
@@ -37,6 +46,27 @@ pub(super) async fn handle_metadata(
                     debug!(topic = %name, "Invalid topic name in metadata request");
                     result.push(TopicMetadata {
                         error_code: KafkaCode::InvalidTopic,
+                        name,
+                        is_internal: false,
+                        partitions: vec![],
+                    });
+                    continue;
+                }
+
+                // Metadata for a named topic requires Describe on it. Check
+                // before existence so a denied principal cannot probe which
+                // topics exist (matches Kafka).
+                if !handler
+                    .topic_authorized(ctx, AclOperation::Describe, &name)
+                    .await
+                {
+                    debug!(
+                        topic = %name,
+                        principal = %ctx.principal,
+                        "Denied Metadata by ACL"
+                    );
+                    result.push(TopicMetadata {
+                        error_code: KafkaCode::TopicAuthorizationFailed,
                         name,
                         is_internal: false,
                         partitions: vec![],
@@ -57,6 +87,27 @@ pub(super) async fn handle_metadata(
                     // Topic exists, return its metadata
                     result.push(handler.build_topic_metadata(&name).await);
                 } else if handler.auto_create_topics {
+                    // Auto-creation is a write operation: require Create on
+                    // the topic. Without this gate any principal with
+                    // Describe could create topics via Metadata requests.
+                    if !handler
+                        .topic_authorized(ctx, AclOperation::Create, &name)
+                        .await
+                    {
+                        debug!(
+                            topic = %name,
+                            principal = %ctx.principal,
+                            "Denied Metadata auto-create by ACL"
+                        );
+                        result.push(TopicMetadata {
+                            error_code: KafkaCode::TopicAuthorizationFailed,
+                            name,
+                            is_internal: false,
+                            partitions: vec![],
+                        });
+                        continue;
+                    }
+
                     // A-2: Topic doesn't exist but auto-create is enabled
                     // Log a warning to help detect typos (e.g., "orders-events" vs "order-events")
                     warn!(
@@ -93,7 +144,10 @@ pub(super) async fn handle_metadata(
             result
         }
         None => {
-            // Return all known topics
+            // Return all known topics the principal may Describe.
+            // Unauthorized topics are filtered rather than erred so a
+            // list-all request doesn't leak the names of restricted topics
+            // (matches Kafka).
             let topic_names = match handler.coordinator.get_topics().await {
                 Ok(names) => names,
                 Err(e) => {
@@ -104,6 +158,12 @@ pub(super) async fn handle_metadata(
             let mut result = Vec::with_capacity(topic_names.len());
 
             for name in topic_names {
+                if !handler
+                    .topic_authorized(ctx, AclOperation::Describe, &name)
+                    .await
+                {
+                    continue;
+                }
                 result.push(handler.build_topic_metadata(&name).await);
             }
 

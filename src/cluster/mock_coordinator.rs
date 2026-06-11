@@ -898,20 +898,30 @@ impl PartitionTransferCoordinator for MockCoordinator {
         Ok((successful, failed))
     }
 
-    async fn mark_broker_failed(&self, broker_id: i32, _reason: &str) -> SlateDBResult<usize> {
-        // Count partitions owned by this broker
-        let owners = self.partition_owners.read().await;
-        let affected_count = owners
+    async fn mark_broker_failed(
+        &self,
+        broker_id: i32,
+        _reason: &str,
+    ) -> SlateDBResult<Vec<(String, i32)>> {
+        // Release (and collect) partitions owned by this broker, mirroring
+        // the atomic fence+release semantics of the Raft implementation.
+        let mut owners = self.partition_owners.write().await;
+        let now = Instant::now();
+        let released: Vec<(String, i32)> = owners
             .iter()
-            .filter(|(_, (owner, expiry))| *owner == broker_id && *expiry > Instant::now())
-            .count();
+            .filter(|(_, (owner, expiry))| *owner == broker_id && *expiry > now)
+            .map(|((topic, partition), _)| (topic.clone(), *partition))
+            .collect();
+        for key in &released {
+            owners.remove(key);
+        }
         drop(owners);
 
         // Remove broker from active brokers
         let mut brokers = self.brokers.write().await;
         brokers.remove(&broker_id);
 
-        Ok(affected_count)
+        Ok(released)
     }
 
     async fn get_all_partition_owners(&self) -> HashMap<(String, i32), i32> {

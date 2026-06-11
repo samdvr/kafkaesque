@@ -57,6 +57,10 @@ cleanup() {
 # Trap Ctrl+C and call cleanup
 trap cleanup INT TERM
 
+# The broker refuses to start without RAFT_CLUSTER_SECRET outside the
+# development profile. Local clusters share one secret (override via env).
+export RAFT_CLUSTER_SECRET="${RAFT_CLUSTER_SECRET:-kafkaesque-local-cluster-secret}"
+
 # Define cluster membership
 # All nodes need to know about each other for proper Raft cluster formation
 RAFT_PEER_0="0=127.0.0.1:9093"

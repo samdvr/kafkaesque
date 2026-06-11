@@ -352,9 +352,12 @@ impl SlateDBClusterHandler {
         if let Some(rebalance_coord) = partition_manager.rebalance_coordinator() {
             let rc = rebalance_coord.clone();
             let sm_arc = coordinator.node().state_machine();
-            sm_arc.read().await.set_heartbeat_hook(Arc::new(move |broker_id| {
-                rc.record_heartbeat(broker_id);
-            }));
+            sm_arc
+                .read()
+                .await
+                .set_heartbeat_hook(Arc::new(move |broker_id| {
+                    rc.record_heartbeat(broker_id);
+                }));
         }
 
         // Start background tasks
@@ -379,43 +382,42 @@ impl SlateDBClusterHandler {
             // Bootstrap the ACL state from a file on the leader. Followers
             // pick up the bindings via Raft replication. Idempotent: a
             // restart re-applies the same file (CreateAcls deduplicates).
-            if let Some(path) = config.acl_bootstrap_file.as_ref() {
-                if coordinator.is_leader().await {
-                    match std::fs::read_to_string(path) {
-                        Ok(contents) => {
-                            match serde_json::from_str::<
-                                Vec<crate::cluster::raft::AclBinding>,
-                            >(&contents)
-                            {
-                                Ok(bindings) => {
-                                    let n = bindings.len();
-                                    match coordinator.create_acls(bindings).await {
-                                        Ok(created) => info!(
-                                            file = %path,
-                                            entries = n,
-                                            new_bindings = created,
-                                            "Bootstrapped ACL bindings from file"
-                                        ),
-                                        Err(e) => warn!(
-                                            file = %path,
-                                            error = %e,
-                                            "Failed to apply ACL bootstrap"
-                                        ),
-                                    }
+            if let Some(path) = config.acl_bootstrap_file.as_ref()
+                && coordinator.is_leader().await
+            {
+                match std::fs::read_to_string(path) {
+                    Ok(contents) => {
+                        match serde_json::from_str::<Vec<crate::cluster::raft::AclBinding>>(
+                            &contents,
+                        ) {
+                            Ok(bindings) => {
+                                let n = bindings.len();
+                                match coordinator.create_acls(bindings).await {
+                                    Ok(created) => info!(
+                                        file = %path,
+                                        entries = n,
+                                        new_bindings = created,
+                                        "Bootstrapped ACL bindings from file"
+                                    ),
+                                    Err(e) => warn!(
+                                        file = %path,
+                                        error = %e,
+                                        "Failed to apply ACL bootstrap"
+                                    ),
                                 }
-                                Err(e) => warn!(
-                                    file = %path,
-                                    error = %e,
-                                    "Failed to parse ACL bootstrap file"
-                                ),
                             }
+                            Err(e) => warn!(
+                                file = %path,
+                                error = %e,
+                                "Failed to parse ACL bootstrap file"
+                            ),
                         }
-                        Err(e) => warn!(
-                            file = %path,
-                            error = %e,
-                            "Failed to read ACL bootstrap file"
-                        ),
                     }
+                    Err(e) => warn!(
+                        file = %path,
+                        error = %e,
+                        "Failed to read ACL bootstrap file"
+                    ),
                 }
             }
             Arc::new(crate::cluster::authorizer::RaftAclAuthorizer::new(
@@ -486,6 +488,54 @@ impl SlateDBClusterHandler {
     pub(crate) fn cached_topic_name(&self, topic: &str) -> Arc<str> {
         self.topic_name_cache
             .get_with(topic.to_string(), || Arc::from(topic))
+    }
+
+    /// Cluster-level ACL gate, driven by the
+    /// `cluster_operation_for_api` table. Returns `true` when the API key
+    /// needs no cluster-level check, or when the principal holds the
+    /// required operation on the `kafka-cluster` resource.
+    pub(crate) async fn authorize_cluster_api(
+        &self,
+        ctx: &RequestContext,
+        api_key: crate::server::request::ApiKey,
+    ) -> bool {
+        use crate::cluster::authorizer::{
+            AuthorizeRequest, AuthorizeResult, CLUSTER_RESOURCE_NAME, cluster_operation_for_api,
+        };
+        let Some(operation) = cluster_operation_for_api(api_key) else {
+            return true;
+        };
+        self.authorizer
+            .authorize(AuthorizeRequest {
+                principal: &ctx.principal,
+                host: &ctx.client_host,
+                operation,
+                resource_type: crate::cluster::raft::AclResourceType::Cluster,
+                resource_name: CLUSTER_RESOURCE_NAME,
+            })
+            .await
+            == AuthorizeResult::Allowed
+    }
+
+    /// Topic-level ACL check. Returns `true` when the principal
+    /// may perform `operation` on `topic`.
+    pub(crate) async fn topic_authorized(
+        &self,
+        ctx: &RequestContext,
+        operation: crate::cluster::raft::AclOperation,
+        topic: &str,
+    ) -> bool {
+        use crate::cluster::authorizer::{AuthorizeRequest, AuthorizeResult};
+        self.authorizer
+            .authorize(AuthorizeRequest {
+                principal: &ctx.principal,
+                host: &ctx.client_host,
+                operation,
+                resource_type: crate::cluster::raft::AclResourceType::Topic,
+                resource_name: topic,
+            })
+            .await
+            == AuthorizeResult::Allowed
     }
 
     /// Build topic metadata response for a single topic.
@@ -568,7 +618,9 @@ impl SlateDBClusterHandler {
         // Time the full per-partition produce path so the
         // pre-existing PRODUCE_DURATION histogram is actually populated.
         let start = std::time::Instant::now();
-        let response = self.produce_to_partition_inner(topic, partition, acks).await;
+        let response = self
+            .produce_to_partition_inner(topic, partition, acks)
+            .await;
         let status = if response.error_code == KafkaCode::None {
             "success"
         } else {
@@ -727,7 +779,9 @@ impl Handler for SlateDBClusterHandler {
         };
         let mechanisms: Vec<String> = provider.supported_mechanisms().to_vec();
         let mech_upper = request.mechanism.to_uppercase();
-        let supported = mechanisms.iter().any(|m| m.eq_ignore_ascii_case(&mech_upper));
+        let supported = mechanisms
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(&mech_upper));
         SaslHandshakeResponseData {
             error_code: if supported {
                 KafkaCode::None
@@ -758,7 +812,10 @@ impl Handler for SlateDBClusterHandler {
         let Some(provider) = &self.sasl_provider else {
             self.sasl_post_auth.insert(
                 ctx.client_addr,
-                SaslPostAuth { principal: None, complete: false },
+                SaslPostAuth {
+                    principal: None,
+                    complete: false,
+                },
             );
             return SaslAuthenticateResponseData {
                 error_code: KafkaCode::SaslAuthenticationFailed,
@@ -767,7 +824,10 @@ impl Handler for SlateDBClusterHandler {
             };
         };
 
-        let mechanism = pick_sasl_mechanism(provider.has_scram_session(ctx.client_addr).await, &request.auth_bytes);
+        let mechanism = pick_sasl_mechanism(
+            provider.has_scram_session(ctx.client_addr).await,
+            &request.auth_bytes,
+        );
         let (ok, principal, response_bytes) = provider
             .authenticate_with_session(ctx.client_addr, mechanism, &request.auth_bytes)
             .await;
@@ -814,13 +874,13 @@ impl Handler for SlateDBClusterHandler {
         self.sasl_post_auth.remove(&client_addr).map(|(_k, v)| v)
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
     async fn handle_metadata(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: MetadataRequestData,
     ) -> MetadataResponseData {
-        metadata::handle_metadata(self, request).await
+        metadata::handle_metadata(self, ctx, request).await
     }
 
     #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id, topic_count = request.topics.len()))]
@@ -841,22 +901,22 @@ impl Handler for SlateDBClusterHandler {
         fetch::handle_fetch(self, ctx, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
     async fn handle_list_offsets(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: ListOffsetsRequestData,
     ) -> ListOffsetsResponseData {
-        offsets::handle_list_offsets(self, request).await
+        offsets::handle_list_offsets(self, ctx, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
     async fn handle_find_coordinator(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: FindCoordinatorRequestData,
     ) -> FindCoordinatorResponseData {
-        groups::handle_find_coordinator(self, request).await
+        groups::handle_find_coordinator(self, ctx, request).await
     }
 
     #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id, group_id = %request.group_id))]
@@ -958,13 +1018,13 @@ impl Handler for SlateDBClusterHandler {
         admin::handle_delete_topics(self, ctx, request).await
     }
 
-    #[tracing::instrument(skip(self, _ctx, request), fields(request_id = %_ctx.request_id))]
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
     async fn handle_init_producer_id(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         request: InitProducerIdRequestData,
     ) -> InitProducerIdResponseData {
-        producer_id::handle_init_producer_id(self, request).await
+        producer_id::handle_init_producer_id(self, ctx, request).await
     }
 }
 
@@ -1491,8 +1551,8 @@ mod tests {
 
     #[test]
     fn test_validate_batch_crc_empty() {
-        use bytes::Bytes;
         use crate::protocol::validate_batch_crc;
+        use bytes::Bytes;
         let empty = Bytes::new();
         let result = validate_batch_crc(&empty);
         assert!(matches!(result, CrcValidationResult::TooSmall));
@@ -1500,8 +1560,8 @@ mod tests {
 
     #[test]
     fn test_validate_batch_crc_garbage() {
-        use bytes::Bytes;
         use crate::protocol::validate_batch_crc;
+        use bytes::Bytes;
         let garbage = Bytes::from_static(b"not a valid kafka batch");
         let result = validate_batch_crc(&garbage);
         // Should not be Valid (either Invalid or TooSmall depending on implementation)
@@ -1510,8 +1570,8 @@ mod tests {
 
     #[test]
     fn test_validate_batch_crc_minimum_size() {
-        use bytes::Bytes;
         use crate::protocol::validate_batch_crc;
+        use bytes::Bytes;
         // 16 bytes is less than the minimum for a valid batch header
         let too_small = Bytes::from(vec![0u8; 16]);
         let result = validate_batch_crc(&too_small);

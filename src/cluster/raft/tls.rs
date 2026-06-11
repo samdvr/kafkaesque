@@ -106,9 +106,7 @@ impl RaftTlsConfig {
         // server validates the *client* identity too.
         let client_verifier = WebPkiClientVerifier::builder(roots.clone())
             .build()
-            .map_err(|e| {
-                SlateDBError::Config(format!("Invalid Raft client verifier: {}", e))
-            })?;
+            .map_err(|e| SlateDBError::Config(format!("Invalid Raft client verifier: {}", e)))?;
         let server_config = ServerConfig::builder()
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(certs.clone(), key.clone_key())
@@ -188,9 +186,8 @@ impl RaftTlsConfig {
 fn load_certs(path: &Path) -> SlateDBResult<Vec<CertificateDer<'static>>> {
     use std::fs::File;
     use std::io::BufReader;
-    let f = File::open(path).map_err(|e| {
-        SlateDBError::Config(format!("Open {}: {}", path.display(), e))
-    })?;
+    let f = File::open(path)
+        .map_err(|e| SlateDBError::Config(format!("Open {}: {}", path.display(), e)))?;
     let mut reader = BufReader::new(f);
     rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
@@ -201,15 +198,12 @@ fn load_certs(path: &Path) -> SlateDBResult<Vec<CertificateDer<'static>>> {
 fn load_private_key(path: &Path) -> SlateDBResult<PrivateKeyDer<'static>> {
     use std::fs::File;
     use std::io::BufReader;
-    let f = File::open(path).map_err(|e| {
-        SlateDBError::Config(format!("Open {}: {}", path.display(), e))
-    })?;
+    let f = File::open(path)
+        .map_err(|e| SlateDBError::Config(format!("Open {}: {}", path.display(), e)))?;
     let mut reader = BufReader::new(f);
     rustls_pemfile::private_key(&mut reader)
         .map_err(|e| SlateDBError::Config(format!("Parse key {}: {}", path.display(), e)))?
-        .ok_or_else(|| {
-            SlateDBError::Config(format!("No private key found in {}", path.display()))
-        })
+        .ok_or_else(|| SlateDBError::Config(format!("No private key found in {}", path.display())))
 }
 
 #[cfg(test)]

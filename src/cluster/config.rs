@@ -589,18 +589,23 @@ pub struct ClusterConfig {
     // --- Fast Failover Configuration ---
     /// Whether fast failover is enabled.
     ///
-    /// When enabled, brokers send heartbeats at a faster rate (default 500ms)
-    /// and failures are detected within ~2.5 seconds instead of waiting for
+    /// When enabled, the Raft leader runs a failure detector over the
+    /// broker heartbeats applied through the state machine and proactively
+    /// transfers partitions away from failed brokers instead of waiting for
     /// the 60-second lease expiration.
     ///
     /// Default: true
     pub fast_failover_enabled: bool,
 
-    /// Interval between fast heartbeats (milliseconds).
+    /// Expected interval between broker heartbeats for failure detection
+    /// (milliseconds).
     ///
-    /// This is the frequency at which brokers send heartbeats for
-    /// fast failure detection. Lower values detect failures faster
-    /// but increase network traffic.
+    /// Heartbeats are produced by the regular broker heartbeat loop, which
+    /// runs every `heartbeat_interval`. If this value is shorter than
+    /// `heartbeat_interval` the failure detector clamps it up to the real
+    /// cadence at startup — expecting heartbeats faster than they are sent
+    /// would mark every healthy broker as failed. To detect failures
+    /// faster, lower `heartbeat_interval` (HEARTBEAT_INTERVAL_SECS).
     ///
     /// Default: 500ms
     pub fast_heartbeat_interval_ms: u64,
@@ -610,7 +615,7 @@ pub struct ClusterConfig {
     /// Suspected state is an intermediate state that helps reduce
     /// false positives from transient network issues.
     ///
-    /// Default: 2 (1 second at 500ms interval)
+    /// Default: 2
     pub failure_suspicion_threshold: u32,
 
     /// Number of missed heartbeats before declaring a broker as failed.
@@ -618,7 +623,7 @@ pub struct ClusterConfig {
     /// After this many missed heartbeats, the broker is considered dead
     /// and its partitions are redistributed.
     ///
-    /// Default: 5 (2.5 seconds at 500ms interval)
+    /// Default: 5
     pub failure_threshold: u32,
 
     // --- Auto-Balancing Configuration ---
@@ -1070,6 +1075,41 @@ impl ClusterConfig {
             ));
         }
 
+        // Fast failover sanity: the detector counts missed heartbeats at the
+        // *actual* send cadence (`heartbeat_interval`, clamped at startup),
+        // so the thresholds must be meaningful at that cadence. A zero
+        // threshold would instantly fail every broker; suspicion must come
+        // before failure for the intermediate state to exist.
+        if self.fast_failover_enabled {
+            if self.fast_heartbeat_interval_ms == 0 {
+                errors.push("fast_heartbeat_interval_ms must be greater than 0".to_string());
+            }
+            if self.failure_threshold == 0 {
+                errors.push("failure_threshold must be at least 1".to_string());
+            }
+            if self.failure_suspicion_threshold > self.failure_threshold {
+                errors.push(format!(
+                    "failure_suspicion_threshold ({}) must not exceed failure_threshold ({})",
+                    self.failure_suspicion_threshold, self.failure_threshold
+                ));
+            }
+            // Detection time at the real heartbeat cadence. If it exceeds
+            // the lease-TTL path, fast failover silently never fires first.
+            let effective_interval = self
+                .heartbeat_interval
+                .max(Duration::from_millis(self.fast_heartbeat_interval_ms));
+            let detection_time = effective_interval * self.failure_threshold;
+            if detection_time >= self.lease_duration {
+                errors.push(format!(
+                    "fast failover detection time ({:?} = max(heartbeat_interval, \
+                     fast_heartbeat_interval_ms) * failure_threshold) must be less than \
+                     lease_duration ({:?}); otherwise lease expiry always wins and fast \
+                     failover never triggers",
+                    detection_time, self.lease_duration
+                ));
+            }
+        }
+
         // Ownership cache TTL should be short for consistency
         if self.ownership_cache_ttl_secs > 10 {
             errors.push(format!(
@@ -1173,9 +1213,7 @@ impl ClusterConfig {
                 "min_lease_ttl_for_write_secs ({}) must be less than lease buffer ({} seconds). \
                  Writes require at least {} seconds of remaining lease. \
                  Increase lease_duration or decrease lease_renewal_interval.",
-                self.min_lease_ttl_for_write_secs,
-                lease_buffer,
-                self.min_lease_ttl_for_write_secs
+                self.min_lease_ttl_for_write_secs, lease_buffer, self.min_lease_ttl_for_write_secs
             ));
         }
 
@@ -1192,6 +1230,18 @@ impl ClusterConfig {
             errors.push(
                 "cluster_id must not be empty when using a remote object-store backend; \
                  two clusters sharing a bucket with the same (or empty) id will corrupt each other"
+                    .to_string(),
+            );
+        }
+
+        // SASL consistency: requiring SASL without enabling the SASL handshake
+        // handlers would reject every client connection. Fail at startup with
+        // an actionable message instead of bricking all clients at runtime.
+        if self.sasl_required && !self.sasl_enabled {
+            errors.push(
+                "sasl_required=true requires sasl_enabled=true: with SASL required but the \
+                 SASL handshake disabled, every client connection would be rejected. \
+                 Set SASL_ENABLED=true (and configure SASL_USERS_FILE) or unset SASL_REQUIRED."
                     .to_string(),
             );
         }
@@ -1613,7 +1663,55 @@ impl ClusterConfig {
             return Err(format!("Configuration validation failed: {}", errors.join("; ")).into());
         }
 
+        Self::validate_env_security_posture()?;
+
         Ok(config)
+    }
+
+    /// Secure-by-default startup gate for environment-driven deployments.
+    ///
+    /// The Raft RPC port accepts cluster-membership changes (`JoinCluster`
+    /// auto-promotes the caller to voter) and arbitrary coordination
+    /// commands, so running it unauthenticated is only acceptable for local
+    /// development. Outside an explicit development profile
+    /// (`CLUSTER_PROFILE=development`/`dev`) startup fails unless
+    /// `RAFT_CLUSTER_SECRET` is set to a non-empty value.
+    ///
+    /// This is checked in `from_env` (the deployed binary's entry point)
+    /// rather than `validate()` because the secret is intentionally not part
+    /// of `ClusterConfig` — it must not appear in debug output or config
+    /// dumps — and programmatic/test construction of configs should not
+    /// require process-global env state.
+    fn validate_env_security_posture() -> Result<(), Box<dyn std::error::Error>> {
+        let profile = match std::env::var("CLUSTER_PROFILE") {
+            Ok(raw) => raw
+                .parse::<ClusterProfile>()
+                .map_err(|e| format!("Invalid CLUSTER_PROFILE: {}", e))?,
+            // No profile declared: assume production. Security gates must
+            // not silently relax because an env var was forgotten.
+            Err(_) => ClusterProfile::Production,
+        };
+
+        if profile == ClusterProfile::Development {
+            return Ok(());
+        }
+
+        // Reuse RaftAuthKeys' normalization so an empty/whitespace-only
+        // secret is treated as unset here exactly as it is by the RPC layer.
+        let auth_keys = crate::cluster::raft::RaftAuthKeys::from_env();
+        if !auth_keys.cluster_secret_configured() {
+            return Err(format!(
+                "RAFT_CLUSTER_SECRET is not set (profile: {}). The Raft control-plane port \
+                 accepts cluster joins and coordination commands, so it must be authenticated \
+                 outside development. Set RAFT_CLUSTER_SECRET to the same strong random value \
+                 on every node, or explicitly opt into an unauthenticated control plane for \
+                 local development with CLUSTER_PROFILE=development.",
+                profile
+            )
+            .into());
+        }
+
+        Ok(())
     }
 }
 
@@ -2406,10 +2504,14 @@ mod tests {
 
     #[test]
     fn test_config_fast_failover_custom_interval() {
+        // failure_threshold of 10 at the default 10s heartbeat cadence means
+        // 100s detection time, so the lease must outlast it for fast
+        // failover to fire before lease expiry.
         let config = ClusterConfig {
             fast_heartbeat_interval_ms: 1000,
             failure_suspicion_threshold: 3,
             failure_threshold: 10,
+            lease_duration: Duration::from_secs(120),
             ..Default::default()
         };
 
@@ -2417,6 +2519,25 @@ mod tests {
         assert_eq!(config.failure_suspicion_threshold, 3);
         assert_eq!(config.failure_threshold, 10);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_fast_failover_detection_slower_than_lease_rejected() {
+        // Same thresholds but with the default 60s lease: detection (100s)
+        // would never beat lease expiry, so validation must reject it.
+        let config = ClusterConfig {
+            fast_heartbeat_interval_ms: 1000,
+            failure_suspicion_threshold: 3,
+            failure_threshold: 10,
+            ..Default::default()
+        };
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("detection time")),
+            "expected a detection-time validation error, got: {:?}",
+            errors
+        );
     }
 
     // ========================================================================
@@ -2602,6 +2723,24 @@ mod tests {
             Some("/etc/kafka/users.txt".to_string())
         );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_sasl_required_without_enabled_fails_validation() {
+        // SASL_REQUIRED without SASL_ENABLED would reject every client
+        // connection at runtime; validation must catch it at startup.
+        let config = ClusterConfig {
+            sasl_enabled: false,
+            sasl_required: true,
+            ..Default::default()
+        };
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("sasl_required")),
+            "expected a sasl_required validation error, got: {:?}",
+            errors
+        );
     }
 
     #[test]

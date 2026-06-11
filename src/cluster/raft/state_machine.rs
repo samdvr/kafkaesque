@@ -105,18 +105,14 @@ impl CoordinationStateMachine {
                 // Capture the broker_id before `cmd` is moved into apply,
                 // so the heartbeat hook below can pass it to the local
                 // failure detector.
-                let heartbeat_broker = if let super::domains::BrokerCommand::Heartbeat {
-                    broker_id,
-                    ..
-                } = &cmd
-                {
-                    Some(*broker_id)
-                } else {
-                    None
-                };
-                let response = CoordinationResponse::BrokerDomainResponse(
-                    state.broker_domain.apply(cmd),
-                );
+                let heartbeat_broker =
+                    if let super::domains::BrokerCommand::Heartbeat { broker_id, .. } = &cmd {
+                        Some(*broker_id)
+                    } else {
+                        None
+                    };
+                let response =
+                    CoordinationResponse::BrokerDomainResponse(state.broker_domain.apply(cmd));
                 if let Some(broker_id) = heartbeat_broker
                     && let Some(hook) = self.heartbeat_hook.get()
                 {
@@ -126,6 +122,26 @@ impl CoordinationStateMachine {
             }
 
             CoordinationCommand::PartitionDomain(cmd) => {
+                // Cross-domain fencing gate: a broker that is not Active
+                // (fenced after being marked failed, or shutting down) must
+                // not be able to acquire partitions or renew leases. Without
+                // this check a fenced-but-still-running broker could win back
+                // ownership it just lost and resume writing (split-brain).
+                let requesting_broker = match &cmd {
+                    super::domains::PartitionCommand::AcquirePartition { broker_id, .. }
+                    | super::domains::PartitionCommand::RenewLease { broker_id, .. } => {
+                        Some(*broker_id)
+                    }
+                    _ => None,
+                };
+                if let Some(broker_id) = requesting_broker
+                    && let Some(broker) = state.broker_domain.brokers.get(&broker_id)
+                    && broker.status != super::domains::BrokerStatus::Active
+                {
+                    return CoordinationResponse::PartitionDomainResponse(
+                        super::domains::PartitionResponse::BrokerNotActive { broker_id },
+                    );
+                }
                 CoordinationResponse::PartitionDomainResponse(state.partition_domain.apply(cmd))
             }
 
@@ -138,29 +154,17 @@ impl CoordinationStateMachine {
             }
 
             CoordinationCommand::TransferDomain(cmd) => {
-                // Transfer domain requires cross-domain access
-                // Clone broker states to avoid borrow checker issues
-                let broker_states = state.broker_domain.brokers.clone();
-
-                let is_broker_active = |broker_id: i32| {
-                    broker_states
-                        .get(&broker_id)
-                        .map(|b| b.status == super::domains::BrokerStatus::Active)
-                        .unwrap_or(false)
-                };
-
-                let broker_status =
-                    |broker_id: i32| broker_states.get(&broker_id).map(|b| b.status.clone());
-
-                // Temporarily take ownership to work around borrow checker
-                let mut transfer_domain = std::mem::take(&mut state.transfer_domain);
-                let response = transfer_domain.apply_with_context(
+                // Transfer domain requires cross-domain access: it reads and
+                // *mutates* broker state (fencing on MarkBrokerFailed) and
+                // partition state (ownership transfers / releases) in the
+                // same applied command. The three borrows are of disjoint
+                // fields, so no cloning is needed.
+                let state = &mut *state;
+                let response = state.transfer_domain.apply_with_context(
                     cmd,
-                    is_broker_active,
+                    &mut state.broker_domain.brokers,
                     &mut state.partition_domain.partitions,
-                    broker_status,
                 );
-                state.transfer_domain = transfer_domain;
 
                 CoordinationResponse::TransferDomainResponse(response)
             }

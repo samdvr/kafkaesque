@@ -4,7 +4,7 @@ use nom::{
     IResult,
     bytes::complete::take,
     multi::many_m_n,
-    number::complete::{be_i16, be_i32, be_u16},
+    number::complete::{be_i16, be_i32},
 };
 use nombytes::NomBytes;
 
@@ -34,9 +34,23 @@ pub fn bytes_to_string_opt(
     }
 }
 
+/// Parse a Kafka `STRING`: signed INT16 length followed by that many bytes.
+///
+/// Per the Kafka protocol spec the length is a *signed* INT16. A negative
+/// length (including -1, which is only legal for NULLABLE_STRING) is invalid
+/// for a non-nullable STRING and is rejected. Reading the length as unsigned
+/// would misinterpret 0xFFFF as 65535, mis-aligning every subsequent field.
 pub fn parse_string(s: NomBytes) -> IResult<NomBytes, Bytes> {
-    let (s, length) = be_u16(s)?;
-    let (s, string) = take(length)(s)?;
+    let (s, length) = be_i16(s)?;
+
+    if length < 0 {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            s,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+
+    let (s, string) = take(length as usize)(s)?;
     Ok((s, string.into_bytes()))
 }
 
@@ -214,6 +228,32 @@ mod tests {
 
         assert_eq!(parsed, Bytes::from("hello"));
         assert_eq!(remaining.into_bytes(), Bytes::from("extra"));
+    }
+
+    #[test]
+    fn test_parse_string_rejects_negative_length() {
+        // 0xFFFF is -1 as INT16: legal only for NULLABLE_STRING, never STRING.
+        // A u16 reading would treat this as length 65535.
+        let mut data = Vec::new();
+        data.extend_from_slice(&(-1i16).to_be_bytes());
+        data.extend_from_slice(b"payload");
+
+        let input = NomBytes::new(Bytes::from(data));
+        assert!(parse_string(input).is_err());
+
+        // Any other negative length is equally invalid.
+        let mut data = Vec::new();
+        data.extend_from_slice(&(-2i16).to_be_bytes());
+        let input = NomBytes::new(Bytes::from(data));
+        assert!(parse_string(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_string_empty() {
+        let data = 0i16.to_be_bytes().to_vec();
+        let input = NomBytes::new(Bytes::from(data));
+        let (_, parsed) = parse_string(input).unwrap();
+        assert_eq!(parsed, Bytes::new());
     }
 
     #[test]

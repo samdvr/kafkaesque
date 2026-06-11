@@ -275,9 +275,7 @@ async fn dispatch_request_common<H: Handler>(
     // API keys (ApiVersions, SaslHandshake, SaslAuthenticate). Without this
     // check the dispatch table happily answers Produce/Fetch/Admin even
     // before any handshake has happened.
-    if auth_gate.required
-        && !auth_gate.authenticated
-        && !AuthGate::allows_pre_auth(header.api_key)
+    if auth_gate.required && !auth_gate.authenticated && !AuthGate::allows_pre_auth(header.api_key)
     {
         tracing::warn!(
             client = %client_addr,
@@ -827,9 +825,19 @@ impl ClientConnection {
     /// Dispatch a request to the appropriate handler.
     ///
     /// Tracks SASL authentication failures for rate limiting via AuthRateLimited trait.
-    async fn dispatch_request<H: Handler>(&mut self, handler: &Arc<H>, data: Bytes) -> Result<Vec<u8>> {
-        let (result, auth_result) =
-            dispatch_request_common(handler.as_ref(), data, self.addr, "plain", &mut self.auth_gate).await;
+    async fn dispatch_request<H: Handler>(
+        &mut self,
+        handler: &Arc<H>,
+        data: Bytes,
+    ) -> Result<Vec<u8>> {
+        let (result, auth_result) = dispatch_request_common(
+            handler.as_ref(),
+            data,
+            self.addr,
+            "plain",
+            &mut self.auth_gate,
+        )
+        .await;
 
         // Track auth result for rate limiting (unified via trait)
         self.record_auth_result(auth_result).await;
@@ -1090,9 +1098,19 @@ impl TlsClientConnection {
     /// Dispatch a request to the appropriate handler.
     ///
     /// Tracks SASL authentication failures for rate limiting via AuthRateLimited trait.
-    async fn dispatch_request<H: Handler>(&mut self, handler: &Arc<H>, data: Bytes) -> Result<Vec<u8>> {
-        let (result, auth_result) =
-            dispatch_request_common(handler.as_ref(), data, self.addr, "tls", &mut self.auth_gate).await;
+    async fn dispatch_request<H: Handler>(
+        &mut self,
+        handler: &Arc<H>,
+        data: Bytes,
+    ) -> Result<Vec<u8>> {
+        let (result, auth_result) = dispatch_request_common(
+            handler.as_ref(),
+            data,
+            self.addr,
+            "tls",
+            &mut self.auth_gate,
+        )
+        .await;
 
         // Track auth result for rate limiting (unified via trait)
         self.record_auth_result(auth_result).await;

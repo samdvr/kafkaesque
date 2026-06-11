@@ -105,6 +105,25 @@ raftTls:
   # this to whatever name the issued certs carry as a SAN.
   serverName: kafkaesque-raft
 
+# HMAC authentication for the Raft control plane. The broker REFUSES TO
+# START without RAFT_CLUSTER_SECRET outside the development profile: the
+# Raft port accepts cluster joins (auto-promoted to voter) and arbitrary
+# coordination commands, so it must never run unauthenticated.
+#
+# Exactly one of the following must be configured:
+# - existingSecret: name of a pre-created Kubernetes Secret holding the
+#   shared HMAC value under `secretKey` (recommended; keeps the secret out
+#   of Helm values/releases). Create it with e.g.:
+#     kubectl create secret generic kafkaesque-raft-auth \
+#       --from-literal=raft-cluster-secret="$(openssl rand -base64 32)"
+# - clusterSecret: an inline value; the chart renders it into a Secret.
+#   Convenient for dev/test, but the value lands in the Helm release
+#   manifest — prefer existingSecret for production.
+raftAuth:
+  existingSecret: ""
+  secretKey: raft-cluster-secret
+  clusterSecret: ""
+
 # Kubernetes service configuration
 service:
   type: ClusterIP

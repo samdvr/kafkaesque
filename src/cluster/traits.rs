@@ -541,15 +541,22 @@ pub trait PartitionTransferCoordinator: Send + Sync {
     /// Mark a broker as failed and track it in the cluster state.
     ///
     /// This should be called when fast failure detection determines a broker
-    /// is no longer responsive.
+    /// is no longer responsive. The implementation must atomically fence the
+    /// broker and release every partition it owned (with a leader-epoch bump
+    /// so in-flight writes from the failed broker are rejected).
     ///
     /// # Arguments
     /// * `broker_id` - The broker ID that failed
     /// * `reason` - Human-readable reason for the failure
     ///
     /// # Returns
-    /// * `Ok(partitions_affected)` - Number of partitions owned by the failed broker
-    async fn mark_broker_failed(&self, broker_id: i32, reason: &str) -> SlateDBResult<usize>;
+    /// * `Ok(released_partitions)` - The `(topic, partition)` pairs released
+    ///   from the failed broker; the caller reassigns exactly this set.
+    async fn mark_broker_failed(
+        &self,
+        broker_id: i32,
+        reason: &str,
+    ) -> SlateDBResult<Vec<(String, i32)>>;
 
     /// Get all partition owners as a map from (topic, partition) to broker_id.
     ///

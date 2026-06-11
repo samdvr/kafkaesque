@@ -109,32 +109,41 @@ impl Authorizer for RaftAclAuthorizer {
     }
 }
 
+/// Resource name used for cluster-level ACL bindings. Matches real Kafka,
+/// where the cluster resource always has the literal name `kafka-cluster`.
+pub const CLUSTER_RESOURCE_NAME: &str = "kafka-cluster";
+
 /// Static map from Kafka API keys to the operation they require on the
 /// cluster resource. Topic-level / group-level checks are handled inline by
 /// each handler since they need the resource name; this table only covers
 /// requests whose only authz target is the cluster itself.
 ///
-/// Returning `None` means "no cluster-level check is required" — the
-/// per-resource check still runs.
+/// This table is consulted by `SlateDBClusterHandler::authorize_cluster_api`
+/// before the corresponding handler runs. Returning `None` means "no
+/// cluster-level check is required" — the per-resource check still runs.
 pub fn cluster_operation_for_api(api_key: crate::server::request::ApiKey) -> Option<AclOperation> {
     use crate::server::request::ApiKey;
     match api_key {
-        // Cluster-mutating admin APIs.
-        ApiKey::CreateTopics | ApiKey::DeleteTopics => Some(AclOperation::Create),
         // Producer-id allocation is a cluster action (it consumes a global
         // counter and is gated by IdempotentWrite in real Kafka).
         ApiKey::InitProducerId => Some(AclOperation::IdempotentWrite),
-        // Metadata describes the cluster; allow Describe.
-        ApiKey::Metadata => Some(AclOperation::Describe),
-        // FindCoordinator describes the cluster's group coordinator.
-        ApiKey::FindCoordinator => Some(AclOperation::Describe),
         // ApiVersions / SASL handshake / authenticate run before authn so
         // they bypass authz entirely.
         ApiKey::ApiVersions | ApiKey::SaslHandshake | ApiKey::SaslAuthenticate => None,
         // Per-topic / per-group APIs — authz is checked inline by the
-        // handler with the topic/group name in hand.
+        // handler with the topic/group name in hand. This includes:
+        // - Metadata: per-topic Describe, unauthorized topics get
+        //   TopicAuthorizationFailed (named) or are filtered (list-all),
+        //   matching real Kafka rather than gating the whole API on a
+        //   cluster-level Describe that ordinary clients never hold.
+        // - FindCoordinator: Describe on the group named in the request.
+        // - CreateTopics / DeleteTopics: Create / Delete on the topic.
         ApiKey::Produce
         | ApiKey::Fetch
+        | ApiKey::Metadata
+        | ApiKey::FindCoordinator
+        | ApiKey::CreateTopics
+        | ApiKey::DeleteTopics
         | ApiKey::ListOffsets
         | ApiKey::OffsetCommit
         | ApiKey::OffsetFetch

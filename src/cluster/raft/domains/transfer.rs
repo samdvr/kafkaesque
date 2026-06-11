@@ -6,15 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::broker::BrokerStatus;
+use super::broker::{BrokerInfo, BrokerStatus};
 use super::partition::PartitionInfo;
-
-/// Type alias for partition lookup function to reduce type complexity.
-pub type GetPartitionFn<'a> = Box<dyn Fn(&str, i32) -> Option<PartitionInfo> + 'a>;
-
-/// Type alias for partition update function to reduce type complexity.
-/// Parameters: topic, partition, owner_broker_id, leader_epoch, lease_expires_at_ms
-pub type UpdatePartitionFn<'a> = Box<dyn FnMut(&str, i32, Option<i32>, i32, u64) + 'a>;
 
 /// Reason for transferring partition ownership.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,10 +114,16 @@ pub enum TransferResponse {
     /// Partition not found for transfer.
     PartitionNotFoundForTransfer { topic: String, partition: i32 },
 
-    /// Broker was marked as failed.
+    /// Broker was marked as failed. The broker has been fenced and every
+    /// partition it owned has been released (owner cleared, leader epoch
+    /// bumped) in the same applied command, so there is no window in which
+    /// the failed broker can keep writing or renewing leases.
     BrokerMarkedFailed {
         broker_id: i32,
         partitions_affected: usize,
+        /// The partitions that were released from the failed broker, so the
+        /// failover initiator can reassign exactly this set.
+        released_partitions: Vec<(String, i32)>,
     },
 
     /// Broker was already marked as failed.
@@ -151,16 +150,6 @@ pub struct TransferDomainState {
     pub pending_transfers: HashMap<u64, BatchTransferState>,
 }
 
-/// Context required for transfer operations.
-pub struct TransferContext<'a> {
-    /// Check if a broker is active.
-    pub is_broker_active: Box<dyn Fn(i32) -> bool + 'a>,
-    /// Get partition info.
-    pub get_partition: GetPartitionFn<'a>,
-    /// Update partition ownership.
-    pub update_partition: UpdatePartitionFn<'a>,
-}
-
 impl TransferDomainState {
     /// Create a new empty transfer state.
     pub fn new() -> Self {
@@ -169,22 +158,28 @@ impl TransferDomainState {
 
     /// Apply a transfer command and return the response.
     ///
+    /// Takes mutable access to the broker and partition domains so that
+    /// `MarkBrokerFailed` can fence the broker and release its partitions in
+    /// the *same* applied Raft command — splitting these across separate
+    /// commands leaves a window where a "failed" broker is still `Active`,
+    /// can renew leases, and can keep accepting writes.
+    ///
     /// # Arguments
     /// * `cmd` - The transfer command to apply
-    /// * `is_broker_active` - Function to check if a broker is active
+    /// * `brokers` - Mutable reference to broker state (for status checks and fencing)
     /// * `partitions` - Mutable reference to partition state for updates
-    /// * `broker_check` - Function to get broker status
-    pub fn apply_with_context<F, G>(
+    pub fn apply_with_context(
         &mut self,
         cmd: TransferCommand,
-        is_broker_active: F,
+        brokers: &mut HashMap<i32, BrokerInfo>,
         partitions: &mut HashMap<(Arc<str>, i32), PartitionInfo>,
-        broker_status: G,
-    ) -> TransferResponse
-    where
-        F: Fn(i32) -> bool,
-        G: Fn(i32) -> Option<BrokerStatus>,
-    {
+    ) -> TransferResponse {
+        let is_broker_active = |brokers: &HashMap<i32, BrokerInfo>, broker_id: i32| {
+            brokers
+                .get(&broker_id)
+                .is_some_and(|b| b.status == BrokerStatus::Active)
+        };
+
         match cmd {
             TransferCommand::TransferPartition {
                 topic,
@@ -198,7 +193,7 @@ impl TransferDomainState {
                 let topic_arc: Arc<str> = Arc::from(topic.as_str());
                 let key = (Arc::clone(&topic_arc), partition);
 
-                if !is_broker_active(to_broker_id) {
+                if !is_broker_active(brokers, to_broker_id) {
                     return TransferResponse::TransferDestinationUnavailable {
                         topic,
                         partition,
@@ -242,10 +237,32 @@ impl TransferDomainState {
                     return TransferResponse::BrokerAlreadyFailed { broker_id };
                 }
 
-                let partitions_affected = partitions
-                    .values()
-                    .filter(|p| p.owner_broker_id == Some(broker_id))
-                    .count();
+                // Fence the broker in the same applied command. A fenced
+                // broker is excluded from active-broker lists, cannot be a
+                // transfer destination, and (via the state-machine gate)
+                // cannot acquire partitions or renew leases. A heartbeat
+                // does not un-fence it — recovery requires explicit
+                // re-registration.
+                if let Some(broker) = brokers.get_mut(&broker_id) {
+                    broker.status = BrokerStatus::Fenced;
+                }
+
+                // Release every partition the failed broker owned: clear the
+                // owner, expire the lease, and bump the leader epoch. The
+                // epoch bump is the actual write fence — any in-flight
+                // append from the failed broker carries the old epoch and is
+                // rejected by epoch validation, even before a new owner is
+                // assigned.
+                let mut released_partitions = Vec::new();
+                for ((topic, partition), partition_state) in partitions.iter_mut() {
+                    if partition_state.owner_broker_id == Some(broker_id) {
+                        partition_state.owner_broker_id = None;
+                        partition_state.lease_expires_at_ms = 0;
+                        partition_state.leader_epoch += 1;
+                        released_partitions.push((topic.to_string(), *partition));
+                    }
+                }
+                let partitions_affected = released_partitions.len();
 
                 self.failed_brokers.insert(
                     broker_id,
@@ -260,6 +277,7 @@ impl TransferDomainState {
                 TransferResponse::BrokerMarkedFailed {
                     broker_id,
                     partitions_affected,
+                    released_partitions,
                 }
             }
 
@@ -289,8 +307,7 @@ impl TransferDomainState {
                     let topic_arc: Arc<str> = Arc::from(transfer.topic.as_str());
                     let key = (Arc::clone(&topic_arc), transfer.partition);
 
-                    let dest_ok = broker_status(transfer.to_broker_id)
-                        .is_some_and(|s| s == BrokerStatus::Active);
+                    let dest_ok = is_broker_active(brokers, transfer.to_broker_id);
 
                     if !dest_ok {
                         failed_transfers.push((
@@ -387,6 +404,26 @@ mod tests {
             leader_epoch: 1,
             lease_expires_at_ms: 0,
         }
+    }
+
+    /// Build a broker map where every listed id is `Active`.
+    fn active_brokers(ids: &[i32]) -> HashMap<i32, BrokerInfo> {
+        ids.iter()
+            .map(|&id| {
+                (
+                    id,
+                    BrokerInfo {
+                        broker_id: id,
+                        host: format!("broker-{}", id),
+                        port: 9092,
+                        registered_at_ms: 0,
+                        last_heartbeat_ms: 0,
+                        status: BrokerStatus::Active,
+                        reported_timestamp_ms: 0,
+                    },
+                )
+            })
+            .collect()
     }
 
     // ========================================================================
@@ -779,15 +816,18 @@ mod tests {
         let response = TransferResponse::BrokerMarkedFailed {
             broker_id: 1,
             partitions_affected: 10,
+            released_partitions: vec![("topic".to_string(), 0)],
         };
 
         match response {
             TransferResponse::BrokerMarkedFailed {
                 broker_id,
                 partitions_affected,
+                released_partitions,
             } => {
                 assert_eq!(broker_id, 1);
                 assert_eq!(partitions_affected, 10);
+                assert_eq!(released_partitions, vec![("topic".to_string(), 0)]);
             }
             _ => panic!("Expected BrokerMarkedFailed"),
         }
@@ -831,6 +871,7 @@ mod tests {
         let response = TransferResponse::BrokerMarkedFailed {
             broker_id: 1,
             partitions_affected: 5,
+            released_partitions: vec![("a".to_string(), 0), ("b".to_string(), 3)],
         };
 
         let serialized = postcard::to_stdvec(&response).unwrap();
@@ -959,6 +1000,7 @@ mod tests {
     #[test]
     fn test_mark_broker_failed() {
         let mut state = TransferDomainState::new();
+        let mut brokers = active_brokers(&[1, 2]);
         let mut partitions = HashMap::new();
         partitions.insert(
             (Arc::from("test"), 0),
@@ -979,28 +1021,51 @@ mod tests {
                 detected_at_ms: 1000,
                 reason: "Test failure".to_string(),
             },
-            |_| true,
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         match response {
             TransferResponse::BrokerMarkedFailed {
                 broker_id,
                 partitions_affected,
+                mut released_partitions,
             } => {
                 assert_eq!(broker_id, 1);
                 assert_eq!(partitions_affected, 2);
+                released_partitions.sort();
+                assert_eq!(
+                    released_partitions,
+                    vec![("test".to_string(), 0), ("test".to_string(), 1)]
+                );
             }
             _ => panic!("Expected BrokerMarkedFailed"),
         }
 
         assert!(state.is_broker_failed(1));
+
+        // The broker is fenced atomically with the mark.
+        assert_eq!(brokers.get(&1).unwrap().status, BrokerStatus::Fenced);
+        // Other brokers are untouched.
+        assert_eq!(brokers.get(&2).unwrap().status, BrokerStatus::Active);
+
+        // Its partitions are released with a bumped epoch (write fence) and
+        // an expired lease; the surviving broker's partition is untouched.
+        for p in [0, 1] {
+            let info = partitions.get(&(Arc::from("test"), p)).unwrap();
+            assert_eq!(info.owner_broker_id, None);
+            assert_eq!(info.leader_epoch, 2);
+            assert_eq!(info.lease_expires_at_ms, 0);
+        }
+        let survivor = partitions.get(&(Arc::from("test"), 2)).unwrap();
+        assert_eq!(survivor.owner_broker_id, Some(2));
+        assert_eq!(survivor.leader_epoch, 1);
     }
 
     #[test]
     fn test_mark_broker_already_failed() {
         let mut state = TransferDomainState::new();
+        let mut brokers = active_brokers(&[1]);
         let mut partitions = HashMap::new();
 
         // First mark as failed
@@ -1010,9 +1075,8 @@ mod tests {
                 detected_at_ms: 1000,
                 reason: "First failure".to_string(),
             },
-            |_| true,
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         // Second attempt should return BrokerAlreadyFailed
@@ -1022,9 +1086,8 @@ mod tests {
                 detected_at_ms: 2000,
                 reason: "Second attempt".to_string(),
             },
-            |_| true,
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         assert!(matches!(
@@ -1036,6 +1099,7 @@ mod tests {
     #[test]
     fn test_transfer_partition() {
         let mut state = TransferDomainState::new();
+        let mut brokers = active_brokers(&[2]); // Broker 2 is active
         let mut partitions = HashMap::new();
         partitions.insert(
             (Arc::from("test"), 0),
@@ -1052,9 +1116,8 @@ mod tests {
                 lease_duration_ms: 60000,
                 timestamp_ms: 1000,
             },
-            |id| id == 2, // Broker 2 is active
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         match response {
@@ -1076,6 +1139,7 @@ mod tests {
     #[test]
     fn test_transfer_partition_source_not_owner() {
         let mut state = TransferDomainState::new();
+        let mut brokers = active_brokers(&[2]);
         let mut partitions = HashMap::new();
         partitions.insert(
             (Arc::from("test"), 0),
@@ -1092,9 +1156,8 @@ mod tests {
                 lease_duration_ms: 60000,
                 timestamp_ms: 1000,
             },
-            |id| id == 2,
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         match response {
@@ -1113,6 +1176,7 @@ mod tests {
     #[test]
     fn test_transfer_partition_not_found() {
         let mut state = TransferDomainState::new();
+        let mut brokers = active_brokers(&[1, 2]);
         let mut partitions = HashMap::new();
 
         let response = state.apply_with_context(
@@ -1125,9 +1189,8 @@ mod tests {
                 lease_duration_ms: 60000,
                 timestamp_ms: 1000,
             },
-            |_| true,
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         assert!(matches!(
@@ -1139,6 +1202,9 @@ mod tests {
     #[test]
     fn test_transfer_partition_dest_unavailable() {
         let mut state = TransferDomainState::new();
+        // No brokers are active (destination is fenced)
+        let mut brokers = active_brokers(&[2]);
+        brokers.get_mut(&2).unwrap().status = BrokerStatus::Fenced;
         let mut partitions = HashMap::new();
         partitions.insert(
             (Arc::from("test"), 0),
@@ -1155,9 +1221,8 @@ mod tests {
                 lease_duration_ms: 60000,
                 timestamp_ms: 1000,
             },
-            |_| false, // No brokers are active
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Fenced),
         );
 
         assert!(matches!(
@@ -1169,6 +1234,7 @@ mod tests {
     #[test]
     fn test_batch_transfer() {
         let mut state = TransferDomainState::new();
+        let mut brokers = active_brokers(&[2]);
         let mut partitions = HashMap::new();
         partitions.insert(
             (Arc::from("test"), 0),
@@ -1202,9 +1268,8 @@ mod tests {
                 lease_duration_ms: 60000,
                 timestamp_ms: 1000,
             },
-            |id| id == 2,
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         match response {
@@ -1223,6 +1288,7 @@ mod tests {
     #[test]
     fn test_batch_transfer_with_epoch_mismatch() {
         let mut state = TransferDomainState::new();
+        let mut brokers = active_brokers(&[2]);
         let mut partitions = HashMap::new();
         partitions.insert(
             (Arc::from("test"), 0),
@@ -1243,9 +1309,8 @@ mod tests {
                 lease_duration_ms: 60000,
                 timestamp_ms: 1000,
             },
-            |id| id == 2,
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         match response {
@@ -1265,6 +1330,7 @@ mod tests {
     #[test]
     fn test_batch_transfer_partition_not_found() {
         let mut state = TransferDomainState::new();
+        let mut brokers = active_brokers(&[1, 2]);
         let mut partitions = HashMap::new();
 
         let response = state.apply_with_context(
@@ -1281,9 +1347,8 @@ mod tests {
                 lease_duration_ms: 60000,
                 timestamp_ms: 1000,
             },
-            |_| true,
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         match response {
@@ -1303,6 +1368,8 @@ mod tests {
     #[test]
     fn test_batch_transfer_dest_unavailable() {
         let mut state = TransferDomainState::new();
+        // Broker 2 (the destination) doesn't exist
+        let mut brokers = active_brokers(&[1]);
         let mut partitions = HashMap::new();
         partitions.insert(
             (Arc::from("test"), 0),
@@ -1323,15 +1390,8 @@ mod tests {
                 lease_duration_ms: 60000,
                 timestamp_ms: 1000,
             },
-            |_| true,
+            &mut brokers,
             &mut partitions,
-            |id| {
-                if id == 2 {
-                    None
-                } else {
-                    Some(BrokerStatus::Active)
-                }
-            }, // Broker 2 doesn't exist
         );
 
         match response {
@@ -1351,6 +1411,7 @@ mod tests {
     #[test]
     fn test_batch_transfer_wrong_owner() {
         let mut state = TransferDomainState::new();
+        let mut brokers = active_brokers(&[1, 2, 3]);
         let mut partitions = HashMap::new();
         partitions.insert(
             (Arc::from("test"), 0),
@@ -1371,9 +1432,8 @@ mod tests {
                 lease_duration_ms: 60000,
                 timestamp_ms: 1000,
             },
-            |_| true,
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         match response {
@@ -1394,6 +1454,7 @@ mod tests {
     fn test_batch_transfer_unowned_partition_succeeds() {
         // During failover, partitions may become unowned - transfers should still work
         let mut state = TransferDomainState::new();
+        let mut brokers = active_brokers(&[1, 2]);
         let mut partitions = HashMap::new();
         partitions.insert(
             (Arc::from("test"), 0),
@@ -1414,9 +1475,8 @@ mod tests {
                 lease_duration_ms: 60000,
                 timestamp_ms: 1000,
             },
-            |_| true,
+            &mut brokers,
             &mut partitions,
-            |_| Some(BrokerStatus::Active),
         );
 
         match response {

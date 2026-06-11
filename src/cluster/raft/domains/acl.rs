@@ -130,11 +130,7 @@ pub struct AclBinding {
 
 impl AclBinding {
     /// Does this binding's resource pattern match `name`?
-    fn matches_resource(
-        &self,
-        resource_type: AclResourceType,
-        name: &str,
-    ) -> bool {
+    fn matches_resource(&self, resource_type: AclResourceType, name: &str) -> bool {
         if self.resource_type != resource_type {
             return false;
         }
@@ -435,13 +431,7 @@ mod tests {
             AclOperation::Delete,
         ] {
             assert_eq!(
-                state.is_authorized(
-                    "User:alice",
-                    "*",
-                    op,
-                    AclResourceType::Topic,
-                    "orders"
-                ),
+                state.is_authorized("User:alice", "*", op, AclResourceType::Topic, "orders"),
                 AclDecision::Allowed,
                 "All should imply {:?}",
                 op

@@ -121,6 +121,14 @@ spec:
               value: "0.0.0.0:{{ .Values.config.raftPort }}"
             - name: RAFT_PEERS
               value: {{ include "kafkaesque.raftPeers" . | quote }}
+            # HMAC secret authenticating every Raft RPC frame. Required at
+            # startup outside the development profile; must hold the same
+            # value on every broker (see raftAuth in values.yaml).
+            - name: RAFT_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.raftAuth.existingSecret | default (printf "%s-raft-auth" (include "kafkaesque.fullname" .)) }}
+                  key: {{ .Values.raftAuth.secretKey }}
             {{- if .Values.tls.enabled }}
             # Audit P0-4: client-port TLS. Cert + key paths point into the
             # secret mount below. The broker reads these on start-up via

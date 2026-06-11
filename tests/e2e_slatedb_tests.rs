@@ -124,8 +124,19 @@ fn compute_crc32c(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Permit single-node Raft bootstrap for the in-process test handlers.
+/// Each test runs one isolated broker against its own temp dir, so the
+/// two-fresh-brokers bootstrap race the production gate protects against
+/// cannot occur.
+fn allow_single_node_bootstrap() {
+    // SAFETY: process-global env var; every test in this binary wants the
+    // same value.
+    unsafe { std::env::set_var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE", "true") };
+}
+
 /// Create a test handler with local file storage.
 async fn create_persistent_handler(data_path: &str) -> SlateDBClusterHandler {
+    allow_single_node_bootstrap();
     let config = ClusterConfig {
         broker_id: 1,
         auto_create_topics: true,
@@ -872,6 +883,7 @@ async fn test_e2e_produce_consume_with_advertised_host() {
     // Configure handler with different bind host vs advertised host
     // This simulates a real deployment where server binds to 0.0.0.0 but
     // advertises a specific IP for clients to connect back to
+    allow_single_node_bootstrap();
     let config = ClusterConfig {
         broker_id: 42,
         host: "0.0.0.0".to_string(), // Bind to all interfaces

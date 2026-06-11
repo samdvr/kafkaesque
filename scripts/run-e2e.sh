@@ -37,6 +37,11 @@ echo ""
 KCAT_OPTS="-X api.version.request=false -X broker.version.fallback=2.0.0"
 E2E_FAILED=0
 
+# The broker refuses to start without RAFT_CLUSTER_SECRET outside the
+# development profile. Exercise the production posture in e2e by setting
+# a shared secret across all brokers (override via the environment).
+export RAFT_CLUSTER_SECRET="${RAFT_CLUSTER_SECRET:-kafkaesque-e2e-shared-secret}"
+
 run_test() {
     local name="$1"
     local cmd="$2"

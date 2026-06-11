@@ -185,6 +185,12 @@ impl PartitionCoordinator for RaftCoordinator {
             CoordinationResponse::PartitionDomainResponse(
                 PartitionResponse::PartitionOwnedByOther { .. },
             ) => Ok(None),
+            // This broker has been fenced (e.g. marked failed by the fast
+            // failure detector while it was partitioned away) — it must not
+            // re-acquire ownership until it re-registers.
+            CoordinationResponse::PartitionDomainResponse(PartitionResponse::BrokerNotActive {
+                ..
+            }) => Ok(None),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -214,6 +220,15 @@ impl PartitionCoordinator for RaftCoordinator {
             CoordinationResponse::PartitionDomainResponse(
                 PartitionResponse::PartitionNotOwned { .. },
             ) => {
+                self.owner_cache
+                    .invalidate(&(Arc::from(topic), partition))
+                    .await;
+                Ok(false)
+            }
+            // Fenced broker: lease renewal is refused outright.
+            CoordinationResponse::PartitionDomainResponse(PartitionResponse::BrokerNotActive {
+                ..
+            }) => {
                 self.owner_cache
                     .invalidate(&(Arc::from(topic), partition))
                     .await;
@@ -344,6 +359,19 @@ impl PartitionCoordinator for RaftCoordinator {
                     .invalidate(&(Arc::from(topic.as_str()), partition))
                     .await;
                 Err(SlateDBError::NotOwned { topic, partition })
+            }
+            // Fenced broker: treat as not owned so the write path returns
+            // NotLeaderForPartition to the client instead of retrying.
+            CoordinationResponse::PartitionDomainResponse(PartitionResponse::BrokerNotActive {
+                ..
+            }) => {
+                self.owner_cache
+                    .invalidate(&(Arc::from(topic), partition))
+                    .await;
+                Err(SlateDBError::NotOwned {
+                    topic: topic.to_string(),
+                    partition,
+                })
             }
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",

@@ -7,7 +7,8 @@
 //!
 //! Run with: `cargo bench --bench produce_bench`
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 
 /// Simulate batch rewriting with allocation (current approach).
 fn batch_rewrite_with_alloc(records: &[u8], base_offset: i64) -> Vec<u8> {

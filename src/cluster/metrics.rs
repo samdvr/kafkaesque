@@ -2032,7 +2032,11 @@ pub static PRODUCER_STATE_EVICTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
 /// * `has_sequence` - Whether the producer had sequence > 0 (active producer)
 pub fn record_producer_state_eviction(topic: &str, partition: i32, has_sequence: bool) {
     PRODUCER_STATE_EVICTIONS
-        .with_label_values(&[topic, &partition.to_string(), if has_sequence { "true" } else { "false" }])
+        .with_label_values(&[
+            topic,
+            &partition.to_string(),
+            if has_sequence { "true" } else { "false" },
+        ])
         .inc();
 }
 

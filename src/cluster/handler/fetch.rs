@@ -101,7 +101,11 @@ pub(super) async fn handle_fetch(
         responses,
     };
     let total_bytes = total_record_bytes(&response.responses);
-    let status = if total_bytes > 0 { "success" } else { "timeout" };
+    let status = if total_bytes > 0 {
+        "success"
+    } else {
+        "timeout"
+    };
     crate::cluster::metrics::record_fetch_latency(
         &topic_label,
         status,
@@ -234,9 +238,7 @@ async fn collect_fetch(
                                 o => o,
                             };
 
-                            if effective_offset > current_hwm
-                                || effective_offset < log_start
-                            {
+                            if effective_offset > current_hwm || effective_offset < log_start {
                                 return FetchPartitionResponse {
                                     partition_index: partition.partition_index,
                                     error_code: KafkaCode::OffsetOutOfRange,

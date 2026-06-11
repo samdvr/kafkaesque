@@ -249,12 +249,7 @@ impl GroupDomainState {
                 // replica produces the same value when applying this log entry.
                 // Using Uuid::new_v4() here would diverge state across replicas.
                 let final_member_id = if member_id.is_empty() {
-                    format!(
-                        "{}-{}-{}",
-                        client_id,
-                        timestamp_ms,
-                        group.members.len()
-                    )
+                    format!("{}-{}-{}", client_id, timestamp_ms, group.members.len())
                 } else {
                     member_id
                 };

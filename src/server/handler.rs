@@ -409,10 +409,7 @@ pub trait Handler: Send + Sync {
     /// record keyed by the client's `SocketAddr` while running
     /// `handle_sasl_authenticate`, and the dispatcher takes it back out
     /// here. Default `None` keeps PLAIN-only and test handlers unchanged.
-    async fn take_sasl_post_auth(
-        &self,
-        _client_addr: SocketAddr,
-    ) -> Option<SaslPostAuth> {
+    async fn take_sasl_post_auth(&self, _client_addr: SocketAddr) -> Option<SaslPostAuth> {
         None
     }
 

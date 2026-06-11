@@ -253,10 +253,7 @@ impl SaslAuthenticator for PlainAuthenticator {
         let stored = users.get(username);
         let candidate = stored.map(|s| s.as_str()).unwrap_or("");
         use subtle::ConstantTimeEq;
-        let eq: bool = candidate
-            .as_bytes()
-            .ct_eq(password.as_bytes())
-            .into();
+        let eq: bool = candidate.as_bytes().ct_eq(password.as_bytes()).into();
         if stored.is_some() && eq {
             SaslResult::Success {
                 principal: username.to_string(),

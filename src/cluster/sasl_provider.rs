@@ -40,9 +40,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::config::ClusterConfig;
-use super::scram::{
-    ScramCredentials, ScramServerState, handle_client_final, handle_client_first,
-};
+use super::scram::{ScramCredentials, ScramServerState, handle_client_final, handle_client_first};
 
 /// Per-user record. Stores both the cleartext password (for PLAIN) and
 /// SCRAM-derived credentials (for SCRAM-SHA-256). PLAIN is kept for the
@@ -256,10 +254,7 @@ impl SaslProvider {
         let stored = users.get(username);
         let candidate = stored.map(|r| r.password.as_str()).unwrap_or("");
         use subtle::ConstantTimeEq;
-        let eq: bool = candidate
-            .as_bytes()
-            .ct_eq(password.as_bytes())
-            .into();
+        let eq: bool = candidate.as_bytes().ct_eq(password.as_bytes()).into();
         if stored.is_some() && eq {
             info!(username = %username, "SASL PLAIN authentication successful");
             (true, Some(username.to_string()))
@@ -304,10 +299,7 @@ impl SaslProvider {
                 // just return the failure response.
                 match &state {
                     ScramServerState::AwaitingClientFinal { .. } => {
-                        self.scram_sessions
-                            .write()
-                            .await
-                            .insert(client_addr, state);
+                        self.scram_sessions.write().await.insert(client_addr, state);
                         debug!(client = %client_addr, "SCRAM client-first accepted");
                         // Not authenticated yet — handler still needs to
                         // send the response. We mark failure here so the
@@ -510,8 +502,13 @@ mod tests {
             .await;
         assert!(!ok, "intermediate step should not be 'ok' yet");
         assert!(principal.is_none());
-        let server_first = std::str::from_utf8(&server_first_bytes).unwrap().to_string();
-        assert!(server_first.starts_with("r="), "server-first must carry combined nonce");
+        let server_first = std::str::from_utf8(&server_first_bytes)
+            .unwrap()
+            .to_string();
+        assert!(
+            server_first.starts_with("r="),
+            "server-first must carry combined nonce"
+        );
         assert!(provider.has_scram_session(addr).await);
 
         // Reconstruct what the client would compute.
@@ -534,8 +531,7 @@ mod tests {
         use crate::cluster::scram::ScramCredentials;
         let creds = ScramCredentials::derive(b"hunter2", &salt, iterations);
         let cbind_b64 = B64.encode(b"n,,");
-        let client_final_without_proof =
-            format!("c={},r={}", cbind_b64, combined_nonce);
+        let client_final_without_proof = format!("c={},r={}", cbind_b64, combined_nonce);
         let auth_message = format!(
             "{},{},{}",
             client_first_bare, server_first, client_final_without_proof
@@ -590,7 +586,10 @@ mod tests {
         assert!(ok, "client-final with valid proof should succeed");
         assert_eq!(principal.as_deref(), Some("User:alice"));
         let server_final = std::str::from_utf8(&server_final_bytes).unwrap();
-        assert!(server_final.starts_with("v="), "server-final must carry verifier");
+        assert!(
+            server_final.starts_with("v="),
+            "server-final must carry verifier"
+        );
 
         // Session was consumed.
         assert!(!provider.has_scram_session(addr).await);

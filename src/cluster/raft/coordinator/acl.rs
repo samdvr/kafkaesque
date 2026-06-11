@@ -25,7 +25,9 @@ impl RaftCoordinator {
             }))
             .await?;
         match resp {
-            CoordinationResponse::AclDomainResponse(AclResponse::Created { created }) => Ok(created),
+            CoordinationResponse::AclDomainResponse(AclResponse::Created { created }) => {
+                Ok(created)
+            }
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response to CreateAcls: {:?}",
                 other

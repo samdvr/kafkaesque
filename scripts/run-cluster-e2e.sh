@@ -28,6 +28,11 @@ BINARY="${KAFKAESQUE_BINARY:-./target/release/kafkaesque}"
 if [ ! -f "$BINARY" ]; then
     BINARY="./target/debug/kafkaesque"
 fi
+
+# The broker refuses to start without RAFT_CLUSTER_SECRET outside the
+# development profile. Exercise the production posture in e2e by setting
+# a shared secret across all brokers (override via the environment).
+export RAFT_CLUSTER_SECRET="${RAFT_CLUSTER_SECRET:-kafkaesque-e2e-shared-secret}"
 if [ ! -f "$BINARY" ]; then
     echo -e "${RED}Kafkaesque binary not found. Run: cargo build --release --bin kafkaesque${NC}"
     exit 1

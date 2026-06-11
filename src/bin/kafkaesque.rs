@@ -7,7 +7,7 @@
 //!
 //! Single broker (local storage):
 //! ```bash
-//! RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE=true cargo run --bin kafkaesque
+//! CLUSTER_PROFILE=development RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE=true cargo run --bin kafkaesque
 //! ```
 //!
 //! The `RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE=true` opt-in is required when
@@ -15,13 +15,24 @@
 //! two nodes with no peers configured would each form their own one-node
 //! cluster against the same object store.
 //!
+//! ## Security posture
+//!
+//! Outside the development profile (`CLUSTER_PROFILE=development`), startup
+//! fails unless `RAFT_CLUSTER_SECRET` is set: the Raft RPC port accepts
+//! cluster joins and coordination commands, so it must be authenticated on
+//! any real network. Set the same strong random value on every node:
+//! ```bash
+//! RAFT_CLUSTER_SECRET="$(openssl rand -base64 32)"   # same value cluster-wide
+//! ```
+//!
 //! With JSON logging for production:
 //! ```bash
 //! LOG_FORMAT=json RUST_LOG=info cargo run --bin kafkaesque
 //! ```
 //!
-//! Multiple brokers (in separate terminals):
+//! Multiple brokers (in separate terminals, sharing one secret):
 //! ```bash
+//! export RAFT_CLUSTER_SECRET=local-cluster-secret
 //! BROKER_ID=0 PORT=9092 RAFT_LISTEN_ADDR=127.0.0.1:9093 cargo run --bin kafkaesque
 //! BROKER_ID=1 PORT=9094 RAFT_LISTEN_ADDR=127.0.0.1:9095 RAFT_PEERS="0=127.0.0.1:9093" cargo run --bin kafkaesque
 //! BROKER_ID=2 PORT=9096 RAFT_LISTEN_ADDR=127.0.0.1:9097 RAFT_PEERS="0=127.0.0.1:9093,1=127.0.0.1:9095" cargo run --bin kafkaesque
@@ -71,9 +82,9 @@ use kafkaesque::runtime::{BrokerRuntimes, RuntimeConfig};
 use kafkaesque::server::KafkaServer;
 #[cfg(feature = "tls")]
 use kafkaesque::server::TlsKafkaServer;
+use kafkaesque::server::health::HealthServer;
 #[cfg(feature = "tls")]
 use kafkaesque::server::tls::TlsConfig;
-use kafkaesque::server::health::HealthServer;
 use kafkaesque::telemetry::{LogFormat, init_logging};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};

@@ -26,7 +26,7 @@ use crate::server::request::{
     SyncGroupRequestData,
 };
 use crate::server::response::{
-    DeleteGroupResult, DeleteGroupsResponseData, DescribedGroup, DescribeGroupsResponseData,
+    DeleteGroupResult, DeleteGroupsResponseData, DescribeGroupsResponseData, DescribedGroup,
     FindCoordinatorResponseData, HeartbeatResponseData, JoinGroupMemberData, JoinGroupResponseData,
     LeaveGroupResponseData, ListGroupsResponseData, ListedGroup, SyncGroupResponseData,
 };
@@ -90,8 +90,30 @@ fn select_coordinator_id(key: &str, brokers: &[BrokerInfo]) -> Option<i32> {
 /// Handle a find coordinator request.
 pub(super) async fn handle_find_coordinator(
     handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
     request: FindCoordinatorRequestData,
 ) -> FindCoordinatorResponseData {
+    // FindCoordinator for a consumer group (key_type 0) requires Describe
+    // on that group, matching Kafka. Other key types (transactions) are not
+    // supported by Kafkaesque, so only the group path is gated here.
+    if request.key_type == 0
+        && !group_authorized(handler, ctx, AclOperation::Describe, &request.key).await
+    {
+        debug!(
+            group_id = %request.key,
+            principal = %ctx.principal,
+            "Denied FindCoordinator by ACL"
+        );
+        return FindCoordinatorResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::GroupAuthorizationFailed,
+            error_message: Some("Not authorized to describe this group".to_string()),
+            node_id: -1,
+            host: String::new(),
+            port: 0,
+        };
+    }
+
     // Get live brokers and select coordinator using consistent hashing
     let brokers = match handler.coordinator.get_live_brokers().await {
         Ok(broker_list) => broker_list,
@@ -545,9 +567,16 @@ pub(super) async fn handle_describe_groups(
 
         match handler.coordinator.get_group_members(&group_id).await {
             Ok(member_ids) => {
+                // Kafka semantics: an unknown/empty group is reported with
+                // state "Dead" and no error, not as a healthy "Stable" group.
+                let group_state = if member_ids.is_empty() {
+                    "Dead"
+                } else {
+                    "Stable"
+                };
                 groups.push(
                     DescribedGroup::builder(group_id)
-                        .group_state("Stable")
+                        .group_state(group_state)
                         .protocol_type("consumer")
                         .members(
                             member_ids

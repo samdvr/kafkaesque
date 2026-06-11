@@ -25,8 +25,8 @@ pub mod producer;
 pub mod transfer;
 
 pub use acl::{
-    AclBinding, AclCommand, AclDecision, AclDomainState, AclFilter, AclOperation,
-    AclPatternType, AclPermissionType, AclResourceType, AclResponse,
+    AclBinding, AclCommand, AclDecision, AclDomainState, AclFilter, AclOperation, AclPatternType,
+    AclPermissionType, AclResourceType, AclResponse,
 };
 pub use broker::{BrokerCommand, BrokerDomainState, BrokerResponse, BrokerStatus};
 pub use group::{GroupCommand, GroupDomainState, GroupResponse, MemberDescription};

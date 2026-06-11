@@ -43,15 +43,20 @@ Kafkaesque provides a 100% Kafka wire protocol compatible interface, meaning sta
 Run a single broker using local filesystem as "object storage":
 
 ```bash
-cargo run --release --bin kafkaesque
+CLUSTER_PROFILE=development cargo run --release --bin kafkaesque
 ```
 
 The broker listens on `localhost:9092`. Data is stored in `/tmp/kafkaesque-data`.
+
+`CLUSTER_PROFILE=development` opts into an unauthenticated Raft control
+plane for local use. Outside the development profile the broker refuses to
+start unless `RAFT_CLUSTER_SECRET` is set (see [Security](#security)).
 
 ### Run with Docker
 
 ```bash
 docker run --rm -p 9092:9092 -p 8080:8080 \
+  -e CLUSTER_PROFILE=development \
   -e OBJECT_STORE_TYPE=local \
   -e DATA_PATH=/data \
   -v /tmp/kafkaesque-data:/data \
@@ -72,10 +77,25 @@ Configuration is handled entirely via environment variables.
 | | `DATA_PATH` | `/tmp...` | Path or prefix for data. |
 | **Raft** | `RAFT_PEERS` | (empty) | Peer list: `0=host:port,1=host:port`. |
 | | `RAFT_LISTEN_ADDR` | `127.0.0.1:9093` | Internal Raft RPC address. |
+| **Security** | `CLUSTER_PROFILE` | `production` | Deployment profile; only `development` permits running without Raft auth. |
+| | `RAFT_CLUSTER_SECRET` | (required outside dev) | Shared HMAC key authenticating all Raft RPC traffic. Same value on every node. |
 | **S3** | `S3_BUCKET` | | AWS S3 Bucket name. |
 | | `AWS_REGION` | | AWS Region (e.g. `us-east-1`). |
 
 *See `src/config.rs` for all available options.*
+
+## Security
+
+The Raft RPC port accepts cluster-membership changes and coordination
+commands, so it must never be exposed unauthenticated. The broker is
+secure by default: startup fails unless `RAFT_CLUSTER_SECRET` is set to a
+non-empty value, or you explicitly opt out with
+`CLUSTER_PROFILE=development` for local work.
+
+```bash
+# Generate once, distribute the same value to every node:
+export RAFT_CLUSTER_SECRET="$(openssl rand -base64 32)"
+```
 
 ## Deployment
 
@@ -88,6 +108,7 @@ For a 3-node cluster, ensure each broker has a unique `BROKER_ID` and the full `
 BROKER_ID=0 \
 RAFT_LISTEN_ADDR=0.0.0.0:9093 \
 RAFT_PEERS="0=node0:9093,1=node1:9093,2=node2:9093" \
+RAFT_CLUSTER_SECRET="$SHARED_SECRET" \
 OBJECT_STORE_TYPE=s3 \
 S3_BUCKET=my-kafka-data \
 cargo run --release --bin kafkaesque

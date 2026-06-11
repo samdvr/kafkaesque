@@ -135,11 +135,42 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             use super::failure_detector::FailureDetectorConfig;
             use super::load_metrics::LoadMetricsConfig;
 
+            // The failure detector is fed by *applied Raft broker heartbeats*,
+            // which brokers send every `config.heartbeat_interval` (with up to
+            // ±15% sender-side jitter) — there is no separate fast-heartbeat
+            // sender running at `fast_heartbeat_interval_ms`. Telling the
+            // detector to expect 500ms heartbeats while they actually arrive
+            // every 5s would declare every healthy broker failed between two
+            // consecutive heartbeats and trigger continuous spurious
+            // failovers. Clamp the detector's expectation to the real cadence
+            // and scale the jitter tolerance to absorb sender jitter plus
+            // Raft replication/apply latency.
+            let configured_interval = Duration::from_millis(config.fast_heartbeat_interval_ms);
+            let actual_interval = config.heartbeat_interval;
+            let detector_interval = configured_interval.max(actual_interval);
+            if configured_interval < actual_interval {
+                warn!(
+                    broker_id = config.broker_id,
+                    fast_heartbeat_interval_ms = configured_interval.as_millis() as u64,
+                    heartbeat_interval_ms = actual_interval.as_millis() as u64,
+                    "fast_heartbeat_interval_ms is shorter than the interval at which broker \
+                     heartbeats are actually sent; clamping the failure detector to the real \
+                     heartbeat cadence to avoid spurious failure detection. Lower \
+                     HEARTBEAT_INTERVAL_SECS to detect failures faster."
+                );
+            }
+
             let rebalance_config = RebalanceCoordinatorConfig {
                 failure_detector: FailureDetectorConfig {
-                    heartbeat_interval: Duration::from_millis(config.fast_heartbeat_interval_ms),
+                    heartbeat_interval: detector_interval,
                     failure_threshold: config.failure_threshold,
                     suspicion_threshold: config.failure_suspicion_threshold,
+                    check_interval: (detector_interval / 2).max(Duration::from_millis(100)),
+                    // Broker heartbeats carry up to ±15% jitter and go through
+                    // Raft consensus before reaching the detector hook, so the
+                    // default 50ms tolerance is far too tight at multi-second
+                    // intervals. A quarter interval comfortably covers both.
+                    jitter_tolerance: detector_interval / 4,
                     ..Default::default()
                 },
                 load_metrics: LoadMetricsConfig::default(),
@@ -402,15 +433,15 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                                     {
                                         error!(topic = &*topic, partition, error = %e, "Failed to release partition during zombie mode");
                                     }
-                                    if let Some(store) = store_opt {
-                                        if let Err(e) = store.close().await {
-                                            warn!(
-                                                topic = &*topic,
-                                                partition,
-                                                error = %e,
-                                                "Failed to close partition store on zombie entry"
-                                            );
-                                        }
+                                    if let Some(store) = store_opt
+                                        && let Err(e) = store.close().await
+                                    {
+                                        warn!(
+                                            topic = &*topic,
+                                            partition,
+                                            error = %e,
+                                            "Failed to close partition store on zombie entry"
+                                        );
                                     }
                                 }
                                 super::metrics::record_coordinator_failure("zombie_mode");
@@ -504,15 +535,15 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                             if let Some((key, prev_state)) =
                                 partition_states.remove(&(Arc::clone(&topic), partition))
                             {
-                                if let Some(store) = prev_state.store() {
-                                    if let Err(e) = store.close().await {
-                                        warn!(
-                                            topic = &*key.0,
-                                            partition = key.1,
-                                            error = %e,
-                                            "Failed to close partition store after lease loss"
-                                        );
-                                    }
+                                if let Some(store) = prev_state.store()
+                                    && let Err(e) = store.close().await
+                                {
+                                    warn!(
+                                        topic = &*key.0,
+                                        partition = key.1,
+                                        error = %e,
+                                        "Failed to close partition store after lease loss"
+                                    );
                                 }
                                 info!(
                                     topic = &*key.0,
@@ -1606,7 +1637,10 @@ async fn release_reassigned_partition<C: ClusterCoordinator>(
         store.clear_load_metrics().await;
         if let Err(e) = store.close().await {
             if e.is_fenced() {
-                debug!(topic, partition, "Fenced during close (expected after reassignment)");
+                debug!(
+                    topic,
+                    partition, "Fenced during close (expected after reassignment)"
+                );
             } else {
                 warn!(topic, partition, error = %e, "Error closing store during reassignment");
             }

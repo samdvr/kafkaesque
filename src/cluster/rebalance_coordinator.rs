@@ -160,7 +160,15 @@ pub trait PartitionTransferExecutor: Send + Sync {
     ) -> Result<(usize, Vec<(String, i32, String)>), String>;
 
     /// Mark a broker as failed in the coordination state.
-    async fn mark_broker_failed(&self, broker_id: i32, reason: &str) -> Result<usize, String>;
+    ///
+    /// Implementations must atomically fence the broker and release its
+    /// partitions, returning the released `(topic, partition)` pairs so the
+    /// failover flow can reassign exactly that set.
+    async fn mark_broker_failed(
+        &self,
+        broker_id: i32,
+        reason: &str,
+    ) -> Result<Vec<(String, i32)>, String>;
 
     /// Get current partition ownership map.
     async fn get_partition_owners(&self) -> HashMap<(String, i32), i32>;
@@ -232,7 +240,11 @@ impl<C: ClusterCoordinator + 'static> PartitionTransferExecutor for CoordinatorE
             .map_err(|e| e.to_string())
     }
 
-    async fn mark_broker_failed(&self, broker_id: i32, reason: &str) -> Result<usize, String> {
+    async fn mark_broker_failed(
+        &self,
+        broker_id: i32,
+        reason: &str,
+    ) -> Result<Vec<(String, i32)>, String> {
         self.coordinator
             .mark_broker_failed(broker_id, reason)
             .await
@@ -364,12 +376,17 @@ impl RebalanceCoordinator {
             "Handling broker failure - starting partition redistribution"
         );
 
-        // Mark broker as failed in Raft state
-        let partitions_affected = executor
+        // Mark broker as failed in Raft state. This single applied command
+        // fences the broker and releases all of its partitions (clearing
+        // owners and bumping leader epochs), returning exactly the set that
+        // needs reassignment. Because the partitions are already released,
+        // re-reading the ownership map would no longer show them — the
+        // returned list is the authoritative source for the transfer plan.
+        let failed_partitions = executor
             .mark_broker_failed(failed_broker_id, "heartbeat_timeout")
             .await?;
 
-        if partitions_affected == 0 {
+        if failed_partitions.is_empty() {
             info!(
                 failed_broker_id,
                 "No partitions to redistribute for failed broker"
@@ -382,7 +399,7 @@ impl RebalanceCoordinator {
             });
         }
 
-        // Get current partition ownership
+        // Get current partition ownership (for load-aware distribution)
         let partition_owners = executor.get_partition_owners().await;
         let active_brokers = executor.get_active_brokers().await;
 
@@ -395,25 +412,11 @@ impl RebalanceCoordinator {
         if available_brokers.is_empty() {
             error!(
                 failed_broker_id,
-                "No available brokers for partition redistribution"
+                "No available brokers for partition redistribution; \
+                 released partitions will be picked up by the ownership loop \
+                 once brokers become available"
             );
             return Err("No available brokers for failover".to_string());
-        }
-
-        // Find partitions owned by the failed broker
-        let failed_partitions: Vec<(String, i32)> = partition_owners
-            .iter()
-            .filter(|(_, owner)| **owner == failed_broker_id)
-            .map(|((topic, partition), _)| (topic.clone(), *partition))
-            .collect();
-
-        if failed_partitions.is_empty() {
-            return Ok(FailoverResult {
-                failed_broker_id,
-                partitions_redistributed: 0,
-                partitions_failed: 0,
-                target_brokers: vec![],
-            });
         }
 
         // Count existing partitions per broker for load-aware distribution
@@ -1075,7 +1078,7 @@ mod tests {
     struct MockExecutor {
         partition_owners: std::sync::RwLock<HashMap<(String, i32), i32>>,
         active_brokers: std::sync::RwLock<Vec<i32>>,
-        mark_failed_result: std::sync::RwLock<Result<usize, String>>,
+        mark_failed_error: std::sync::RwLock<Option<String>>,
         batch_transfer_result: std::sync::RwLock<Option<BatchTransferResult>>,
     }
 
@@ -1084,7 +1087,7 @@ mod tests {
             Self {
                 partition_owners: std::sync::RwLock::new(HashMap::new()),
                 active_brokers: std::sync::RwLock::new(vec![]),
-                mark_failed_result: std::sync::RwLock::new(Ok(0)),
+                mark_failed_error: std::sync::RwLock::new(None),
                 batch_transfer_result: std::sync::RwLock::new(None),
             }
         }
@@ -1102,8 +1105,8 @@ mod tests {
                 .insert((topic.to_string(), partition), owner);
         }
 
-        fn set_mark_failed_result(&self, result: Result<usize, String>) {
-            *self.mark_failed_result.write().unwrap() = result;
+        fn set_mark_failed_error(&self, error: String) {
+            *self.mark_failed_error.write().unwrap() = Some(error);
         }
 
         fn set_batch_transfer_result(&self, result: BatchTransferResult) {
@@ -1141,10 +1144,24 @@ mod tests {
 
         async fn mark_broker_failed(
             &self,
-            _broker_id: i32,
+            broker_id: i32,
             _reason: &str,
-        ) -> Result<usize, String> {
-            self.mark_failed_result.read().unwrap().clone()
+        ) -> Result<Vec<(String, i32)>, String> {
+            if let Some(error) = self.mark_failed_error.read().unwrap().as_ref() {
+                return Err(error.clone());
+            }
+            // Mirror the real semantics: release (and return) every
+            // partition owned by the failed broker.
+            let mut owners = self.partition_owners.write().unwrap();
+            let released: Vec<(String, i32)> = owners
+                .iter()
+                .filter(|(_, owner)| **owner == broker_id)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in &released {
+                owners.remove(key);
+            }
+            Ok(released)
         }
 
         async fn get_partition_owners(&self) -> HashMap<(String, i32), i32> {
@@ -1189,7 +1206,10 @@ mod tests {
     async fn test_handle_broker_failure_no_available_brokers() {
         let coordinator = RebalanceCoordinator::with_defaults(1, Handle::current());
         let executor = MockExecutor::new();
-        executor.set_mark_failed_result(Ok(5)); // Broker owns 5 partitions
+        // Broker 2 owns 5 partitions
+        for i in 0..5 {
+            executor.add_partition("topic", i, 2);
+        }
 
         // Only the failed broker is available
         *executor.active_brokers.write().unwrap() = vec![2];
@@ -1206,7 +1226,6 @@ mod tests {
         executor.add_partition("topic", 0, 2);
         executor.add_partition("topic", 1, 2);
         executor.add_partition("topic", 2, 3);
-        executor.set_mark_failed_result(Ok(2)); // 2 partitions affected
 
         let result = coordinator.handle_broker_failure(2, &executor).await;
         assert!(result.is_ok());
@@ -1255,7 +1274,6 @@ mod tests {
         executor.add_partition("topic-a", 0, 2);
         executor.add_partition("topic-a", 1, 2);
         executor.add_partition("topic-b", 0, 2);
-        executor.set_mark_failed_result(Ok(3)); // 3 partitions affected
 
         // Set batch transfer to fail
         executor.set_batch_transfer_result(Err("Raft proposal failed: timeout".to_string()));
@@ -1280,7 +1298,6 @@ mod tests {
         // Add partitions owned by broker 2
         executor.add_partition("topic", 0, 2);
         executor.add_partition("topic", 1, 2);
-        executor.set_mark_failed_result(Ok(2)); // 2 partitions affected
 
         // Set batch transfer to succeed with 1 failure
         executor.set_batch_transfer_result(Ok((
@@ -1319,7 +1336,6 @@ mod tests {
         for i in 0..8 {
             executor.add_partition("topic", i, 2);
         }
-        executor.set_mark_failed_result(Ok(8)); // 8 partitions affected
 
         let result = coordinator.handle_broker_failure(2, &executor).await;
         assert!(result.is_ok());
@@ -1345,7 +1361,6 @@ mod tests {
         for i in 0..4 {
             executor.add_partition("topic", i, 2);
         }
-        executor.set_mark_failed_result(Ok(4));
 
         let start = std::time::Instant::now();
         let result = coordinator.handle_broker_failure(2, &executor).await;
@@ -1375,7 +1390,6 @@ mod tests {
         // Broker 2 fails with 2 partitions
         executor.add_partition("topic", 0, 2);
         executor.add_partition("topic", 1, 2);
-        executor.set_mark_failed_result(Ok(2));
 
         let result = coordinator.handle_broker_failure(2, &executor).await;
         assert!(result.is_ok());
@@ -1477,7 +1491,7 @@ mod tests {
         let executor = MockExecutor::with_brokers(vec![1, 2, 3]);
 
         // Make mark_broker_failed return error
-        executor.set_mark_failed_result(Err("Raft proposal failed".to_string()));
+        executor.set_mark_failed_error("Raft proposal failed".to_string());
 
         let result = coordinator.handle_broker_failure(2, &executor).await;
         assert!(result.is_err());
@@ -1509,7 +1523,6 @@ mod tests {
 
         // First failover
         executor.add_partition("t1", 0, 2);
-        executor.set_mark_failed_result(Ok(1));
         coordinator
             .handle_broker_failure(2, &executor)
             .await
@@ -1550,7 +1563,6 @@ mod tests {
         let executor = MockExecutor::new();
 
         executor.add_partition("topic", 0, 1);
-        executor.set_mark_failed_result(Ok(1));
         *executor.active_brokers.write().unwrap() = vec![1]; // Only failed broker
 
         let result = coordinator.handle_broker_failure(1, &executor).await;
@@ -1566,7 +1578,6 @@ mod tests {
         // Register and fail broker 2
         coordinator.register_broker(2);
         executor.add_partition("topic", 0, 2);
-        executor.set_mark_failed_result(Ok(1));
 
         // Before failover, broker should be tracked
         assert_eq!(coordinator.failure_detector().broker_count(), 1);

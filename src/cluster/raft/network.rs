@@ -357,10 +357,7 @@ impl RaftNetworkFactoryImpl {
     /// Create a new network factory with HMAC keys and optional TLS.
     /// When `tls` is `Some`, every outbound Raft connection will perform
     /// a TLS handshake against the peer's listener.
-    pub fn with_keys_and_tls(
-        auth_keys: Arc<RaftAuthKeys>,
-        tls: Option<RaftTlsConfig>,
-    ) -> Self {
+    pub fn with_keys_and_tls(auth_keys: Arc<RaftAuthKeys>, tls: Option<RaftTlsConfig>) -> Self {
         Self {
             nodes: Arc::new(RwLock::new(BTreeMap::new())),
             auth_keys,

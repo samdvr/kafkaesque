@@ -143,7 +143,16 @@ impl PartitionTransferCoordinator for RaftCoordinator {
     }
 
     /// Mark a broker as failed and track it in the cluster state.
-    async fn mark_broker_failed(&self, broker_id: i32, reason: &str) -> SlateDBResult<usize> {
+    ///
+    /// The applied Raft command atomically fences the broker, releases every
+    /// partition it owned (bumping leader epochs so its in-flight writes are
+    /// rejected), and records the failure. The released partitions are
+    /// returned so the failover initiator can reassign exactly that set.
+    async fn mark_broker_failed(
+        &self,
+        broker_id: i32,
+        reason: &str,
+    ) -> SlateDBResult<Vec<(String, i32)>> {
         let detected_at_ms = current_time_ms();
         let command = CoordinationCommand::TransferDomain(TransferCommand::MarkBrokerFailed {
             broker_id,
@@ -155,19 +164,19 @@ impl PartitionTransferCoordinator for RaftCoordinator {
         match response {
             CoordinationResponse::TransferDomainResponse(
                 TransferResponse::BrokerMarkedFailed {
-                    partitions_affected,
+                    released_partitions,
                     ..
                 },
             ) => {
                 // Invalidate any cached ownership for this broker
                 self.owner_cache.invalidate_all();
                 self.owner_cache.run_pending_tasks().await;
-                Ok(partitions_affected)
+                Ok(released_partitions)
             }
             CoordinationResponse::TransferDomainResponse(
                 TransferResponse::BrokerAlreadyFailed { .. },
-            ) => Ok(0),
-            CoordinationResponse::BrokerDomainResponse(_) => Ok(0), // Handle BrokerNotFound from broker domain
+            ) => Ok(Vec::new()),
+            CoordinationResponse::BrokerDomainResponse(_) => Ok(Vec::new()), // Handle BrokerNotFound from broker domain
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected mark_broker_failed response: {:?}",
                 other

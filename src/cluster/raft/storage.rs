@@ -171,13 +171,12 @@ impl RaftStore {
                     continue;
                 }
                 let bytes = std::fs::read(&path)?;
-                let log_entry: Entry<TypeConfig> =
-                    postcard::from_bytes(&bytes).map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("log {}: deserialize: {}", path.display(), e),
-                        )
-                    })?;
+                let log_entry: Entry<TypeConfig> = postcard::from_bytes(&bytes).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("log {}: deserialize: {}", path.display(), e),
+                    )
+                })?;
                 log.insert(log_entry.log_id.index, log_entry);
             }
         }
@@ -212,7 +211,10 @@ impl RaftStore {
             return Ok(());
         };
         let bytes = postcard::to_stdvec(vote).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("vote serialize: {}", e))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("vote serialize: {}", e),
+            )
         })?;
         Self::atomic_write_fsync(&dir.join("vote.bin"), &bytes)
     }

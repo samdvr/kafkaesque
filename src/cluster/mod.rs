@@ -61,8 +61,8 @@
 //! }
 //! ```
 
-pub mod auto_balancer;
 pub mod authorizer;
+pub mod auto_balancer;
 pub mod buffer_pool;
 mod config;
 mod coordinator;

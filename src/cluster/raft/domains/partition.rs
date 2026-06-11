@@ -117,6 +117,11 @@ pub enum PartitionResponse {
     /// Partition is not owned by the requesting broker.
     PartitionNotOwned { topic: String, partition: i32 },
 
+    /// The requesting broker is not Active (fenced or shutting down) and
+    /// may not acquire partitions or renew leases. Returned by the
+    /// state-machine cross-domain gate, not by the partition domain itself.
+    BrokerNotActive { broker_id: i32 },
+
     /// Partition was released.
     PartitionReleased { topic: String, partition: i32 },
 

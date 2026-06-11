@@ -376,9 +376,15 @@ mod tests {
         // Server processes client-first.
         let creds_clone = creds.clone();
         let (state, server_first_bytes) = handle_client_first(client_first.as_bytes(), |u| {
-            if u == user { Some(creds_clone.clone()) } else { None }
+            if u == user {
+                Some(creds_clone.clone())
+            } else {
+                None
+            }
         });
-        let server_first = std::str::from_utf8(&server_first_bytes).unwrap().to_string();
+        let server_first = std::str::from_utf8(&server_first_bytes)
+            .unwrap()
+            .to_string();
 
         // Extract combined nonce so the test "client" can echo it.
         let combined_nonce = server_first
@@ -392,8 +398,7 @@ mod tests {
         let client_key = hmac_sha256(&salted, b"Client Key");
         let stored_key: [u8; 32] = Sha256::digest(client_key).into();
         let cbind_b64 = B64.encode(b"n,,");
-        let client_final_without_proof =
-            format!("c={},r={}", cbind_b64, combined_nonce);
+        let client_final_without_proof = format!("c={},r={}", cbind_b64, combined_nonce);
         let auth_message = format!(
             "{},{},{}",
             client_first_bare, server_first, client_final_without_proof
@@ -410,8 +415,7 @@ mod tests {
         );
 
         // Server validates client-final.
-        let (final_state, server_final_bytes) =
-            handle_client_final(client_final.as_bytes(), state);
+        let (final_state, server_final_bytes) = handle_client_final(client_final.as_bytes(), state);
         match final_state {
             ScramServerState::Authenticated(p) => assert_eq!(p, "User:alice"),
             other => panic!("Expected Authenticated, got {:?}", other),
@@ -433,7 +437,10 @@ mod tests {
         let (state, _server_first) =
             handle_client_first(client_first.as_bytes(), |_| None /* no users */);
         // State is AwaitingClientFinal even though the user doesn't exist.
-        assert!(matches!(state, ScramServerState::AwaitingClientFinal { .. }));
+        assert!(matches!(
+            state,
+            ScramServerState::AwaitingClientFinal { .. }
+        ));
 
         // Construct a plausible-looking client-final with a bogus proof.
         let combined_nonce = match &state {
@@ -442,10 +449,7 @@ mod tests {
         };
         let cbind_b64 = B64.encode(b"n,,");
         let bogus_proof = B64.encode([0u8; 32]);
-        let client_final = format!(
-            "c={},r={},p={}",
-            cbind_b64, combined_nonce, bogus_proof
-        );
+        let client_final = format!("c={},r={},p={}", cbind_b64, combined_nonce, bogus_proof);
         let (final_state, _err) = handle_client_final(client_final.as_bytes(), state);
         assert!(matches!(final_state, ScramServerState::Failed(_)));
     }
@@ -459,7 +463,8 @@ mod tests {
         let client_first = format!("n,,{}", client_first_bare);
 
         let creds_clone = creds.clone();
-        let (state, _) = handle_client_first(client_first.as_bytes(), move |_| Some(creds_clone.clone()));
+        let (state, _) =
+            handle_client_first(client_first.as_bytes(), move |_| Some(creds_clone.clone()));
         let cbind_b64 = B64.encode(b"n,,");
         // Wrong nonce on client-final — must fail without revealing whether
         // the password was right.

@@ -76,6 +76,14 @@ spec:
             # Format: "node_id=host:port,node_id=host:port,..."
             - name: RAFT_PEERS
               value: "0=kafkaesque-0.kafkaesque-headless.kafkaesque.svc.cluster.local:9093,1=kafkaesque-1.kafkaesque-headless.kafkaesque.svc.cluster.local:9093,2=kafkaesque-2.kafkaesque-headless.kafkaesque.svc.cluster.local:9093"
+            # HMAC secret authenticating every Raft RPC frame. Required at
+            # startup outside the development profile; must hold the same
+            # value on every broker. See secret.yaml for rotation guidance.
+            - name: RAFT_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kafkaesque-raft-auth
+                  key: raft-cluster-secret
 
           securityContext:
             allowPrivilegeEscalation: false

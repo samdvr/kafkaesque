@@ -75,7 +75,6 @@ pub use auth::RaftAuthKeys;
 pub use commands::{CoordinationCommand, CoordinationResponse};
 pub use config::RaftConfig;
 pub use coordinator::RaftCoordinator;
-pub use tls::RaftTlsConfig;
 pub use domains::{
     AclBinding, AclCommand, AclDecision, AclDomainState, AclFilter, AclOperation, AclPatternType,
     AclPermissionType, AclResourceType, AclResponse, BrokerCommand, BrokerDomainState,
@@ -88,4 +87,5 @@ pub use network::{RaftNetworkFactoryImpl, RaftRpcMessage, RaftRpcResponse, reque
 pub use node::RaftNode;
 pub use state_machine::CoordinationStateMachine;
 pub use storage::RaftStore;
+pub use tls::RaftTlsConfig;
 pub use types::{RaftNodeId, TypeConfig};

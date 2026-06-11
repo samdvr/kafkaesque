@@ -34,5 +34,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "request_parse_structured"
+path = "fuzz_targets/request_parse_structured.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

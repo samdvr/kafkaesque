@@ -318,7 +318,14 @@ async fn run_broker(
             match run_task.await {
                 Ok(r) => r,
                 Err(e) => Err(kafkaesque::error::Error::IoError(
-                    if e.is_cancelled() { std::io::ErrorKind::Interrupted } else { std::io::ErrorKind::Other },
+                    kafkaesque::error::PreservedIoError {
+                        kind: if e.is_cancelled() {
+                            std::io::ErrorKind::Interrupted
+                        } else {
+                            std::io::ErrorKind::Other
+                        },
+                        message: e.to_string(),
+                    },
                 )),
             }
         } => {

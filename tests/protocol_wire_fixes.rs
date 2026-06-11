@@ -527,6 +527,49 @@ fn patching_base_offset_does_not_bless_corrupt_batches() {
 }
 
 // ============================================================================
+// Low-priority protocol/wire fixes (audit §2.8, §3.5)
+// ============================================================================
+
+#[test]
+fn parse_kafka_string_decodes_topic_names_in_one_step() {
+    let mut buf = header(3, 1, 200, Some("meta"));
+    buf.put_i32(1);
+    put_string(&mut buf, "my-topic");
+
+    let request = Request::parse(Bytes::from(buf.to_vec())).unwrap();
+    match request {
+        Request::Metadata(_, body) => {
+            assert_eq!(
+                body.topics,
+                Some(vec!["my-topic".to_string()])
+            );
+        }
+        other => panic!("expected Metadata, got {:?}", other),
+    }
+}
+
+#[test]
+fn io_error_preserves_underlying_message() {
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "broken pipe on read",
+    );
+    let err = kafkaesque::error::Error::from(io_err);
+    let display = format!("{}", err);
+    assert!(display.contains("broken pipe on read"));
+}
+
+#[test]
+fn trailing_request_bytes_are_counted_not_silently_dropped() {
+    let mut buf = header(3, 1, 201, None);
+    buf.put_i32(-1); // all topics
+    buf.put_slice(b"leftover-padding");
+
+    let request = Request::parse(Bytes::from(buf.to_vec())).unwrap();
+    assert!(matches!(request, Request::Metadata(_, _)));
+}
+
+// ============================================================================
 // Finding 6: ParsingError payload bounded
 // ============================================================================
 

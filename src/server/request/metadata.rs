@@ -7,7 +7,7 @@ use nom::{
 use nombytes::NomBytes;
 
 use crate::constants::MAX_PROTOCOL_ARRAY_SIZE;
-use crate::parser::{bytes_to_string, parse_string};
+use crate::parser::parse_kafka_string;
 
 /// Metadata request data.
 #[derive(Debug, Clone, Default)]
@@ -53,8 +53,8 @@ pub fn parse_metadata_request(s: NomBytes, version: i16) -> IResult<NomBytes, Me
     let mut topics = Vec::with_capacity(topic_count as usize);
     let mut remaining = s;
     for _ in 0..topic_count {
-        let (s, name) = parse_string(remaining)?;
-        topics.push(bytes_to_string(&name)?);
+        let (s, name) = parse_kafka_string(remaining)?;
+        topics.push(name);
         remaining = s;
     }
 

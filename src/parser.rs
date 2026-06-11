@@ -3,12 +3,58 @@ use bytes::Bytes;
 use nom::{
     IResult,
     bytes::complete::take,
-    multi::many_m_n,
     number::complete::{be_i16, be_i32},
 };
 use nombytes::NomBytes;
 
 use crate::constants::MAX_PROTOCOL_ARRAY_SIZE;
+
+fn utf8_verify_err(input: NomBytes) -> nom::Err<nom::error::Error<NomBytes>> {
+    nom::Err::Failure(nom::error::Error::new(
+        input,
+        nom::error::ErrorKind::Verify,
+    ))
+}
+
+/// Parse a Kafka `STRING` directly into a validated UTF-8 [`String`].
+///
+/// Unlike `parse_string` followed by `bytes_to_string`, this avoids the
+/// intermediate [`Bytes`] allocation on the hot path where every topic and
+/// group name is decoded.
+pub fn parse_kafka_string(s: NomBytes) -> IResult<NomBytes, String> {
+    let (s, length) = be_i16(s)?;
+
+    if length < 0 {
+        return Err(utf8_verify_err(s));
+    }
+
+    let (s, raw) = take(length as usize)(s)?;
+    let bytes = raw.into_bytes();
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => Ok((s, text.to_string())),
+        Err(_) => Err(utf8_verify_err(s)),
+    }
+}
+
+/// Parse a Kafka `NULLABLE_STRING` directly into `Option<String>`.
+pub fn parse_kafka_string_opt(s: NomBytes) -> IResult<NomBytes, Option<String>> {
+    let (s, length) = be_i16(s)?;
+
+    if length == -1 {
+        return Ok((s, None));
+    }
+
+    if length < 0 {
+        return Err(utf8_verify_err(s));
+    }
+
+    let (s, raw) = take(length as usize)(s)?;
+    let bytes = raw.into_bytes();
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => Ok((s, Some(text.to_string()))),
+        Err(_) => Err(utf8_verify_err(s)),
+    }
+}
 
 /// Convert bytes to a validated UTF-8 string.
 /// Returns an error if the bytes are not valid UTF-8.
@@ -54,28 +100,34 @@ pub fn parse_string(s: NomBytes) -> IResult<NomBytes, Bytes> {
     Ok((s, string.into_bytes()))
 }
 
-pub fn parse_array<O, E, F>(f: F) -> impl FnMut(NomBytes) -> IResult<NomBytes, Vec<O>, E>
+pub fn parse_array<O, E, F>(mut f: F) -> impl FnMut(NomBytes) -> IResult<NomBytes, Vec<O>, E>
 where
-    F: nom::Parser<NomBytes, O, E> + Copy,
+    F: FnMut(NomBytes) -> IResult<NomBytes, O, E>,
     E: nom::error::ParseError<NomBytes>,
 {
     move |input: NomBytes| {
-        let (input, length) = be_i32(input)?;
+        let (mut rest, length) = be_i32(input)?;
 
         // Null array
         if length == -1 {
-            return Ok((input, vec![]));
+            return Ok((rest, vec![]));
         }
 
         // Validate array size bounds
         if !(0..=MAX_PROTOCOL_ARRAY_SIZE).contains(&length) {
             return Err(nom::Err::Failure(E::from_error_kind(
-                input,
+                rest,
                 nom::error::ErrorKind::TooLarge,
             )));
         }
 
-        many_m_n(length as usize, length as usize, f)(input)
+        let mut out = Vec::with_capacity(length as usize);
+        for _ in 0..length {
+            let (r, item) = f(rest)?;
+            out.push(item);
+            rest = r;
+        }
+        Ok((rest, out))
     }
 }
 
@@ -186,6 +238,35 @@ pub fn skip_tagged_fields(s: NomBytes) -> IResult<NomBytes, ()> {
 mod tests {
     use super::*;
     use nom::number::complete::be_i32;
+
+    #[test]
+    fn test_parse_kafka_string_valid() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&5i16.to_be_bytes());
+        data.extend_from_slice(b"hello");
+
+        let input = NomBytes::new(Bytes::from(data));
+        let (_, parsed) = parse_kafka_string(input).unwrap();
+        assert_eq!(parsed, "hello");
+    }
+
+    #[test]
+    fn test_parse_kafka_string_rejects_invalid_utf8() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2i16.to_be_bytes());
+        data.extend_from_slice(&[0xFF, 0xFE]);
+
+        let input = NomBytes::new(Bytes::from(data));
+        assert!(parse_kafka_string(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_kafka_string_opt_null() {
+        let data = (-1i16).to_be_bytes().to_vec();
+        let input = NomBytes::new(Bytes::from(data));
+        let (_, parsed) = parse_kafka_string_opt(input).unwrap();
+        assert_eq!(parsed, None);
+    }
 
     #[test]
     fn test_bytes_to_string_valid_utf8() {

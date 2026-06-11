@@ -7,9 +7,7 @@ use nom::{
 };
 use nombytes::NomBytes;
 
-use crate::parser::{
-    bytes_to_string, bytes_to_string_opt, parse_array, parse_nullable_string, parse_string,
-};
+use crate::parser::{parse_array, parse_kafka_string, parse_kafka_string_opt};
 
 /// Produce request data.
 #[derive(Debug, Clone)]
@@ -33,7 +31,7 @@ pub struct ProducePartitionData {
 }
 
 pub fn parse_produce_request(s: NomBytes, _version: i16) -> IResult<NomBytes, ProduceRequestData> {
-    let (s, transactional_id) = parse_nullable_string(s)?;
+    let (s, transactional_id) = parse_kafka_string_opt(s)?;
     let (s, acks) = be_i16(s)?;
     let (s, timeout_ms) = be_i32(s)?;
     let (s, topics) = parse_array(parse_produce_topic)(s)?;
@@ -41,7 +39,7 @@ pub fn parse_produce_request(s: NomBytes, _version: i16) -> IResult<NomBytes, Pr
     Ok((
         s,
         ProduceRequestData {
-            transactional_id: bytes_to_string_opt(transactional_id)?,
+            transactional_id,
             acks,
             timeout_ms,
             topics,
@@ -50,13 +48,13 @@ pub fn parse_produce_request(s: NomBytes, _version: i16) -> IResult<NomBytes, Pr
 }
 
 fn parse_produce_topic(s: NomBytes) -> IResult<NomBytes, ProduceTopicData> {
-    let (s, name) = parse_string(s)?;
+    let (s, name) = parse_kafka_string(s)?;
     let (s, partitions) = parse_array(parse_produce_partition)(s)?;
 
     Ok((
         s,
         ProduceTopicData {
-            name: bytes_to_string(&name)?,
+            name,
             partitions,
         },
     ))

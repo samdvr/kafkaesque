@@ -6,9 +6,7 @@ use nom::{
 };
 use nombytes::NomBytes;
 
-use crate::parser::{
-    bytes_to_string, bytes_to_string_opt, parse_array, parse_nullable_string, parse_string,
-};
+use crate::parser::{parse_array, parse_kafka_string, parse_kafka_string_opt};
 
 // ============================================================================
 // ListOffsets
@@ -53,13 +51,13 @@ pub fn parse_list_offsets_request(
 }
 
 fn parse_list_offsets_topic(s: NomBytes, version: i16) -> IResult<NomBytes, ListOffsetsTopicData> {
-    let (s, name) = parse_string(s)?;
+    let (s, name) = parse_kafka_string(s)?;
     let (s, partitions) = parse_array(|s| parse_list_offsets_partition(s, version))(s)?;
 
     Ok((
         s,
         ListOffsetsTopicData {
-            name: bytes_to_string(&name)?,
+            name,
             partitions,
         },
     ))
@@ -126,15 +124,14 @@ pub fn parse_offset_commit_request(
     s: NomBytes,
     version: i16,
 ) -> IResult<NomBytes, OffsetCommitRequestData> {
-    let (s, group_id) = parse_string(s)?;
+    let (s, group_id) = parse_kafka_string(s)?;
     // `generation_id` and `member_id` were added in OffsetCommit v1; a v0
     // request has neither. Reading them unconditionally consumed the v0
     // topics array as garbage. v0 commits are "simple" (outside a consumer
     // group generation): Kafka models that as generation -1 / empty member.
     let (s, generation_id) = if version >= 1 { be_i32(s)? } else { (s, -1i32) };
     let (s, member_id) = if version >= 1 {
-        let (s, member_id) = parse_string(s)?;
-        (s, bytes_to_string(&member_id)?)
+        parse_kafka_string(s)?
     } else {
         (s, String::new())
     };
@@ -156,7 +153,7 @@ pub fn parse_offset_commit_request(
     Ok((
         s,
         OffsetCommitRequestData {
-            group_id: bytes_to_string(&group_id)?,
+            group_id,
             generation_id,
             member_id,
             topics,
@@ -168,13 +165,13 @@ fn parse_offset_commit_topic(
     s: NomBytes,
     version: i16,
 ) -> IResult<NomBytes, OffsetCommitTopicData> {
-    let (s, name) = parse_string(s)?;
+    let (s, name) = parse_kafka_string(s)?;
     let (s, partitions) = parse_array(|s| parse_offset_commit_partition(s, version))(s)?;
 
     Ok((
         s,
         OffsetCommitTopicData {
-            name: bytes_to_string(&name)?,
+            name,
             partitions,
         },
     ))
@@ -190,14 +187,14 @@ fn parse_offset_commit_partition(
     // Parsed and dropped: the broker timestamps commits itself, which is
     // exactly the v0/v2+ behavior.
     let (s, _commit_timestamp) = if version == 1 { be_i64(s)? } else { (s, -1i64) };
-    let (s, committed_metadata) = parse_nullable_string(s)?;
+    let (s, committed_metadata) = parse_kafka_string_opt(s)?;
 
     Ok((
         s,
         OffsetCommitPartitionData {
             partition_index,
             committed_offset,
-            committed_metadata: bytes_to_string_opt(committed_metadata)?,
+            committed_metadata,
         },
     ))
 }
@@ -223,26 +220,26 @@ pub fn parse_offset_fetch_request(
     s: NomBytes,
     _version: i16,
 ) -> IResult<NomBytes, OffsetFetchRequestData> {
-    let (s, group_id) = parse_string(s)?;
+    let (s, group_id) = parse_kafka_string(s)?;
     let (s, topics) = parse_array(parse_offset_fetch_topic)(s)?;
 
     Ok((
         s,
         OffsetFetchRequestData {
-            group_id: bytes_to_string(&group_id)?,
+            group_id,
             topics,
         },
     ))
 }
 
 fn parse_offset_fetch_topic(s: NomBytes) -> IResult<NomBytes, OffsetFetchTopicData> {
-    let (s, name) = parse_string(s)?;
+    let (s, name) = parse_kafka_string(s)?;
     let (s, partition_indexes) = parse_array(be_i32)(s)?;
 
     Ok((
         s,
         OffsetFetchTopicData {
-            name: bytes_to_string(&name)?,
+            name,
             partition_indexes,
         },
     ))

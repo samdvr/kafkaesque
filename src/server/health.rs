@@ -118,7 +118,7 @@ impl HealthServer {
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .await
-            .map_err(|e| Error::IoError(e.kind()))?;
+            .map_err(Error::from)?;
 
         let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -136,7 +136,7 @@ impl HealthServer {
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.listener
             .local_addr()
-            .map_err(|e| Error::IoError(e.kind()))
+            .map_err(Error::from)
     }
 
     /// Initiate graceful shutdown.
@@ -441,7 +441,10 @@ mod tests {
                 let addr = server.local_addr().unwrap();
                 assert!(addr.port() > 0);
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind (CI environments may have restrictions)
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -460,7 +463,10 @@ mod tests {
                 assert!(!server.is_ready());
                 assert_eq!(server.health_status(), HealthStatus::NotReady);
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind (CI environments may have restrictions)
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -569,7 +575,10 @@ mod tests {
                 let addr = server.local_addr().unwrap();
                 assert!(addr.port() > 0);
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -584,7 +593,10 @@ mod tests {
                 // Shutdown should not panic
                 server.shutdown();
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -652,7 +664,10 @@ mod tests {
                 let result = handle.await.unwrap();
                 assert!(result.is_ok());
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),

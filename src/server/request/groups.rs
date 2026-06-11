@@ -7,7 +7,7 @@ use nom::{
 };
 use nombytes::NomBytes;
 
-use crate::parser::{bytes_to_string, parse_array, parse_string};
+use crate::parser::{parse_array, parse_kafka_string};
 
 // ============================================================================
 // FindCoordinator
@@ -24,13 +24,13 @@ pub fn parse_find_coordinator_request(
     s: NomBytes,
     version: i16,
 ) -> IResult<NomBytes, FindCoordinatorRequestData> {
-    let (s, key) = parse_string(s)?;
+    let (s, key) = parse_kafka_string(s)?;
     let (s, key_type) = if version >= 1 { be_i8(s)? } else { (s, 0i8) };
 
     Ok((
         s,
         FindCoordinatorRequestData {
-            key: bytes_to_string(&key)?,
+            key,
             key_type,
         },
     ))
@@ -74,7 +74,7 @@ pub fn parse_join_group_request(
     s: NomBytes,
     version: i16,
 ) -> IResult<NomBytes, JoinGroupRequestData> {
-    let (s, group_id) = parse_string(s)?;
+    let (s, group_id) = parse_kafka_string(s)?;
     let (s, session_timeout_ms) = be_i32(s)?;
     // rebalance_timeout_ms: added in v1 (KIP-62); defaults to the session
     // timeout for v0, matching the Kafka broker's up-conversion.
@@ -83,25 +83,25 @@ pub fn parse_join_group_request(
     } else {
         (s, session_timeout_ms)
     };
-    let (s, member_id) = parse_string(s)?;
-    let (s, protocol_type) = parse_string(s)?;
+    let (s, member_id) = parse_kafka_string(s)?;
+    let (s, protocol_type) = parse_kafka_string(s)?;
     let (s, protocols) = parse_array(parse_join_group_protocol)(s)?;
 
     Ok((
         s,
         JoinGroupRequestData {
-            group_id: bytes_to_string(&group_id)?,
+            group_id,
             session_timeout_ms,
             rebalance_timeout_ms,
-            member_id: bytes_to_string(&member_id)?,
-            protocol_type: bytes_to_string(&protocol_type)?,
+            member_id,
+            protocol_type,
             protocols,
         },
     ))
 }
 
 fn parse_join_group_protocol(s: NomBytes) -> IResult<NomBytes, JoinGroupProtocolData> {
-    let (s, name) = parse_string(s)?;
+    let (s, name) = parse_kafka_string(s)?;
     let (s, metadata_len) = be_i32(s)?;
     if metadata_len < 0 {
         return Err(nom::Err::Error(nom::error::Error::new(
@@ -114,7 +114,7 @@ fn parse_join_group_protocol(s: NomBytes) -> IResult<NomBytes, JoinGroupProtocol
     Ok((
         s,
         JoinGroupProtocolData {
-            name: bytes_to_string(&name)?,
+            name,
             metadata: metadata.into_bytes(),
         },
     ))
@@ -136,16 +136,16 @@ pub fn parse_heartbeat_request(
     s: NomBytes,
     _version: i16,
 ) -> IResult<NomBytes, HeartbeatRequestData> {
-    let (s, group_id) = parse_string(s)?;
+    let (s, group_id) = parse_kafka_string(s)?;
     let (s, generation_id) = be_i32(s)?;
-    let (s, member_id) = parse_string(s)?;
+    let (s, member_id) = parse_kafka_string(s)?;
 
     Ok((
         s,
         HeartbeatRequestData {
-            group_id: bytes_to_string(&group_id)?,
+            group_id,
             generation_id,
-            member_id: bytes_to_string(&member_id)?,
+            member_id,
         },
     ))
 }
@@ -165,14 +165,14 @@ pub fn parse_leave_group_request(
     s: NomBytes,
     _version: i16,
 ) -> IResult<NomBytes, LeaveGroupRequestData> {
-    let (s, group_id) = parse_string(s)?;
-    let (s, member_id) = parse_string(s)?;
+    let (s, group_id) = parse_kafka_string(s)?;
+    let (s, member_id) = parse_kafka_string(s)?;
 
     Ok((
         s,
         LeaveGroupRequestData {
-            group_id: bytes_to_string(&group_id)?,
-            member_id: bytes_to_string(&member_id)?,
+            group_id,
+            member_id,
         },
     ))
 }
@@ -200,24 +200,24 @@ pub fn parse_sync_group_request(
     s: NomBytes,
     _version: i16,
 ) -> IResult<NomBytes, SyncGroupRequestData> {
-    let (s, group_id) = parse_string(s)?;
+    let (s, group_id) = parse_kafka_string(s)?;
     let (s, generation_id) = be_i32(s)?;
-    let (s, member_id) = parse_string(s)?;
+    let (s, member_id) = parse_kafka_string(s)?;
     let (s, assignments) = parse_array(parse_sync_group_assignment)(s)?;
 
     Ok((
         s,
         SyncGroupRequestData {
-            group_id: bytes_to_string(&group_id)?,
+            group_id,
             generation_id,
-            member_id: bytes_to_string(&member_id)?,
+            member_id,
             assignments,
         },
     ))
 }
 
 fn parse_sync_group_assignment(s: NomBytes) -> IResult<NomBytes, SyncGroupAssignmentData> {
-    let (s, member_id) = parse_string(s)?;
+    let (s, member_id) = parse_kafka_string(s)?;
     let (s, assignment_len) = be_i32(s)?;
     if assignment_len < 0 {
         return Err(nom::Err::Error(nom::error::Error::new(
@@ -230,7 +230,7 @@ fn parse_sync_group_assignment(s: NomBytes) -> IResult<NomBytes, SyncGroupAssign
     Ok((
         s,
         SyncGroupAssignmentData {
-            member_id: bytes_to_string(&member_id)?,
+            member_id,
             assignment: assignment.into_bytes(),
         },
     ))
@@ -250,10 +250,7 @@ pub fn parse_describe_groups_request(
     s: NomBytes,
     _version: i16,
 ) -> IResult<NomBytes, DescribeGroupsRequestData> {
-    let (s, group_ids) = parse_array(|input| {
-        let (input, group_id) = parse_string(input)?;
-        Ok((input, bytes_to_string(&group_id)?))
-    })(s)?;
+    let (s, group_ids) = parse_array(parse_kafka_string)(s)?;
 
     Ok((s, DescribeGroupsRequestData { group_ids }))
 }
@@ -275,10 +272,7 @@ pub fn parse_list_groups_request(
     // Version 0-3 have no request body
     // Version 4+ have states_filter
     let (s, states_filter) = if version >= 4 {
-        parse_array(|input| {
-            let (input, state) = parse_string(input)?;
-            Ok((input, bytes_to_string(&state)?))
-        })(s)?
+        parse_array(parse_kafka_string)(s)?
     } else {
         (s, vec![])
     };
@@ -300,10 +294,7 @@ pub fn parse_delete_groups_request(
     s: NomBytes,
     _version: i16,
 ) -> IResult<NomBytes, DeleteGroupsRequestData> {
-    let (s, group_ids) = parse_array(|input| {
-        let (input, group_id) = parse_string(input)?;
-        Ok((input, bytes_to_string(&group_id)?))
-    })(s)?;
+    let (s, group_ids) = parse_array(parse_kafka_string)(s)?;
 
     Ok((s, DeleteGroupsRequestData { group_ids }))
 }

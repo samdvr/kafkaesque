@@ -20,7 +20,7 @@ use nom::{
 use nombytes::NomBytes;
 
 use crate::error::{Error, Result};
-use crate::parser::{bytes_to_string_opt, parse_nullable_string, skip_tagged_fields};
+use crate::parser::{parse_kafka_string_opt, skip_tagged_fields};
 
 // Re-export all request data types
 pub use admin::*;
@@ -194,7 +194,7 @@ pub fn parse_request_header(s: NomBytes) -> IResult<NomBytes, RequestHeader> {
     // Always parse client_id as standard nullable string (i16 length).
     // This is correct even for flexible header v2 (and ApiVersions v3+
     // per KIP-511): client_id never uses compact encoding in headers.
-    let (s, client_id) = parse_nullable_string(s)?;
+    let (s, client_id) = parse_kafka_string_opt(s)?;
 
     // Flexible request headers (header v2) carry tagged_fields after
     // client_id. Skipping this for flexible APIs other than ApiVersions
@@ -207,8 +207,6 @@ pub fn parse_request_header(s: NomBytes) -> IResult<NomBytes, RequestHeader> {
     } else {
         s
     };
-
-    let client_id = bytes_to_string_opt(client_id)?;
 
     Ok((
         s,
@@ -417,7 +415,8 @@ impl Request {
         // in one of our per-version layouts — is visible at debug level.
         let trailing = rest.into_bytes();
         if !trailing.is_empty() {
-            tracing::debug!(
+            crate::cluster::metrics::record_request_trailing_bytes(api_key.as_str(), trailing.len());
+            tracing::warn!(
                 api_key = api_key.as_str(),
                 api_version = version,
                 trailing_bytes = trailing.len(),

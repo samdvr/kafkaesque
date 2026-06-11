@@ -283,7 +283,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .await
-            .map_err(|e| Error::IoError(e.kind()))?;
+            .map_err(|e| Error::from(e))?;
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let (force_shutdown_tx, _) = watch::channel(false);
@@ -320,7 +320,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.listener
             .local_addr()
-            .map_err(|e| Error::IoError(e.kind()))
+            .map_err(|e| Error::from(e))
     }
 
     /// Get the number of active connections.
@@ -431,7 +431,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                 }
                 // Accept new connections
                 accept_result = self.listener.accept() => {
-                    let (stream, addr) = accept_result.map_err(|e| Error::IoError(e.kind()))?;
+                    let (stream, addr) = accept_result.map_err(|e| Error::from(e))?;
                     let ip = addr.ip();
 
                     // Check auth rate limit first
@@ -538,7 +538,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
             .listener
             .accept()
             .await
-            .map_err(|e| Error::IoError(e.kind()))?;
+            .map_err(|e| Error::from(e))?;
 
         tracing::debug!(client_addr = %addr, "Accepted connection");
 
@@ -641,7 +641,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .await
-            .map_err(|e| Error::IoError(e.kind()))?;
+            .map_err(|e| Error::from(e))?;
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let (force_shutdown_tx, _) = watch::channel(false);
@@ -680,7 +680,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.listener
             .local_addr()
-            .map_err(|e| Error::IoError(e.kind()))
+            .map_err(|e| Error::from(e))
     }
 
     /// Get the number of active connections.
@@ -781,7 +781,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                     return Ok(());
                 }
                 accept_result = self.listener.accept() => {
-                    let (stream, addr) = accept_result.map_err(|e| Error::IoError(e.kind()))?;
+                    let (stream, addr) = accept_result.map_err(|e| Error::from(e))?;
                     let ip = addr.ip();
 
                     // Check auth rate limit first
@@ -917,7 +917,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
             .listener
             .accept()
             .await
-            .map_err(|e| Error::IoError(e.kind()))?;
+            .map_err(|e| Error::from(e))?;
 
         tracing::debug!(client_addr = %addr, "Accepted TLS connection");
 
@@ -973,7 +973,10 @@ mod tests {
                 assert!(addr.port() > 0);
                 server.shutdown();
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind (CI environments may have restrictions)
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -991,7 +994,10 @@ mod tests {
                 assert_eq!(server.max_total_connections, 100);
                 server.shutdown();
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -1007,7 +1013,10 @@ mod tests {
                 assert_eq!(server.max_total_connections, 0);
                 server.shutdown();
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -1030,7 +1039,10 @@ mod tests {
                 assert!(addr.port() > 0);
                 server.shutdown();
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -1045,7 +1057,10 @@ mod tests {
                 assert_eq!(server.active_connections(), 0);
                 server.shutdown();
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -1061,7 +1076,10 @@ mod tests {
                 assert!(Arc::strong_count(&limiter) >= 1);
                 server.shutdown();
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -1077,7 +1095,10 @@ mod tests {
                 // Can shutdown multiple times
                 server.shutdown();
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -1094,7 +1115,10 @@ mod tests {
                     .await;
                 assert!(drained);
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -1354,7 +1378,10 @@ mod tests {
                 let result = handle.await.unwrap();
                 assert!(result.is_ok());
             }
-            Err(crate::error::Error::IoError(std::io::ErrorKind::PermissionDenied)) => {
+            Err(crate::error::Error::IoError(crate::error::PreservedIoError {
+                kind: std::io::ErrorKind::PermissionDenied,
+                message: String::new(),
+            })) => {
                 // Skip test if we can't bind
             }
             Err(e) => panic!("Unexpected error: {:?}", e),

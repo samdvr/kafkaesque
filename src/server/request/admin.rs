@@ -7,7 +7,7 @@ use nom::{
 use nombytes::NomBytes;
 
 use crate::parser::{
-    bytes_to_string, bytes_to_string_opt, parse_array, parse_compact_nullable_string,
+    bytes_to_string_opt, parse_array, parse_compact_nullable_string, parse_kafka_string,
     parse_nullable_string, parse_string, skip_tagged_fields,
 };
 
@@ -59,7 +59,7 @@ pub fn parse_create_topics_request(
 }
 
 fn parse_create_topic(s: NomBytes) -> IResult<NomBytes, CreateTopicData> {
-    let (s, name) = parse_string(s)?;
+    let (s, name) = parse_kafka_string(s)?;
     let (s, num_partitions) = be_i32(s)?;
     let (s, replication_factor) = be_i16(s)?;
     // Skip replica assignments and configs for now
@@ -77,7 +77,7 @@ fn parse_create_topic(s: NomBytes) -> IResult<NomBytes, CreateTopicData> {
     Ok((
         s,
         CreateTopicData {
-            name: bytes_to_string(&name)?,
+            name,
             num_partitions,
             replication_factor,
         },
@@ -99,10 +99,7 @@ pub fn parse_delete_topics_request(
     s: NomBytes,
     _version: i16,
 ) -> IResult<NomBytes, DeleteTopicsRequestData> {
-    let (s, topic_names) = parse_array(|s| {
-        let (s, name) = parse_string(s)?;
-        Ok((s, bytes_to_string(&name)?))
-    })(s)?;
+    let (s, topic_names) = parse_array(parse_kafka_string)(s)?;
     let (s, timeout_ms) = be_i32(s)?;
 
     Ok((

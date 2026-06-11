@@ -19,7 +19,9 @@
 //!
 //! # Design
 //!
-//! - Thread-local storage avoids contention between threads
+//! - Per-connection task-local pools (with thread-local fallback) avoid
+//!   contention and survive tokio task migration better than a bare
+//!   `thread_local!` pool on the async produce path
 //! - Buffers are cleared (not deallocated) between uses
 //! - Maximum buffer size cap prevents unbounded memory growth
 //! - Falls back to fresh allocation for very large batches
@@ -37,9 +39,37 @@ const DEFAULT_BUFFER_CAPACITY: usize = 64 * 1024;
 /// Number of buffers to keep in the thread-local pool.
 const POOL_SIZE: usize = 4;
 
+tokio::task_local! {
+    /// Per-connection task-local pool. Initialized via [`run_scoped`] around
+    /// each client connection loop so produce appends on that connection
+    /// reuse buffers even when tokio migrates the task across threads.
+    static TASK_BUFFER_POOL: RefCell<BufferPool>;
+}
+
 thread_local! {
-    /// Thread-local pool of reusable buffers.
-    static BUFFER_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
+    /// Fallback pool for sync contexts (unit tests, non-async callers).
+    static THREAD_BUFFER_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
+}
+
+fn with_pool<R>(f: impl FnOnce(&RefCell<BufferPool>) -> R) -> R {
+    if TASK_BUFFER_POOL.try_with(|_| ()).is_ok() {
+        TASK_BUFFER_POOL.with(f)
+    } else {
+        THREAD_BUFFER_POOL.with(f)
+    }
+}
+
+/// Run an async future with a dedicated task-local buffer pool.
+///
+/// The Kafka connection loop wraps each client session in this scope so
+/// produce-path [`get_buffer`] / [`return_buffer`] calls hit a pool pinned
+/// to the connection task instead of a process-wide thread-local slot.
+pub async fn run_scoped<Fut, T>(fut: Fut) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    let pool = RefCell::new(BufferPool::new());
+    TASK_BUFFER_POOL.scope(pool, fut).await
 }
 
 /// A simple buffer pool using a stack of Vec<u8>.
@@ -105,7 +135,7 @@ pub fn with_batch_buffer<F, R>(capacity_hint: usize, f: F) -> R
 where
     F: FnOnce(&mut Vec<u8>) -> R,
 {
-    BUFFER_POOL.with(|pool| {
+    with_pool(|pool| {
         let mut buffer = pool.borrow_mut().get(capacity_hint);
         let result = f(&mut buffer);
         pool.borrow_mut().put(buffer);
@@ -118,12 +148,12 @@ where
 /// The caller is responsible for returning the buffer via `return_buffer`.
 /// Use this when you need to pass the buffer across async boundaries.
 pub fn get_buffer(capacity_hint: usize) -> Vec<u8> {
-    BUFFER_POOL.with(|pool| pool.borrow_mut().get(capacity_hint))
+    with_pool(|pool| pool.borrow_mut().get(capacity_hint))
 }
 
 /// Return a buffer to the pool.
 pub fn return_buffer(buffer: Vec<u8>) {
-    BUFFER_POOL.with(|pool| pool.borrow_mut().put(buffer));
+    with_pool(|pool| pool.borrow_mut().put(buffer));
 }
 
 #[cfg(test)]

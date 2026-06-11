@@ -182,7 +182,7 @@ async fn read_kafka_frame<S: AsyncRead + Unpin>(
         if e.kind() == io::ErrorKind::UnexpectedEof {
             Error::MissingData("Connection closed".to_owned())
         } else {
-            Error::IoError(e.kind())
+            Error::from(e)
         }
     })?;
 
@@ -213,7 +213,7 @@ async fn read_kafka_frame<S: AsyncRead + Unpin>(
         if e.kind() == io::ErrorKind::UnexpectedEof {
             Error::MissingData("Connection closed mid-message".to_owned())
         } else {
-            Error::IoError(e.kind())
+            Error::from(e)
         }
     })?;
 
@@ -231,8 +231,8 @@ async fn write_kafka_frame<S: AsyncWrite + Unpin>(
         stream
             .write_all(response)
             .await
-            .map_err(|e| Error::IoError(e.kind()))?;
-        stream.flush().await.map_err(|e| Error::IoError(e.kind()))
+            .map_err(|e| Error::from(e))?;
+        stream.flush().await.map_err(|e| Error::from(e))
     })
     .await
     {
@@ -268,7 +268,7 @@ where
     let read_timeout = Duration::from_secs(DEFAULT_REQUEST_READ_TIMEOUT_SECS);
     let handler_timeout = Duration::from_secs(DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS);
 
-    let result = async {
+    let result = crate::cluster::buffer_pool::run_scoped(async {
     loop {
         let read_result =
             match timeout(read_timeout, read_kafka_frame(stream, max_message_size)).await {
@@ -361,7 +361,7 @@ where
             }
         }
     }
-    }.await;
+    }).await;
 
     handler.on_connection_closed(client).await;
     result

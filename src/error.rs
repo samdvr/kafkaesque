@@ -31,6 +31,32 @@ use thiserror::Error as ThisError;
 
 pub type Result<T> = result::Result<T, Error>;
 
+/// Preserved I/O error detail for protocol-layer diagnostics.
+///
+/// Storing only [`io::ErrorKind`] (the old shape) discarded the underlying
+/// message from `last_os_error()` / `source()` chains, which made connection
+/// failures hard to triage from logs alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreservedIoError {
+    pub kind: io::ErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for PreservedIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.kind, self.message)
+    }
+}
+
+impl From<io::Error> for PreservedIoError {
+    fn from(e: io::Error) -> Self {
+        Self {
+            kind: e.kind(),
+            message: e.to_string(),
+        }
+    }
+}
+
 /// Protocol and connection level errors.
 ///
 /// These are low-level errors that occur during:
@@ -42,8 +68,8 @@ pub type Result<T> = result::Result<T, Error>;
 #[derive(Clone, Debug, ThisError)]
 pub enum Error {
     /// An error in the network.
-    #[error("IO error: {0:?}")]
-    IoError(io::ErrorKind),
+    #[error("IO error: {0}")]
+    IoError(PreservedIoError),
 
     /// Could not parse the data.
     #[error("Parsing error: invalid data ({} bytes)", .0.len())]
@@ -67,7 +93,7 @@ pub enum Error {
 impl PartialEq for Error {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Error::IoError(a), Error::IoError(b)) => a == b,
+            (Error::IoError(a), Error::IoError(b)) => a.kind == b.kind && a.message == b.message,
             (Error::ParsingError(a), Error::ParsingError(b)) => a == b,
             (Error::MissingData(a), Error::MissingData(b)) => a == b,
             (Error::Config(a), Error::Config(b)) => a == b,
@@ -81,7 +107,7 @@ impl Eq for Error {}
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
-        Error::IoError(e.kind())
+        Error::IoError(e.into())
     }
 }
 
@@ -95,7 +121,7 @@ impl From<crate::cluster::SlateDBError> for Error {
     fn from(e: crate::cluster::SlateDBError) -> Self {
         use crate::cluster::SlateDBError;
         match e {
-            SlateDBError::Io(io_err) => Error::IoError(io_err.kind()),
+            SlateDBError::Io(io_err) => Error::IoError(io_err.into()),
             SlateDBError::Config(msg) => Error::Config(msg),
             other => Error::Config(other.to_string()),
         }
@@ -245,9 +271,16 @@ mod tests {
     use num_traits::FromPrimitive;
 
     #[test]
-    fn test_error_io_error() {
-        let err = Error::IoError(io::ErrorKind::ConnectionRefused);
-        assert_eq!(err, Error::IoError(io::ErrorKind::ConnectionRefused));
+    fn test_error_io_error_preserves_message() {
+        let io_err = io::Error::new(io::ErrorKind::ConnectionRefused, "connection reset by peer");
+        let err = Error::from(io_err);
+        match err {
+            Error::IoError(detail) => {
+                assert_eq!(detail.kind, io::ErrorKind::ConnectionRefused);
+                assert!(detail.message.contains("connection reset by peer"));
+            }
+            other => panic!("expected IoError, got {:?}", other),
+        }
     }
 
     #[test]

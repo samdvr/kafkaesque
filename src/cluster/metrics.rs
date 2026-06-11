@@ -125,6 +125,12 @@ define_histogram_vec!(
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
     ]
 );
+define_counter_vec!(
+    REQUEST_TRAILING_BYTES,
+    "request_trailing_bytes_total",
+    "Requests whose body parse left unconsumed trailing bytes (wire layout gap or client padding)",
+    ["api"]
+);
 
 // =============================================================================
 // Produce metrics
@@ -1341,6 +1347,13 @@ pub fn record_request(api: &str, status: &str, duration_secs: f64) {
     REQUEST_DURATION
         .with_label_values(&[api])
         .observe(duration_secs);
+}
+
+/// Record trailing bytes left after a successful request-body parse.
+pub fn record_request_trailing_bytes(api: &str, trailing_bytes: usize) {
+    REQUEST_TRAILING_BYTES
+        .with_label_values(&[api])
+        .inc_by(trailing_bytes as u64);
 }
 
 // ============================================================================

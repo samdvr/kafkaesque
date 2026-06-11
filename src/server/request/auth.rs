@@ -4,7 +4,7 @@ use bytes::Bytes;
 use nom::{IResult, number::complete::be_i32};
 use nombytes::NomBytes;
 
-use crate::parser::{bytes_to_string, parse_string};
+use crate::parser::parse_kafka_string;
 
 /// SaslHandshake request data.
 #[derive(Debug, Clone)]
@@ -16,12 +16,12 @@ pub fn parse_sasl_handshake_request(
     s: NomBytes,
     _version: i16,
 ) -> IResult<NomBytes, SaslHandshakeRequestData> {
-    let (s, mechanism) = parse_string(s)?;
+    let (s, mechanism) = parse_kafka_string(s)?;
 
     Ok((
         s,
         SaslHandshakeRequestData {
-            mechanism: bytes_to_string(&mechanism)?,
+            mechanism,
         },
     ))
 }

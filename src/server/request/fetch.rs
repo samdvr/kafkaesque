@@ -6,7 +6,7 @@ use nom::{
 };
 use nombytes::NomBytes;
 
-use crate::parser::{bytes_to_string, parse_array, parse_string};
+use crate::parser::{parse_array, parse_kafka_string};
 
 /// Fetch request data.
 #[derive(Debug, Clone)]
@@ -54,13 +54,13 @@ pub fn parse_fetch_request(s: NomBytes, _version: i16) -> IResult<NomBytes, Fetc
 }
 
 fn parse_fetch_topic(s: NomBytes) -> IResult<NomBytes, FetchTopicData> {
-    let (s, name) = parse_string(s)?;
+    let (s, name) = parse_kafka_string(s)?;
     let (s, partitions) = parse_array(parse_fetch_partition)(s)?;
 
     Ok((
         s,
         FetchTopicData {
-            name: bytes_to_string(&name)?,
+            name,
             partitions,
         },
     ))

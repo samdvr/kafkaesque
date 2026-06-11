@@ -335,7 +335,7 @@ async fn start_test_server(
             // Skip test if network access is denied (sandboxed environment)
             if e.to_string().contains("PermissionDenied")
                 || e.to_string().contains("permission denied")
-                || matches!(&e, kafkaesque::error::Error::IoError(kind) if *kind == std::io::ErrorKind::PermissionDenied)
+                || matches!(&e, kafkaesque::error::Error::IoError(detail) if detail.kind == std::io::ErrorKind::PermissionDenied)
             {
                 eprintln!("Skipping test: network access denied (sandboxed environment)");
                 return None;

@@ -234,6 +234,7 @@ pub(super) async fn handle_offset_commit(
             }
             Err(e) => {
                 error!(error = %e, "Failed to validate member for offset commit");
+                let kafka_code = e.to_kafka_code();
                 let topics: Vec<_> = request
                     .topics
                     .iter()
@@ -244,7 +245,7 @@ pub(super) async fn handle_offset_commit(
                             .iter()
                             .map(|p| OffsetCommitPartitionResponse {
                                 partition_index: p.partition_index,
-                                error_code: KafkaCode::Unknown,
+                                error_code: kafka_code,
                             })
                             .collect(),
                     })
@@ -357,7 +358,7 @@ pub(super) async fn handle_offset_commit(
                         &topic.name,
                         "error",
                     );
-                    KafkaCode::Unknown
+                    e.to_kafka_code()
                 }
             };
 

@@ -1,13 +1,13 @@
-//! SlateDB cluster server example.
+//! SlateDB cluster server.
 //!
-//! This example demonstrates a horizontally scalable Kafka-compatible server
-//! using SlateDB for storage and Raft for coordination.
+//! This is the deployed Kafkaesque broker binary: a horizontally scalable
+//! Kafka-compatible server using SlateDB for storage and Raft for coordination.
 //!
 //! ## Running
 //!
 //! Single broker (local storage):
 //! ```bash
-//! RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE=true cargo run --example cluster
+//! RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE=true cargo run --bin kafkaesque
 //! ```
 //!
 //! The `RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE=true` opt-in is required when
@@ -17,14 +17,14 @@
 //!
 //! With JSON logging for production:
 //! ```bash
-//! LOG_FORMAT=json RUST_LOG=info cargo run --example cluster
+//! LOG_FORMAT=json RUST_LOG=info cargo run --bin kafkaesque
 //! ```
 //!
 //! Multiple brokers (in separate terminals):
 //! ```bash
-//! BROKER_ID=0 PORT=9092 RAFT_LISTEN_ADDR=127.0.0.1:9093 cargo run --example cluster
-//! BROKER_ID=1 PORT=9094 RAFT_LISTEN_ADDR=127.0.0.1:9095 RAFT_PEERS="0=127.0.0.1:9093" cargo run --example cluster
-//! BROKER_ID=2 PORT=9096 RAFT_LISTEN_ADDR=127.0.0.1:9097 RAFT_PEERS="0=127.0.0.1:9093,1=127.0.0.1:9095" cargo run --example cluster
+//! BROKER_ID=0 PORT=9092 RAFT_LISTEN_ADDR=127.0.0.1:9093 cargo run --bin kafkaesque
+//! BROKER_ID=1 PORT=9094 RAFT_LISTEN_ADDR=127.0.0.1:9095 RAFT_PEERS="0=127.0.0.1:9093" cargo run --bin kafkaesque
+//! BROKER_ID=2 PORT=9096 RAFT_LISTEN_ADDR=127.0.0.1:9097 RAFT_PEERS="0=127.0.0.1:9093,1=127.0.0.1:9095" cargo run --bin kafkaesque
 //! ```
 //!
 //! With S3 storage (MinIO example):
@@ -35,7 +35,7 @@
 //! AWS_ACCESS_KEY_ID=minioadmin \
 //! AWS_SECRET_ACCESS_KEY=minioadmin \
 //! AWS_REGION=us-east-1 \
-//! cargo run --example cluster
+//! cargo run --bin kafkaesque
 //! ```
 //!
 //! Then connect with any Kafka client:
@@ -132,21 +132,16 @@ impl<H: kafkaesque::server::Handler + Send + Sync + 'static> Listener<H> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging with format from LOG_FORMAT env var (default: pretty)
-    // Set LOG_FORMAT=json for JSON output suitable for log aggregators
     init_logging(LogFormat::from_env()).map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
-    // Read configuration from environment
     let config = ClusterConfig::from_env()?;
 
-    // Create runtime configuration from cluster config
     let runtime_config = RuntimeConfig {
         control_plane_threads: config.control_plane_threads,
         data_plane_threads: config.data_plane_threads,
         ..Default::default()
     };
 
-    // Create separate runtimes for control plane and data plane
     let runtimes = BrokerRuntimes::new(runtime_config)?;
     let handles = runtimes.handles();
 
@@ -156,7 +151,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Created separate control plane and data plane runtimes"
     );
 
-    // Run the broker on the control plane runtime
     runtimes.block_on_control(run_broker(config, handles))
 }
 
@@ -164,11 +158,6 @@ async fn run_broker(
     config: ClusterConfig,
     runtime_handles: kafkaesque::runtime::RuntimeHandles,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Validate TLS configuration up front. Three failure modes
-    // worth distinguishing because the operator-facing fix is different:
-    // (a) `TLS_ENABLED=true` but the binary wasn't built with `--features tls`,
-    // (b) `TLS_ENABLED=true` but cert/key paths are missing,
-    // (c) the build is fine but TLS isn't on (no-op).
     if config.tls_enabled {
         validate_tls_config(&config)?;
     }
@@ -184,13 +173,11 @@ async fn run_broker(
         "Starting SlateDB cluster server with Raft coordination"
     );
 
-    // Create handler first so the health server can be wired to the real
-    // zombie-mode flag the PartitionManager toggles.
     let handler =
         SlateDBClusterHandler::with_runtime_handles(config.clone(), runtime_handles.clone())
             .await?;
 
-    // Mirror the real ZombieModeState into an AtomicBool the HealthServer can
+    // Mirror ZombieModeState into an AtomicBool the HealthServer can
     // load on every probe. Polling on a 200ms tick is fast enough for K8s
     // readiness (which probes on the order of seconds) and avoids changing
     // HealthServer's public API.
@@ -205,7 +192,6 @@ async fn run_broker(
         }
     });
 
-    // Start health server with the mirrored flag.
     let health_handle = if config.health_port > 0 {
         let health_addr = format!("{}:{}", config.host, config.health_port);
         match HealthServer::with_broker_id(
@@ -221,7 +207,6 @@ async fn run_broker(
                     health_addr = %health_addr,
                     "Health server started"
                 );
-                // Health server runs on control plane runtime
                 Some(runtime_handles.control.spawn(async move {
                     let _ = server.run().await;
                 }))
@@ -236,16 +221,10 @@ async fn run_broker(
         None
     };
 
-    // Create server with data plane runtime for client connections. When
-    // TLS is enabled, wrap the listener in `TlsKafkaServer`; otherwise use
-    // the plain server. Both share the same `Listener` surface so the
-    // shutdown drain logic below stays single-path.
     let addr = format!("{}:{}", config.host, config.port);
     let listener: Listener<_> = if config.tls_enabled {
         #[cfg(feature = "tls")]
         {
-            // Unwraps are safe: validate_tls_config above rejected the case
-            // where either path is None.
             let cert = config.tls_cert_path.as_ref().expect("validated above");
             let key = config.tls_key_path.as_ref().expect("validated above");
             let tls_config = TlsConfig::from_pem_files(cert, key)
@@ -269,8 +248,6 @@ async fn run_broker(
         }
         #[cfg(not(feature = "tls"))]
         {
-            // Unreachable: validate_tls_config returns Err under
-            // not(feature = "tls"), and the call above already short-circuited.
             unreachable!("TLS feature disabled; validate_tls_config should have rejected")
         }
     } else {
@@ -301,10 +278,6 @@ async fn run_broker(
         config.host, config.port
     );
 
-    // Run the Kafka server until SIGTERM/SIGINT, then drain. Without this,
-    // every `kubectl rollout restart` would be a data-loss event:
-    // the process would die with un-flushed SlateDB writes, un-released partition
-    // leases, and no Raft deregistration.
     let mut sigterm = signal(SignalKind::terminate()).map_err(Box::new)?;
     let mut sigint = signal(SignalKind::interrupt()).map_err(Box::new)?;
     let run_task = match &listener {
@@ -341,9 +314,8 @@ async fn run_broker(
     }
 
     // Drain: stop accepting, finish in-flight requests, then shut down handler.
-    // Use a 25s connection-drain budget; K8s default terminationGracePeriod is
-    // 30s so this leaves ~5s for handler.shutdown() to flush stores and
-    // release leases.
+    // 25s connection-drain budget; K8s default terminationGracePeriod is 30s
+    // so this leaves ~5s for handler.shutdown() to flush stores and release leases.
     info!("Stopping Kafka listener and draining in-flight connections");
     let drained = listener.shutdown_and_wait(Duration::from_secs(25)).await;
     if !drained {
@@ -355,7 +327,6 @@ async fn run_broker(
         warn!(error = %e, "Handler shutdown returned an error");
     }
 
-    // Cleanup health server and zombie mirror.
     if let Some(handle) = health_handle {
         handle.abort();
     }

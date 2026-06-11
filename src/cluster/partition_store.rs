@@ -283,6 +283,11 @@ impl PartitionStore {
         self.high_watermark.load(Ordering::SeqCst)
     }
 
+    /// Minimum remaining lease TTL (seconds) the store requires for new writes.
+    pub fn min_lease_ttl_for_write_secs(&self) -> u64 {
+        self.min_lease_ttl_for_write_secs
+    }
+
     /// Set the load metrics collector for this partition.
     ///
     /// The collector is shared across all partitions via Arc, enabling

@@ -63,7 +63,6 @@
 
 pub mod auto_balancer;
 pub mod authorizer;
-pub mod background_tasks;
 pub mod buffer_pool;
 mod config;
 mod coordinator;
@@ -75,7 +74,6 @@ pub mod load_metrics;
 pub mod metrics;
 mod object_store;
 pub mod observability;
-pub mod ownership_guard;
 mod partition_handle;
 mod partition_manager;
 mod partition_recovery;
@@ -83,7 +81,6 @@ mod partition_state;
 mod partition_store;
 pub mod raft;
 pub mod rebalance_coordinator;
-pub mod retry;
 #[cfg(feature = "sasl")]
 mod sasl_provider;
 #[cfg(feature = "sasl")]
@@ -99,7 +96,6 @@ mod partition_store_tests;
 
 use std::sync::Arc;
 
-pub use background_tasks::{BackgroundTaskRegistry, SharedTaskRegistry, TaskStatus};
 pub use config::{ClusterConfig, ClusterProfile, ObjectStoreType};
 pub use coordinator::{
     BrokerInfo, consistent_hash_assignment, validate_group_id, validate_topic_name,
@@ -111,9 +107,6 @@ pub use error::{
 pub use handler::{HealthStatus, SlateDBClusterHandler};
 #[cfg(any(test, feature = "test-utilities"))]
 pub use mock_coordinator::MockCoordinator;
-pub use ownership_guard::{
-    FencingError, OwnershipConfig, OwnershipGuard, OwnershipGuardBuilder, WritePermit,
-};
 pub use partition_handle::{PartitionHandle, PartitionId, ReadGuard, WriteGuard};
 pub use partition_manager::PartitionManager;
 pub use partition_state::PartitionState;

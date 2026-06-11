@@ -1,7 +1,46 @@
 //! Serialize data into the bytecode protocol.
 use bytes::{BufMut, Bytes};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+
+#[inline]
+fn encode_string_len<T: BufMut>(buffer: &mut T, len: usize) -> Result<()> {
+    if len > i16::MAX as usize {
+        return Err(Error::Config(format!(
+            "string length {} exceeds wire field maximum {}",
+            len,
+            i16::MAX
+        )));
+    }
+    buffer.put_i16(len as i16);
+    Ok(())
+}
+
+#[inline]
+fn encode_bytes_len<T: BufMut>(buffer: &mut T, len: usize) -> Result<()> {
+    if len > i32::MAX as usize {
+        return Err(Error::Config(format!(
+            "byte length {} exceeds wire field maximum {}",
+            len,
+            i32::MAX
+        )));
+    }
+    buffer.put_i32(len as i32);
+    Ok(())
+}
+
+#[inline]
+fn encode_array_len<T: BufMut>(buffer: &mut T, len: usize) -> Result<()> {
+    if len > i32::MAX as usize {
+        return Err(Error::Config(format!(
+            "array length {} exceeds wire field maximum {}",
+            len,
+            i32::MAX
+        )));
+    }
+    buffer.put_i32(len as i32);
+    Ok(())
+}
 
 pub trait ToByte {
     fn encode<T: BufMut>(&self, buffer: &mut T) -> Result<()>;
@@ -57,7 +96,7 @@ impl ToByte for i64 {
 
 impl ToByte for str {
     fn encode<T: BufMut>(&self, buffer: &mut T) -> Result<()> {
-        buffer.put_i16(self.len() as i16);
+        encode_string_len(buffer, self.len())?;
         buffer.put(self.as_bytes());
         Ok(())
     }
@@ -65,7 +104,7 @@ impl ToByte for str {
 
 impl ToByte for String {
     fn encode<T: BufMut>(&self, buffer: &mut T) -> Result<()> {
-        buffer.put_i16(self.len() as i16);
+        encode_string_len(buffer, self.len())?;
         buffer.put(self.as_bytes());
         Ok(())
     }
@@ -79,7 +118,7 @@ impl<V: ToByte> ToByte for [V] {
 
 impl ToByte for [u8] {
     fn encode<T: BufMut>(&self, buffer: &mut T) -> Result<()> {
-        buffer.put_i32(self.len() as i32);
+        encode_bytes_len(buffer, self.len())?;
         buffer.put(self);
         Ok(())
     }
@@ -93,7 +132,7 @@ where
     F: FnMut(&mut W, &T) -> Result<()>,
     W: BufMut,
 {
-    buffer.put_i32(xs.len() as i32);
+    encode_array_len(buffer, xs.len())?;
     for x in xs {
         f(buffer, x)?;
     }
@@ -103,7 +142,7 @@ where
 /// Encode a slice of ToByte items as a Kafka protocol array.
 /// This is a convenience wrapper around `encode_as_array` for the common case.
 pub fn encode_array<T: ToByte, W: BufMut>(buffer: &mut W, items: &[T]) -> Result<()> {
-    buffer.put_i32(items.len() as i32);
+    encode_array_len(buffer, items.len())?;
     for item in items {
         item.encode(buffer)?;
     }
@@ -186,7 +225,7 @@ impl ToByte for Option<String> {
 
 impl ToByte for Bytes {
     fn encode<W: BufMut>(&self, buffer: &mut W) -> Result<()> {
-        buffer.put_i32(self.len() as i32);
+        encode_bytes_len(buffer, self.len())?;
         buffer.put_slice(self);
         Ok(())
     }
@@ -365,5 +404,27 @@ mod tests {
         let val = 42i32;
         val.encode(&mut buf).unwrap();
         assert_eq!(buf, vec![0x00, 0x00, 0x00, 0x2A]);
+    }
+
+    #[test]
+    fn test_encode_string_overflow_returns_error() {
+        let mut buf = Vec::new();
+        let oversize: String = "a".repeat(i16::MAX as usize + 1);
+        let err = oversize.encode(&mut buf).unwrap_err();
+        match err {
+            Error::Config(msg) => {
+                assert!(msg.contains("exceeds wire field maximum"));
+                assert!(msg.contains(&i16::MAX.to_string()));
+            }
+            other => panic!("expected Error::Config, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_str_at_limit_succeeds() {
+        let mut buf = Vec::new();
+        let at_limit: String = "x".repeat(i16::MAX as usize);
+        at_limit.encode(&mut buf).unwrap();
+        assert_eq!(buf.len(), 2 + i16::MAX as usize);
     }
 }

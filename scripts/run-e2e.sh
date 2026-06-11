@@ -75,7 +75,7 @@ OBJECT_STORE_TYPE=local \
 DATA_PATH=/tmp/kafkaesque-data \
 AUTO_CREATE_TOPICS=true \
 RUST_LOG=kafkaesque=info \
-/app/target/release/examples/cluster > /tmp/server.log 2>&1 &
+/app/target/release/kafkaesque > /tmp/server.log 2>&1 &
 SERVER_PID=$!
 
 # Wait for server
@@ -141,7 +141,7 @@ if [ "$RUN_CLUSTER" = true ]; then
     RAFT_PEERS="1=127.0.0.1:9095,2=127.0.0.1:9097" \
     OBJECT_STORE_TYPE=local DATA_PATH=/tmp/kafkaesque-cluster-test/broker0 \
     AUTO_CREATE_TOPICS=true RUST_LOG=kafkaesque=info \
-    /app/target/release/examples/cluster > /tmp/kafkaesque-cluster-test/broker0.log 2>&1 &
+    /app/target/release/kafkaesque > /tmp/kafkaesque-cluster-test/broker0.log 2>&1 &
     BROKER0_PID=$!
 
     BROKER_ID=1 HOST=127.0.0.1 PORT=9094 \
@@ -149,7 +149,7 @@ if [ "$RUN_CLUSTER" = true ]; then
     RAFT_PEERS="0=127.0.0.1:9093,2=127.0.0.1:9097" \
     OBJECT_STORE_TYPE=local DATA_PATH=/tmp/kafkaesque-cluster-test/broker1 \
     AUTO_CREATE_TOPICS=true RUST_LOG=kafkaesque=info \
-    /app/target/release/examples/cluster > /tmp/kafkaesque-cluster-test/broker1.log 2>&1 &
+    /app/target/release/kafkaesque > /tmp/kafkaesque-cluster-test/broker1.log 2>&1 &
     BROKER1_PID=$!
 
     BROKER_ID=2 HOST=127.0.0.1 PORT=9096 \
@@ -157,7 +157,7 @@ if [ "$RUN_CLUSTER" = true ]; then
     RAFT_PEERS="0=127.0.0.1:9093,1=127.0.0.1:9095" \
     OBJECT_STORE_TYPE=local DATA_PATH=/tmp/kafkaesque-cluster-test/broker2 \
     AUTO_CREATE_TOPICS=true RUST_LOG=kafkaesque=info \
-    /app/target/release/examples/cluster > /tmp/kafkaesque-cluster-test/broker2.log 2>&1 &
+    /app/target/release/kafkaesque > /tmp/kafkaesque-cluster-test/broker2.log 2>&1 &
     BROKER2_PID=$!
 
     # Wait for all brokers

@@ -299,7 +299,7 @@ impl WriteGuard {
     /// Returns true if the estimated remaining lease is above the safety threshold.
     #[inline]
     pub fn lease_likely_valid(&self) -> bool {
-        self.estimated_remaining_lease() >= crate::constants::DEFAULT_MIN_LEASE_TTL_FOR_WRITE_SECS
+        self.estimated_remaining_lease() >= self.handle.store.min_lease_ttl_for_write_secs()
     }
 
     /// Append a record batch to the partition.
@@ -310,13 +310,13 @@ impl WriteGuard {
     /// # Returns
     /// The base offset assigned to the batch, or error if append fails.
     pub async fn append(&self, records: &Bytes) -> SlateDBResult<i64> {
-        // Validate lease is still likely valid
+        let required = self.handle.store.min_lease_ttl_for_write_secs();
         if !self.lease_likely_valid() {
             return Err(SlateDBError::LeaseTooShort {
                 topic: self.topic().to_string(),
                 partition: self.partition(),
                 remaining_secs: self.estimated_remaining_lease(),
-                required_secs: crate::constants::DEFAULT_MIN_LEASE_TTL_FOR_WRITE_SECS,
+                required_secs: required,
             });
         }
 

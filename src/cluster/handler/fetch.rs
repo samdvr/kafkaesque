@@ -270,17 +270,16 @@ async fn collect_fetch(
                                     }
                                 }
                                 Err(e) => {
-                                    let error_code = if e.is_fenced() {
+                                    let error_code = e.to_kafka_code();
+                                    if e.is_fenced() {
                                         error!(
                                             topic = %topic_name,
                                             partition = partition.partition_index,
                                             "Fenced during fetch - returning NotLeaderForPartition"
                                         );
-                                        KafkaCode::NotLeaderForPartition
                                     } else {
                                         error!(error = %e, "Fetch failed");
-                                        KafkaCode::Unknown
-                                    };
+                                    }
                                     FetchPartitionResponse {
                                         partition_index: partition.partition_index,
                                         error_code,

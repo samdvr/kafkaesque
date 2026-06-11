@@ -184,17 +184,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y kcat
 
       - name: Build cluster binary
-        run: cargo build --release --example cluster
+        run: cargo build --release --bin kafkaesque
 
       - name: Run single-broker E2E
         env:
-          KAFKAESQUE_BINARY: ./target/release/examples/cluster
+          KAFKAESQUE_BINARY: ./target/release/kafkaesque
           RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE: "true"
         run: bash scripts/run-e2e.sh
 
       - name: Run cluster E2E (3 brokers, Raft)
         env:
-          KAFKAESQUE_BINARY: ./target/release/examples/cluster
+          KAFKAESQUE_BINARY: ./target/release/kafkaesque
         run: bash scripts/run-cluster-e2e.sh
 
   cargo-deny:
@@ -236,3 +236,30 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           severity: CRITICAL,HIGH
+
+  multiarch-image:
+    name: Multi-arch release image (linux/amd64,linux/arm64)
+    runs-on: ubuntu-latest
+    # Builds (and on tag pushes, publishes) the release image for both
+    # x86_64 and arm64 so Apple Silicon devs and arm64 fleets aren't
+    # stuck cross-compiling. PRs build only — no registry push.
+    needs: image-scan
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.minimal
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: kafkaesque:multiarch

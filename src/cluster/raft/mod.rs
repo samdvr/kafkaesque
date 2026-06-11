@@ -64,7 +64,6 @@ mod commands;
 mod config;
 mod coordinator;
 pub mod domains;
-pub mod group_state_machine;
 mod network;
 mod node;
 mod state_machine;

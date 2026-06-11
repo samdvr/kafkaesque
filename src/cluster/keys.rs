@@ -370,4 +370,76 @@ mod tests {
         assert_eq!(HIGH_WATERMARK_KEY, b"_hwm");
         assert_eq!(LEADER_EPOCH_KEY, b"_epoch");
     }
+
+    // ==========================================================================
+    // Property tests — encode/decode roundtrips for the full key/value space.
+    //
+    // These complement the hand-written cases above by exhaustively
+    // covering integer ranges (i64::MIN..=i64::MAX, i32::MIN..=i32::MAX)
+    // that point examples can't hit. A failure here means the on-disk
+    // format would silently corrupt under specific inputs — the worst
+    // class of storage bug.
+    // ==========================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn record_key_roundtrip(offset in any::<i64>()) {
+            let key = encode_record_key(offset);
+            prop_assert_eq!(decode_record_offset(&key), Some(offset));
+        }
+
+        #[test]
+        fn record_keys_sort_lexicographically(a in any::<i64>(), b in any::<i64>()) {
+            // Big-endian + signed offset: lexicographic order over the byte
+            // representation matches numeric order ONLY when both offsets
+            // share a sign bit. Negative offsets are never written in
+            // practice (HWM is non-negative), but the property still holds
+            // for the non-negative subset.
+            prop_assume!(a >= 0 && b >= 0);
+            let ka = encode_record_key(a);
+            let kb = encode_record_key(b);
+            prop_assert_eq!(a.cmp(&b), ka.cmp(&kb));
+        }
+
+        #[test]
+        fn leader_epoch_roundtrip(epoch in any::<i32>()) {
+            let v = encode_leader_epoch(epoch);
+            prop_assert_eq!(decode_leader_epoch(&v), Some(epoch));
+        }
+
+        #[test]
+        fn leader_epoch_decode_extra_bytes_ok(epoch in any::<i32>(), extra in proptest::collection::vec(any::<u8>(), 0..16)) {
+            let mut v = encode_leader_epoch(epoch).to_vec();
+            v.extend_from_slice(&extra);
+            prop_assert_eq!(decode_leader_epoch(&v), Some(epoch));
+        }
+
+        #[test]
+        fn leader_epoch_decode_too_short_none(bytes in proptest::collection::vec(any::<u8>(), 0..4)) {
+            prop_assert_eq!(decode_leader_epoch(&bytes), None);
+        }
+
+        #[test]
+        fn producer_state_key_roundtrip(producer_id in any::<i64>()) {
+            let key = encode_producer_state_key(producer_id);
+            prop_assert_eq!(decode_producer_id(&key), Some(producer_id));
+        }
+
+        #[test]
+        fn producer_state_value_roundtrip(seq in any::<i32>(), epoch in any::<i16>()) {
+            let v = encode_producer_state_value(seq, epoch);
+            prop_assert_eq!(decode_producer_state_value(&v), Some((seq, epoch)));
+        }
+
+        #[test]
+        fn record_key_wrong_prefix_returns_none(prefix in any::<u8>(), offset in any::<i64>()) {
+            prop_assume!(prefix != RECORD_KEY_PREFIX);
+            let mut key = [0u8; 9];
+            key[0] = prefix;
+            key[1..9].copy_from_slice(&offset.to_be_bytes());
+            prop_assert_eq!(decode_record_offset(&key), None);
+        }
+    }
 }

@@ -154,6 +154,42 @@ pub fn uses_flexible_encoding(api_key: ApiKey, version: i16) -> bool {
     }
 }
 
+/// What the parser/encoder layer actually decodes and emits for each API.
+///
+/// This is the WIRE-FORMAT coverage. `SUPPORTED_VERSIONS` is what the broker
+/// ADVERTISES via `ApiVersions`. The two must agree — drift produces silent
+/// mis-parses (advertise more than parser handles) or invisible API support
+/// (parser handles more than advertised). The unit test
+/// `parser_coverage_matches_advertised` asserts equality at every position.
+///
+/// To add or expand version support:
+/// 1. Implement the new wire format in `request/{api}.rs` and `response/{api}.rs`.
+/// 2. Bump the entry in `PARSER_ENCODER_COVERAGE` to match.
+/// 3. Bump the matching entry in `SUPPORTED_VERSIONS`.
+/// 4. The unit test ensures all three stay in lockstep.
+pub const PARSER_ENCODER_COVERAGE: &[(ApiKey, i16, i16)] = &[
+    (ApiKey::Produce, 3, 3),
+    (ApiKey::Fetch, 4, 4),
+    (ApiKey::ListOffsets, 0, 2),
+    (ApiKey::Metadata, 0, 1),
+    (ApiKey::OffsetCommit, 0, 2),
+    (ApiKey::OffsetFetch, 0, 1),
+    (ApiKey::FindCoordinator, 0, 1),
+    (ApiKey::JoinGroup, 0, 2),
+    (ApiKey::Heartbeat, 0, 1),
+    (ApiKey::LeaveGroup, 0, 1),
+    (ApiKey::SyncGroup, 0, 1),
+    (ApiKey::DescribeGroups, 0, 1),
+    (ApiKey::ListGroups, 0, 2),
+    (ApiKey::SaslHandshake, 0, 1),
+    (ApiKey::ApiVersions, 0, 3),
+    (ApiKey::CreateTopics, 0, 1),
+    (ApiKey::DeleteTopics, 0, 1),
+    (ApiKey::SaslAuthenticate, 0, 1),
+    (ApiKey::InitProducerId, 0, 4),
+    (ApiKey::DeleteGroups, 0, 1),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +330,42 @@ mod tests {
                 sv.api_key,
                 sv.min_version,
                 sv.max_version
+            );
+        }
+    }
+
+    /// Single-source-of-truth check: the advertised version range must match
+    /// what the parser/encoder layer actually handles. Drift is silent
+    /// otherwise — advertise too much and clients trip ParsingError; too
+    /// little and the support hides.
+    #[test]
+    fn parser_coverage_matches_advertised() {
+        assert_eq!(
+            SUPPORTED_VERSIONS.len(),
+            PARSER_ENCODER_COVERAGE.len(),
+            "SUPPORTED_VERSIONS and PARSER_ENCODER_COVERAGE must list the same APIs"
+        );
+        for sv in SUPPORTED_VERSIONS {
+            let coverage = PARSER_ENCODER_COVERAGE
+                .iter()
+                .find(|(k, _, _)| *k == sv.api_key)
+                .unwrap_or_else(|| {
+                    panic!("PARSER_ENCODER_COVERAGE missing entry for {:?}", sv.api_key)
+                });
+            assert_eq!(
+                (sv.min_version, sv.max_version),
+                (coverage.1, coverage.2),
+                "{:?}: advertised {:?} != parser/encoder coverage {:?}",
+                sv.api_key,
+                (sv.min_version, sv.max_version),
+                (coverage.1, coverage.2),
+            );
+        }
+        for (api_key, _, _) in PARSER_ENCODER_COVERAGE {
+            assert!(
+                SUPPORTED_VERSIONS.iter().any(|sv| sv.api_key == *api_key),
+                "PARSER_ENCODER_COVERAGE has {:?} but SUPPORTED_VERSIONS does not",
+                api_key
             );
         }
     }

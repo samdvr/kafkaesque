@@ -719,15 +719,19 @@ mod zombie_mode {
         // Step 1: Check zombie mode before acquiring lock
         assert!(!zombie_state.is_active());
 
-        // Step 2: Spawn task that enters zombie mode while we hold lock
+        // Step 2: Spawn task that enters zombie mode after we signal it.
+        // Using a oneshot channel rather than a wall-clock sleep removes
+        // CI-load flakiness — the task fires the moment the lock is held.
         let zombie_clone2 = zombie_clone.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
-            sleep(Duration::from_millis(50)).await;
+            let _ = release_rx.await;
             zombie_clone2.enter();
         });
 
-        // Step 3: Acquire lock
+        // Step 3: Acquire lock, then signal the zombie task to proceed
         let _guard = write_lock.lock().await;
+        release_tx.send(()).expect("zombie task still alive");
 
         // Wait for zombie entry
         handle.await.unwrap();

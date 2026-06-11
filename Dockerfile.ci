@@ -52,13 +52,13 @@ COPY Cargo.toml Cargo.lock ./
 
 # Create dummy source to pre-build dependencies
 # We explicitly specify --target to ensure cargo distinguishes host vs target
-RUN mkdir -p src examples tests benches && \
+RUN mkdir -p src/bin examples tests benches && \
     echo 'fn main() {}' > src/main.rs && \
     echo 'pub fn dummy() {}' > src/lib.rs && \
-    echo 'fn main() {}' > examples/cluster.rs && \
+    echo 'fn main() {}' > src/bin/kafkaesque.rs && \
     echo 'fn main() {}' > examples/benchmark.rs && \
     echo 'fn main() {}' > benches/produce_bench.rs && \
-    cargo build --target x86_64-unknown-linux-musl --release --example cluster 2>/dev/null || true && \
+    cargo build --target x86_64-unknown-linux-musl --release --bin kafkaesque 2>/dev/null || true && \
     cargo build --target x86_64-unknown-linux-musl --lib 2>/dev/null || true && \
     rm -rf src examples tests benches target/x86_64-unknown-linux-musl/release/.fingerprint/kafkaesque-*
 
@@ -73,8 +73,8 @@ COPY benches ./benches
 # Explicit --target is important here to utilize the config correctly.
 RUN cargo test --target x86_64-unknown-linux-musl --lib --release && \
     cargo test --target x86_64-unknown-linux-musl --tests --release && \
-    cargo build --target x86_64-unknown-linux-musl --release --example cluster && \
-    strip target/x86_64-unknown-linux-musl/release/examples/cluster
+    cargo build --target x86_64-unknown-linux-musl --release --bin kafkaesque && \
+    strip target/x86_64-unknown-linux-musl/release/kafkaesque
 
 # =============================================================================
 # Stage 2: E2E test runner (minimal Alpine - ~40MB total)
@@ -97,14 +97,14 @@ RUN addgroup -S kafkaesque && adduser -S -G kafkaesque kafkaesque
 WORKDIR /app
 
 # Copy statically compiled binary (no runtime dependencies)
-COPY --from=builder --chown=kafkaesque:kafkaesque /app/target/x86_64-unknown-linux-musl/release/examples/cluster /app/target/release/examples/cluster
+COPY --from=builder --chown=kafkaesque:kafkaesque /app/target/x86_64-unknown-linux-musl/release/kafkaesque /app/target/release/kafkaesque
 
 # Copy E2E test scripts
 COPY --chown=kafkaesque:kafkaesque scripts/run-e2e.sh /app/run-e2e.sh
 RUN chmod +x /app/run-e2e.sh
 
 # Verify binary is executable (don't run --help as it starts the server)
-RUN test -x /app/target/release/examples/cluster && echo "Binary verified"
+RUN test -x /app/target/release/kafkaesque && echo "Binary verified"
 
 USER kafkaesque
 

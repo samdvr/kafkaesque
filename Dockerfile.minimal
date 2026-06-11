@@ -26,11 +26,11 @@ WORKDIR /app
 
 # Dependency caching
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src examples && \
+RUN mkdir -p src/bin examples && \
     echo 'fn main() {}' > src/main.rs && \
     echo 'pub fn dummy() {}' > src/lib.rs && \
-    echo 'fn main() {}' > examples/cluster.rs && \
-    cargo build --release --example cluster 2>/dev/null || true && \
+    echo 'fn main() {}' > src/bin/kafkaesque.rs && \
+    cargo build --release --bin kafkaesque 2>/dev/null || true && \
     rm -rf src examples
 
 # Build release binary
@@ -38,8 +38,8 @@ COPY src ./src
 COPY examples ./examples
 
 ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static -C opt-level=z -C lto=fat -C codegen-units=1"
-RUN cargo build --release --example cluster && \
-    strip --strip-all target/release/examples/cluster
+RUN cargo build --release --bin kafkaesque && \
+    strip --strip-all target/release/kafkaesque
 
 # =============================================================================
 # Stage 2: Minimal runtime (scratch + glibc compatibility)
@@ -57,7 +57,7 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 # Copy only the binary
-COPY --from=builder /app/target/release/examples/cluster /app/cluster
+COPY --from=builder /app/target/release/kafkaesque /app/kafkaesque
 
 # Non-root user for security
 RUN adduser -D -u 1000 kafkaesque && \
@@ -66,4 +66,4 @@ USER kafkaesque
 
 EXPOSE 9092 9093 8080
 
-ENTRYPOINT ["/app/cluster"]
+ENTRYPOINT ["/app/kafkaesque"]

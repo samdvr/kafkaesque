@@ -4,7 +4,7 @@
 #
 # Requirements:
 # - kafkacat/kcat installed
-# - Kafkaesque binary built (cargo build --release --example cluster)
+# - Kafkaesque binary built (cargo build --release --bin kafkaesque)
 
 set -e
 
@@ -24,12 +24,12 @@ else
     exit 1
 fi
 
-BINARY="${KAFKAESQUE_BINARY:-./target/release/examples/cluster}"
+BINARY="${KAFKAESQUE_BINARY:-./target/release/kafkaesque}"
 if [ ! -f "$BINARY" ]; then
-    BINARY="./target/debug/examples/cluster"
+    BINARY="./target/debug/kafkaesque"
 fi
 if [ ! -f "$BINARY" ]; then
-    echo -e "${RED}Kafkaesque binary not found. Run: cargo build --release --example cluster${NC}"
+    echo -e "${RED}Kafkaesque binary not found. Run: cargo build --release --bin kafkaesque${NC}"
     exit 1
 fi
 

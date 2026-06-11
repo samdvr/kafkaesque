@@ -107,13 +107,15 @@ rdkafka = { version = "0.38.0", features = ["cmake-build"] }
 serial_test = "3.2"
 kafkaesque = { path = ".", features = ["test-utilities"] }
 criterion = { version = "0.8.1", features = ["html_reports"] }
+proptest = "1.5"
 
 [[bench]]
 name = "produce_bench"
 harness = false
 
-[[example]]
-name = "cluster"
+[[bin]]
+name = "kafkaesque"
+path = "src/bin/kafkaesque.rs"
 
 [[example]]
 name = "benchmark"

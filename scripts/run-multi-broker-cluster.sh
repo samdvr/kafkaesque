@@ -4,7 +4,7 @@
 set -e
 
 echo "Building cluster example..."
-cargo build --release --example cluster
+cargo build --release --bin kafkaesque
 
 # Cleanup function to kill backgrounded brokers
 # Shuts down in reverse order to minimize Raft replication errors during shutdown
@@ -67,19 +67,19 @@ ALL_PEERS="${RAFT_PEER_0},${RAFT_PEER_1},${RAFT_PEER_2}"
 # Start brokers in the background
 # Broker 0 is the initial leader (lowest ID), but all brokers know about all peers
 echo "Starting broker 0 (will initialize cluster)..."
-BROKER_ID=0 PORT=9092 HEALTH_PORT=8080 RAFT_LISTEN_ADDR=127.0.0.1:9093 RAFT_PEERS="${RAFT_PEER_1},${RAFT_PEER_2}" target/release/examples/cluster &
+BROKER_ID=0 PORT=9092 HEALTH_PORT=8080 RAFT_LISTEN_ADDR=127.0.0.1:9093 RAFT_PEERS="${RAFT_PEER_1},${RAFT_PEER_2}" target/release/kafkaesque &
 BROKER0_PID=$!
 
 # Give broker 0 time to initialize the cluster and become leader
 sleep 3
 
 echo "Starting broker 1 (joining cluster)..."
-BROKER_ID=1 PORT=9094 HEALTH_PORT=8081 RAFT_LISTEN_ADDR=127.0.0.1:9095 RAFT_PEERS="${RAFT_PEER_0},${RAFT_PEER_2}" target/release/examples/cluster &
+BROKER_ID=1 PORT=9094 HEALTH_PORT=8081 RAFT_LISTEN_ADDR=127.0.0.1:9095 RAFT_PEERS="${RAFT_PEER_0},${RAFT_PEER_2}" target/release/kafkaesque &
 BROKER1_PID=$!
 sleep 2
 
 echo "Starting broker 2 (joining cluster)..."
-BROKER_ID=2 PORT=9096 HEALTH_PORT=8082 RAFT_LISTEN_ADDR=127.0.0.1:9097 RAFT_PEERS="${RAFT_PEER_0},${RAFT_PEER_1}" target/release/examples/cluster &
+BROKER_ID=2 PORT=9096 HEALTH_PORT=8082 RAFT_LISTEN_ADDR=127.0.0.1:9097 RAFT_PEERS="${RAFT_PEER_0},${RAFT_PEER_1}" target/release/kafkaesque &
 BROKER2_PID=$!
 sleep 5 # Wait for cluster to stabilize
 

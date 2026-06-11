@@ -43,7 +43,7 @@ Kafkaesque provides a 100% Kafka wire protocol compatible interface, meaning sta
 Run a single broker using local filesystem as "object storage":
 
 ```bash
-cargo run --release --example cluster
+cargo run --release --bin kafkaesque
 ```
 
 The broker listens on `localhost:9092`. Data is stored in `/tmp/kafkaesque-data`.
@@ -90,7 +90,7 @@ RAFT_LISTEN_ADDR=0.0.0.0:9093 \
 RAFT_PEERS="0=node0:9093,1=node1:9093,2=node2:9093" \
 OBJECT_STORE_TYPE=s3 \
 S3_BUCKET=my-kafka-data \
-cargo run --release --example cluster
+cargo run --release --bin kafkaesque
 ```
 
 ### Kubernetes

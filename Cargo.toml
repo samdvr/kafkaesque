@@ -71,6 +71,10 @@ moka = { version = "0.12", features = ["future", "sync"] }
 # Concurrent collections
 dashmap = "6.1"
 
+# Lock-free atomic Arc swaps (used in hot read paths where a value is
+# set-once / rarely-cleared but read on every produce/fetch).
+arc-swap = "1.7"
+
 # Consistent hashing for partition assignment
 conhash = "0.5.1"
 

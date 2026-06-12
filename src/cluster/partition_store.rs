@@ -43,7 +43,6 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::RwLock;
 
 use super::load_metrics::LoadMetricsCollector;
 use tokio::sync::Mutex;
@@ -188,7 +187,13 @@ pub struct PartitionStore {
     /// Load metrics collector for auto-balancing.
     /// Records bytes/messages produced and fetched for this partition.
     /// Shared across all partitions via Arc for aggregation.
-    load_collector: RwLock<Option<Arc<LoadMetricsCollector>>>,
+    ///
+    /// Hot read path: every successful append/fetch records bytes here, so
+    /// the read must be allocation- and lock-free. `ArcSwapOption` gives a
+    /// lock-free `load()` that returns a refcount-bumped guard; the guard
+    /// dereferences to `Option<&Arc<...>>` so we never block on a read lock
+    /// or hold a tokio guard across an `await`.
+    load_collector: arc_swap::ArcSwapOption<LoadMetricsCollector>,
 
     /// Leader epoch for epoch-based fencing (TOCTOU prevention).
     ///
@@ -345,29 +350,29 @@ impl PartitionStore {
     ///
     /// The collector is shared across all partitions via Arc, enabling
     /// aggregated load statistics for auto-balancing decisions.
-    pub async fn set_load_collector(&self, collector: Arc<LoadMetricsCollector>) {
-        *self.load_collector.write().await = Some(collector);
+    pub fn set_load_collector(&self, collector: Arc<LoadMetricsCollector>) {
+        self.load_collector.store(Some(collector));
     }
 
     /// Drop this partition's metrics from the shared collector so the
     /// per-partition `DashMap` doesn't grow unboundedly as ownership
     /// churns. Called from `release_partition` before the store is closed.
-    pub async fn clear_load_metrics(&self) {
-        if let Some(collector) = self.load_collector.write().await.take() {
+    pub fn clear_load_metrics(&self) {
+        if let Some(collector) = self.load_collector.swap(None) {
             collector.clear_partition(&self.topic, self.partition);
         }
     }
 
     /// Record a produce operation in the load metrics.
-    async fn record_produce_metrics(&self, bytes: u64, messages: u64) {
-        if let Some(ref collector) = *self.load_collector.read().await {
+    fn record_produce_metrics(&self, bytes: u64, messages: u64) {
+        if let Some(collector) = self.load_collector.load_full() {
             collector.record_produce(&self.topic, self.partition, bytes, messages);
         }
     }
 
     /// Record a fetch operation in the load metrics.
-    async fn record_fetch_metrics(&self, bytes: u64, messages: u64) {
-        if let Some(ref collector) = *self.load_collector.read().await {
+    fn record_fetch_metrics(&self, bytes: u64, messages: u64) {
+        if let Some(collector) = self.load_collector.load_full() {
             collector.record_fetch(&self.topic, self.partition, bytes, messages);
         }
     }
@@ -431,38 +436,25 @@ impl PartitionStore {
             });
         }
 
-        // Acquire write lock to ensure atomic offset allocation
-        let _guard = self.write_lock.lock().await;
-
-        // Re-check zombie mode AFTER acquiring lock (double-check pattern)
-        // A broker could enter zombie mode while we were waiting for the lock
-        if let Some(ref zombie_state) = self.zombie_mode
-            && zombie_state.is_active()
-        {
-            error!(
-                topic = %self.topic,
-                partition = self.partition,
-                "Rejecting write: broker entered zombie mode while waiting for lock"
-            );
-            return Err(SlateDBError::NotOwned {
-                topic: self.topic.clone(),
-                partition: self.partition,
-            });
-        }
-
         // ==================================================================
-        // EPOCH-BASED FENCING: Verify epoch before write
+        // EPOCH-BASED FENCING: read epoch BEFORE acquiring the write lock.
         // ==================================================================
-        // This is the critical safety check that prevents TOCTOU races.
-        // If another broker has acquired this partition (with a higher epoch),
-        // we must reject the write to prevent data corruption.
+        // The previous shape held the per-partition write_lock across this
+        // SlateDB get plus the actual durable write — every concurrent
+        // producer to the partition serialized end-to-end on object-store
+        // latency. Reading the epoch outside the lock lets concurrent
+        // writers parallelize the epoch fetch; the actual write below
+        // remains atomic via SlateDB's own single-writer fencing.
         //
-        // This check happens UNDER the write lock to prevent races between
-        // the check and the actual write.
-        if self.leader_epoch > 0 {
-            let stored_epoch = match self.db.get(LEADER_EPOCH_KEY).await {
-                Ok(Some(bytes)) => decode_leader_epoch(&bytes).unwrap_or(0),
-                Ok(None) => 0,
+        // SAFETY: An adversarial broker bumping the epoch between this read
+        // and our write is detected by SlateDB at `write_with_options` time,
+        // which fails with `is_fenced()`. The check below provides an
+        // earlier reject for the common case (cleaner error code, avoids
+        // building the WriteBatch) without being load-bearing for safety.
+        let prefetched_epoch: Option<i32> = if self.leader_epoch > 0 {
+            match self.db.get(LEADER_EPOCH_KEY).await {
+                Ok(Some(bytes)) => Some(decode_leader_epoch(&bytes).unwrap_or(0)),
+                Ok(None) => Some(0),
                 Err(e) => {
                     let err = SlateDBError::from(e);
                     if err.is_fenced() {
@@ -491,24 +483,50 @@ impl PartitionStore {
                         self.topic, self.partition, err
                     )));
                 }
-            };
-
-            if stored_epoch != self.leader_epoch {
-                error!(
-                    topic = %self.topic,
-                    partition = self.partition,
-                    expected_epoch = self.leader_epoch,
-                    stored_epoch,
-                    "EPOCH MISMATCH: Another broker has acquired this partition"
-                );
-                super::metrics::record_epoch_mismatch(&self.topic, self.partition);
-                return Err(SlateDBError::EpochMismatch {
-                    topic: self.topic.clone(),
-                    partition: self.partition,
-                    expected_epoch: self.leader_epoch,
-                    stored_epoch,
-                });
             }
+        } else {
+            None
+        };
+
+        // Acquire write lock to ensure atomic offset allocation
+        let _guard = self.write_lock.lock().await;
+
+        // Re-check zombie mode AFTER acquiring lock (double-check pattern)
+        // A broker could enter zombie mode while we were waiting for the lock
+        if let Some(ref zombie_state) = self.zombie_mode
+            && zombie_state.is_active()
+        {
+            error!(
+                topic = %self.topic,
+                partition = self.partition,
+                "Rejecting write: broker entered zombie mode while waiting for lock"
+            );
+            return Err(SlateDBError::NotOwned {
+                topic: self.topic.clone(),
+                partition: self.partition,
+            });
+        }
+
+        // Pure in-memory compare against the prefetched epoch — no I/O held
+        // under the lock. SlateDB's own fence enforcement catches any race
+        // between this check and the actual write below.
+        if let Some(stored_epoch) = prefetched_epoch
+            && stored_epoch != self.leader_epoch
+        {
+            error!(
+                topic = %self.topic,
+                partition = self.partition,
+                expected_epoch = self.leader_epoch,
+                stored_epoch,
+                "EPOCH MISMATCH: Another broker has acquired this partition"
+            );
+            super::metrics::record_epoch_mismatch(&self.topic, self.partition);
+            return Err(SlateDBError::EpochMismatch {
+                topic: self.topic.clone(),
+                partition: self.partition,
+                expected_epoch: self.leader_epoch,
+                stored_epoch,
+            });
         }
 
         // Reject invalid record counts BEFORE we reserve any offsets — a
@@ -894,8 +912,7 @@ impl PartitionStore {
         );
 
         // Record load metrics for auto-balancing
-        self.record_produce_metrics(records.len() as u64, record_count as u64)
-            .await;
+        self.record_produce_metrics(records.len() as u64, record_count as u64);
 
         Ok(base_offset)
     }
@@ -1114,8 +1131,7 @@ impl PartitionStore {
 
         // Record load metrics for auto-balancing
         if let Some(ref r) = records {
-            self.record_fetch_metrics(r.len() as u64, batch_count as u64)
-                .await;
+            self.record_fetch_metrics(r.len() as u64, batch_count as u64);
         }
 
         Ok((high_watermark, records))
@@ -2117,7 +2133,7 @@ impl PartitionStoreBuilder {
             zombie_mode: self.zombie_mode,
             producer_states: producer_states_cache,
             min_lease_ttl_for_write_secs: self.min_lease_ttl_for_write_secs,
-            load_collector: RwLock::new(None),
+            load_collector: arc_swap::ArcSwapOption::from(None),
             leader_epoch: validated_epoch,
             close_once: tokio::sync::OnceCell::new(),
         };

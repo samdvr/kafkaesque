@@ -527,9 +527,19 @@ impl SlateDBClusterHandler {
     /// This method returns a cached Arc<str> for the topic name,
     /// or creates and caches a new one if not present. This avoids allocation
     /// pressure from creating `Arc::from(topic.name.as_str())` on every request.
+    ///
+    /// `moka::sync::Cache::get_with` takes the key by value, so the previous
+    /// implementation allocated a `String` on every call regardless of cache
+    /// state — defeating the cache. We probe with `get` (borrowed key) first
+    /// and only allocate when populating on a miss.
     pub(crate) fn cached_topic_name(&self, topic: &str) -> Arc<str> {
+        if let Some(cached) = self.topic_name_cache.get(topic) {
+            return cached;
+        }
+        let owned: Arc<str> = Arc::from(topic);
         self.topic_name_cache
-            .get_with(topic.to_string(), || Arc::from(topic))
+            .insert(topic.to_string(), owned.clone());
+        owned
     }
 
     /// The HWM-advance notify for one partition, created lazily.
@@ -597,25 +607,42 @@ impl SlateDBClusterHandler {
 
     /// Build topic metadata response for a single topic.
     ///
-    /// This method queries the coordinator for partition information and builds
-    /// a complete metadata response including leader information for each partition.
+    /// Queries the coordinator once for all partition owners on this topic
+    /// (a single Raft read-index barrier), then assembles partition entries
+    /// from the result. The previous implementation issued N sequential
+    /// `get_partition_owner` calls — at e.g. 1 ms per Raft read this turned
+    /// a 1k-partition Metadata refresh into a 1-second sequential stall.
     pub(crate) async fn build_topic_metadata(&self, topic: &str) -> TopicMetadata {
-        let partition_count = self
-            .coordinator
-            .get_partition_count(topic)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(1);
+        let owners = match self.coordinator.get_partition_owners(topic).await {
+            Ok(o) => o,
+            Err(_) => Vec::new(),
+        };
+
+        // Fall back to `get_partition_count` only if the bulk read returned
+        // nothing — e.g. an unknown topic, or a coordinator backend that
+        // reports an empty owner list for a freshly created topic that has
+        // not yet been assigned. We still want a partition-shaped response
+        // so clients see the topic exists.
+        let partition_count = if owners.is_empty() {
+            self.coordinator
+                .get_partition_count(topic)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(1)
+        } else {
+            owners.len() as i32
+        };
+
+        let mut by_partition: std::collections::HashMap<i32, Option<i32>> =
+            std::collections::HashMap::with_capacity(owners.len());
+        for (partition, owner) in owners {
+            by_partition.insert(partition, owner);
+        }
 
         let mut partitions = Vec::with_capacity(partition_count as usize);
         for p in 0..partition_count {
-            let owner = self
-                .coordinator
-                .get_partition_owner(topic, p)
-                .await
-                .ok()
-                .flatten();
+            let owner = by_partition.get(&p).copied().unwrap_or(None);
 
             // When no owner is known, return LeaderNotAvailable instead of
             // falsely claiming this broker is the leader. This prevents clients

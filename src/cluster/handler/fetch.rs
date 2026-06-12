@@ -101,8 +101,53 @@ pub(super) async fn handle_fetch(
         .map(|n| Box::pin(n.notified()))
         .collect();
 
+    // Validate topic names and authorize once per request — these results
+    // are stable across long-poll iterations, but the previous version
+    // re-ran `validate_topic_name` and the async ACL check inside
+    // `collect_fetch` on every wakeup. With max_wait_ms = 1s and HWM-driven
+    // wakes every ~200ms, that quintuples the per-request authorize cost
+    // for no semantic gain.
+    let mut topic_plans: Vec<TopicFetchPlan> = Vec::with_capacity(request.topics.len());
+    for topic in &request.topics {
+        if validate_topic_name(&topic.name).is_err() {
+            debug!(topic = %topic.name, "Invalid topic name in fetch request");
+            topic_plans.push(TopicFetchPlan::Reject {
+                error_code: KafkaCode::InvalidTopic,
+            });
+            continue;
+        }
+        let denied = handler
+            .authorizer
+            .authorize(crate::cluster::authorizer::AuthorizeRequest {
+                principal: &ctx.principal,
+                host: &ctx.client_host,
+                operation: crate::cluster::raft::AclOperation::Read,
+                resource_type: crate::cluster::raft::AclResourceType::Topic,
+                resource_name: &topic.name,
+            })
+            .await
+            == crate::cluster::authorizer::AuthorizeResult::Denied;
+        if denied {
+            info!(
+                target: "audit",
+                topic = %topic.name,
+                principal = %ctx.principal,
+                api = "Fetch",
+                operation = "Read",
+                "ACL denied: Fetch"
+            );
+            topic_plans.push(TopicFetchPlan::Reject {
+                error_code: KafkaCode::TopicAuthorizationFailed,
+            });
+            continue;
+        }
+        topic_plans.push(TopicFetchPlan::Allowed {
+            topic_arc: Arc::from(topic.name.as_str()),
+        });
+    }
+
     // First pass: build the response with whatever's currently available.
-    let mut responses = collect_fetch(handler, ctx, &request).await;
+    let mut responses = collect_fetch(handler, &request, &topic_plans).await;
 
     // Long-poll loop: if min_bytes isn't satisfied and we have time left,
     // wait for any requested partition's HWM to advance, then re-check.
@@ -123,7 +168,7 @@ pub(super) async fn handle_fetch(
                 // A requested partition advanced — re-arm before re-fetching
                 // so a wake during `collect_fetch` is not lost.
                 armed = watched.iter().map(|n| Box::pin(n.notified())).collect();
-                responses = collect_fetch(handler, ctx, &request).await;
+                responses = collect_fetch(handler, &request, &topic_plans).await;
             }
             Err(_) => {
                 // Deadline elapsed.
@@ -150,17 +195,35 @@ pub(super) async fn handle_fetch(
     response
 }
 
+/// Per-topic disposition of a fetch request, computed once before the
+/// long-poll loop so per-iteration cost is just per-partition I/O.
+enum TopicFetchPlan {
+    /// Topic name is valid and the principal is authorized — the partition
+    /// fan-out should run for this topic. The `Arc<str>` is shared between
+    /// log lines and metrics calls so we don't reallocate per partition.
+    Allowed { topic_arc: Arc<str> },
+    /// Reject every partition in this topic with a fixed wire error_code.
+    /// Used for invalid topic names and ACL denials, both of which are
+    /// stable for the duration of the request.
+    Reject { error_code: KafkaCode },
+}
+
 /// One pass of per-partition fetching for every topic in the request. Pulled
 /// out of `handle_fetch` so the long-poll loop can re-run it on each wakeup.
+///
+/// Concurrency is flattened across the whole request: every (topic, partition)
+/// pair runs through one `buffer_unordered`. The previous shape iterated
+/// topics sequentially with a per-topic partition fan-out, so a 5-topic
+/// × 20-partition request ran at 20-wide concurrency for 5 sequential rounds
+/// instead of 100-wide for one round (audit P-8).
 async fn collect_fetch(
     handler: &SlateDBClusterHandler,
-    ctx: &RequestContext,
     request: &FetchRequestData,
+    topic_plans: &[TopicFetchPlan],
 ) -> Vec<FetchTopicResponse> {
     use futures::stream::{self, StreamExt};
     use std::sync::atomic::{AtomicI64, Ordering};
 
-    let mut responses = Vec::with_capacity(request.topics.len());
     let max_concurrent_reads = handler.max_concurrent_partition_reads;
 
     // Request-level `max_bytes` budget shared by all partitions in the
@@ -176,230 +239,214 @@ async fn collect_fetch(
         i64::MAX
     }));
 
-    for topic in &request.topics {
-        // Validate topic name to prevent injection attacks
-        if validate_topic_name(&topic.name).is_err() {
-            debug!(topic = %topic.name, "Invalid topic name in fetch request");
-            let partition_responses: Vec<_> = topic
-                .partitions
-                .iter()
-                .map(|p| FetchPartitionResponse {
-                    partition_index: p.partition_index,
-                    error_code: KafkaCode::InvalidTopic,
-                    high_watermark: -1,
-                    last_stable_offset: -1,
-                    aborted_transactions: vec![],
-                    records: None,
-                })
-                .collect();
-            responses.push(FetchTopicResponse {
-                name: topic.name.clone(),
-                partitions: partition_responses,
-            });
-            continue;
+    // Flatten (topic_idx, partition) pairs so we can fan out across the
+    // entire request rather than per-topic. Rejected topics emit
+    // pre-computed per-partition error responses without touching the
+    // partition manager.
+    struct PendingPartition {
+        topic_idx: usize,
+        topic_arc: Arc<str>,
+        partition: crate::server::request::FetchPartitionData,
+    }
+    let mut pending: Vec<PendingPartition> = Vec::new();
+    let mut topic_partitions: Vec<Vec<FetchPartitionResponse>> =
+        request.topics.iter().map(|t| Vec::with_capacity(t.partitions.len())).collect();
+
+    for (topic_idx, (topic, plan)) in request.topics.iter().zip(topic_plans.iter()).enumerate() {
+        match plan {
+            TopicFetchPlan::Reject { error_code } => {
+                for p in &topic.partitions {
+                    topic_partitions[topic_idx].push(FetchPartitionResponse {
+                        partition_index: p.partition_index,
+                        error_code: *error_code,
+                        high_watermark: -1,
+                        last_stable_offset: -1,
+                        aborted_transactions: vec![],
+                        records: None,
+                    });
+                }
+            }
+            TopicFetchPlan::Allowed { topic_arc } => {
+                for partition in topic.partitions.iter().cloned() {
+                    pending.push(PendingPartition {
+                        topic_idx,
+                        topic_arc: Arc::clone(topic_arc),
+                        partition,
+                    });
+                }
+            }
         }
+    }
 
-        // Fetch requires Read on the topic resource.
-        if handler
-            .authorizer
-            .authorize(crate::cluster::authorizer::AuthorizeRequest {
-                principal: &ctx.principal,
-                host: &ctx.client_host,
-                operation: crate::cluster::raft::AclOperation::Read,
-                resource_type: crate::cluster::raft::AclResourceType::Topic,
-                resource_name: &topic.name,
-            })
-            .await
-            == crate::cluster::authorizer::AuthorizeResult::Denied
-        {
-            info!(
-                target: "audit",
-                topic = %topic.name,
-                principal = %ctx.principal,
-                api = "Fetch",
-                operation = "Read",
-                "ACL denied: Fetch"
-            );
-            let partition_responses: Vec<_> = topic
-                .partitions
-                .iter()
-                .map(|p| FetchPartitionResponse {
-                    partition_index: p.partition_index,
-                    error_code: KafkaCode::TopicAuthorizationFailed,
-                    high_watermark: -1,
-                    last_stable_offset: -1,
-                    aborted_transactions: vec![],
-                    records: None,
-                })
-                .collect();
-            responses.push(FetchTopicResponse {
-                name: topic.name.clone(),
-                partitions: partition_responses,
-            });
-            continue;
-        }
+    let fetched: Vec<(usize, FetchPartitionResponse)> = stream::iter(pending)
+        .map(|pp| {
+            let request_budget = Arc::clone(&request_budget);
+            async move {
+                let topic_name = pp.topic_arc;
+                let partition = pp.partition;
+                let response = match handler
+                    .partition_manager
+                    .get_for_read(&topic_name, partition.partition_index)
+                    .await
+                {
+                    Ok(store) => {
+                        let current_hwm = store.high_watermark();
 
-        let topic_name: Arc<str> = Arc::from(topic.name.as_str());
-
-        // Process partitions with concurrency limit
-        let partition_responses: Vec<_> = stream::iter(topic.partitions.clone())
-            .map(|partition| {
-                let topic_name = Arc::clone(&topic_name);
-                let request_budget = Arc::clone(&request_budget);
-                async move {
-                    match handler
-                        .partition_manager
-                        .get_for_read(&topic_name, partition.partition_index)
-                        .await
-                    {
-                        Ok(store) => {
-                            let current_hwm = store.high_watermark();
-
-                            // Resolve Kafka offset sentinels before any
-                            // range checks. -1 means "latest" (the HWM), -2
-                            // means "earliest" (log-start). Before this fix
-                            // both fell through to `fetch_from`, which
-                            // returns empty for any negative offset, and
-                            // `auto.offset.reset=latest` consumers hung.
-                            let log_start = match store.earliest_offset().await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    error!(error = %e, "earliest_offset failed");
-                                    return FetchPartitionResponse {
+                        // Resolve Kafka offset sentinels before any
+                        // range checks. -1 means "latest" (the HWM), -2
+                        // means "earliest" (log-start). Before this fix
+                        // both fell through to `fetch_from`, which
+                        // returns empty for any negative offset, and
+                        // `auto.offset.reset=latest` consumers hung.
+                        let log_start = match store.earliest_offset().await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                error!(error = %e, "earliest_offset failed");
+                                return (
+                                    pp.topic_idx,
+                                    FetchPartitionResponse {
                                         partition_index: partition.partition_index,
                                         error_code: KafkaCode::Unknown,
                                         high_watermark: -1,
                                         last_stable_offset: -1,
                                         aborted_transactions: vec![],
                                         records: None,
-                                    };
-                                }
-                            };
+                                    },
+                                );
+                            }
+                        };
 
-                            let effective_offset = match partition.fetch_offset {
-                                -1 => current_hwm,
-                                -2 => log_start,
-                                o if o < 0 => {
-                                    return FetchPartitionResponse {
+                        let effective_offset = match partition.fetch_offset {
+                            -1 => current_hwm,
+                            -2 => log_start,
+                            o if o < 0 => {
+                                return (
+                                    pp.topic_idx,
+                                    FetchPartitionResponse {
                                         partition_index: partition.partition_index,
                                         error_code: KafkaCode::OffsetOutOfRange,
                                         high_watermark: current_hwm,
-                                        last_stable_offset: current_hwm,
+                                        last_stable_offset: -1,
                                         aborted_transactions: vec![],
                                         records: None,
-                                    };
-                                }
-                                o => o,
-                            };
+                                    },
+                                );
+                            }
+                            o => o,
+                        };
 
-                            if effective_offset > current_hwm || effective_offset < log_start {
-                                return FetchPartitionResponse {
+                        if effective_offset > current_hwm || effective_offset < log_start {
+                            return (
+                                pp.topic_idx,
+                                FetchPartitionResponse {
                                     partition_index: partition.partition_index,
                                     error_code: KafkaCode::OffsetOutOfRange,
                                     high_watermark: current_hwm,
-                                    last_stable_offset: current_hwm,
+                                    last_stable_offset: -1,
                                     aborted_transactions: vec![],
                                     records: None,
-                                };
-                            }
+                                },
+                            );
+                        }
 
-                            // Request-level max_bytes already consumed by
-                            // other partitions: return the HWM with no
-                            // records so the client still makes progress.
-                            let remaining = request_budget.load(Ordering::Relaxed);
-                            if remaining <= 0 {
-                                return FetchPartitionResponse {
+                        let remaining = request_budget.load(Ordering::Relaxed);
+                        if remaining <= 0 {
+                            return (
+                                pp.topic_idx,
+                                FetchPartitionResponse {
                                     partition_index: partition.partition_index,
                                     error_code: KafkaCode::None,
                                     high_watermark: current_hwm,
                                     last_stable_offset: current_hwm,
                                     aborted_transactions: vec![],
                                     records: None,
-                                };
-                            }
+                                },
+                            );
+                        }
 
-                            // Per-partition cap (`partition_max_bytes`, <= 0
-                            // meaning unlimited) further bounded by what's
-                            // left of the request budget. The store applies
-                            // its own broker-wide ceiling on top.
-                            let partition_cap = if partition.partition_max_bytes > 0 {
-                                partition.partition_max_bytes as usize
-                            } else {
-                                usize::MAX
-                            };
-                            let budget = partition_cap.min(remaining as usize);
+                        let partition_cap = if partition.partition_max_bytes > 0 {
+                            partition.partition_max_bytes as usize
+                        } else {
+                            usize::MAX
+                        };
+                        let budget = partition_cap.min(remaining as usize);
 
-                            match store.fetch_from_with_budget(effective_offset, budget).await {
-                                Ok((high_watermark, records)) => {
-                                    if let Some(ref record_bytes) = records {
-                                        let bytes = record_bytes.len() as u64;
-                                        request_budget.fetch_sub(bytes as i64, Ordering::Relaxed);
-                                        let msg_count = crate::protocol::parse_record_count(
-                                            record_bytes,
-                                        )
-                                        .max(0)
+                        match store.fetch_from_with_budget(effective_offset, budget).await {
+                            Ok((high_watermark, records)) => {
+                                if let Some(ref record_bytes) = records {
+                                    let bytes = record_bytes.len() as u64;
+                                    request_budget.fetch_sub(bytes as i64, Ordering::Relaxed);
+                                    let msg_count =
+                                        crate::protocol::parse_record_count(record_bytes).max(0)
                                             as u64;
-                                        crate::cluster::metrics::record_fetch(
-                                            &topic_name,
-                                            partition.partition_index,
-                                            msg_count,
-                                            bytes,
-                                        );
-                                    }
-
-                                    FetchPartitionResponse {
-                                        partition_index: partition.partition_index,
-                                        error_code: KafkaCode::None,
-                                        high_watermark,
-                                        last_stable_offset: high_watermark,
-                                        aborted_transactions: vec![],
-                                        records,
-                                    }
+                                    crate::cluster::metrics::record_fetch(
+                                        &topic_name,
+                                        partition.partition_index,
+                                        msg_count,
+                                        bytes,
+                                    );
                                 }
-                                Err(e) => {
-                                    let error_code = e.to_kafka_code();
-                                    if e.is_fenced() {
-                                        error!(
-                                            topic = %topic_name,
-                                            partition = partition.partition_index,
-                                            "Fenced during fetch - returning NotLeaderForPartition"
-                                        );
-                                    } else {
-                                        error!(error = %e, "Fetch failed");
-                                    }
-                                    FetchPartitionResponse {
-                                        partition_index: partition.partition_index,
-                                        error_code,
-                                        high_watermark: -1,
-                                        last_stable_offset: -1,
-                                        aborted_transactions: vec![],
-                                        records: None,
-                                    }
+
+                                FetchPartitionResponse {
+                                    partition_index: partition.partition_index,
+                                    error_code: KafkaCode::None,
+                                    high_watermark,
+                                    last_stable_offset: high_watermark,
+                                    aborted_transactions: vec![],
+                                    records,
+                                }
+                            }
+                            Err(e) => {
+                                let error_code = e.to_kafka_code();
+                                if e.is_fenced() {
+                                    error!(
+                                        topic = %topic_name,
+                                        partition = partition.partition_index,
+                                        "Fenced during fetch - returning NotLeaderForPartition"
+                                    );
+                                } else {
+                                    error!(error = %e, "Fetch failed");
+                                }
+                                FetchPartitionResponse {
+                                    partition_index: partition.partition_index,
+                                    error_code,
+                                    high_watermark: -1,
+                                    last_stable_offset: -1,
+                                    aborted_transactions: vec![],
+                                    records: None,
                                 }
                             }
                         }
-                        Err(_) => FetchPartitionResponse {
-                            partition_index: partition.partition_index,
-                            error_code: KafkaCode::NotLeaderForPartition,
-                            high_watermark: -1,
-                            last_stable_offset: -1,
-                            aborted_transactions: vec![],
-                            records: None,
-                        },
                     }
-                }
-            })
-            .buffer_unordered(max_concurrent_reads)
-            .collect()
-            .await;
+                    Err(_) => FetchPartitionResponse {
+                        partition_index: partition.partition_index,
+                        error_code: KafkaCode::NotLeaderForPartition,
+                        high_watermark: -1,
+                        last_stable_offset: -1,
+                        aborted_transactions: vec![],
+                        records: None,
+                    },
+                };
+                (pp.topic_idx, response)
+            }
+        })
+        .buffer_unordered(max_concurrent_reads)
+        .collect()
+        .await;
 
-        responses.push(FetchTopicResponse {
-            name: topic.name.clone(),
-            partitions: partition_responses,
-        });
+    for (topic_idx, response) in fetched {
+        topic_partitions[topic_idx].push(response);
     }
 
-    responses
+    request
+        .topics
+        .iter()
+        .zip(topic_partitions.into_iter())
+        .map(|(topic, partitions)| FetchTopicResponse {
+            name: topic.name.clone(),
+            partitions,
+        })
+        .collect()
 }
 
 #[cfg(test)]

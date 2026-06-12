@@ -523,12 +523,14 @@ pub(super) async fn handle_offset_commit(
                 continue;
             }
 
-            // Bound the committed offset against the partition's live
-            // [log_start_offset, high_watermark] window. Without this,
-            // committing `i64::MAX` makes a consumer silently skip every
-            // future record; committing below the LSO commits an offset
-            // whose data has already been retention-purged, surfacing as a
-            // delayed `OFFSET_OUT_OF_RANGE` on the next fetch.
+            // Bound the committed offset against the partition's live log.
+            // Real Kafka accepts any non-negative committed offset (treating
+            // it as opaque consumer state), so we only reject below the log
+            // start: those offsets reference data that retention has already
+            // purged, which surfaces as a delayed `OFFSET_OUT_OF_RANGE` on
+            // the next fetch and breaks resumption. Offsets above HWM are
+            // legitimate for cross-cluster replication and external offset
+            // tracking — log a warning rather than failing the commit.
             let bounds_error = match handler
                 .partition_manager
                 .get_for_read(&topic.name, partition.partition_index)
@@ -537,9 +539,7 @@ pub(super) async fn handle_offset_commit(
                 Ok(store) => {
                     let hwm = store.high_watermark();
                     let log_start = store.log_start_offset();
-                    if partition.committed_offset < log_start
-                        || partition.committed_offset > hwm
-                    {
+                    if partition.committed_offset < log_start {
                         debug!(
                             group_id = %request.group_id,
                             topic = %topic.name,
@@ -547,10 +547,20 @@ pub(super) async fn handle_offset_commit(
                             committed_offset = partition.committed_offset,
                             log_start,
                             hwm,
-                            "Rejecting OffsetCommit: offset outside [log_start, hwm]"
+                            "Rejecting OffsetCommit: offset below log_start (data retention-purged)"
                         );
                         Some(KafkaCode::OffsetOutOfRange)
                     } else {
+                        if partition.committed_offset > hwm {
+                            tracing::warn!(
+                                group_id = %request.group_id,
+                                topic = %topic.name,
+                                partition = partition.partition_index,
+                                committed_offset = partition.committed_offset,
+                                hwm,
+                                "OffsetCommit accepted with committed_offset > HWM"
+                            );
+                        }
                         None
                     }
                 }

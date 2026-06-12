@@ -936,7 +936,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             .remove(&key)
             .and_then(|(_, s)| s.store())
         {
-            store.clear_load_metrics().await;
+            store.clear_load_metrics();
             // Close the store (close() takes &self so this always works)
             if let Err(e) = store.close().await {
                 error!(topic, partition, error = %e, "Failed to close partition store");
@@ -1199,7 +1199,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                     .remove(&cache_key)
                     .and_then(|(_, s)| s.store())
                 {
-                    store.clear_load_metrics().await;
+                    store.clear_load_metrics();
                     if let Err(close_err) = store.close().await {
                         warn!(topic, partition, error = %close_err, "Failed to close partition store after ownership loss");
                     }
@@ -1812,7 +1812,7 @@ async fn verify_ownership<C: ClusterCoordinator>(
                 .remove(&key)
                 .and_then(|(_, s)| s.store())
             {
-                store.clear_load_metrics().await;
+                store.clear_load_metrics();
                 if let Err(e) = store.close().await {
                     warn!(topic, partition, error = %e, "Failed to close partition store after ownership loss");
                 }
@@ -1846,7 +1846,7 @@ async fn release_reassigned_partition<C: ClusterCoordinator>(
             topic, partition, "Releasing reassigned partition - closing SlateDB"
         );
 
-        store.clear_load_metrics().await;
+        store.clear_load_metrics();
         if let Err(e) = store.close().await {
             if e.is_fenced() {
                 debug!(
@@ -1900,7 +1900,7 @@ async fn release_partition_for_deleted_topic<C: ClusterCoordinator>(
         .remove(&key)
         .and_then(|(_, s)| s.store())
     {
-        store.clear_load_metrics().await;
+        store.clear_load_metrics();
         // close() takes &self so this always works
         let _ = store.close().await;
     }

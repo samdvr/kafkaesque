@@ -105,7 +105,7 @@ impl ScramCredentials {
 }
 
 /// Stage of the SCRAM handshake from the server's perspective.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ScramServerState {
     /// Awaiting the client-first-message.
     AwaitingClientFirst,

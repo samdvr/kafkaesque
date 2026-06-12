@@ -184,19 +184,29 @@ pub(super) async fn handle_metadata(
                     Vec::new()
                 }
             };
-            let mut result = Vec::with_capacity(topic_names.len());
 
+            // Authorize first so we don't waste coordinator round-trips on
+            // topics we'll filter out anyway. Then run `build_topic_metadata`
+            // for the survivors with bounded concurrency — each call issues
+            // at least one Raft read, so a list-all over hundreds of topics
+            // would otherwise serialize end-to-end on the network round-trip.
+            let mut authorized = Vec::with_capacity(topic_names.len());
             for name in topic_names {
-                if !handler
+                if handler
                     .topic_authorized(ctx, AclOperation::Describe, &name)
                     .await
                 {
-                    continue;
+                    authorized.push(name);
                 }
-                result.push(handler.build_topic_metadata(&name).await);
             }
 
-            result
+            use futures::stream::{self, StreamExt};
+            const METADATA_FETCH_CONCURRENCY: usize = 16;
+            stream::iter(authorized)
+                .map(|name| async move { handler.build_topic_metadata(&name).await })
+                .buffer_unordered(METADATA_FETCH_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await
         }
     };
 

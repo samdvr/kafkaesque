@@ -168,6 +168,46 @@ fn encode_versioned_raw_response(
     response.encode_with_size()
 }
 
+/// Encode a versioned response body directly into a single framed buffer,
+/// without an intermediate body `Vec` that would later be copied into the
+/// framed output. The body is written behind a pre-zeroed header, then the
+/// header is patched in place.
+///
+/// The previous shape — encode body into a `Vec<u8>`, then wrap it in
+/// `Response::new_raw{,_flexible}` which `extend_from_slice`'d the body
+/// into a fresh framed `Vec` — paid one full memcpy per response on the
+/// fetch hot path. For a 10 MB fetch that's 10 MB of avoided memory
+/// bandwidth and a halving of resident memory at peak.
+fn encode_versioned_response_into_frame<F>(
+    correlation_id: i32,
+    api_key: crate::server::request::ApiKey,
+    api_version: i16,
+    encode_body: F,
+) -> Result<Vec<u8>>
+where
+    F: FnOnce(&mut Vec<u8>) -> Result<()>,
+{
+    let flexible = matches!(
+        api_key.response_style(api_version),
+        ResponseStyle::Flexible
+    );
+    let header_len: usize = if flexible { 9 } else { 8 };
+
+    let mut framed = Vec::with_capacity(header_len + 1024);
+    framed.resize(header_len, 0);
+    encode_body(&mut framed)?;
+
+    let body_len = framed.len() - 4;
+    let size: i32 = body_len as i32;
+    framed[0..4].copy_from_slice(&size.to_be_bytes());
+    framed[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+    if flexible {
+        framed[8] = 0;
+    }
+
+    Ok(framed)
+}
+
 /// Read one length-prefixed Kafka request frame from any async stream.
 ///
 /// Returns the decoded frame plus the inflight-byte permit that reserved
@@ -736,11 +776,16 @@ async fn dispatch_request_common<H: Handler>(
         }
         Request::Fetch(header, req) => {
             let resp = handler.handle_fetch(&ctx, req).await;
-            let mut body = Vec::new();
-            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
-                return (Err(e), auth_result);
+            let frame = encode_versioned_response_into_frame(
+                correlation_id,
+                header.api_key,
+                header.api_version,
+                |buf| resp.encode_versioned(buf, header.api_version),
+            );
+            match frame {
+                Ok(frame) => Ok(frame),
+                Err(e) => return (Err(e), auth_result),
             }
-            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::ListOffsets(header, req) => {
             let resp = handler.handle_list_offsets(&ctx, req).await;

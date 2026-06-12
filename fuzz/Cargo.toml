@@ -246,6 +246,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "scram_stateful"
+path = "fuzz_targets/scram_stateful.rs"
+test = false
+doc = false
+bench = false
+
 # ===========================================================================
 # Postcard decoders for cluster RPC + on-disk Raft state
 # ===========================================================================

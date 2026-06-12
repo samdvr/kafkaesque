@@ -123,11 +123,17 @@ pub const CRC_OFFLOAD_THRESHOLD: usize = 64 * 1024;
 ///
 /// Wire-protocol entry points should prefer this over `validate_batch_crc`
 /// when running inside a tokio task; small batches still execute inline.
-pub async fn validate_batch_crc_async(batch: &[u8]) -> CrcValidationResult {
+///
+/// Takes `&Bytes` so the offload path can `clone()` the refcount instead
+/// of memcpy'ing the entire payload — a `Bytes` clone is constant-time
+/// regardless of size, while the previous `&[u8]` signature forced a full
+/// copy via `Bytes::copy_from_slice` for every batch over the offload
+/// threshold.
+pub async fn validate_batch_crc_async(batch: &bytes::Bytes) -> CrcValidationResult {
     if batch.len() < CRC_OFFLOAD_THRESHOLD {
         return validate_batch_crc(batch);
     }
-    let owned = bytes::Bytes::copy_from_slice(batch);
+    let owned = batch.clone();
     match tokio::task::spawn_blocking(move || validate_batch_crc(&owned)).await {
         Ok(result) => result,
         Err(_join) => validate_batch_crc(batch),

@@ -436,6 +436,16 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                     let (stream, addr) = accept_result.map_err(Error::from)?;
                     let ip = addr.ip();
 
+                    // Disable Nagle so small responses (e.g. heartbeats,
+                    // commit acks) flush as soon as we write them. Without
+                    // this, Linux can hold a small outbound segment for up
+                    // to ~40 ms waiting for piggybacked data, inflating
+                    // tail latency on light traffic. Failures here are not
+                    // fatal — log and continue with default behavior.
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::debug!(client_addr = %addr, error = %e, "Failed to set TCP_NODELAY");
+                    }
+
                     // Check auth rate limit first
                     if let Some(remaining) = self.auth_rate_limiter.check_rate_limit(ip).await {
                         tracing::warn!(
@@ -537,6 +547,10 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
     /// Run the server for a single connection (useful for testing).
     pub async fn accept_one(&self) -> Result<()> {
         let (stream, addr) = self.listener.accept().await.map_err(Error::from)?;
+
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!(client_addr = %addr, error = %e, "Failed to set TCP_NODELAY");
+        }
 
         tracing::debug!(client_addr = %addr, "Accepted connection");
 
@@ -778,6 +792,10 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                     let (stream, addr) = accept_result.map_err(Error::from)?;
                     let ip = addr.ip();
 
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::debug!(client_addr = %addr, error = %e, "Failed to set TCP_NODELAY");
+                    }
+
                     // Check auth rate limit first
                     if let Some(remaining) = self.auth_rate_limiter.check_rate_limit(ip).await {
                         tracing::warn!(
@@ -908,6 +926,10 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
     /// Run the server for a single connection (useful for testing).
     pub async fn accept_one(&self) -> Result<()> {
         let (stream, addr) = self.listener.accept().await.map_err(Error::from)?;
+
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!(client_addr = %addr, error = %e, "Failed to set TCP_NODELAY");
+        }
 
         tracing::debug!(client_addr = %addr, "Accepted TLS connection");
 

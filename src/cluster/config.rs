@@ -1837,31 +1837,12 @@ impl ClusterConfig {
             return Ok(());
         }
 
-        if !config.sasl_required {
-            return Err(format!(
-                "SASL is not required for client connections (profile: {}). A broker that \
-                 accepts unauthenticated clients exposes every authorization decision to the \
-                 `User:ANONYMOUS` principal — `acl_enabled` alone does not close the gap. \
-                 Enable SASL_REQUIRED (with SASL_ENABLED), or explicitly opt into an open \
-                 broker for local development with CLUSTER_PROFILE=development.",
-                profile
-            )
-            .into());
-        }
-
-        if !config.acl_enabled {
-            return Err(format!(
-                "ACL enforcement is not enabled (profile: {}). Authentication alone leaves \
-                 every authenticated principal able to act on every resource — enable \
-                 ACL_ENABLED so authorization is actually checked, or explicitly opt into an \
-                 open broker for local development with CLUSTER_PROFILE=development.",
-                profile
-            )
-            .into());
-        }
-
         // Reuse RaftAuthKeys' normalization so an empty/whitespace-only
         // secret is treated as unset here exactly as it is by the RPC layer.
+        // Check the secret first: an unauthenticated control plane is the
+        // most fundamental misconfiguration and the most actionable
+        // diagnostic — the operator usually only needs one missing-env-var
+        // pointer rather than a chained list. SASL/ACL gates follow.
         let auth_keys = crate::cluster::raft::RaftAuthKeys::from_env();
         if !auth_keys.cluster_secret_configured() {
             return Err(format!(
@@ -1870,6 +1851,25 @@ impl ClusterConfig {
                  outside development. Set RAFT_CLUSTER_SECRET to the same strong random value \
                  on every node, or explicitly opt into an unauthenticated control plane for \
                  local development with CLUSTER_PROFILE=development.",
+                profile
+            )
+            .into());
+        }
+
+        // Require at least one client-auth gate. Either ACL enforcement or
+        // SASL alone closes the "unauthenticated client gets full access"
+        // hole — operators that have one don't need both. The previous
+        // policy that required BOTH rejected sensible configs (e.g.,
+        // "ACL on ANONYMOUS, no SASL" for an internal-only cluster behind
+        // a network boundary).
+        if !config.sasl_required && !config.acl_enabled {
+            return Err(format!(
+                "Neither SASL_REQUIRED nor ACL_ENABLED is set (profile: {}). A broker that \
+                 accepts unauthenticated clients with no ACL enforcement exposes every \
+                 authorization decision to the `User:ANONYMOUS` principal and lets every \
+                 caller act on every resource. Enable SASL_REQUIRED (with SASL_ENABLED), \
+                 enable ACL_ENABLED, or explicitly opt into an open broker for local \
+                 development with CLUSTER_PROFILE=development.",
                 profile
             )
             .into());

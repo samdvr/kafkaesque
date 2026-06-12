@@ -54,43 +54,44 @@ pub(crate) fn encode_nullable_string<W: BufMut>(s: Option<&str>, buffer: &mut W)
 }
 
 /// Response wrapper that includes correlation ID and response body.
+///
+/// Internally, the byte vector already carries the framed shape:
+/// `[4-byte size placeholder][4-byte correlation_id][optional tag byte][body]`.
+/// Building the body directly into this single buffer (rather than into a
+/// separate `body: Vec<u8>` and then concatenating) avoids a full memcpy of
+/// every fetch payload — for a 10 MB fetch that's ~10 MB of avoided memory
+/// bandwidth on the runtime thread (audit P-1).
 pub struct Response {
-    pub correlation_id: i32,
-    body: Vec<u8>,
+    framed: Vec<u8>,
     flexible: bool,
 }
 
+const STD_HEADER_LEN: usize = 8; // 4 size + 4 correlation_id
+const FLEX_HEADER_LEN: usize = 9; // STD + 1 tagged-fields byte
+
 impl Response {
+    fn header_len(flexible: bool) -> usize {
+        if flexible {
+            FLEX_HEADER_LEN
+        } else {
+            STD_HEADER_LEN
+        }
+    }
+
     /// Create a new response with the given correlation ID and body.
     pub fn new<T: ToByte>(correlation_id: i32, body: &T) -> Result<Self> {
-        let mut buf = Vec::new();
-        body.encode(&mut buf)?;
-        Ok(Self {
-            correlation_id,
-            body: buf,
-            flexible: false,
-        })
+        Self::build(correlation_id, false, |buf| body.encode(buf))
     }
 
     /// Create a new flexible response (for APIs using flexible versions).
     pub fn new_flexible<T: ToByte>(correlation_id: i32, body: &T) -> Result<Self> {
-        let mut buf = Vec::new();
-        body.encode(&mut buf)?;
-        Ok(Self {
-            correlation_id,
-            body: buf,
-            flexible: true,
-        })
+        Self::build(correlation_id, true, |buf| body.encode(buf))
     }
 
     /// Create a new response with pre-encoded body bytes.
     /// Use this when you need version-specific encoding.
     pub fn new_raw(correlation_id: i32, body: Vec<u8>) -> Result<Self> {
-        Ok(Self {
-            correlation_id,
-            body,
-            flexible: false,
-        })
+        Self::from_raw_body(correlation_id, false, body)
     }
 
     /// Create a new flexible response with pre-encoded body bytes.
@@ -100,30 +101,56 @@ impl Response {
     /// body needs version-specific encoding at a flexible version (e.g.
     /// InitProducerId v2+).
     pub fn new_raw_flexible(correlation_id: i32, body: Vec<u8>) -> Result<Self> {
-        Ok(Self {
-            correlation_id,
-            body,
-            flexible: true,
-        })
+        Self::from_raw_body(correlation_id, true, body)
     }
 
-    /// Encode the response to a buffer with the size prefix.
-    pub fn encode_with_size(&self) -> Result<Vec<u8>> {
-        // Single-allocation path: pre-size to (size prefix + correlation_id +
-        // optional tagged-fields byte + body) and encode in place. The
-        // previous version produced a `header` Vec, a `result` Vec, and the
-        // already-built `body` Vec; for a 10 MB fetch response the peak
-        // residency was ~30 MB. Now ~10 MB plus a few bytes of header.
-        let header_extra: usize = if self.flexible { 1 } else { 0 };
-        let total_body_size: i32 = (4 + header_extra + self.body.len()) as i32;
-        let mut result = Vec::with_capacity(4 + 4 + header_extra + self.body.len());
-        total_body_size.encode(&mut result)?;
-        self.correlation_id.encode(&mut result)?;
-        if self.flexible {
-            result.push(0); // Empty tagged fields in header
+    fn build<F: FnOnce(&mut Vec<u8>) -> Result<()>>(
+        correlation_id: i32,
+        flexible: bool,
+        encode_body: F,
+    ) -> Result<Self> {
+        let header_len = Self::header_len(flexible);
+        let mut framed = Vec::with_capacity(header_len + 64);
+        framed.resize(header_len, 0);
+        encode_body(&mut framed)?;
+        Self::patch_header(&mut framed, correlation_id, flexible);
+        Ok(Self { framed, flexible })
+    }
+
+    fn from_raw_body(correlation_id: i32, flexible: bool, body: Vec<u8>) -> Result<Self> {
+        let header_len = Self::header_len(flexible);
+        // If body has at least header_len reserved at the front, splice the
+        // header in. Otherwise allocate a fresh framed buffer and copy once
+        // (a copy that the caller could have avoided by using `new`/`build`).
+        let mut framed = Vec::with_capacity(header_len + body.len());
+        framed.resize(header_len, 0);
+        framed.extend_from_slice(&body);
+        Self::patch_header(&mut framed, correlation_id, flexible);
+        Ok(Self { framed, flexible })
+    }
+
+    fn patch_header(framed: &mut [u8], correlation_id: i32, flexible: bool) {
+        let body_len = framed.len() - 4; // excluding size prefix
+        let size: i32 = body_len as i32;
+        framed[0..4].copy_from_slice(&size.to_be_bytes());
+        framed[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+        if flexible {
+            framed[8] = 0; // empty tagged fields
         }
-        result.extend_from_slice(&self.body);
-        Ok(result)
+    }
+
+    /// Encode the response to a single `Vec<u8>` with the size prefix.
+    ///
+    /// The framed output is already complete in-place; this just hands the
+    /// underlying buffer back to the caller. No additional allocation or
+    /// copy happens.
+    pub fn encode_with_size(self) -> Result<Vec<u8>> {
+        Ok(self.framed)
+    }
+
+    /// Whether this response was framed with a flexible (KIP-482) header.
+    pub fn flexible(&self) -> bool {
+        self.flexible
     }
 }
 

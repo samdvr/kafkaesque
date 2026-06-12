@@ -37,23 +37,50 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::metrics;
 
 /// Type-safe wrapper for zombie mode state.
 ///
-/// Encapsulates the atomic flags and timestamp tracking for zombie mode,
-/// providing a safer interface than raw atomic operations scattered throughout
-/// the codebase.
+/// The `(active, generation)` pair is packed into a single `AtomicU64` so a
+/// `try_exit` can verify "still the same active session" with one CAS — closing
+/// the TOCTOU window where a `force_exit` + re-`enter` between the timestamp
+/// check and the active-flag CAS would otherwise let the recovery thread exit
+/// a *new* zombie session prematurely.
+///
+/// `state` layout (LSB → MSB):
+///   bit 0     : active flag (0 = healthy, 1 = zombie)
+///   bits 1..64: generation counter, incremented on every healthy → zombie
+///               transition. Wraps at 2^63 (~292 million years at 1 enter/ns)
+///               which is a non-issue.
 #[derive(Debug)]
 pub struct ZombieModeState {
-    /// Whether the broker is currently in zombie mode.
-    active: AtomicBool,
-    /// Timestamp (epoch millis) when zombie mode was entered.
-    /// Used to detect re-entry during exit verification.
+    /// Packed `(generation << 1) | active_flag`.
+    state: AtomicU64,
+    /// Timestamp (epoch millis) when zombie mode was entered. Set when active
+    /// transitions 0 → 1 and cleared on exit. Used purely for metrics — the
+    /// authoritative session identity is the generation packed in `state`.
     entered_at_millis: AtomicU64,
+}
+
+const ACTIVE_BIT: u64 = 1;
+const GEN_SHIFT: u32 = 1;
+
+#[inline]
+fn pack(active: bool, generation: u64) -> u64 {
+    (generation << GEN_SHIFT) | (active as u64)
+}
+
+#[inline]
+fn is_active_bits(state: u64) -> bool {
+    state & ACTIVE_BIT != 0
+}
+
+#[inline]
+fn generation_of(state: u64) -> u64 {
+    state >> GEN_SHIFT
 }
 
 impl Default for ZombieModeState {
@@ -66,7 +93,7 @@ impl ZombieModeState {
     /// Create a new zombie mode state (not in zombie mode).
     pub fn new() -> Self {
         Self {
-            active: AtomicBool::new(false),
+            state: AtomicU64::new(pack(false, 0)),
             entered_at_millis: AtomicU64::new(0),
         }
     }
@@ -77,7 +104,7 @@ impl ZombieModeState {
     /// visibility across all threads.
     #[inline]
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::SeqCst)
+        is_active_bits(self.state.load(Ordering::SeqCst))
     }
 
     /// Get the timestamp (epoch millis) when zombie mode was entered.
@@ -89,8 +116,9 @@ impl ZombieModeState {
 
     /// Enter zombie mode.
     ///
-    /// This atomically sets the zombie flag and records the entry timestamp.
-    /// If already in zombie mode, this is a no-op and returns `false`.
+    /// This atomically sets the zombie flag, increments the session generation,
+    /// and records the entry timestamp. If already in zombie mode, this is a
+    /// no-op and returns `false`.
     ///
     /// # Returns
     ///
@@ -103,32 +131,63 @@ impl ZombieModeState {
     /// - `kafkaesque_zombie_mode_active` gauge set to 1
     /// - `kafkaesque_zombie_mode_transitions_total{direction="enter"}` incremented
     pub fn enter(&self) -> bool {
-        // swap returns the previous value; if it was false, we just entered
-        if !self.active.swap(true, Ordering::SeqCst) {
-            let now_millis = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            self.entered_at_millis.store(now_millis, Ordering::SeqCst);
-            metrics::enter_zombie_mode();
-            true
-        } else {
-            false
+        loop {
+            let cur = self.state.load(Ordering::SeqCst);
+            if is_active_bits(cur) {
+                return false;
+            }
+            let new_gen = generation_of(cur).wrapping_add(1);
+            let new = pack(true, new_gen);
+            if self
+                .state
+                .compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let now_millis = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                self.entered_at_millis.store(now_millis, Ordering::SeqCst);
+                metrics::enter_zombie_mode();
+                return true;
+            }
+            // CAS lost — another caller flipped state. Retry.
         }
+    }
+
+    /// Snapshot the current zombie session for later passing to `try_exit`.
+    ///
+    /// Returns `Some(token)` if currently in zombie mode; `None` otherwise.
+    /// The token captures both the generation and the entered-at timestamp,
+    /// so a subsequent `try_exit(token)` is correct even when timestamps
+    /// happen to collide across re-entries.
+    pub fn snapshot(&self) -> Option<ZombieSession> {
+        let s = self.state.load(Ordering::SeqCst);
+        if !is_active_bits(s) {
+            return None;
+        }
+        Some(ZombieSession {
+            generation: generation_of(s),
+            entered_at_millis: self.entered_at_millis.load(Ordering::SeqCst),
+        })
     }
 
     /// Try to exit zombie mode with re-entry detection.
     ///
     /// This method performs a safe exit that detects if zombie mode was
-    /// re-entered during verification. This prevents the race condition where:
+    /// re-entered during verification. The previous version compared timestamps
+    /// before the CAS, leaving a TOCTOU window where:
     ///
-    /// 1. We start verification (zombie_mode = true, entered_at = T1)
-    /// 2. Heartbeat fails again, re-enters zombie mode (entered_at = T2)
-    /// 3. We finish verification and try to exit
-    /// 4. BAD: If we exited, we'd be operating with stale state
+    /// 1. We start verification (active=true, generation=G1, entered_at=T1)
+    /// 2. Heartbeat fails again, `force_exit` then `enter`: now generation=G2,
+    ///    and if all this happens within the same millisecond entered_at could
+    ///    still be == T1.
+    /// 3. The old code's timestamp comparison passed, the CAS on `active`
+    ///    succeeded, and we exited the *new* session prematurely.
     ///
-    /// Uses compare_exchange to atomically verify and transition state,
-    /// eliminating the TOCTOU race between checking `active` and storing `false`.
+    /// The `(active, generation)` pair is now packed into a single `AtomicU64`,
+    /// so a CAS that requires the same generation atomically rejects any
+    /// concurrent force_exit+enter sequence.
     ///
     /// # Arguments
     ///
@@ -140,57 +199,44 @@ impl ZombieModeState {
     /// `true` if successfully exited zombie mode,
     /// `false` if:
     /// - Not currently in zombie mode
-    /// - Zombie mode was re-entered during verification (timestamp mismatch)
+    /// - Zombie mode was re-entered during verification (generation/timestamp mismatch)
     /// - Another thread exited concurrently (CAS failed)
-    ///
-    /// # Metrics
-    ///
-    /// On successful exit, records:
-    /// - `kafkaesque_zombie_mode_active` gauge set to 0
-    /// - `kafkaesque_zombie_mode_transitions_total{direction="exit"}` incremented
-    /// - `kafkaesque_zombie_mode_duration_seconds{exit_reason}` histogram observation
     pub fn try_exit(&self, expected_entered_at: u64, exit_reason: &str) -> bool {
-        // Check if zombie mode was re-entered during verification
-        let current_entered_at = self.entered_at_millis.load(Ordering::SeqCst);
-        if current_entered_at != expected_entered_at {
-            // Zombie mode was re-entered - don't exit
+        let cur = self.state.load(Ordering::SeqCst);
+        if !is_active_bits(cur) {
+            return false;
+        }
+        let cur_entered_at = self.entered_at_millis.load(Ordering::SeqCst);
+        if cur_entered_at != expected_entered_at {
             return false;
         }
 
-        // Use compare_exchange to atomically check and swap.
-        // This eliminates the TOCTOU race between checking `active` and storing `false`.
-        // If compare_exchange fails, either:
-        // 1. Another thread already exited (was false) - return false
-        // 2. Never in zombie mode - return false
-        match self.active.compare_exchange(
-            true,  // expected: currently in zombie mode
-            false, // desired: exit zombie mode
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
+        // CAS the whole packed word: this rejects any concurrent
+        // force_exit+enter (which would have bumped the generation), even when
+        // the timestamps coincidentally agree.
+        let cur_gen = generation_of(cur);
+        let new = pack(false, cur_gen);
+        match self
+            .state
+            .compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst)
+        {
             Ok(_) => {
-                // Successfully transitioned from true -> false
-                // Calculate duration before clearing timestamp
-                let duration_secs = if current_entered_at > 0 {
+                let duration_secs = if cur_entered_at > 0 {
                     let now_millis = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    (now_millis.saturating_sub(current_entered_at)) as f64 / 1000.0
+                    (now_millis.saturating_sub(cur_entered_at)) as f64 / 1000.0
                 } else {
                     0.0
                 };
 
-                // Clear the timestamp
                 self.entered_at_millis.store(0, Ordering::SeqCst);
                 metrics::exit_zombie_mode(duration_secs, exit_reason);
 
                 true
             }
-            Err(_) => {
-                // compare_exchange failed - was not in zombie mode or another thread exited
-                false
-            }
+            Err(_) => false,
         }
     }
 
@@ -209,23 +255,44 @@ impl ZombieModeState {
     /// `true` if was in zombie mode and exited,
     /// `false` if was not in zombie mode.
     pub fn force_exit(&self, exit_reason: &str) -> bool {
-        if self.active.swap(false, Ordering::SeqCst) {
-            let entered_at = self.entered_at_millis.swap(0, Ordering::SeqCst);
-            let duration_secs = if entered_at > 0 {
-                let now_millis = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                (now_millis.saturating_sub(entered_at)) as f64 / 1000.0
-            } else {
-                0.0
-            };
-            metrics::exit_zombie_mode(duration_secs, exit_reason);
-            true
-        } else {
-            false
+        loop {
+            let cur = self.state.load(Ordering::SeqCst);
+            if !is_active_bits(cur) {
+                return false;
+            }
+            let new = pack(false, generation_of(cur));
+            if self
+                .state
+                .compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let entered_at = self.entered_at_millis.swap(0, Ordering::SeqCst);
+                let duration_secs = if entered_at > 0 {
+                    let now_millis = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    (now_millis.saturating_sub(entered_at)) as f64 / 1000.0
+                } else {
+                    0.0
+                };
+                metrics::exit_zombie_mode(duration_secs, exit_reason);
+                return true;
+            }
         }
     }
+}
+
+/// Opaque token identifying a particular zombie session.
+///
+/// Captured by `ZombieModeState::snapshot()` and passed back to a future
+/// `try_exit_session(...)` call so the exit only succeeds if it matches the
+/// same session — defeating the timestamp-collision TOCTOU even when
+/// `force_exit` + re-`enter` happens within the same millisecond.
+#[derive(Debug, Clone, Copy)]
+pub struct ZombieSession {
+    pub generation: u64,
+    pub entered_at_millis: u64,
 }
 
 #[cfg(test)]

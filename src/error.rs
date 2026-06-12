@@ -265,6 +265,62 @@ pub enum KafkaCode {
     SaslAuthenticationFailed = 58,
 }
 
+impl KafkaCode {
+    /// Stable, low-cardinality metric label for this error code. Used by
+    /// `record_request_with_code` to populate the `error_code` label on
+    /// `kafkaesque_requests_total` so SREs can graph per-error-code rates
+    /// during incidents (audit O-1 — without this, every request logged as
+    /// `error_code="NONE"` and the contract was silently broken).
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            KafkaCode::Unknown => "Unknown",
+            KafkaCode::None => "NONE",
+            KafkaCode::OffsetOutOfRange => "OffsetOutOfRange",
+            KafkaCode::CorruptMessage => "CorruptMessage",
+            KafkaCode::UnknownTopicOrPartition => "UnknownTopicOrPartition",
+            KafkaCode::InvalidMessageSize => "InvalidMessageSize",
+            KafkaCode::LeaderNotAvailable => "LeaderNotAvailable",
+            KafkaCode::NotLeaderForPartition => "NotLeaderForPartition",
+            KafkaCode::RequestTimedOut => "RequestTimedOut",
+            KafkaCode::BrokerNotAvailable => "BrokerNotAvailable",
+            KafkaCode::ReplicaNotAvailable => "ReplicaNotAvailable",
+            KafkaCode::MessageSizeTooLarge => "MessageSizeTooLarge",
+            KafkaCode::StaleControllerEpoch => "StaleControllerEpoch",
+            KafkaCode::OffsetMetadataTooLarge => "OffsetMetadataTooLarge",
+            KafkaCode::NetworkException => "NetworkException",
+            KafkaCode::GroupLoadInProgress => "GroupLoadInProgress",
+            KafkaCode::GroupCoordinatorNotAvailable => "GroupCoordinatorNotAvailable",
+            KafkaCode::NotCoordinatorForGroup => "NotCoordinatorForGroup",
+            KafkaCode::InvalidTopic => "InvalidTopic",
+            KafkaCode::RecordListTooLarge => "RecordListTooLarge",
+            KafkaCode::NotEnoughReplicas => "NotEnoughReplicas",
+            KafkaCode::NotEnoughReplicasAfterAppend => "NotEnoughReplicasAfterAppend",
+            KafkaCode::InvalidRequiredAcks => "InvalidRequiredAcks",
+            KafkaCode::IllegalGeneration => "IllegalGeneration",
+            KafkaCode::InconsistentGroupProtocol => "InconsistentGroupProtocol",
+            KafkaCode::InvalidGroupId => "InvalidGroupId",
+            KafkaCode::UnknownMemberId => "UnknownMemberId",
+            KafkaCode::InvalidSessionTimeout => "InvalidSessionTimeout",
+            KafkaCode::RebalanceInProgress => "RebalanceInProgress",
+            KafkaCode::InvalidCommitOffsetSize => "InvalidCommitOffsetSize",
+            KafkaCode::TopicAuthorizationFailed => "TopicAuthorizationFailed",
+            KafkaCode::GroupAuthorizationFailed => "GroupAuthorizationFailed",
+            KafkaCode::ClusterAuthorizationFailed => "ClusterAuthorizationFailed",
+            KafkaCode::InvalidTimestamp => "InvalidTimestamp",
+            KafkaCode::UnsupportedSaslMechanism => "UnsupportedSaslMechanism",
+            KafkaCode::IllegalSaslState => "IllegalSaslState",
+            KafkaCode::UnsupportedVersion => "UnsupportedVersion",
+            KafkaCode::TopicAlreadyExists => "TopicAlreadyExists",
+            KafkaCode::UnsupportedForMessageFormat => "UnsupportedForMessageFormat",
+            KafkaCode::NotController => "NotController",
+            KafkaCode::InvalidRequest => "InvalidRequest",
+            KafkaCode::OutOfOrderSequenceNumber => "OutOfOrderSequenceNumber",
+            KafkaCode::DuplicateSequenceNumber => "DuplicateSequenceNumber",
+            KafkaCode::SaslAuthenticationFailed => "SaslAuthenticationFailed",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

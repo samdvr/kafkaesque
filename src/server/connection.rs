@@ -709,9 +709,17 @@ async fn dispatch_request_common<H: Handler>(
     // Track auth result for rate limiting
     let mut auth_result = AuthResult::NotAuth;
 
+    // Track the wire-level error_code for the `record_request_with_code`
+    // Prometheus label. Default `"NONE"` for happy paths and per-partition /
+    // per-topic responses (those have no single top-level error). For
+    // responses that DO carry a top-level error_code we promote it so SREs
+    // can graph per-error-code rates during incidents (audit O-1).
+    let mut error_code_label: &'static str = "NONE";
+
     let result = match request {
         Request::ApiVersions(header, req) => {
             let response = handler.handle_api_versions(&ctx, req).await;
+            error_code_label = response.error_code.metric_label();
             // ApiVersions v3+ uses flexible encoding with compact arrays
             // v0-v2 uses standard encoding (v0 has no throttle_time_ms, v1+ has it)
             if header.api_version >= 3 {
@@ -748,18 +756,21 @@ async fn dispatch_request_common<H: Handler>(
         ),
         Request::OffsetFetch(header, req) => {
             let resp = handler.handle_offset_fetch(&ctx, req).await;
+            error_code_label = resp.error_code.metric_label();
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
             }
             encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
-        Request::FindCoordinator(_, req) => encode_response(
-            correlation_id,
-            &handler.handle_find_coordinator(&ctx, req).await,
-        ),
+        Request::FindCoordinator(_, req) => {
+            let resp = handler.handle_find_coordinator(&ctx, req).await;
+            error_code_label = resp.error_code.metric_label();
+            encode_response(correlation_id, &resp)
+        }
         Request::JoinGroup(header, req) => {
             let resp = handler.handle_join_group(&ctx, req).await;
+            error_code_label = resp.error_code.metric_label();
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
@@ -768,6 +779,7 @@ async fn dispatch_request_common<H: Handler>(
         }
         Request::Heartbeat(header, req) => {
             let resp = handler.handle_heartbeat(&ctx, req).await;
+            error_code_label = resp.error_code.metric_label();
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
@@ -776,6 +788,7 @@ async fn dispatch_request_common<H: Handler>(
         }
         Request::LeaveGroup(header, req) => {
             let resp = handler.handle_leave_group(&ctx, req).await;
+            error_code_label = resp.error_code.metric_label();
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
@@ -784,6 +797,7 @@ async fn dispatch_request_common<H: Handler>(
         }
         Request::SyncGroup(header, req) => {
             let resp = handler.handle_sync_group(&ctx, req).await;
+            error_code_label = resp.error_code.metric_label();
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
@@ -795,16 +809,19 @@ async fn dispatch_request_common<H: Handler>(
             &handler.handle_describe_groups(&ctx, req).await,
         ),
         Request::ListGroups(_, req) => {
-            encode_response(correlation_id, &handler.handle_list_groups(&ctx, req).await)
+            let resp = handler.handle_list_groups(&ctx, req).await;
+            error_code_label = resp.error_code.metric_label();
+            encode_response(correlation_id, &resp)
         }
         Request::DeleteGroups(_, req) => encode_response(
             correlation_id,
             &handler.handle_delete_groups(&ctx, req).await,
         ),
-        Request::SaslHandshake(_, req) => encode_response(
-            correlation_id,
-            &handler.handle_sasl_handshake(&ctx, req).await,
-        ),
+        Request::SaslHandshake(_, req) => {
+            let resp = handler.handle_sasl_handshake(&ctx, req).await;
+            error_code_label = resp.error_code.metric_label();
+            encode_response(correlation_id, &resp)
+        }
         Request::SaslAuthenticate(_, req) => {
             // Track SASL auth result. We must extract the principal from the
             // wire bytes BEFORE moving `req` into the handler so the gate
@@ -851,6 +868,7 @@ async fn dispatch_request_common<H: Handler>(
             } else {
                 AuthResult::Failure
             };
+            error_code_label = response.error_code.metric_label();
             encode_response(correlation_id, &response)
         }
         Request::CreateTopics(_, req) => encode_response(
@@ -863,6 +881,7 @@ async fn dispatch_request_common<H: Handler>(
         ),
         Request::InitProducerId(header, req) => {
             let resp = handler.handle_init_producer_id(&ctx, req).await;
+            error_code_label = resp.error_code.metric_label();
             let mut body = Vec::new();
             if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
                 return (Err(e), auth_result);
@@ -881,6 +900,7 @@ async fn dispatch_request_common<H: Handler>(
                 correlation_id,
                 "Rejecting request with unadvertised API version"
             );
+            error_code_label = KafkaCode::UnsupportedVersion.metric_label();
             encode_unsupported_version_response(h.api_key, correlation_id)
         }
         Request::Unknown(h, body) => encode_response(
@@ -892,7 +912,12 @@ async fn dispatch_request_common<H: Handler>(
     {
         let duration = start.elapsed().as_secs_f64();
         let status = if result.is_ok() { "success" } else { "error" };
-        crate::cluster::metrics::record_request(api_name, status, duration);
+        crate::cluster::metrics::record_request_with_code(
+            api_name,
+            status,
+            error_code_label,
+            duration,
+        );
     }
 
     (result, auth_result)

@@ -807,6 +807,16 @@ impl RebalanceCoordinator {
     async fn failure_check_loop<E: PartitionTransferExecutor>(&self, executor: Arc<E>) {
         let check_interval = self.config.failure_detector.check_interval;
 
+        // Track our last-observed leadership state. The pending-failover set
+        // is per-broker in-memory and was previously LOST when leadership
+        // moved (audit R-5): the new leader's set is empty, the failure
+        // detector already has the brokers in `Failed` (no transition fires),
+        // and the new leader never retries the failover. On every false→true
+        // transition of `should_initiate_failover` we now seed the pending
+        // set from the failure detector's current Failed-state snapshot, so
+        // failovers survive leader changes.
+        let mut was_leader = false;
+
         while self.running.load(Ordering::SeqCst) {
             // Sleep but wake immediately if `stop()` is called.
             tokio::select! {
@@ -834,10 +844,34 @@ impl RebalanceCoordinator {
                 }
             }
 
-            if !executor.should_initiate_failover().await {
+            let is_leader = executor.should_initiate_failover().await;
+            if !is_leader {
                 debug!("Skipping failover initiation on non-leader broker");
+                was_leader = false;
                 continue;
             }
+
+            // On a non-leader → leader transition, seed the pending set with
+            // any broker the failure detector currently shows as Failed.
+            // Without this, a follower that becomes leader inherits an empty
+            // pending set even though Failed brokers exist, and the next
+            // `check_broker_health` will not re-emit a transition for them.
+            if !was_leader {
+                let already_failed = self
+                    .failure_detector
+                    .get_brokers_in_state(BrokerHealthState::Failed);
+                if !already_failed.is_empty() {
+                    let mut pending = self.pending_failovers.lock().await;
+                    for broker_id in &already_failed {
+                        pending.insert(*broker_id);
+                    }
+                    info!(
+                        seeded = already_failed.len(),
+                        "Became failover leader; seeded pending failovers from failure detector"
+                    );
+                }
+            }
+            was_leader = true;
 
             let to_retry: Vec<i32> = {
                 let pending = self.pending_failovers.lock().await;

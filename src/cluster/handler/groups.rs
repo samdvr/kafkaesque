@@ -14,7 +14,7 @@
 
 use bytes::Bytes;
 use conhash::ConsistentHash;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::cluster::coordinator::BrokerInfo;
 use crate::constants::VIRTUAL_NODES_PER_BROKER;
@@ -118,10 +118,13 @@ pub(super) async fn handle_find_coordinator(
     if request.key_type == 0
         && !group_authorized(handler, ctx, AclOperation::Describe, &request.key).await
     {
-        debug!(
+        info!(
+            target: "audit",
             group_id = %request.key,
             principal = %ctx.principal,
-            "Denied FindCoordinator by ACL"
+            api = "FindCoordinator",
+            operation = "Describe",
+            "ACL denied: FindCoordinator"
         );
         return FindCoordinatorResponseData {
             throttle_time_ms: 0,
@@ -172,10 +175,13 @@ pub(super) async fn handle_join_group(
 
     // JoinGroup requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
-        debug!(
+        info!(
+            target: "audit",
             group_id = %request.group_id,
             principal = %ctx.principal,
-            "Denied JoinGroup by ACL"
+            api = "JoinGroup",
+            operation = "Read",
+            "ACL denied: JoinGroup"
         );
         return JoinGroupResponseData {
             throttle_time_ms: 0,
@@ -377,10 +383,13 @@ pub(super) async fn handle_sync_group(
 
     // SyncGroup requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
-        debug!(
+        info!(
+            target: "audit",
             group_id = %request.group_id,
             principal = %ctx.principal,
-            "Denied SyncGroup by ACL"
+            api = "SyncGroup",
+            operation = "Read",
+            "ACL denied: SyncGroup"
         );
         return SyncGroupResponseData {
             throttle_time_ms: 0,
@@ -593,10 +602,13 @@ pub(super) async fn handle_heartbeat(
     }
     // Heartbeat requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
-        debug!(
+        info!(
+            target: "audit",
             group_id = %request.group_id,
             principal = %ctx.principal,
-            "Denied Heartbeat by ACL"
+            api = "Heartbeat",
+            operation = "Read",
+            "ACL denied: Heartbeat"
         );
         return HeartbeatResponseData {
             throttle_time_ms: 0,
@@ -654,10 +666,13 @@ pub(super) async fn handle_leave_group(
     }
     // LeaveGroup requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
-        debug!(
+        info!(
+            target: "audit",
             group_id = %request.group_id,
             principal = %ctx.principal,
-            "Denied LeaveGroup by ACL"
+            api = "LeaveGroup",
+            operation = "Read",
+            "ACL denied: LeaveGroup"
         );
         return LeaveGroupResponseData {
             throttle_time_ms: 0,
@@ -718,10 +733,13 @@ pub(super) async fn handle_describe_groups(
     let mut groups = Vec::with_capacity(request.group_ids.len());
     for group_id in request.group_ids {
         if !group_authorized(handler, ctx, AclOperation::Describe, &group_id).await {
-            debug!(
+            info!(
+                target: "audit",
                 group_id = %group_id,
                 principal = %ctx.principal,
-                "Denied DescribeGroups by ACL"
+                api = "DescribeGroups",
+                operation = "Describe",
+                "ACL denied: DescribeGroups"
             );
             groups.push(DescribedGroup::error(
                 group_id,
@@ -819,10 +837,13 @@ pub(super) async fn handle_delete_groups(
     let mut results = Vec::with_capacity(request.group_ids.len());
     for group_id in request.group_ids {
         if !group_authorized(handler, ctx, AclOperation::Delete, &group_id).await {
-            debug!(
+            info!(
+                target: "audit",
                 group_id = %group_id,
                 principal = %ctx.principal,
-                "Denied DeleteGroups by ACL"
+                api = "DeleteGroups",
+                operation = "Delete",
+                "ACL denied: DeleteGroups"
             );
             results.push(DeleteGroupResult::error(
                 group_id,

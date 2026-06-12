@@ -20,7 +20,7 @@
 //! Durability is provided by the object storage backend's own replication.
 
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use once_cell::sync::Lazy;
 use tokio::sync::Semaphore;
@@ -190,11 +190,15 @@ pub(super) async fn handle_produce(
                         .authorize_cluster_api(ctx, ApiKey::InitProducerId)
                         .await
                 {
-                    debug!(
+                    info!(
+                        target: "audit",
                         topic = %topic_name,
                         partition = partition.partition_index,
                         principal = %ctx.principal,
-                        "Denied acks=0 idempotent produce by cluster ACL"
+                        api = "Produce",
+                        operation = "IdempotentWrite",
+                        acks = 0,
+                        "ACL denied: acks=0 idempotent produce (cluster IdempotentWrite)"
                     );
                     crate::cluster::metrics::record_produce_dropped("idempotent_acl_denied", 1);
                     continue;
@@ -288,10 +292,13 @@ pub(super) async fn handle_produce(
             .await
             == crate::cluster::authorizer::AuthorizeResult::Denied
         {
-            debug!(
+            info!(
+                target: "audit",
                 topic = %topic.name,
                 principal = %ctx.principal,
-                "Denied produce by ACL"
+                api = "Produce",
+                operation = "Write",
+                "ACL denied: Produce"
             );
             let partition_responses: Vec<_> = topic
                 .partitions
@@ -335,11 +342,14 @@ pub(super) async fn handle_produce(
                 let principal = ctx.principal.clone();
                 async move {
                     if !idempotent_allowed && batch_is_idempotent(&partition.records) {
-                        debug!(
+                        info!(
+                            target: "audit",
                             topic = %topic_name,
                             partition = partition.partition_index,
                             principal = %principal,
-                            "Denied idempotent produce by cluster ACL"
+                            api = "Produce",
+                            operation = "IdempotentWrite",
+                            "ACL denied: idempotent produce (cluster IdempotentWrite)"
                         );
                         return ProducePartitionResponse {
                             partition_index: partition.partition_index,

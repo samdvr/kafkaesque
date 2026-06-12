@@ -1416,6 +1416,12 @@ static TRACKED_LATENCY_TOPICS: Lazy<std::sync::Mutex<HashSet<String>>> =
 static TRACKED_PRINCIPALS: Lazy<std::sync::Mutex<HashSet<String>>> =
     Lazy::new(|| std::sync::Mutex::new(HashSet::new()));
 
+/// Tracks unique consumer-group IDs seen on labelled metrics. Bounded so a
+/// runaway group-ID generator (random group IDs, per-request groups) cannot
+/// inflate Prometheus cardinality without limit. Audit O-3.
+static TRACKED_GROUPS: Lazy<std::sync::Mutex<HashSet<String>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashSet::new()));
+
 /// Configure metrics cardinality settings.
 ///
 /// Call this once at startup before recording any partition metrics.
@@ -1513,6 +1519,26 @@ pub(crate) fn bounded_principal_label(principal: &str) -> String {
     }
     tracked.insert(principal.to_string());
     principal.to_string()
+}
+
+/// Bound consumer-group labels on metrics that include `group` as a dimension.
+/// Same overflow semantics as [`bounded_topic_label`]. Audit O-3 — without
+/// this, every `record_offset_commit` / `record_rebalance_duration` call
+/// became a cardinality bomb when a buggy client used random group IDs.
+pub(crate) fn bounded_group_label(group: &str) -> String {
+    let max_cardinality = MAX_METRIC_CARDINALITY.load(Ordering::Relaxed);
+    if max_cardinality == 0 {
+        return group.to_string();
+    }
+    let mut tracked = TRACKED_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+    if tracked.contains(group) {
+        return group.to_string();
+    }
+    if tracked.len() >= max_cardinality {
+        return "_overflow".to_string();
+    }
+    tracked.insert(group.to_string());
+    group.to_string()
 }
 
 /// Bound (topic, partition) labels for per-partition counters/gauges. Same
@@ -1760,8 +1786,10 @@ pub fn record_group_operation_with_latency(operation: &str, status: &str, durati
 /// * `topic` - The topic name
 /// * `status` - The result ("success" or "error")
 pub fn record_offset_commit(group: &str, topic: &str, status: &str) {
+    let group_lbl = bounded_group_label(group);
+    let topic_lbl = bounded_topic_label(topic);
     OFFSET_COMMITS
-        .with_label_values(&[group, topic, status])
+        .with_label_values(&[group_lbl.as_str(), topic_lbl.as_str(), status])
         .inc();
 }
 
@@ -1826,8 +1854,9 @@ pub fn record_fencing_detection(method: &str) {
 /// * `group` - The consumer group ID
 /// * `duration_secs` - The rebalance duration in seconds
 pub fn record_rebalance_duration(group: &str, duration_secs: f64) {
+    let group_lbl = bounded_group_label(group);
     REBALANCE_DURATION
-        .with_label_values(&[group])
+        .with_label_values(&[group_lbl.as_str()])
         .observe(duration_secs);
 }
 
@@ -1838,8 +1867,9 @@ pub fn record_rebalance_duration(group: &str, duration_secs: f64) {
 /// * `status` - The result ("success", "error", "fenced")
 /// * `duration_secs` - The acquisition duration in seconds
 pub fn record_partition_acquisition(topic: &str, status: &str, duration_secs: f64) {
+    let topic_lbl = bounded_topic_label(topic);
     PARTITION_ACQUISITION_DURATION
-        .with_label_values(&[topic, status])
+        .with_label_values(&[topic_lbl.as_str(), status])
         .observe(duration_secs);
 }
 
@@ -1849,7 +1879,10 @@ pub fn record_partition_acquisition(topic: &str, status: &str, duration_secs: f6
 /// * `topic` - The topic name
 /// * `count` - Number of partitions
 pub fn set_topic_partition_count(topic: &str, count: i64) {
-    TOPIC_PARTITION_COUNT.with_label_values(&[topic]).set(count);
+    let topic_lbl = bounded_topic_label(topic);
+    TOPIC_PARTITION_COUNT
+        .with_label_values(&[topic_lbl.as_str()])
+        .set(count);
 }
 
 /// Soft cap on per-group label cardinality. Beyond this, the set helpers
@@ -2119,8 +2152,9 @@ pub static LEASE_TOO_SHORT: Lazy<IntCounterVec> = Lazy::new(|| {
 /// * `topic` - The topic name
 /// * `partition` - The partition ID
 pub fn record_lease_too_short(topic: &str, partition: i32) {
+    let (topic_lbl, partition_lbl) = bounded_partition_label(topic, partition);
     LEASE_TOO_SHORT
-        .with_label_values(&[topic, &partition.to_string()])
+        .with_label_values(&[topic_lbl.as_str(), partition_lbl.as_str()])
         .inc();
 }
 
@@ -2301,8 +2335,9 @@ pub fn set_producer_id_counter(value: i64) {
 /// * `topic` - The topic name
 /// * `partition` - The partition ID
 pub fn record_producer_state_persistence_failure(topic: &str, partition: i32) {
+    let (topic_lbl, partition_lbl) = bounded_partition_label(topic, partition);
     PRODUCER_STATE_PERSISTENCE_FAILURES
-        .with_label_values(&[topic, &partition.to_string()])
+        .with_label_values(&[topic_lbl.as_str(), partition_lbl.as_str()])
         .inc();
 }
 
@@ -2316,8 +2351,9 @@ pub fn record_producer_state_persistence_failure(topic: &str, partition: i32) {
 /// * `partition` - The partition ID
 /// * `count` - Number of producer states recovered
 pub fn set_producer_state_recovery_count(topic: &str, partition: i32, count: i64) {
+    let (topic_lbl, partition_lbl) = bounded_partition_label(topic, partition);
     PRODUCER_STATE_RECOVERY_COUNT
-        .with_label_values(&[topic, &partition.to_string()])
+        .with_label_values(&[topic_lbl.as_str(), partition_lbl.as_str()])
         .set(count);
 }
 

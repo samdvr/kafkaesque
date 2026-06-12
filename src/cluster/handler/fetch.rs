@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::error::KafkaCode;
 use crate::server::RequestContext;
@@ -212,10 +212,13 @@ async fn collect_fetch(
             .await
             == crate::cluster::authorizer::AuthorizeResult::Denied
         {
-            debug!(
+            info!(
+                target: "audit",
                 topic = %topic.name,
                 principal = %ctx.principal,
-                "Denied fetch by ACL"
+                api = "Fetch",
+                operation = "Read",
+                "ACL denied: Fetch"
             );
             let partition_responses: Vec<_> = topic
                 .partitions

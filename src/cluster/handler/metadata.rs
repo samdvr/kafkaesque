@@ -12,7 +12,7 @@
 //! To disable auto-creation, set `AUTO_CREATE_TOPICS=false` environment variable
 //! or configure `auto_create_topics: false` in `ClusterConfig`.
 
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::KafkaCode;
 use crate::server::RequestContext;
@@ -60,10 +60,13 @@ pub(super) async fn handle_metadata(
                     .topic_authorized(ctx, AclOperation::Describe, &name)
                     .await
                 {
-                    debug!(
+                    info!(
+                        target: "audit",
                         topic = %name,
                         principal = %ctx.principal,
-                        "Denied Metadata by ACL"
+                        api = "Metadata",
+                        operation = "Describe",
+                        "ACL denied: Metadata"
                     );
                     result.push(TopicMetadata {
                         error_code: KafkaCode::TopicAuthorizationFailed,
@@ -94,10 +97,13 @@ pub(super) async fn handle_metadata(
                         .topic_authorized(ctx, AclOperation::Create, &name)
                         .await
                     {
-                        debug!(
+                        info!(
+                            target: "audit",
                             topic = %name,
                             principal = %ctx.principal,
-                            "Denied Metadata auto-create by ACL"
+                            api = "Metadata",
+                            operation = "Create",
+                            "ACL denied: Metadata auto-create"
                         );
                         result.push(TopicMetadata {
                             error_code: KafkaCode::TopicAuthorizationFailed,

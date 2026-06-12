@@ -1,7 +1,7 @@
 //! Admin request handling (create/delete topics).
 
 use futures::stream::{self, StreamExt};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::constants::DEFAULT_NUM_PARTITIONS;
 use crate::error::KafkaCode;
@@ -54,10 +54,13 @@ pub(super) async fn handle_create_topics(
             })
             .await;
         if decision == AuthorizeResult::Denied {
-            debug!(
+            info!(
+                target: "audit",
                 topic = %topic.name,
                 principal = %ctx.principal,
-                "Denied CreateTopics by ACL"
+                api = "CreateTopics",
+                operation = "Create",
+                "ACL denied: CreateTopics"
             );
             topics.push(CreateTopicResponseData {
                 name: topic.name,
@@ -218,10 +221,13 @@ pub(super) async fn handle_delete_topics(
             })
             .await;
         if decision == AuthorizeResult::Denied {
-            debug!(
+            info!(
+                target: "audit",
                 topic = %name,
                 principal = %ctx.principal,
-                "Denied DeleteTopics by ACL"
+                api = "DeleteTopics",
+                operation = "Delete",
+                "ACL denied: DeleteTopics"
             );
             responses.push(DeleteTopicResponseData {
                 name,

@@ -162,15 +162,31 @@ impl HealthServer {
 
     /// Check if the server is ready to accept traffic.
     ///
-    /// Returns false if:
-    /// - Broker is in zombie mode (lost cluster coordination)
+    /// Returns false if any of the following gates fail — load balancers
+    /// observing a `503` route around this broker until the underlying issue
+    /// resolves itself. Each gate corresponds to a known operational failure
+    /// mode that prior versions of `is_ready` *missed* (audit O-4):
+    ///
+    /// - **Zombie mode**: the broker has lost cluster coordination and writes
+    ///   are rejected. Routing produces here would surface as `NotLeader`.
+    /// - **Object store unreachable**: SlateDB / metadata operations are
+    ///   timing out or failing in a row. Routing produces here would surface
+    ///   as ack timeouts and silent durability gaps. The threshold is set on
+    ///   `OBJECT_STORE_CONSECUTIVE_FAILURES` (default 10) — a single transient
+    ///   500 doesn't flip readiness, but a sustained outage does.
     pub fn is_ready(&self) -> bool {
-        !self.zombie_state.is_active()
+        if self.zombie_state.is_active() {
+            return false;
+        }
+        if !crate::cluster::metrics::is_object_store_healthy() {
+            return false;
+        }
+        true
     }
 
     /// Get the current health status.
     pub fn health_status(&self) -> HealthStatus {
-        if self.zombie_state.is_active() {
+        if !self.is_ready() {
             HealthStatus::NotReady
         } else {
             HealthStatus::Healthy
@@ -360,15 +376,22 @@ fn health_response(zombie_state: &ZombieModeState, broker_id: Option<i32>) -> St
     )
 }
 
-/// Generate readiness response (503 if in zombie mode).
+/// Generate readiness response (503 if not ready).
+///
+/// Returns 503 with a `reason: <gate>` body line for any failed gate so
+/// operators can disambiguate "broker is in zombie mode" from "broker can't
+/// reach S3" without consulting metrics.
 fn ready_response(zombie_state: &ZombieModeState, broker_id: Option<i32>) -> String {
-    let is_zombie = zombie_state.is_active();
     let broker_str = broker_id
         .map(|id| format!("broker_id: {}\n", id))
         .unwrap_or_default();
 
-    if is_zombie {
-        format!(
+    let zombie_active = zombie_state.is_active();
+    let object_store_healthy = crate::cluster::metrics::is_object_store_healthy();
+    let consecutive_failures = crate::cluster::metrics::object_store_consecutive_failures();
+
+    if zombie_active {
+        return format!(
             "HTTP/1.1 503 Service Unavailable\r\n\
              Content-Type: text/plain\r\n\
              Connection: close\r\n\
@@ -377,18 +400,32 @@ fn ready_response(zombie_state: &ZombieModeState, broker_id: Option<i32>) -> Str
              reason: zombie_mode\n\
              {}",
             broker_str
-        )
-    } else {
-        format!(
-            "HTTP/1.1 200 OK\r\n\
+        );
+    }
+
+    if !object_store_healthy {
+        return format!(
+            "HTTP/1.1 503 Service Unavailable\r\n\
              Content-Type: text/plain\r\n\
              Connection: close\r\n\
              \r\n\
-             status: ready\n\
+             status: not_ready\n\
+             reason: object_store_unhealthy\n\
+             object_store_consecutive_failures: {}\n\
              {}",
-            broker_str
-        )
+            consecutive_failures, broker_str
+        );
     }
+
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/plain\r\n\
+         Connection: close\r\n\
+         \r\n\
+         status: ready\n\
+         {}",
+        broker_str
+    )
 }
 
 /// Generate 401 response for unauthenticated `/metrics` access when

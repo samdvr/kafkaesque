@@ -739,25 +739,52 @@ impl RaftNetworkConnection {
     }
 
     /// Attempt to send an RPC (single attempt, no retry).
+    ///
+    /// Cancellation safety (audit R-1): the previous version held the lock
+    /// across the RPC and left a half-written stream in the cell if the outer
+    /// future was cancelled mid-call. The next caller would then read another
+    /// caller's response bytes — desyncing the postcard framing and silently
+    /// deserializing, e.g., a Vote reply as an AppendEntries reply.
+    ///
+    /// The fix is a take-then-commit pattern: we *take* the cached stream out
+    /// of the cell before calling `do_rpc`. If the call succeeds we *commit*
+    /// (put it back). If the call fails or the future is cancelled at any
+    /// await point, the local `stream` is dropped along with the future, the
+    /// TCP connection closes, and the cell stays empty — the next caller
+    /// always reconnects from scratch rather than picking up a half-state
+    /// stream.
+    ///
+    /// We still hold `cached_conn.lock()` across the RPC, so concurrent
+    /// callers serialize on the same target — `do_rpc` would otherwise
+    /// interleave bytes on a single TCP socket.
     async fn try_send_rpc(&self, data: &[u8]) -> Result<RaftRpcResponse, std::io::Error> {
-        // Try to reuse cached connection
         let mut guard = self.cached_conn.lock().await;
-        if let Some(ref mut stream) = *guard {
-            match Self::do_rpc_with_timeout(stream, data, &self.auth_keys).await {
-                Ok(response) => return Ok(response),
-                Err(_) => {
-                    // Connection is broken, will reconnect below
-                    *guard = None;
-                }
+
+        // Acquire ownership of the stream (cached or freshly connected). The
+        // cell goes to None for the duration; cancellation between any await
+        // below leaves it None, which is exactly what we want.
+        let mut stream = match guard.take() {
+            Some(s) => s,
+            None => connect_raft(&self.target_addr, self.tls.as_ref()).await?,
+        };
+
+        // Cancellation point: the cell is None, the stream is owned locally.
+        // If we're cancelled here the stream is dropped on unwind.
+        match Self::do_rpc_with_timeout(&mut stream, data, &self.auth_keys).await {
+            Ok(response) => {
+                // Commit — return the stream to the cell so the next caller
+                // can reuse it. Reaching this point means the response was
+                // fully read; the stream is in a clean state.
+                *guard = Some(stream);
+                Ok(response)
+            }
+            Err(e) => {
+                // RPC failed; the stream may have a partial frame or pending
+                // bytes. Drop it (do not commit) so the next caller starts
+                // from a fresh TCP connection.
+                Err(e)
             }
         }
-
-        // Create new connection (with TLS handshake if configured).
-        let mut stream = connect_raft(&self.target_addr, self.tls.as_ref()).await?;
-
-        let response = Self::do_rpc_with_timeout(&mut stream, data, &self.auth_keys).await?;
-        *guard = Some(stream);
-        Ok(response)
     }
 
     /// Perform the RPC on an existing stream with timeout.

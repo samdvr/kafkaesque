@@ -1,99 +1,51 @@
-# kafkaesque — Staff Engineering Audit Report
+# Kafkaesque — Staff-Level Codebase Audit
 
-**Scope:** entire `src/` (~73k LOC), `tests/` (51 files), `fuzz/`, `benches/`.
-**Method:** parallel deep-read by eight Staff-level reviewers — server/protocol,
-Raft consensus, storage, request handlers, security, concurrency/reliability,
-testing/observability, and architecture/quality. Findings are de-duplicated and
-ordered by real-world impact.
+**Scope:** Full codebase at `/Users/sam/Downloads/kafkaesque` (~75k LOC of Rust, Kafka-compatible broker on object storage with embedded Raft).
+**Method:** Five parallel audit passes — correctness/bugs, performance, architecture/design, concurrency/reliability, testing/observability — each verifying file:line references against current source.
+**Date:** 2026-06-12
 
 ---
 
 ## Executive Summary
 
-kafkaesque is an ambitious, well-tested Rust implementation of a Kafka-compatible
-broker with an embedded Raft control plane and SlateDB on object storage.
-The codebase shows clear engineering discipline — `#![forbid(unsafe_code)]`,
-35 fuzz targets, property tests, an integration suite covering wire-protocol,
-chaos, and durability, and explicit fail-closed posture in the security
-configuration. Hot paths like fencing detection, lease handling, replay-cache
-construction, and HMAC verification are implemented with non-trivial care.
+Kafkaesque is an ambitious, well-organized Rust broker that takes correctness seriously: it has CRC validation, leader-epoch fencing, Raft-replicated lease state, a generation-pointer snapshot scheme, fuzz coverage of parsers, and property tests for state-machine determinism. Many of the obvious foot-guns (negative-length parsing, unbounded frame sizes, integer overflow on the wire path) are already defended.
 
-That said, this audit found **systemic weaknesses across three axes**:
+The audit nonetheless surfaced significant production-grade risk in three areas:
 
-1. **Determinism & durability of the Raft state machine.** Multiple non-atomic
-   reads/writes in snapshot construction, ordering bugs in `apply_to_state_machine`,
-   and pervasive use of `HashMap` (with random `RandomState`) inside replicated
-   state lead to a state machine that is *correct in the steady-state happy
-   path* but cannot guarantee replicas converge to byte-identical snapshots, and
-   has small, real windows where a snapshot can claim to cover an entry that has
-   not been applied. Under cancellation or panic these become silent data loss.
+1. **Cancellation safety in async hot paths.** Several `await` points hold mutable state across drops in ways that can corrupt invariants — most importantly the cached Raft RPC connection (response-mismatch on cancellation), the partition-store write path (offset duplication on cancel mid-WAL-write), and `install_snapshot` (in-memory state half-applied). These are silent in normal operation but corrupt state under timeouts, shutdown races, or peer disconnects.
 
-2. **Coordination is not actually leader-gated.** The rebalance loop,
-   metrics-reset loop, and several admin commands run on every broker
-   independently. A coordinator-side proposal failure during failover is not
-   retried and strands a broker's partitions until manual intervention.
-   Combined with non-supervised background tasks (panics are swallowed),
-   reliability under partial failures is materially worse than the codebase
-   appears at first glance.
+2. **Hot-path overhead from per-request allocations and a per-partition write-lock held across storage round-trips.** The fetch response double-copies every payload; produce serializes durable writes per partition behind a single Mutex held across multiple SlateDB awaits; `Arc<str>`/`String`/`UUID` allocations are minted per request. None are bugs in isolation; collectively they cap throughput well below what the architecture is capable of.
 
-3. **Security posture is correct in the documented path but porous in practice.**
-   `User:ANONYMOUS` is matched by wildcard `User:*` ACL bindings; the production
-   posture gate accepts `acl_enabled` *or* `sasl_required` instead of requiring
-   both; mTLS does not derive a principal; `RaftAuthKeys::default()` is the
-   permissive variant; the metrics bearer-token check is not constant-time;
-   PBKDF2 iterations are pinned to the historical Kafka floor of 4096. Each is
-   small alone; together they describe a broker that an authenticated insider
-   or a network-local adversary can pivot inside.
+3. **Observability and testing gaps that hide regressions.** `record_request` emits `error_code="NONE"` for every request, so the wire-error label has cardinality 1 and SREs are blind to per-error-code rates during incidents. ACL denials log at `debug!` so audit trails are missing at default log level. Several "linearizability" and "chaos" tests run against `MockCoordinator`/in-memory stubs rather than the real Raft coordinator and `PartitionStore`, so the guarantees they advertise are weaker than the file names suggest.
 
-In addition, several handler paths violate Kafka's semantic contract in ways
-clients will trip on (FindCoordinator routing, idempotent-producer ACL,
-OffsetCommit bounds, SyncGroup non-leader fall-through), and observability has
-real gaps (no trace propagation across Raft messages, opaque error labels,
-sub-ms latency buckets missing, no shipped dashboards/runbooks).
+Beneath these, design debt around god-traits (`Handler` 30 methods, `ClusterConfig` ~85 fields), a 3,800-line `metrics.rs` global-singleton kitchen sink, and ~700 lines of TLS/plain server duplication makes maintenance increasingly expensive. The `MockCoordinator` is a parallel re-implementation of business rules that has already drifted (e.g., always returns producer epoch 0).
 
-**Production readiness assessment:** The system is fit for **non-critical
-internal workloads** today, with operator vigilance over the security
-configuration and known correctness gaps. It is **not yet ready** to back a
-multi-tenant Kafka API or workloads with strict acks=all durability claims
-without addressing the Critical and High items below.
-
-### Risk dashboard
-
-| Category | Critical | High | Medium | Low |
-|---|---:|---:|---:|---:|
-| Correctness & Bugs | 9 | 18 | 22 | 14 |
-| Performance | 0 | 4 | 9 | 8 |
-| Concurrency & Reliability | 6 | 9 | 8 | 4 |
-| Security | 0 | 4 | 8 | 8 |
-| Architecture & Quality | 0 | 6 | 8 | 11 |
-| Testing & Observability | 2 | 6 | 8 | 5 |
+**Risk verdict:** Suitable for development and small-scale staging today. Not yet ready for high-throughput production with strict durability SLAs without addressing the cancellation-safety findings (#C-1, #C-7, #C-11 below) and tightening observability (#O-12, #O-13). With those fixed, the architecture is sound enough to scale.
 
 ---
 
-## Top Critical Issues (fix before next deploy)
+## Top Critical Issues (Prioritized)
 
-These are the items where the consequence is *silent data loss*, *cross-broker
-corruption*, *unauthenticated control-plane access*, or *cluster-wide stalls*.
-
-| # | Issue | Location | Why it's critical |
-|---|---|---|---|
-| C1 | `apply_to_state_machine` updates `last_applied_log` **before** running `apply_command`; not awaited under a write guard | `src/cluster/raft/storage.rs:1022-1044` | A cancellation or panic between the index-update and the apply causes the snapshot to claim an entry was applied that was not. Permanent silent loss of one or more state-machine commands. |
-| C2 | `build_snapshot` reads `state` and `last_applied_log` non-atomically | `src/cluster/raft/storage.rs:1130-1158` | Snapshot meta can claim coverage of an apply that is not yet in the captured state. A replica restored from this snapshot skips that command on replay. |
-| C3 | `apply_retention` performs no `leader_epoch` check | `src/cluster/partition_store.rs:1288-1378` and `src/cluster/partition_manager.rs:483-558` | Two brokers can both `apply_retention` on the same partition during a leader hand-off; both `await_durable=true` writes advance LSO, deleting records the new owner has acked reads on. Cross-broker corruption. |
-| C4 | Zombie-mode entry calls `coordinator.release_partition` **before** `store.close()` | `src/cluster/partition_manager.rs:445-454` | After release the new owner can begin writing while we still hold unflushed `acks=0` writes in our memtable. Data loss for already-acked writes, and on flush failure during shutdown those writes are silently dropped. |
-| C5 | Rebalance loop is not leader-gated; every broker proposes simultaneous moves every tick | `src/cluster/rebalance_coordinator.rs:810-820`, `metrics_reset_loop` similarly | N concurrent rebalance proposals fight over the same partitions; followers' proposals fail or redirect — wasted Raft bandwidth and split views of "what is overloaded". Same defect on `metrics_reset_loop`. |
-| C6 | Failover is non-idempotent under errors — a single proposal failure strands a broker | `src/cluster/rebalance_coordinator.rs:540-590, 770-807` | If `mark_broker_failed` returns `Err`, `clear_failed_broker` is never called and the next tick sees `state == Failed` (no event), so the broker's partitions remain unowned forever. |
-| C7 | `FindCoordinator` returns a broker that does not own the group's state | `src/cluster/handler/groups.rs:91-177` | Group state is fully replicated by Raft (any broker can serve), but the consistent-hash routing tells clients to go to broker B, while ops can be served on A. Two brokers concurrently handle the same group's transitions. |
-| C8 | Idempotent producer path has no `IdempotentWrite` cluster-ACL check | `src/cluster/handler/produce.rs:80-110` and `src/cluster/handler/mod.rs:669-816` | An authenticated principal denied `IdempotentWrite` can still send idempotent batches under another producer-id and fence the legitimate producer. |
-| C9 | Simple-consumer offset commit creates arbitrary `group_id` entries with no group-existence or fencing check | `src/cluster/handler/offsets.rs:206-207, 382-435` | Authenticated client can spam `OffsetCommit` with arbitrary `group_id` strings, growing the replicated state machine unboundedly; can also clobber an active group's offsets when `generation_id == -1`. |
-| C10 | `OffsetCommit` accepts any `committed_offset` including past `i64::MAX` and below `log_start` | `src/cluster/handler/offsets.rs:382-435` | A consumer commits `i64::MAX` and silently skips every record forever; on retention-purged partitions, an old offset commits successfully and the next fetch fails with a delayed `OFFSET_OUT_OF_RANGE`. |
-| C11 | `SyncGroup` non-leader assignments are silently dropped — leader-failover-mid-rebalance can lose assignments | `src/cluster/handler/groups.rs:421-510` | When two clients race to be leader, the one that lands second has its assignment overwritten with no diagnostic and no metric — split views of group assignments. |
-| C12 | Inflight-byte budget releases the moment the frame is read, not when dispatch finishes | `src/server/connection.rs:198-216` | The documented "bound on inbound bytes allocated but not yet dispatched" is not in fact maintained. Coordinated produce flood blows past 1 GiB easily. |
-| C13 | Replay-cache populated *before* HMAC verification of Raft frames | `src/cluster/raft/auth.rs:395-421` | An attacker can inject 200,000 attacker-chosen nonces into the replay cache without authenticating, DoSing it and producing a timing oracle for live nonces. |
-| C14 | `User:*` ACL wildcard matches `User:ANONYMOUS`; production posture gate is satisfied with `acl_enabled` *or* `sasl_required` | `src/cluster/raft/domains/acl.rs:144`, `src/cluster/authorizer.rs:85`, `src/cluster/config.rs:1816-1826` | A common `User:*` Allow ACL gives unauthenticated TCP clients the same access. The posture gate doesn't catch this configuration. |
-| C15 | `RaftAuthKeys::default()` returns the permissive (unauthenticated-OK) variant | `src/cluster/raft/auth.rs:372-381` | Any code path that builds the broker without going through `from_env` (tests, embedded use, programmatic construction) runs the Raft control plane wide open. A single TCP packet from any host with route to the Raft port wins the cluster (`JoinCluster` auto-promotes). |
-| C16 | `init_telemetry` panics if `init_logging` already ran; `shutdown_telemetry()` is never called from main | `src/telemetry.rs:241-245`, `src/bin/kafkaesque.rs:344-353` | Enabling the `otel` feature crashes startup; even if it didn't, the OTLP batch exporter drops pending spans on exit. |
-| C17 | Background tasks have no supervisor — panic-and-forget | `src/cluster/rebalance_coordinator.rs:719-757`, `src/bin/kafkaesque.rs:222-224` | Failure-detector or health-server panics are silent. K8s liveness probes still pass at the LB but the metrics endpoint is dead and there's no log. |
+| # | Title | Sev | Location |
+|---|-------|-----|----------|
+| 1 | Cached Raft RPC connection is cancellation-unsafe; concurrent calls serialize and can desync framing | Critical | `src/cluster/raft/network.rs:744-761,769-777` |
+| 2 | Partition-store write lock held across SlateDB write — cancellation can duplicate base offset | High | `src/cluster/partition_store.rs:415,740,784` |
+| 3 | `install_snapshot` persist + multi-step in-memory swap is not atomic under cancellation | High | `src/cluster/raft/storage.rs:1080-1122` |
+| 4 | Fetch response copies the entire record payload twice before write | Critical (perf) | `src/server/response/fetch.rs:101-107`, `response/mod.rs:111-127` |
+| 5 | Per-partition write-Mutex held across 2-3 SlateDB round-trips serializes durable produce | High (perf) | `src/cluster/partition_store.rs:140,415,740` |
+| 6 | `record_request` always records `error_code="NONE"` — typed Kafka error codes never reach Prometheus | High (obs) | `src/server/connection.rs:892-895`; `metrics.rs:1376` |
+| 7 | Lease validity uses local wall clock instead of replicated `lease_clock_ms` — split-brain risk | High | `src/cluster/raft/coordinator/partition.rs:285,321`; `state_machine.rs:55-68` |
+| 8 | Pending-failover set is per-broker in-memory; lost on coordinator-leader change → permanent partition stranding | High | `src/cluster/rebalance_coordinator.rs:337,810-868` |
+| 9 | `PartitionStore::close()` takes `&self` and is racy across many call sites | High | `src/cluster/partition_store.rs:1438-1444` |
+| 10 | Zombie-mode `try_exit` has TOCTOU between timestamp check and CAS | High | `src/cluster/zombie_mode.rs:152-195` |
+| 11 | `ListOffsets` always returns `timestamp = -1` for timestamp queries — `offsetsForTimes()` broken | High | `src/cluster/handler/offsets.rs:159` |
+| 12 | `leader_epoch == 0` partitions skip per-write epoch fencing entirely | High | `src/cluster/partition_store.rs:444,1317` |
+| 13 | Sequential per-partition coordinator round-trip in `build_topic_metadata` (O(N) sequential Raft) | High (perf) | `src/cluster/handler/mod.rs:602-652`, `handler/metadata.rs:181-191` |
+| 14 | Cardinality bombs: many metrics use raw user-controlled `topic`/`group` labels without bounding | High (obs) | `src/cluster/metrics.rs:1764,1830,1842,1852,2123,2305,2320` |
+| 15 | ACL denials logged at `debug!` everywhere except produce — no audit trail at default log level | High (obs) | `src/cluster/handler/{fetch,groups,offsets,metadata,admin}.rs` (~12 sites) |
+| 16 | Server layer has a hard dependency on `cluster::*` — advertised "embeddable" Handler trait is not embeddable | High | `src/server/{mod.rs:860,871,connection.rs:309,593,594,600,895,health.rs:39,411}` |
+| 17 | `/health` `is_ready()` only checks zombie state; ignores object-store health and Raft state | High | `src/server/health.rs:167-178` |
+| 18 | Linearizability and chaos tests run against in-process stubs, not real `PartitionStore`/Raft | High | `tests/linearizability_tests.rs:85-150`; `tests/chaos_tests.rs:230-281` |
 
 ---
 
@@ -101,869 +53,617 @@ corruption*, *unauthenticated control-plane access*, or *cluster-wide stalls*.
 
 ### 1. Correctness & Bugs
 
-#### 1.1 Raft state machine — non-determinism and atomicity (HIGH–CRITICAL)
-
-* **Snapshot/apply atomicity (Critical).** See **C1, C2** above.
-  Additional fix: hold a single `RwLock` write guard around both
-  "advance `last_applied_log`" and "run `apply_command`", and have
-  `build_snapshot` capture the state under that same lock to fence apply.
-
-* **`HashMap` everywhere in the replicated state machine (Critical).**
-  Every domain (`partition.rs`, `group.rs`, `producer.rs`, `transfer.rs`,
-  `broker.rs`, `acl.rs`) uses `HashMap` / `HashSet`. Postcard serializes
-  these in iteration order, randomized per-process. **Snapshots built on
-  different replicas have different bytes for the same logical state.**
-  This blocks any future Merkle-tree snapshot diffing, content-addressed
-  dedup, or operator-driven byte-level reconciliation. **Fix:** switch all
-  domain maps to `BTreeMap`/`BTreeSet`, or implement custom serialize that
-  sorts. This is also the root cause of `removed: Vec<AclBinding>` being
-  unstable across replicas (`raft/domains/acl.rs:240-273`).
-
-* **`apply_command` increments `state.version` even on no-op / rejected commands**
-  (`src/cluster/raft/state_machine.rs:181-269`). Any caller using `version`
-  as a cache-invalidation token is misled. Either rename to `apply_count`
-  or only bump when state actually mutates.
-
-* **Cross-replica determinism violations in command logic:**
-  - `JoinGroup` synthesizes member-id from `members.len()` without checking
-    whether the same `(client_id, client_host)` is already present, producing
-    duplicate members on rejoin (`src/cluster/raft/domains/group.rs:343-347`).
-  - `BrokerCommand::Heartbeat` accepts a backdated `timestamp_ms` and
-    monotonicity-violates `last_heartbeat_ms`
-    (`src/cluster/raft/domains/broker.rs:119-132`); use
-    `broker.last_heartbeat_ms = broker.last_heartbeat_ms.max(timestamp_ms)`.
-  - `current_time_ms()` uses `unwrap()` on `SystemTime::duration_since(UNIX_EPOCH)`
-    (`src/cluster/raft/coordinator/mod.rs:331-336`). One bad clock read
-    panics the coordinator background task.
-
-* **Idempotent retry handling on the join path:** `handle_join_cluster` and
-  `handle_promote_member` substring-match `"already"` in the openraft error
-  message (`src/cluster/raft/network.rs:1180-1188, 1212-1220`). A minor
-  openraft bump silently breaks join idempotency.
-
-* **`MAX_FORWARD_HOPS` mixes `>=` (client) and `>` (server)** — boundary
-  condition wrong by 1, can spuriously trigger `ForwardLoopDetected` on
-  legitimate 3-broker chains during transient leader instability
-  (`src/cluster/raft/network.rs:62-63, 406-411, 1078-1086`).
-
-* **`CompleteRebalance` / `TriggerRebalance` are not leader-gated and carry
-  no proposing-broker identity** (`src/cluster/raft/domains/group.rs:630-659`).
-  Any broker (or compromised one) can drive rebalance storms.
-
-#### 1.2 Storage layer — durability and consistency (CRITICAL)
-
-* **`apply_retention` lacks epoch and lease check (Critical, C3).** See top
-  of report. The single mutating path on `PartitionStore` that bypasses
-  fencing.
-
-* **Zombie-mode close ordering loses acked writes (Critical, C4).** See top
-  of report. Fix is to call `store.close()` *before* `coordinator.release_partition`
-  and to refuse release on flush failure.
-
-* **`recover_hwm_from_records` `scan_floor` masks confirmed gaps (High).**
-  Recovery uses `log_start_offset.max(persisted_hwm)`, but the standalone
-  `_hwm` key is only updated every 64 batches — gaps in the most recent
-  64-batch window (the most likely source of post-crash gaps) are categorized
-  as "potential unflushed writes" and the broker comes online silently.
-  (`src/cluster/partition_store.rs:1843-1845`,
-  `src/cluster/partition_recovery.rs:245`). Use the highest *batch-embedded*
-  HWM seen during the scan as the reference.
-
-* **`ensure_partition` accepts negative partition indices (High)** —
-  `src/cluster/partition_manager.rs:948-1037`. SlateDB instances created at
-  `topic-X/partition--1/`. Test on line 2380 explicitly accepts either
-  outcome, masking the bug. Reject `partition < 0` at the top of the function.
-
-* **Record-key encoding broken for negative offsets (Medium, latent).**
-  `i64::to_be_bytes` lex-orders negatives *after* positives; range queries
-  against negative offsets silently return empty results
-  (`src/cluster/keys.rs:41-46`). Fix: flip the sign bit (or assert
-  `offset >= 0` at every encode site).
-
-* **`record_count: i32` cast to `i64` and added to `base_offset` without
-  checked arithmetic** (`src/cluster/partition_store.rs:667`). On corrupt
-  input `new_hwm` overflows negative; combined with the negative-offset
-  encoding bug, undefined ordering follows. Use `checked_add`.
-
-* **`delete_partition_data` uses `try_collect()` on a paged `list()` (Medium).**
-  Memory-spike on partition deletion of busy partitions
-  (`src/cluster/partition_manager.rs:1217-1228`). Stream the listing.
-
-* **`get_for_write` slow path treats any error as ownership loss (Medium).**
-  Transient Raft hiccups eject the partition and force re-acquire +
-  recovery scan (`src/cluster/partition_manager.rs:1153-1173`). Retry with
-  backoff; only close on explicit "no longer own" responses.
-
-* **`release_partition_for_deleted_topic` does not call `coordinator.release_partition`**
-  (`src/cluster/partition_manager.rs:1849-1872`). Lease lingers until natural
-  expiry; inconsistent with the metric label `("release", "topic_deleted")`.
-
-* **`WriteGuard::estimated_remaining_lease()` uses `held_secs` arithmetic
-  on a stale `lease_remaining_secs`** (`src/cluster/partition_handle.rs:303-314`).
-  TOCTOU between the cached lease grant and the actual wall-clock deadline.
-  Real safeguard is the per-write epoch check in `append_batch_inner` —
-  rename `lease_likely_valid` to make this explicit.
-
-#### 1.3 Wire protocol & request handling (HIGH)
-
-* **Inflight budget doesn't bound dispatch memory (Critical, C12).** See top.
-
-* **Fetch parser is not version-aware** — `parse_fetch_request` reads
-  `max_bytes` and `isolation_level` unconditionally
-  (`src/server/request/fetch.rs:35-54`). Currently safe only because
-  `versions.rs:104` clamps Fetch min-version to 4. Time-bomb: any future
-  range bump silently corrupts request parsing.
-
-* **`parse_array` accepts `-1` (null) for non-nullable fields** —
-  `parse_produce_request` calls it with the topics array and silently
-  treats `-1` as "no topics," giving a no-op produce ack instead of an
-  error (`src/parser.rs:113-119` + `src/server/request/produce.rs`).
-  Provide separate `parse_array` and `parse_nullable_array` helpers.
-
-* **`parse_compact_nullable_string` does not bound length before `take`**
-  (`src/parser.rs:187-204`). A varint length of `u32::MAX` asks for a
-  4 GiB take; nom fails on insufficient bytes but no explicit upper bound.
-  Add a `MAX_STRING_SIZE` cap.
-
-* **CRC validation is performed deep in the produce handler, not at ingress**
-  (`src/server/connection.rs:567+`). A flood of corrupt-batch produces
-  wastes CPU on partition lookup, leader checks, etc. before per-partition
-  rejection.
-
-* **Trailing bytes after request body parse are warned-and-dispatched** —
-  silently masks parser drift bugs and allows attacker-smuggled bytes
-  appended to a valid request (`src/server/request/mod.rs:413-431`).
-  Reject with `InvalidRequest`.
-
-* **`Produce` parser rejects null record-set (`-1`)** — Kafka specifies
-  this is `NULLABLE_BYTES`; clients legitimately sending `-1` get a parse
-  error (`src/server/request/produce.rs:57-69`).
-
-* **Handler-timeout response uses `KafkaCode::InvalidRequest` instead of
-  `RequestTimedOut`** (`src/server/connection.rs:339-352`). Clients log
-  this as a bug and may not retry.
-
-* **Many handler errors collapse to a single Kafka error code:**
-  - `produce_to_partition` returns `NotLeaderForPartition` for *any*
-    `get_for_write` error (`src/cluster/handler/mod.rs:710-726`) —
-    triggers metadata-refresh storms on transient I/O.
-  - `handle_init_producer_id` returns `KafkaCode::Unknown` for everything
-    (`src/cluster/handler/producer_id.rs:78-87`).
-  - `handle_offset_fetch` returns `error_code = None` for both "no offset"
-    and coordinator failures (`src/cluster/handler/offsets.rs:556-570`),
-    causing silent data skip on consumer startup hiccups.
-
-* **`OffsetCommit` accepts any `committed_offset` (Critical, C10).** See top.
-
-* **`handle_metadata` auto-create races with concurrent `DeleteTopics`**
-  (`src/cluster/handler/metadata.rs:78-141`) — topic resurrection bug.
-
-* **`handle_fetch` does not enforce upper bound on `max_wait_ms`**
-  (`src/cluster/handler/fetch.rs:66-72`). Client can request `i32::MAX`
-  (~24.8 days); pin a connection task indefinitely.
-
-* **`handle_fetch` long-poll arm-and-await race** — `Notify::notified()`
-  futures created *after* `collect_fetch` returns; a producer wake landing
-  in the gap is dropped, causing spurious `max_wait_ms` waits
-  (`src/cluster/handler/fetch.rs:108-121`).
-
-* **`handle_list_offsets` does not check zombie mode** —
-  `src/cluster/handler/offsets.rs:27-143`.
-
-* **Offset metadata is unbounded in size; bytes go straight into the
-  replicated state machine** (`src/cluster/handler/offsets.rs:382-393`).
-
-* **`validate_group_id` is only called in `JoinGroup`** — every other
-  group/offset endpoint accepts arbitrary group strings including control
-  characters (`src/cluster/handler/groups.rs:553-605` and others).
-
-* **`JoinGroup` does not validate `session_timeout_ms` / `rebalance_timeout_ms`
-  bounds**. A negative value casts to `u64::MAX`, permanently holding a
-  group slot (`src/cluster/handler/groups.rs:255-265`).
-
-* **`is_simple_consumer_commit` uses `< 0` instead of `== -1`**
-  (`src/cluster/handler/offsets.rs:206`). Buggy clients sending
-  `generation_id = -2, member_id = ""` bypass fencing entirely.
-
-* **ACL-denied `acks=0` produce drops are not audit-logged**
-  (`src/cluster/handler/produce.rs:131-156`). No per-principal counter.
-
-#### 1.4 Connection & resource management (HIGH)
-
-* **Per-IP connection counter cleanup is fire-and-forget on `Drop`**
-  (`src/server/mod.rs:187-208`). The async spawn from `Drop` may not run
-  on shutdown; `active_connections` decrements synchronously while
-  `connections_per_ip[ip]` lags, causing per-IP false rejections under
-  churn. Use a synchronous primitive.
-
-* **Plain Kafka listener has no "first-byte" timeout** —
-  `read_kafka_frame`'s 30 s read timeout is the only bound. With a default
-  `max_total_connections = 1024`, ~34 conn/s pins the broker
-  (`src/server/mod.rs:847-872`).
-
-* **TLS server config:** `with_no_client_auth()` by default and even when
-  mTLS is configured the validated cert is **not** surfaced as a SASL
-  principal (`src/server/tls.rs:75-76, 92-121`). Operators believe mTLS
-  pins identity but unauthenticated SASL still produces `User:ANONYMOUS`.
-  Combined with C14 the wildcard ACL still applies.
-
-* **No `ensure_crypto_provider()` in Raft TLS** — possible runtime panic
-  on Raft TLS startup (`src/cluster/raft/tls.rs:91-126`).
-
-* **Neither TLS module pins TLS 1.3** — TLS 1.2 permitted unnecessarily.
-
-* **Health server reads only 1024 bytes** — long Authorization headers
-  (e.g. JWTs from a forwarding gateway) silently truncated, returning 401
-  (`src/server/health.rs:215`).
-
-* **`send_error_response` writes then returns Err — race with connection
-  close** can cause clients to see TCP RST instead of the Kafka error code
-  (`src/server/connection.rs:324-338`). Add `flush + shutdown` before the
-  return.
-
-* **`SCRAM` session map keyed by `SocketAddr`, no TTL, no cap**
-  (`src/cluster/sasl_provider.rs:64, 322-323`). Half-open SCRAMs (drop
-  before client-final) leak entries until OS notifies the connection layer.
-
-#### 1.5 Authentication & authorization (HIGH)
-
-* **Metrics bearer-token compare is non-constant-time (High, fix in 1 line)** —
-  `src/server/health.rs:302`. Use `subtle::ConstantTimeEq` exactly as
-  `sasl_provider.rs:278` already does.
-
-* **Production posture gate satisfied by `acl_enabled` *or* `sasl_required`** —
-  `src/cluster/config.rs:1816-1826`. Should require `sasl_required==true`.
-
-* **`User:ANONYMOUS` matched by `User:*` (C14)** — already covered.
-
-* **PBKDF2 iterations hardcoded at 4096** — OWASP 2023 floor is 600 000.
-  Stolen `stored_key`+`salt` from a leaked SlateDB snapshot is cheaply
-  crackable. Expose `SASL_SCRAM_ITERATIONS` (`src/cluster/scram.rs:45, 80-84`).
-
-* **Cleartext passwords retained in `UserRecord`** even when only SCRAM is
-  used (`src/cluster/sasl_provider.rs:48-51, 172-182`). Wrap in
-  `secrecy::SecretString` / `Zeroizing`; recompute PBKDF2 for PLAIN.
-
-* **SCRAM gaps:**
-  - GS2 channel-binding consistency (n,, vs y,,) not enforced between
-    client-first and client-final (`src/cluster/scram.rs:129-135, 250-256`).
-  - `m=` mandatory-extension marker in client-final silently ignored.
-  - `authzid` silently dropped instead of either honored or rejected.
-  - `random_nonce()` derived from a single UUIDv4 (~122 bits) with replaced
-    chars; switch to 32 bytes from `OsRng`.
-
-* **Raft replay window 5 minutes / 60 s clock skew** is generous for a
-  control plane; cache is in-memory only. Persist nonce-cache or tighten
-  to 60 s / 5 s (`src/cluster/raft/auth.rs:85-87`).
-
-* **ACL host matching is exact-string only** — IPv4-mapped IPv6, dual-stack,
-  and zone-id literals all silently miss
-  (`src/cluster/raft/domains/acl.rs:147-149`). Normalize via
-  `Ipv6Addr::to_canonical()` and compare typed `IpAddr`s. Add CIDR support
-  or document the limitation explicitly.
-
-* **`from_strings` for `RaftAuthKeys` accepts any non-empty secret** —
-  one-byte `RAFT_CLUSTER_SECRET=x` passes the gate
-  (`src/cluster/raft/auth.rs:247-263`). Require ≥32 bytes.
-
-* **PLAIN failure path logs the username**, which is regularly the user's
-  password due to typos in interactive clients
-  (`src/cluster/sasl_provider.rs:280-286`).
-
-* **Super-user list does not validate `User:` prefix** — operator can set
-  `KAFKAESQUE_SUPER_USERS=User:*` and grant cluster-admin to everyone
-  (`src/cluster/config.rs:1598-1603`).
-
-#### 1.6 Other correctness items
-
-* **`AuthRateLimiter::record_failure` race with `record_success`** across
-  connections from the same IP — sticky lockouts after legitimate logins
-  (`src/server/rate_limiter.rs:115-180`). CAS on
-  `(failure_count, lockout_until)`.
-
-* **`RaftRpcServer::run` has no per-IP cap or accept semaphore on Raft port**
-  (`src/cluster/raft/network.rs:917-955`). Connection-flood DoS;
-  authenticated cluster-secret holders aside, an attacker can still
-  exhaust file descriptors and CPU on TLS handshake.
-
-* **`read_rpc_frame` cancellation between reads** can leak partial state
-  on the server side (`src/cluster/raft/auth.rs:431-501`). Atomic read of
-  the rest after a single length prefix.
-
-* **Raft RPC dispatch deserialize errors close the connection without
-  responding** (`src/cluster/raft/network.rs:1019-1162`). Clients retry 3×
-  with backoff against a closing socket. Send a typed
-  `RaftRpcResponse::ErrorV2(InvalidRequest)`.
-
-* **`proposal_semaphore` not held on the leader side for forwarded writes**
-  — backpressure is asymmetric; a misconfigured follower can DoS the leader
-  (`src/cluster/raft/node.rs:289-374`).
-
-* **Trace-context fields on `RaftRpcMessage` envelope are absent**
-  (`src/cluster/raft/network.rs`) — see Observability §6.
+#### C-1 — `parse_unsigned_varint` silently truncates 5-byte varint values
+- **Severity:** Medium
+- **Location:** `src/parser.rs:189-216`
+- **Description:** The overflow guard `if shift > 28 { return Err... }` is checked after `shift += 7`, so when `shift == 28` the bits `b & 0x7F` are shifted left by 28 and the high 4 bits of byte 5 are silently dropped. Different on-the-wire varints decode to the same `u32`.
+- **Impact:** Breaks canonical-encoding assumptions; parser non-determinism vector for fuzzing oracles and signature equality.
+- **Fix:** On the 5th byte, additionally verify `b <= 0x0F` before OR'ing into `result`.
+
+#### C-2 — `ListOffsets` always returns timestamp = -1 even on timestamp-based queries
+- **Severity:** High
+- **Location:** `src/cluster/handler/offsets.rs:159`
+- **Description:** `offset_for_timestamp` returns the offset, but the response's `timestamp` is hardcoded to `-1`. Per Kafka protocol the response should carry the batch timestamp so `KafkaConsumer.offsetsForTimes()` returns real `OffsetAndTimestamp` entries.
+- **Impact:** `offsetsForTimes()` consumers see `timestamp: -1` instead of the actual batch timestamp; clients filtering on non-negative timestamps drop the partition silently.
+- **Fix:** When `partition.timestamp >= 0` and lookup succeeded, return the batch's `max_timestamp`.
+
+#### C-3 — `leader_epoch == 0` partitions skip per-write epoch fencing
+- **Severity:** High
+- **Location:** `src/cluster/partition_store.rs:444,1317` (`decode_leader_epoch(...).unwrap_or(0)` + `if self.leader_epoch > 0` gate)
+- **Description:** Brand-new partitions opened with `leader_epoch == 0` (the default) skip the epoch-fencing check entirely. Combined with the lease cache fast path, partitions opened pre-fencing have no per-write epoch validation; only SlateDB's internal single-writer fencing protects them.
+- **Impact:** Pre-fencing partitions are vulnerable to TOCTOU regardless of code path.
+- **Fix:** Either require `leader_epoch > 0` at open, or bump the stored epoch on every open so future opens always have a non-zero baseline.
+
+#### C-4 — CRC validation runs after `get_for_write` (Raft round-trip on cache miss) for `acks>=1`
+- **Severity:** Medium
+- **Location:** `src/cluster/handler/mod.rs:710-770`
+- **Description:** `produce_to_partition_inner` acquires the lease (potentially a Raft read) before validating the batch CRC. The `acks=0` path correctly validates first. Asymmetric — an attacker can drive Raft load with corrupt batches.
+- **Fix:** Move CRC validation above `get_for_write` on the `acks>=1` path.
+
+#### C-5 — JoinGroup protocol metadata and SyncGroup assignment have no parse-time bound
+- **Severity:** Medium
+- **Location:** `src/server/request/groups.rs:99-106,215-222`
+- **Description:** Both parsers reject negative lengths but accept up to `i32::MAX`. The `MAX_MEMBER_METADATA_SIZE` validation runs in the handler, after the allocation has already happened.
+- **Fix:** Bound at parse time using the constant from `crate::constants`.
+
+#### C-6 — SASL `auth_bytes` length has no per-mechanism upper bound
+- **Severity:** Medium
+- **Location:** `src/server/request/auth.rs:34-41`
+- **Description:** `parse_sasl_authenticate_request` rejects negative lengths but accepts up to `i32::MAX` (frame cap is 100 MB). Pre-auth DoS amplifier — an unauthenticated client allocates ~100 MB per SaslAuthenticate request.
+- **Fix:** Cap to a reasonable maximum (e.g., 64 KiB) before `take`.
+
+#### C-7 — Error response on handler timeout drops `flush`/`shutdown`
+- **Severity:** Low
+- **Location:** `src/server/connection.rs:399`
+- **Description:** Timeout-path error response lacks `flush`/`shutdown` calls, racing with TCP RST so clients see a connection reset rather than `RequestTimedOut(7)`.
+- **Fix:** Add `let _ = stream.flush().await; let _ = stream.shutdown().await;` after the error write.
+
+#### C-8 — Trailing-bytes rejection closes the connection (not just the request)
+- **Severity:** Medium
+- **Location:** `src/server/request/mod.rs:421-434`; `src/server/connection.rs:386,639-654`
+- **Description:** Extra trailing bytes after a clean parse cause a typed `InvalidRequest` error AND a connection close. Clients don't recover.
+- **Fix:** Distinguish `Error::TrailingBytes` from `Error::ParsingError` and treat the former as non-fatal — return the error response, keep the connection open.
+
+#### C-9 — Corrupt batch error mapped to `InvalidTopic` instead of `CorruptMessage`
+- **Severity:** Low
+- **Location:** `src/protocol.rs:262`; `src/cluster/handler/fetch.rs:334-338`; `partition_store.rs::append_batch_inner`
+- **Description:** When `record_count <= 0` rejection fires, the SlateDB `Config` error maps to `KafkaCode::InvalidTopic` (42) instead of `CorruptMessage` (2). Clients don't trigger the "refresh metadata" recovery flow.
+- **Fix:** Add a dedicated `SlateDBError::CorruptBatch` variant or pattern-match on the message in `to_kafka_code()`.
+
+#### C-10 — Information leak: HWM returned in `last_stable_offset` on `OffsetOutOfRange`
+- **Severity:** Low
+- **Location:** `src/cluster/handler/fetch.rs:281-301`
+- **Description:** When `effective_offset < log_start`, response sets `last_stable_offset: current_hwm`. Per Kafka contract this should be `-1` for OOR responses; here it leaks the HWM to a client that requested a denied range.
+- **Fix:** Return `last_stable_offset: -1` for `OffsetOutOfRange`.
+
+#### C-11 — `set_global_inflight_byte_budget` not wired from config
+- **Severity:** Low
+- **Location:** `src/server/connection.rs:73-78`
+- **Description:** Setter is `#[allow(dead_code)]` and never called. Production runs at the 1 GiB hardcoded default regardless of `ClusterConfig`.
+- **Fix:** Wire the setter from `ClusterConfig` at startup; log the active value.
+
+#### C-12 — SASL PLAIN principal extraction missing password presence check
+- **Severity:** Low
+- **Location:** `src/server/connection.rs:952-961`
+- **Description:** `splitn(3, |b| *b == 0)` accepts inputs like `\0user` (no password section); `principal_from_sasl_plain` returns `Some(...)` even when the SASL PLAIN payload has no password byte at all.
+- **Fix:** Require `parts.next().is_some()` for the password section before extracting `authcid`.
+
+#### C-13 — Short frames not rejected pre-allocation
+- **Severity:** Low
+- **Location:** `src/server/connection.rs:190-210`
+- **Description:** `read_kafka_frame` accepts size=0 and proceeds to header parse. Wastes resources on clearly malformed frames.
+- **Fix:** Reject `size < 8` (minimum: api_key + api_version + correlation_id) early.
+
+#### C-14 — Failed `release_partition` swallowed during zombie-recovery
+- **Severity:** Low
+- **Location:** `src/cluster/partition_manager.rs:1682`
+- **Description:** `let _ = ctx.coordinator.release_partition(...)` discards errors. Combined with `OWNED_PARTITIONS.dec()` immediately after, metrics drift from reality and the partition stays "stuck" until lease expiry.
+- **Fix:** Log the error explicitly; consider retry-with-backoff.
 
 ---
 
 ### 2. Performance
 
-#### 2.1 Hot-path allocations
+#### P-1 — Fetch response copies the entire record payload twice before write
+- **Severity:** Critical
+- **Location:** `src/server/response/fetch.rs:101-107`; `response/mod.rs:111-127`; `connection.rs:729-736`
+- **Description:** `Bytes` payload from SlateDB is `put_slice`'d into the response body `Vec`, then `extend_from_slice`'d into the framed `Vec`. For a 10 MB fetch, peak resident memory is ~30 MB and 2 full memcpy passes happen before the syscall.
+- **Impact:** ~2× memory + 2× memcpy of every fetched byte on the hot path.
+- **Fix:** Build the response as `Vec<Bytes>` chunks; use `write_all_vectored` with `IoSlice`, or write structural header followed by each payload `Bytes` separately via `write_all`.
 
-* **Per-produce/fetch `String` allocations** in `LoadMetricsCollector::record_*`
-  (`src/cluster/load_metrics.rs:289-323`) and in
-  `cached_topic_name`/`select_coordinator_id`
-  (`src/cluster/handler/mod.rs:530-533`, `groups.rs:86-87`). Switch to
-  `Arc<str>` or `(Arc<str>, i32)` keys; use `Cache::get` before
-  `get_with(topic.to_string(), …)`.
+#### P-2 — Per-partition write-Mutex held across 2-3 SlateDB awaits
+- **Severity:** High
+- **Location:** `src/cluster/partition_store.rs:140,415,740`
+- **Description:** `let _guard = self.write_lock.lock().await;` is held across (1) SlateDB `get` for epoch, (2) SlateDB `get` for persisted producer state on cache miss, (3) `write_with_options` (with `await_durable=true` for `acks>=1`). Serializes durable writes per partition at object-store latency.
+- **Impact:** A single partition's durable produce throughput is bounded by `1 / object_store_latency`, not `1 / WAL_flush_interval`. Dominant produce-throughput limiter for `acks=1`.
+- **Fix:** Pre-fetch epoch + producer state outside the lock; verify under the lock with in-memory comparison. Cache leader epoch as `AtomicI32`. Consider an in-flight queue that allocates offsets inside the lock and dispatches durable waits outside.
 
-* **`vec![0u8; size]` zero-init for incoming Kafka frames**
-  (`src/server/connection.rs:207`). For 100 MB produce frames this
-  zeroes 100 MB before `read_exact` overwrites it. Use `BytesMut::with_capacity`
-  + `read_buf`.
+#### P-3 — `cached_topic_name` allocates a `String` on every cache hit
+- **Severity:** High
+- **Location:** `src/cluster/handler/mod.rs:530-533`
+- **Description:** `moka::sync::Cache::get_with` takes `K` by value, so `topic.to_string()` runs on every call — defeating the caching. Called multiple times per produce/fetch.
+- **Fix:** `cache.get(topic)` first; only `get_with` on miss.
 
-* **`encode_with_size` triple-allocation per response**
-  (`src/server/response/mod.rs:111-126`) — header `Vec`, body `Vec`,
-  combined `Vec`. For a 10 MB fetch response this peaks ~30 MB. Encode
-  into a single `BytesMut`.
+#### P-4 — `partition_manager.get_for_write/read` allocates `Arc<str>` per call
+- **Severity:** High
+- **Location:** `src/cluster/partition_manager.rs:904-907,911-916,929,1051,1088,1147,1155,1747,1800,1839,1897`
+- **Description:** Every call constructs `Arc::from(topic)` to look up `partition_states`; lease-cache lookup (line 1155) does it again. 200 extra allocations on a 100-partition produce.
+- **Fix:** Plumb `&Arc<str>` through the API; or make `PartitionKey` borrowable so lookups don't allocate.
 
-* **`LoadSnapshot::with_raft_index` clones every map every evaluation cycle**
-  (`src/cluster/auto_balancer.rs:228-246`). Borrow the maps; the snapshot
-  is consumed in place.
+#### P-5 — Per-write `RwLock` read on the load-metrics collector
+- **Severity:** High
+- **Location:** `src/cluster/partition_store.rs:180,342-353,844,1064`
+- **Description:** Every successful append/fetch acquires `RwLock<Option<Arc<...>>>::read().await`. The collector is set once at startup and is constant after.
+- **Fix:** Replace with `arc_swap::ArcSwapOption<LoadMetricsCollector>` or `OnceLock<Arc<...>>`.
 
-#### 2.2 Lock contention
+#### P-6 — Sequential coordinator round-trip per partition in `build_topic_metadata`
+- **Severity:** High
+- **Location:** `src/cluster/handler/mod.rs:602-652`; `handler/metadata.rs:181-191`
+- **Description:** N sequential Raft reads per topic; for 1k partitions × 1ms per read, that's 1s per Metadata refresh per topic.
+- **Fix:** Add `coordinator.get_topic_owners(topic) -> HashMap<i32, i32>` that returns owners in one read; cache invalidated on rebalance events.
 
-* **`auto_balancer` write lock held across awaits during entire batch
-  transfer** (`src/cluster/rebalance_coordinator.rs:614-714`). Readers
-  starve for seconds; `metrics_reset_loop`'s cooldown cleanup blocks
-  exactly when cooldowns are being created. Take the write lock for
-  `should_evaluate()` + `evaluate_snapshot` (sync), drop, then run transfers.
+#### P-7 — Fetch handler clones partitions Vec + re-runs ACL/topic-validation per long-poll iteration
+- **Severity:** High
+- **Location:** `src/cluster/handler/fetch.rs:104-133,179-242`
+- **Description:** `topic.partitions.clone()` per pass; `validate_topic_name` + async `authorizer.authorize()` re-run every pass. Wakes ×5 on a long poll = 5× the work.
+- **Fix:** Move per-topic validation/ACL outside the `collect_fetch` loop; iterate by reference.
 
-* **`bounded_topic_label` mutex on the produce/fetch hot path**
-  (`src/cluster/metrics.rs:1446-1456`). Sharded set or `arc_swap`.
+#### P-8 — Topics processed sequentially in produce/fetch; only partitions fan out
+- **Severity:** High
+- **Location:** `src/cluster/handler/produce.rs:255-364`; `handler/fetch.rs:179-397`
+- **Description:** A 5-topic × 20-partition request runs at 20-wide concurrency for 5 sequential rounds (5 × T_max), instead of 100-wide concurrency for one round.
+- **Fix:** Flatten to a single stream over `(topic_idx, partition)` and `buffer_unordered(max_concurrent)` across the whole request.
 
-#### 2.3 I/O and scans
+#### P-9 — `validate_batch_crc_async` does a full payload memcpy before `spawn_blocking`
+- **Severity:** High
+- **Location:** `src/protocol.rs:126-135`
+- **Description:** Signature takes `&[u8]`, so it copies via `Bytes::copy_from_slice`. Every caller has `&Bytes`, so a `Bytes::clone()` (refcount only) would suffice.
+- **Fix:** Change signature to `&Bytes`; clone instead of copy.
 
-* **`recover_hwm_from_records` and `load_producer_states` are unbounded
-  scans on partition open** (`src/cluster/partition_recovery.rs:81-179`,
-  `366-401`, `partition_store.rs:1865`). Periodically `tokio::yield_now()`,
-  add a `recovery_scan_records_processed` counter, and lazy-load producer
-  state per producer-id rather than full prefix scan.
+#### P-10 — Missing `TCP_NODELAY` on accepted client connections
+- **Severity:** Medium
+- **Location:** `src/server/mod.rs:435-531,778`
+- **Description:** Raft network sets it; the public Kafka socket does not. Up to 40 ms of Nagle delay on small responses.
+- **Fix:** `stream.set_nodelay(true)` after `listener.accept()`.
 
-* **`find_batch_start` cache-miss path re-scans previously scanned ranges**
-  (`src/cluster/partition_store.rs:1107-1170`). Track `prev_scan_start`
-  and only scan `[wider_start..prev_scan_start]` on each iteration.
+#### P-11 — Per-request String/Arc/UUID allocations in `RequestContext`
+- **Severity:** Medium
+- **Location:** `src/server/connection.rs:682-696`
+- **Description:** `principal.clone()`, `client_id.clone()`, `client_addr.ip().to_string()`, `Uuid::new_v4()` minted per request.
+- **Fix:** Borrow-friendly `RequestContext` (`&str`/`IpAddr`); share `principal` as `Arc<str>` on the connection; lazy-generate `request_id` only when tracing is enabled.
 
-* **`apply_retention` builds one `WriteBatch` of all expired batches**
-  (`src/cluster/partition_store.rs:1305, 1356-1362`). Chunk into ~1000
-  batches per WriteBatch with intermediate LSO advances.
+#### P-12 — Lease-cache `Arc::from(topic)` allocation on every `get_for_write`
+- **Severity:** Medium
+- **Location:** `src/cluster/partition_manager.rs:1154-1168`
+- **Description:** Even on lease-cache hit, `Arc<str>` is allocated to construct the lookup key.
+- **Fix:** Same as P-4 — make `PartitionKey` borrowable.
 
-* **`validate_offset_continuity_from` clones+sorts on every call** even
-  though SlateDB scans are sorted (`src/cluster/partition_recovery.rs:225-226`).
-  Validate sortedness as you iterate; drop the clone+sort.
+#### P-13 — Metrics labels allocate `String` and acquire `Mutex` per request
+- **Severity:** Medium
+- **Location:** `src/cluster/metrics.rs:1474-1496,1500-1516,1520-1540,1544-1575,1700-1704`
+- **Description:** `bounded_topic_label` acquires a Mutex and `to_string()`s 1-3 times. `get_partition_label_sync` allocs `String` per call.
+- **Fix:** Cache `(topic, partition) -> &'static GenericCounter` directly in moka. Replace topic-label `Mutex` with `arc_swap::ArcSwap<HashSet<Arc<str>>>` or `DashSet`. Use `itoa` for partition formatting.
 
-#### 2.4 Object-store usage
+#### P-14 — `find_batch_start` issues 2 round-trips per fetch on miss
+- **Severity:** Medium
+- **Location:** `src/cluster/partition_store.rs:1090-1112`
+- **Description:** Strategy 2 (exact `get`) and Strategy 3 (range scan) are independent reads; the range scan covers the exact case for free.
+- **Fix:** Drop strategy 2; reuse the iterator from strategy 3.
 
-* **Retention loop has no per-partition lease check (High)** — see C3 in
-  the storage section. Beyond correctness, retention also runs `await_durable=true`
-  writes, doubling object-store traffic from a non-leader.
+#### P-15 — Client connections lack `BufReader`/`BufWriter`
+- **Severity:** Medium
+- **Location:** `src/server/connection.rs:177-237,256-280`
+- **Description:** 4-byte size header always triggers a fresh `read_exact` syscall.
+- **Fix:** Wrap stream in `tokio::io::BufReader::with_capacity(64 * 1024, ...)` for reads.
 
-#### 2.5 BufferPool
+#### P-16 — Failover transfer planning is O(N×B); `min_by_key` per partition
+- **Severity:** Low
+- **Location:** `src/cluster/rebalance_coordinator.rs:469-509`
+- **Description:** Cold path; 200k comparisons for 10k partitions × 20 brokers.
+- **Fix:** Use a `BinaryHeap<(usize, i32)>`; pop, increment, push — O(N log B).
 
-* **Returned buffers retain worst-case capacity**
-  (`src/cluster/buffer_pool.rs:107-118`). Per-thread thread-local pool
-  accumulates 4 MB per worker. Drop or `shrink_to(DEFAULT_BUFFER_CAPACITY)`
-  on `put` when the buffer grew past threshold.
+#### P-17 — Metadata "list-all" is O(topics × partitions) sequential coordinator calls
+- **Severity:** Medium
+- **Location:** `src/cluster/handler/metadata.rs:181-191`
+- **Description:** 200 topics × 50 partitions = 10,000 sequential Raft reads.
+- **Fix:** Bulk fetch via `get_all_partition_owners()`; parallelize topic authorization with `buffer_unordered`.
 
 ---
 
-### 3. Code Quality & Maintainability
+### 3. Concurrency & Reliability
 
-#### 3.1 Module size and responsibility
+#### R-1 — Cached Raft RPC connection serializes RPCs and is cancellation-unsafe
+- **Severity:** Critical
+- **Location:** `src/cluster/raft/network.rs:744-761,769-777`
+- **Description:** `try_send_rpc` holds `cached_conn.lock().await` for the full duration of `do_rpc_with_timeout`. All concurrent calls to a peer serialize on one socket. If the outer future is cancelled mid-RPC (caller timeout, shutdown, openraft drop), the next call finds the same `Some(stream)` with a half-written frame still on the wire — framing desyncs and the next caller may interpret the previous response as its own.
+- **Impact:** (a) AppendEntries + InstallSnapshot serialize end-to-end; (b) Cancellation-induced response-mismatch can deserialize a `Vote` reply as `AppendEntries`, producing phantom errors, false leadership transitions, or Raft state corruption.
+- **Fix:** Use a drop guard pattern that nulls the slot unless `commit()` is called on success; or drop the cache and use one connection per RPC; or make `do_rpc` fully cancellation-safe by reading the response under timeout in a `select!` arm that drops the stream on cancel.
 
-* **`src/cluster/error.rs` (2541 LOC)** — ~1800 LOC are inline tests; the
-  enum + impl are ~250 LOC. Move tests to `error/tests.rs`; extract
-  `From<slatedb::Error>` + fencing patterns to `error/fencing.rs`.
-  Result: `error.rs` < 300 LOC.
+#### R-2 — Partition append: write lock + SlateDB await — cancellation can duplicate base offset
+- **Severity:** High
+- **Location:** `src/cluster/partition_store.rs:415,740,784`
+- **Description:** HWM is bumped only after `write_with_options` returns. If the caller is cancelled between the SlateDB write submit and the HWM update, SlateDB may have queued the batch (so the data eventually persists) but the broker's view says it didn't. The next caller assigns the same `base_offset`. Two batches end up at the same SlateDB key — the second clobbers the first.
+- **Impact:** Producer-acked data lost on the durable path; outright corruption on the fast path.
+- **Fix:** Reserve the offset range before the await — bump `high_watermark` atomically before issuing the write. Or wrap the await in a non-cancellable `tokio::spawn` + `JoinHandle::await`.
 
-* **`src/cluster/metrics.rs` (3709 LOC)** — 85+ free `record_*`/`set_*`
-  functions, 80+ `Lazy<…>` statics, plus the fencing circuit-breaker
-  (lines 522-638) and cardinality-limiting subsystem (1363-1470). Split
-  into `metrics/{mod, broker, partition, group, request, raft, fencing,
-  cardinality, circuit_breaker}.rs` and introduce typed builders so call
-  sites get IDE help.
+#### R-3 — `install_snapshot`: persist + multi-step in-memory swap not atomic under cancellation
+- **Severity:** High
+- **Location:** `src/cluster/raft/storage.rs:1080-1122`
+- **Description:** Sequence is persist → SM swap → last_applied_log → membership → cached_snapshot. Cancellation between SM swap and last_applied_log leaves SM with the new state but `last_applied_log` pointing to the old; openraft re-delivers entries that are already applied via the snapshot, double-applying non-idempotent commands (counters, sequence allocations).
+- **Fix:** Take all relevant write locks before step 3 and structure so the in-memory commit point is `last_applied_log`'s update; reorder so `last_applied_log` is the last thing updated and acts as the commit point.
 
-* **`src/cluster/config.rs` (3151 LOC)** — `from_env` is a single ~500-line
-  method. Introduce `env_helpers` (`env_or`, `env_opt`, `env_bool`); split
-  into `from_env_broker`, `from_env_storage`, `from_env_sasl`, `from_env_failover`.
+#### R-4 — Lease validity uses local wall clock instead of replicated `lease_clock_ms`
+- **Severity:** High
+- **Location:** `src/cluster/raft/coordinator/partition.rs:285,321`; `state_machine.rs:55-68`
+- **Description:** State machine tracks a replicated, monotonic `lease_clock_ms` so all replicas agree on lease expiration. But `get_partition_owner` and `owns_partition_for_read` compare against `current_time_ms()` (local `SystemTime::now()`). A broker with a forward-skewed wall clock declares its own lease expired locally while the cluster still considers it owned.
+- **Impact:** Split-brain reads on clock skew.
+- **Fix:** Compare against `inner_state.lease_clock_ms` from the same state read.
 
-* **`src/cluster/handler/mod.rs` (1654 LOC)** — `SlateDBClusterHandler::new`
-  is ~360 lines and orchestrates the whole cluster bring-up. Builder with
-  explicit phases: `build()` → `bootstrap()` → `start()`. Move the
-  `RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE` env-var parse out of the constructor.
+#### R-5 — Pending failover set is per-broker in-memory; lost on coordinator-leader change
+- **Severity:** High
+- **Location:** `src/cluster/rebalance_coordinator.rs:337,810-868`
+- **Description:** Newly Failed brokers seed `pending_failovers: Mutex<HashSet<i32>>` which is process-local. Only the Raft leader retries; if the leader steps down mid-retry, the new leader has an empty pending set and the failure detector already shows the broker as Failed → no transition → no retry.
+- **Impact:** Permanent partition stranding after leader change during a transient failover failure.
+- **Fix:** On leader takeover, seed `pending_failovers` from the failure detector. Or replicate the set via Raft. Or drive failover from a state-machine invariant ("any Failed broker with non-empty owner set → reassign").
 
-* **`src/server/connection.rs` (1783 LOC)** — bundles inflight budget,
-  frame reader, auth gate, plain client, TLS client, fuzz hook. Split into
-  `server/connection/{frame, inflight, auth_gate, plain, tls, mod}.rs`.
+#### R-6 — Zombie-mode `try_exit` has TOCTOU between timestamp check and CAS
+- **Severity:** High
+- **Location:** `src/cluster/zombie_mode.rs:152-195`
+- **Description:** Timestamp check, then CAS on `active`. Between the two, a `force_exit()` followed by re-`enter()` can flip `active` to a new generation — the CAS still sees `true` and exits a *new* zombie session whose timestamp was never validated.
+- **Impact:** After a flap, the recovery thread exits the new zombie session prematurely; broker resumes serving while heartbeat is still failing.
+- **Fix:** Pack `(active, generation)` into one `AtomicU64` and CAS the whole word. Or guard transitions with a Mutex.
 
-* **`src/cluster/raft/domains/transfer.rs` (1498 LOC)** — split into
-  `domains/transfer/{types, state, apply, mod}.rs`. Apply systematically
-  to `group.rs` (1072 LOC), `partition.rs` (927 LOC).
+#### R-7 — `PartitionStore::close()` takes `&self`; concurrent calls race SlateDB
+- **Severity:** High
+- **Location:** `src/cluster/partition_store.rs:1438-1444`
+- **Description:** `close()` is `pub async fn close(&self)` with `self.db.close().await?`. SlateDB's `Db::close` is not safe to call twice concurrently. The codebase calls `store.close()` from many paths (release, zombie-entry, lease-loss, shutdown) that can race.
+- **Impact:** Two concurrent close paths → SlateDB internal panic in compaction/WAL.
+- **Fix:** Guard with `tokio::sync::OnceCell<()>` or an `AtomicBool` sentinel.
 
-* **Trivial constructor tests inflate `handler/mod.rs` by ~450 LOC**
-  (`src/cluster/handler/mod.rs:1200-1654`). Delete tests that assert
-  `BrokerId::new(42).value() == 42`.
+#### R-8 — `apply_command` holds SM write lock across heartbeat hook
+- **Severity:** Medium
+- **Location:** `src/cluster/raft/state_machine.rs:186,202-208`
+- **Description:** Heartbeats are the most frequent command; the SM write lock is held during the hook call, blocking every reader. Future hooks that touch shared state could deadlock.
+- **Fix:** Capture the broker_id, drop the guard, then fire the hook.
 
-#### 3.2 Duplicate trait scaffolding
+#### R-9 — `apply_to_state_machine` holds `last_applied_log.write` across SM `apply_command`
+- **Severity:** Medium
+- **Location:** `src/cluster/raft/storage.rs:1031-1052`
+- **Description:** Lock order: `last_applied_log.write` → `sm.read` → `state.write`. No deadlock today (build_snapshot uses the reverse-read order), but any future inversion deadlocks. Also blocks readers during apply.
+- **Fix:** Apply first; then briefly take `last_applied_log.write` to bump the index.
 
-* **`Handler` trait and `MetadataHandler`/`ProduceHandler`/… sub-traits
-  duplicate 600+ LOC of default impls** — sub-traits are unused outside
-  their own test (`src/server/handler.rs` and `src/server/handler_traits.rs`).
-  Delete `handler_traits.rs`, or commit to it: pick one.
+#### R-10 — Raft RPC server has no shutdown — listener loop runs forever
+- **Severity:** Medium
+- **Location:** `src/cluster/raft/network.rs:917-1017`
+- **Description:** No cancellation token. Graceful shutdown is impossible; runtime drop forcibly aborts in-flight `append_entries`/`install_snapshot` mid-write.
+- **Fix:** Add a `CancellationToken` plumbed into `run()`; `select!` against it; track JoinHandles for spawned per-connection tasks.
 
-* **`PartitionCoordinator` trait has 23 async methods; only `RaftCoordinator`
-  and `MockCoordinator` (2381 LOC) implement it**
-  (`src/cluster/traits.rs`). Premature abstraction. Either slim it (split
-  along read/write boundary) or delete and use `RaftCoordinator` concretely
-  with single-node Raft test cluster.
+#### R-11 — `fire_and_forget_produce` (acks=0) doesn't track JoinHandles
+- **Severity:** Medium
+- **Location:** `src/cluster/handler/produce.rs:220-237`
+- **Description:** Spawned task's handle is never tracked. On shutdown, in-flight SlateDB writes are dropped; combined with `release_partition` → `store.close()`, can trip a SlateDB-internal panic in compaction.
+- **Fix:** Track via `JoinSet`; drain (or abort with brief timeout) before `store.close()`.
 
-* **`coordinator/<x>.rs` mirrors `domains/<x>.rs` mechanically** — three
-  files in lockstep per domain. Either collapse the trait impl into the
-  domain file, or generate it via macro.
+#### R-12 — Snapshot persist data PUT happens before pointer-lock acquired
+- **Severity:** Medium
+- **Location:** `src/cluster/raft/storage.rs:755-858`
+- **Description:** Two concurrent persists race on data PUT before serializing on the pointer lock. The first to commit wins; the second's data object is orphaned. On pointer-PUT failure, the orphan-cleanup `delete` is best-effort (`let _ =`); transient S3 failures accumulate orphans.
+- **Fix:** Acquire `snapshot_pointer.write()` before the data PUT.
 
-#### 3.3 Layering violations
+#### R-13 — owner_cache invalidation races local readers
+- **Severity:** Medium
+- **Location:** `src/cluster/raft/coordinator/partition.rs:223-249,259-263`; `state_machine.rs:168-172`
+- **Description:** The hook fires inside the SM write lock, but a parallel reader on the same broker can fetch the cached owner just before the hook completes — small window of "I own this" after a release.
+- **Fix:** Add a generation counter to cached entries, or invalidate before the Raft write returns.
 
-* **Wire-protocol `crate::cluster::raft::AclOperation` types leak through
-  every handler** (`src/cluster/handler/{produce, fetch, groups, offsets,
-  admin, metadata, mod}.rs`). Move ACL types to `cluster/authorizer.rs`
-  (or `cluster/acl/types.rs`) and re-export from `raft/domains/acl.rs`.
+#### R-14 — Raft RPC server drops state if response write fails after SM apply
+- **Severity:** Medium
+- **Location:** `src/cluster/raft/network.rs:1066-1071,1129-1140`
+- **Description:** `dispatch_rpc_message` mutates state, then `write_rpc_frame` may fail; the leader retries (potentially against a different leader) and may issue a duplicate command. For idempotent commands (AppendEntries) it's harmless; for `InitProducerId` it could allocate two IDs.
+- **Fix:** Make all coordination commands idempotent at the SM level via a client-supplied operation ID + dedup.
 
-* **Two `BrokerInfo` structs with different shapes** —
-  `src/cluster/coordinator/mod.rs:34` vs
-  `src/cluster/raft/domains/broker.rs:18`. Define once with the richer
-  fields; provide `BrokerSummary` view where identity-only is needed.
+#### R-15 — Recovery silently skips files with unparseable filenames
+- **Severity:** Medium
+- **Location:** `src/cluster/raft/storage.rs:285-300`
+- **Description:** `let Some(idx) = path.file_stem()...parse::<u64>().ok() else { continue; }` silently skips. A corrupted log filename is invisible while corrupted content errors loudly. Could create a hole that openraft's invariants forbid.
+- **Fix:** Distinguish "wrong pattern" (warn loudly, abort startup) from "unrelated file" (ignore).
 
-* **Namespace collision: `cluster::coordinator` (98 LOC utility) vs
-  `cluster::raft::coordinator` (372 LOC actual)**. Rename top-level to
-  `cluster::types` or fold contents into `cluster::traits`/`cluster::validation`.
-
-#### 3.4 API surface
-
-* **Overly public `pub mod` in `cluster/mod.rs:64-95`** —
-  `keys` (on-disk binary key encoder), `buffer_pool`, `load_metrics`,
-  `observability` are implementation detail. Demote to `pub(crate) mod`.
-  `mock_coordinator` should be `#[doc(hidden)]` even when the
-  `test-utilities` feature is enabled.
-
-#### 3.5 Panics on production paths
-
-* **`unwrap()` on `f64::partial_cmp` in auto-balancer**
-  (`src/cluster/auto_balancer.rs:467, 500-501, 505-506, 608`) — NaN inputs
-  panic the unsupervised auto-balance task.
-
-* **`unwrap()` on poisoned `RwLock`** in `rebalance_coordinator.rs:1120-1199`
-  (largely the test mock — gate it tighter and use `parking_lot::RwLock`).
-
-* **`SystemTime::now().duration_since(UNIX_EPOCH).unwrap()`** in
-  `coordinator/mod.rs:331-336` — see §1.1.
-
-#### 3.6 Errors and validation
-
-* **`SlateDBError` stringifies underlying errors and uses pattern matching
-  on the message text for `is_fenced()`** (`src/cluster/error.rs:531-566`).
-  Pattern strings (`"conditionnotmet"`, `"leaseidmismatch"`) drift across
-  upstream library version bumps and silently disable fencing detection.
-  Wrap typed errors and pattern-match structurally.
-
-* **`SlateDB(_)` is blanket-retriable but covers fencing too**
-  (`src/cluster/error.rs:367`). Write path can retry through fencing.
-
-* **`ClusterConfig::validate()` returns `Vec<String>`**
-  (`src/cluster/config.rs:1102`). Use a typed enum so callers can
-  programmatically distinguish error classes.
-
-* **Trait methods that are infallible and synchronous are `async fn`
-  returning `SlateDBResult`** (`traits.rs:227, 230, 695`) — pollutes the
-  call graph and hides real-async work.
+#### R-16 — Per-connection serve loop has no per-connection in-flight cap
+- **Severity:** Medium
+- **Location:** `src/server/connection.rs:309-407`
+- **Description:** Single client connection is purely sequential. A 30s slow handler blocks the connection's read loop. Hostile IP × 256 connections × 30s × 1MB inflight = 7.5 GB held for 30 s.
+- **Fix:** Add a per-connection request semaphore; ensure handler timeout < per-connection read timeout.
 
 ---
 
 ### 4. Architecture & Design
 
-* **Lack of leader-only execution gating across coordinator loops** —
-  see §5.
+#### A-1 — Server layer reaches into cluster internals (layering violation)
+- **Severity:** High
+- **Location:** `src/server/mod.rs:860,871`; `connection.rs:309,593,594,600,895`; `health.rs:39,411`; `src/error.rs:120`
+- **Description:** The `server/` module is documented as embeddable but directly references `cluster::metrics::*`, `cluster::buffer_pool::*`, `cluster::zombie_mode::*`, plus `From<SlateDBError> for Error`. Drop the cluster code and the server stops compiling.
+- **Fix:** Move metrics/buffer_pool/zombie_mode/observability to a top-level `infra/` or pass `Arc<dyn ServerMetrics>` into `KafkaServer::new`. Remove `From<SlateDBError>` and map at the cluster handler boundary only.
 
-* **Authorization logic is scattered**: ACL checks open-coded in five
-  handlers (`groups.rs:45-62`, `fetch.rs:194`, `produce.rs:138, 243`,
-  `admin.rs`, `mod.rs:579`). Add `Authorizer::allows(ctx, op,
-  resource_type, name) -> bool` extension method.
+#### A-2 — TLS and plain server / connection are duplicate copies (~700 lines)
+- **Severity:** High
+- **Location:** `src/server/mod.rs:215-551` vs `554-927`; `connection.rs:964-1075` vs `1076-1200+`
+- **Description:** The TLS server and connection are byte-for-byte copies of their plain counterparts apart from stream type and one handshake step. Bug fixes drift between paths.
+- **Fix:** Generic `Connection<S: AsyncRead + AsyncWrite + Unpin>` with two acceptor impls (`PlainAcceptor`, `TlsAcceptor`). Net deletion: ~600 lines.
 
-* **No internal command/result types between server-protocol and cluster
-  layer** — `ClusterHandler` consumes `ProduceRequestData` and produces
-  `ProduceResponseData` directly. Wire format *is* the internal API. Adds
-  friction for batching, internal fan-out, and ACL-driven response shaping.
-  Consider `cluster::commands::{ClusterProduceRequest, ClusterProduceResult}`.
+#### A-3 — `metrics.rs` is a 3,800-line global-singleton kitchen sink
+- **Severity:** High
+- **Location:** `src/cluster/metrics.rs`
+- **Description:** ~70 `pub static` `Lazy<...>` Prometheus metrics + ~50 record/set free functions + a circuit-breaker subsystem + an object-store health tracker + a metric-cardinality limiter — all in one file with one global `REGISTRY`. Two `Handler` instances cannot run in the same process.
+- **Fix:** Split into `cluster/metrics/{registry,connection,request,produce,fetch,group,raft,partition,failover,storage}.rs`. Move circuit breaker to `cluster/circuit_breaker.rs`. Move object-store health to `cluster/object_store_health.rs`. Pass `Arc<Metrics>` into handlers explicitly.
 
-* **`SlateDBClusterHandler::new` performs IO, network, and starts background
-  tasks in the constructor**. Builder pattern, see §3.1.
+#### A-4 — `ClusterConfig` is a 60-field god struct with hand-written `from_env`
+- **Severity:** High
+- **Location:** `src/cluster/config.rs:243-781,1355-1822`
+- **Description:** ~85 `pub` fields covering 9 unrelated concerns; `from_env` is ~470 lines of repeated `std::env::var` parsing. Profile overrides silently reset fields after `..base`. `validate_or_panic` is a third error-handling style.
+- **Fix:** Split into themed sub-structs (`BrokerConfig`, `NetworkConfig`, `LeaseConfig`, `RaftConfig`, etc.). Replace `from_env` with serde-driven loader (`figment` or `config-rs`) + a tiny `env_or<T>` helper.
 
-* **Mock-vs-real divergence in `MockCoordinator`** — tests using it skip
-  postcard-encode + replicate + apply, hiding bugs that only show under
-  the serialized-then-applied ordering. Consider replacing with
-  `RaftCoordinator` over an in-memory transport.
+#### A-5 — `partition_manager.rs` does six unrelated jobs in one 2,800-line file
+- **Severity:** High
+- **Location:** `src/cluster/partition_manager.rs:60-1404`
+- **Description:** One struct owns: partition-state map, store opening, heartbeat loop, lease renewal loop, ownership reconciliation loop (six concerns alone), retention loop, session-timeout loop, zombie-mode management.
+- **Fix:** Extract each background task into `cluster/tasks/{heartbeat,lease_renewal,ownership_reconciliation,retention,session_timeout}.rs` as `pub async fn run(ctx: TaskCtx)`. Keep `PartitionManager` as the synchronous data plane.
 
-* **No log compaction implementation; not documented as missing**. Either
-  ship `cleanup.policy=compact` semantics (with concurrent-writers test)
-  or document the gap in README and the API_VERSIONS surface.
+#### A-6 — `Handler` trait is a 30-method god trait; `handler_traits.rs` is a dead 1,028-line parallel
+- **Severity:** Medium
+- **Location:** `src/server/handler.rs:88-501`; `handler_traits.rs:1-1028`
+- **Description:** `Handler` defines every API method in one trait with default-impl traps. A parallel `handler_traits.rs` defines seven sub-traits with a blanket impl that the production `SlateDBClusterHandler` never uses. The doc-comment recommends a path no production code takes.
+- **Fix:** Pick one and delete the other. `dispatch_request_common` repetitive arms compress with a single `dispatch_versioned!` helper.
+
+#### A-7 — `mock_coordinator.rs` is a 2,400-line parallel re-implementation of business rules
+- **Severity:** Medium
+- **Location:** `src/cluster/mock_coordinator.rs`
+- **Description:** Re-implements rebalance state machines, generation tracking, member eviction, producer-id epoch bumping. Already drifted: `init_producer_id` always returns epoch 0 (line 1017). Tests pass against the mock and miss real-state-machine bugs.
+- **Fix:** Delete the mock and replace with a `LocalStateMachineCoordinator` that wraps the real `cluster/raft/domains/*::apply()` functions with a fake-time, single-node, no-network harness (~150 lines).
+
+#### A-8 — `RaftStore` uses 9 independent `Arc<RwLock<_>>` fields ("granular" locks that are actually one logical lock)
+- **Severity:** Medium
+- **Location:** `src/cluster/raft/storage.rs:105-136`
+- **Description:** `vote`, `log`, `last_purged_log_id`, `sm`, `last_applied_log`, `last_membership`, `cached_snapshot`, `snapshot_pointer` are each separately locked; openraft calls them in fixed sequences (callers acquire 2-4 in lockstep). Granularity buys nothing and increases deadlock risk; everything is `async fn` even though most operations don't await.
+- **Fix:** Wrap into one `RaftStoreState` struct under one `Arc<RwLock<_>>`. Use `parking_lot::RwLock` for in-memory pieces.
+
+#### A-9 — Coordinator trait family split four ways but always implemented together
+- **Severity:** Medium
+- **Location:** `src/cluster/traits.rs:57-714`
+- **Description:** Four sub-traits + blanket `ClusterCoordinator`; both real impls implement all four. `PartitionCoordinator` itself is a god trait (24 methods) with default-impl shims (`acquire_partition_with_epoch`, `owns_partition_for_write`, `current_leader_id`) that exist only to keep the mock compiling.
+- **Fix:** Either collapse to one `Coordinator` trait, or reorganize by call-site scope (`BrokerLifecycle`, `PartitionOwnership`, `TopicAdmin`, `ConsumerGroups`, `Producers`, `Transfers`). Strip speculative defaults.
+
+#### A-10 — Config error path uses three different error styles
+- **Severity:** Medium
+- **Location:** `src/cluster/config.rs:1355`; `src/cluster/error.rs:117-253`; `src/error.rs:69-129`
+- **Description:** `from_env` returns `Box<dyn Error>`; `Error::Config(String)` is unstructured; `validate()` returns `Result<(), Vec<String>>`; `validate_or_panic` panics. Tests resort to `string.contains(...)`.
+- **Fix:** Define `ConfigError` (thiserror) with structured variants. `from_env -> Result<ClusterConfig, ConfigError>`. Remove `validate_or_panic`.
+
+#### A-11 — `cluster/raft/mod.rs` mass re-exports internal types
+- **Severity:** Medium
+- **Location:** `src/cluster/raft/mod.rs:74-91`
+- **Description:** Re-exports `RaftStore`, `RaftRpcMessage`, `RaftRpcResponse`, `CoordinationStateMachine`, plus 14 `*Command`/`*Response`/`*DomainState` types. Internal types become semver-public.
+- **Fix:** Limit `raft/mod.rs` re-exports to `RaftCoordinator`, `RaftConfig`, `RaftNode`. Make the rest `pub(crate)`.
+
+#### A-12 — SASL state plumbed via `Handler::take_sasl_post_auth` / `on_connection_closed` (leaky abstraction)
+- **Severity:** Medium
+- **Location:** `src/server/handler.rs:401-433`; `cluster/handler/mod.rs:124-132,940-955`; `connection.rs:808-855`
+- **Description:** SCRAM is multi-step but `Handler` is "stateless"; the cluster handler stashes per-connection state in a `DashMap<SocketAddr, _>`. The dispatcher knows about SASL specifics that the trait was supposed to hide. Two impls of `Handler` cannot share auth state correctly.
+- **Fix:** Pass `&mut SaslSession` alongside `RequestContext`; dispatcher owns the per-connection `SaslSession`.
+
+#### A-13 — Validation lives in two places via "backwards compatibility" re-export
+- **Severity:** Low
+- **Location:** `src/cluster/validation.rs:73-117`; `cluster/coordinator/mod.rs:30`
+- **Description:** Functions live in `validation.rs` but are imported via `cluster::coordinator::` re-export. Three call sites use one path, two the other.
+- **Fix:** Drop the re-export; rename `validation.rs` to `cluster/names.rs` if appropriate.
+
+#### A-14 — Long methods with deep nesting in handler hot paths
+- **Severity:** Low (cumulative)
+- **Locations:** `partition_manager.rs:360-489` (`start_heartbeat_loop`, 130 lines), `:696-864` (`start_ownership_loop`, 165 lines, 6 responsibilities); `cluster/handler/groups.rs:154-347` (`handle_join_group`, 195 lines); `cluster/raft/domains/group.rs:311-693` (`apply`, 380-line match); `connection.rs:712-890` (180-line dispatch match).
+- **Fix:** Extract per-command arms in `apply` into named functions; extract error-response builders; macro-fy the dispatch arms.
+
+#### A-15 — `cluster::handler::mod.rs` mixes a god struct with thin wrappers
+- **Severity:** Medium
+- **Location:** `src/cluster/handler/mod.rs:60-1109`
+- **Description:** `SlateDBClusterHandler` carries the genuinely complex `produce_to_partition_inner` (130 lines) in `mod.rs` next to one-line `handle_produce` wrapper that delegates to `produce.rs`. ACL helpers live in `mod.rs` but are called from every submodule.
+- **Fix:** Move `produce_to_partition*` into `handler/produce.rs`; move `build_topic_metadata` into `handler/metadata.rs`; move `authorize_cluster_api`/`topic_authorized` into `handler/acl.rs`.
 
 ---
 
-### 5. Concurrency & Reliability
+### 5. Testing & Observability
 
-* **Rebalance loop, metrics-reset loop not leader-gated (Critical, C5).**
-  See top.
+#### O-1 — `record_request` always records `error_code="NONE"` — typed errors lost
+- **Severity:** High
+- **Location:** `src/server/connection.rs:892-895`; `src/cluster/metrics.rs:1376` (`record_request_with_code` exists but is never called)
+- **Description:** Every request is recorded with `error_code="NONE"`. The contract documented at line 1370 (wire-level Kafka error code) is silently broken. Operators cannot graph the rate of `NotLeaderForPartition`, `OffsetOutOfRange`, etc.
+- **Fix:** In `dispatch_request_common`, extract the typed `error_code` from each response and call `record_request_with_code(api, status, code.as_str(), duration)`. Add a metrics-quality test.
 
-* **Failover non-idempotent under errors (Critical, C6).** See top.
+#### O-2 — ACL denials log at `debug!` everywhere except produce
+- **Severity:** High
+- **Location:** `src/cluster/handler/{fetch.rs:215, groups.rs:175,178,381,597,658,722,823, offsets.rs:96-707, metadata.rs:64,98, admin.rs:58,222}`
+- **Description:** Default `RUST_LOG=info` swallows them. Compliance-grade audit trail missing for every API except produce. Counters fire but per-event detail is unrecoverable.
+- **Fix:** Promote to `info!(target: "audit", ...)` consistently. Add a test asserting the audit target line appears for every `Denied`.
 
-* **Background tasks have no supervisor (Critical, C17).** See top. Add
-  `match handle.await { Err(panic) => abort/restart-and-log }` wrappers.
+#### O-3 — Cardinality bombs: many metrics use raw user-controlled labels
+- **Severity:** High
+- **Location:** `src/cluster/metrics.rs:1764` (`offset_commits_total{group, topic, status}`), `:1830` (`rebalance_duration_seconds{group}`), `:1842` (`partition_acquisition_duration_seconds{topic, status}`), `:1852` (`topic_partition_count{topic}`), `:2123` (`lease_too_short_total{topic, partition}`), `:2305,2320` (`producer_state_*{topic, partition}`)
+- **Description:** `bounded_topic_label` / `bounded_principal_label` / `bounded_partition_label` exist but only some call sites use them. A buggy or hostile client churning random group/topic IDs inflates Prometheus cardinality without bound.
+- **Impact:** Prometheus OOM; "metrics scrape times out, broker is fine, no visibility."
+- **Fix:** Wrap every user-controlled label site in the existing `bounded_*` helpers. Add a property test asserting total series count stays bounded after 100k random IDs.
 
-* **Failure detector counts missed heartbeats purely by wall time** with
-  no "monitor itself was paused" detector (`src/cluster/failure_detector.rs:264-287`).
-  A 3-second leader GC pause declares every broker dead with default
-  `heartbeat_interval=500ms, threshold=5`. Track the gap between
-  successive `check_brokers()` ticks and advance `last_heartbeat` for all
-  brokers by the gap.
+#### O-4 — `/health` `is_ready()` only checks zombie state
+- **Severity:** High
+- **Location:** `src/server/health.rs:167-178`
+- **Description:** Doesn't consult `is_object_store_healthy()`, doesn't check Raft state (am I a follower with no leader for >N seconds?). A broker that has lost the object store still answers `/ready 200`, so load balancers route produce traffic to a broker that can't durably persist.
+- **Fix:** AND in `metrics::is_object_store_healthy()`, an "in-quorum-with-leader" check, listener health. Add tests covering each new failure mode.
 
-* **`LoadSnapshot.is_stale` uses `SystemTime`; backwards NTP step
-  false-positives "fresh"; forwards step false-positives stale**
-  (`src/cluster/auto_balancer.rs:248-265`). Use `Instant` for monotonic age,
-  use Raft `index` for cross-process freshness.
+#### O-5 — Linearizability tests run against an in-process stub, not the real partition store
+- **Severity:** High
+- **Location:** `tests/linearizability_tests.rs:85-150`
+- **Description:** The "Jepsen-style" tests assert linearizability of `Arc<RwLock<BTreeMap>>` + `AtomicI64`, not of `cluster/partition_store.rs`. Real HWM / batch-index / SlateDB visibility races are uncovered.
+- **Fix:** Replace `TestPartitionStore` with a real `PartitionStore` over `InMemory` object store (the `e2e_slatedb_tests.rs` setup already shows the pattern). Or rename the file honestly.
 
-* **`record_fencing_detection_with_circuit_breaker` race on counter reset**
-  (`src/cluster/metrics.rs:532-624`). Gauge can mismatch counter under
-  concurrent fencing. Use compare-exchange or wrap in `Mutex<CircuitBreakerState>`.
+#### O-6 — Chaos tests are 100% `MockCoordinator`; no real Raft fault injection
+- **Severity:** High
+- **Location:** `tests/chaos_tests.rs:230-281`
+- **Description:** All 84 chaos scenarios use `MockCoordinator` with `Arc<RwLock>` shared state. Real Raft pathologies — leader stickiness during partition, log compaction races, snapshot-install during leader change — are uncovered.
+- **Fix:** Add at least one chaos scenario per failure mode against a real 3-node `RaftCoordinator` cluster (the harness in `raft_integration_tests.rs` already exists). Mark the mock chaos tests `mod mock_chaos`.
 
-* **Zombie-mode `try_exit` race with concurrent `enter`**
-  (`src/cluster/zombie_mode.rs:152-195`). Pack `(active: bool, generation: u64)`
-  into a single AtomicU64; CAS them together.
+#### O-7 — ACL bypass tests cover only 3 of ~15 API authz checks
+- **Severity:** High
+- **Location:** `tests/acl_enforcement_tests.rs`
+- **Description:** Covers produce, metadata, list_offsets. Missing: OffsetCommit, OffsetFetch, JoinGroup, SyncGroup, Heartbeat, FindCoordinator, DescribeGroups, DeleteGroups, CreateTopics, DeleteTopics, InitProducerId.
+- **Fix:** Add one negative test per API asserting both the wire error code AND that `record_acl_denial` was incremented.
 
-* **Auto-balancer always picks `underloaded.first()`** —
-  `src/cluster/auto_balancer.rs:586`. All `max_partitions_per_cycle` (5)
-  moves go to the same target; thundering herd until cooldown.
+#### O-8 — No test exercises a slow / failing object store (degraded mode)
+- **Severity:** High
+- **Location:** Production has explicit detection at `src/cluster/metrics.rs:2836` (`OBJECT_STORE_CONSECUTIVE_FAILURES`) but no test injects flaky behavior.
+- **Description:** Regression in object-store backoff (infinite retry holding write guards, OOM from queued batches) would pass CI.
+- **Fix:** Add a wrapping `ObjectStore` that injects per-call delays/errors; assert produce latency p99 stays bounded, `track_object_store_health(false)` is called, and `is_object_store_healthy()` flips.
 
-* **Rebalance batch chunk failures: no retry path** —
-  `src/cluster/rebalance_coordinator.rs:540-555`. Don't `clear_failed_broker`
-  on batch error; let the next tick retry.
+#### O-9 — Per-connection background tasks spawn without `.instrument(span)` — trace context lost
+- **Severity:** Medium
+- **Location:** `src/server/mod.rs:503`; `src/cluster/raft/coordinator/mod.rs:144,183`; `src/cluster/raft/auth.rs:749,769`
+- **Description:** `tokio::spawn(async move { ... })` for per-connection or background tasks doesn't `.instrument(span)`. With OTel enabled, traces show fragmented spans with no parent linkage.
+- **Fix:** `tokio::spawn(serve.instrument(info_span!("connection", client = %addr)))` everywhere.
 
-* **`RebalanceCoordinator::stop` doesn't await tasks** —
-  `src/cluster/rebalance_coordinator.rs:760-762`. Use
-  `tokio::sync::Notify` / `CancellationToken` so loops wake immediately.
+#### O-10 — Heavy reliance on `tokio::time::sleep` for synchronization (~90 sites; flake risk)
+- **Severity:** Medium
+- **Location:** `tests/raft_integration_tests.rs:1164-1809` (17+ `sleep(50ms)`); `tests/distributed_systems_tests.rs:1142,1153` (`sleep(1100ms)`); `tests/integration_tests.rs:355` (`sleep(50ms)` for server start).
+- **Description:** Loaded CI runners produce intermittent failures; chaos_tests.rs:711 already documents migrating one of these to a `oneshot`.
+- **Fix:** Replace with `wait_for(|| condition, timeout)` polling helper (already exists in `server_lifecycle_tests.rs:29`). Use mockable clocks for lease-expiry tests.
 
-* **`bin/kafkaesque.rs` shutdown drops `BrokerRuntimes` via Drop, blocking
-  silently up to 30s**. Call `BrokerRuntimes::shutdown()` explicitly with
-  a logged timeout.
+#### O-11 — Successful SASL PLAIN auth logs the username (PII)
+- **Severity:** Medium
+- **Location:** `src/cluster/sasl_provider.rs:286`
+- **Description:** Failed auth correctly redacts to a SHA-256 prefix; success logs raw username. Asymmetric. Some compliance regimes treat usernames as identifiers requiring access controls.
+- **Fix:** Symmetrize (also hash on success) or gate behind a config flag.
 
-* **OTLP exporter has no shutdown hook / timeout (Critical, C16)** — see top.
+#### O-12 — No consumer-lag metric updated from production paths
+- **Severity:** Medium
+- **Location:** `src/cluster/metrics.rs:2237` (`record_consumer_lag` exists; production callers grep returns the metrics module only).
+- **Description:** `CONSUMER_LAG{group, topic, partition}` is declared but always empty.
+- **Fix:** On every successful `OffsetCommit`, cross-reference `PARTITION_HIGH_WATERMARK` and call `record_consumer_lag` — one-line addition in `handler/offsets.rs`.
 
----
+#### O-13 — Topic delete leaves dead time series (no `forget_topic_metrics`)
+- **Severity:** Medium
+- **Location:** `src/cluster/metrics.rs:1900` (`forget_group_metrics` exists; no equivalent for topics)
+- **Description:** Per-topic labels stay in the registry forever after `DeleteTopics`.
+- **Fix:** Add `forget_topic_metrics(topic)` mirroring `forget_group_metrics`; call from the `DeleteTopics` path.
 
-### 6. Testing & Observability
+#### O-14 — Some Raft state metrics are declared but never updated from production
+- **Severity:** Medium
+- **Location:** `src/cluster/metrics.rs:2428-2490` (`RAFT_STATE`, `RAFT_TERM`, `RAFT_COMMIT_INDEX`, `RAFT_APPLIED_INDEX`, `RAFT_ELECTIONS`, `RAFT_SNAPSHOTS`, `RAFT_LOG_ENTRIES`)
+- **Description:** Helpers exist but several are unused in production. "Raft has lost quorum" / "Raft is stuck in candidate state" alerts cannot be authored.
+- **Fix:** Hook into the openraft `RaftMetrics` watch in `cluster/raft/node.rs`.
 
-#### 6.1 Critical missing tests
+#### O-15 — No fuzz coverage of stateful SCRAM (client_first + client_final transition)
+- **Severity:** High
+- **Location:** Only `fuzz/fuzz_targets/scram_client_first.rs`; `src/cluster/scram.rs:1-501` has no logging.
+- **Description:** Pre-auth SCRAM is the auth boundary. A panic or auth bypass in the second SCRAM step would slip past CI.
+- **Fix:** Add a stateful fuzz target driving `client_first → client_final` with attacker bytes for both steps.
 
-* **No in-flight produce-during-leader-failover test (Critical).** No test
-  asserts "every `acks=all` response that returned OK is durable on the
-  new leader". This is the most likely place data loss appears in practice.
+#### O-16 — Many "tests" only check Default/Debug/Clone — no contract assertion
+- **Severity:** Medium
+- **Location:** `tests/admin_response_tests.rs:14-118`; `tests/extended_group_tests.rs:16-300+`; `tests/metrics_tests.rs:60-118`
+- **Description:** `metrics_tests.rs:62-66` calls `record_request` three times and asserts nothing about the recorded values. Coverage looks good; behavior coverage is poor.
+- **Fix:** For metric tests, assert `REQUEST_COUNT.with_label_values(...).get() == 1`. Drop derive-tests for Debug/Clone.
 
-* **No object-store transient-error retry integration test (Critical).**
-  `FailingPutStore` is wired to Raft-snapshot install only — no test
-  asserts the data plane retries `slatedb` writes on flapping S3.
+#### O-17 — No edge-case tests for max-size message, max partitions, max fetch response
+- **Severity:** Medium
+- **Location:** `tests/edge_case_tests.rs` (691 lines covers small edges only).
+- **Description:** No test pushes message size to `max_message_size` boundary, partition count to max, fetch response to `max_bytes` boundary.
+- **Fix:** Add boundary tests asserting success at `cap` and `InvalidRequest` at `cap+1`.
 
-* **No log-compaction tests; unclear if compaction is implemented** —
-  document the gap or add the feature with concurrent-writer tests.
+#### O-18 — No metric for `REQUEST_DURATION` by status — slow errors poison success p99
+- **Severity:** Medium
+- **Location:** `src/cluster/metrics.rs:114-138`
+- **Description:** `REQUEST_DURATION{api}` lacks a `status` label.
+- **Fix:** Add `status` (cardinality ×2). Graph error vs success p99 separately.
 
-* **No boot-from-empty vs boot-from-snapshot equivalence property test**
-  — adds confidence that no domain is silently excluded from snapshot
-  serialization (a real risk given `HashMap` non-determinism).
-
-* **SCRAM second-attempt-with-wrong-password not covered at session/handler
-  level** (`src/cluster/sasl_provider.rs:674`). Add: client_first → wrong
-  client_final → state cleared → second client_first on same socket
-  succeeds with correct creds.
-
-#### 6.2 Property and loom test weakness
-
-* **Loom tests use only `Ordering::SeqCst`** — guarantees the tests pass
-  but won't catch bugs production code might have if it ever uses
-  `Relaxed`/`Acquire`/`Release`. Mirror production orderings.
-  `test_zombie_mode_double_check` has comment-only invariants — promote
-  to `assert!`.
-
-* **Property test ranges too small** — `0..32` cmds with 256 cases barely
-  visits states with >4 brokers × >5 topics. Bump to `0..256` cmds with
-  1024 cases, plus a soft runtime cap.
-
-#### 6.3 Test hygiene
-
-* **~50 `tokio::time::sleep(50ms)` calls drive flaky CI** — replace with
-  `assert_eventually(predicate, deadline)` and `wait_for_leader` test
-  harness API.
-
-* **Fuzz corpus growth never minimized** — `scripts/fuzz-all.sh` doesn't
-  run `cargo fuzz cmin`; api_create_topics has 176 corpus files at 17.9 KB.
-  Add `fuzz.log` to `.gitignore`.
-
-* **Fuzz target gaps:** ACL bootstrap-file parser
-  (`KAFKAESQUE_ACL_BOOTSTRAP_FILE`), TLS handshake, frame writer,
-  ApiVersions parse.
-
-* **Tests use real ports via `PORT_COUNTER`** — port reuse across runs
-  is possible.
-
-* **`info!` log on partition-store hot path** at six locations — flood
-  log aggregators at scale.
-
-#### 6.4 Observability gaps
-
-* **No trace-context propagation across Raft messages**
-  (`src/cluster/raft/network.rs`). One client request that traverses
-  leader → followers becomes 3+ disjoint traces in Jaeger. Add
-  `trace_context: Option<Vec<u8>>` to `RaftRpcMessage`; inject/extract
-  via the W3C TraceContext propagator.
-
-* **`requests_total` only labels `success`/`error`**
-  (`src/cluster/metrics.rs:113-118`). Cannot answer "what fraction of
-  Produce returns `NOT_LEADER_FOR_PARTITION` vs `OUT_OF_ORDER_SEQUENCE`".
-  Add `error_code` label (cardinality bounded by ~80 codes × ~25 APIs).
-
-* **`request_duration_seconds` histogram starts at 1 ms**
-  (`src/cluster/metrics.rs:124-126`) — well-tuned p99 produce is in the
-  200–800 µs range. Add sub-ms buckets.
-
-* **Cardinality bombs** — `EPOCH_MISMATCH_DETECTIONS`, `HWM_RECOVERY_EVENTS`,
-  `BATCH_INDEX_SIZE`, `BATCH_INDEX_EVICTIONS`, `RETENTION_DELETED_BATCHES`
-  all use `&["topic", "partition"]` labels with no
-  `bounded_topic_label`/`bounded_partition_label` guard
-  (`src/cluster/metrics.rs:316, 715, 869, 879, 898`). Topics × partitions
-  blow past `MAX_METRIC_CARDINALITY` (10 000).
-
-* **`BROKER_LOAD` and `BROKER_PARTITION_COUNT` gauges leak on broker
-  removal** — no `forget_broker_metrics` analog
-  (`src/cluster/metrics.rs:961-980, 1056-1067`). Stale series after
-  cluster shrink.
-
-* **Errors not recorded on spans** — `record_error!` macro exists at
-  `src/cluster/observability.rs:275-291` but call density on error paths
-  is low. Auto-deduced trace error rate is wrong.
-
-* **No shipped dashboards/alerts/runbooks** — `metrics.rs` peppers
-  `// ALERT when …` comments but no `dashboards/grafana-*.json` or
-  `alerts/prometheus-rules.yml`.
-
-* **`SlateDBError` stringification (cf. §3.6)** also breaks
-  `is_fenced()` once upstream wording changes — observability of
-  fencing then silently drops to zero.
-
-#### 6.5 Repo hygiene
-
-* **`fuzz.log` (47 KB) untracked in repo root** — add to `.gitignore`.
-
-* **Inline `mod tests` in giant production files** masks real LOC and
-  slows recompile. Promote to sibling `*_tests.rs` consistently with
-  the `partition_store_tests.rs` pattern.
+#### O-19 — No flexible-encoding fuzz seeded into per-API parsers
+- **Severity:** Medium
+- **Location:** `fuzz/fuzz_targets/parser_primitives.rs`, `flexible_encoding.rs`; per-API targets pick `version` uniformly but corpora aren't seeded with flexible-encoded payloads.
+- **Fix:** Seed per-API fuzz corpora with valid flexible-encoded requests (the differential `tests/wire_differential.rs` knows how to emit them).
 
 ---
 
 ## Quick Wins (high impact, low effort)
 
-These are surgical fixes — most are 1–20 lines — with disproportionate value.
+These are 1-line to 1-day fixes with disproportionate impact.
 
-1. **Constant-time bearer-token compare** for `/metrics`
-   (`src/server/health.rs:302`) — change `==` to `subtle::ConstantTimeEq`. **5 min.**
-
-2. **Tighten production posture gate**
-   (`src/cluster/config.rs:1816-1826`) — require both
-   `sasl_required==true` *and* `acl_enabled==true` (or just `sasl_required`)
-   for non-development profiles. **15 min.**
-
-3. **Fix idempotent-producer ACL gap** in produce path
-   (`src/cluster/handler/produce.rs:80-110`) — gate on
-   `authorize_cluster_api(InitProducerId)` when
-   `parse_producer_info(records).is_idempotent()`. **30 min.**
-
-4. **Validate `committed_offset` against `[log_start, hwm]` in
-   `OffsetCommit`** (`src/cluster/handler/offsets.rs:382-435`). **45 min.**
-
-5. **Validate `session_timeout_ms`/`rebalance_timeout_ms` bounds in
-   `JoinGroup`** (`src/cluster/handler/groups.rs:255-265`). **15 min.**
-
-6. **Cap `max_wait_ms` in fetch handler**
-   (`src/cluster/handler/fetch.rs:66-72`). **10 min.**
-
-7. **Use `e.to_kafka_code()` in `init_producer_id` and `produce_to_partition`
-   error paths** instead of collapsing to `Unknown`/`NotLeaderForPartition`
-   (`src/cluster/handler/producer_id.rs:78-87`,
-   `src/cluster/handler/mod.rs:710-726`). **30 min.**
-
-8. **Use `RequestTimedOut` instead of `InvalidRequest` for handler
-   timeouts** (`src/server/connection.rs:339-352`). **5 min.**
-
-9. **`Heartbeat` monotonicity:** `last_heartbeat_ms.max(timestamp_ms)`
-   (`src/cluster/raft/domains/broker.rs:119-132`). **5 min.**
-
-10. **Replace `unwrap()` on `partial_cmp` with `unwrap_or(Equal)` or
-    `total_cmp`** (`src/cluster/auto_balancer.rs:467, 500-505, 608`). **5 min.**
-
-11. **`current_time_ms()` `.unwrap_or_default()`**
-    (`src/cluster/raft/coordinator/mod.rs:331-336`). **5 min.**
-
-12. **Swap `HashMap` → `BTreeMap` in domain state structs** for
-    deterministic snapshot bytes. **2–3 hours; high value.**
-
-13. **Verify HMAC before populating replay cache**
-    (`src/cluster/raft/auth.rs:395-421`). **30 min.**
-
-14. **Make `RaftAuthKeys::default()` deny rather than permit**, gate
-    the unauthenticated branch on an explicit `unauthenticated_ok: bool`
-    field set only in dev/tests (`src/cluster/raft/auth.rs:372-381`). **1 hour.**
-
-15. **Leader-gate `rebalance_loop` and `metrics_reset_loop`**
-    (`src/cluster/rebalance_coordinator.rs:810-820`) — wrap loop body in
-    `if executor.should_initiate_failover().await { … }`. **15 min.**
-
-16. **Add `error_code` label to `requests_total`**
-    (`src/cluster/metrics.rs:113-118`). **30 min.**
-
-17. **Sub-ms latency buckets** in `request_duration_seconds`
-    (`src/cluster/metrics.rs:124-126`). **5 min.**
-
-18. **`fuzz.log` in `.gitignore`**. **30 seconds.**
-
-19. **`store.close()` before `coordinator.release_partition` in
-    zombie-mode entry** (`src/cluster/partition_manager.rs:445-454`).
-    **20 min.** *(High blast radius — exercise care.)*
-
-20. **Wrap spawned background tasks in a panic-logging supervisor**
-    (`src/cluster/rebalance_coordinator.rs:719-757`,
-    `src/bin/kafkaesque.rs:222-224`). **1 hour.**
-
-21. **Reject `partition < 0` at the top of `ensure_partition`**
-    (`src/cluster/partition_manager.rs:948-1037`). **5 min.**
-
-22. **Remove the trivial constructor tests at the bottom of
-    `cluster/handler/mod.rs`** (~450 LOC). **15 min.**
-
-23. **Delete `handler_traits.rs`** (sub-traits unused outside their own
-    test). **30 min.**
-
-24. **Add `handle_list_offsets` zombie-mode short-circuit**
-    (`src/cluster/handler/offsets.rs:27-143`). **15 min.**
-
-25. **Strip cleartext password from `UserRecord` when PLAIN is disabled**;
-    wrap in `Zeroizing<String>` otherwise
-    (`src/cluster/sasl_provider.rs:48-51`). **1 hour.**
+| Fix | Effort | Impact | Reference |
+|-----|--------|--------|-----------|
+| Wire typed Kafka error codes through `record_request_with_code` | 1 hour | Unblocks per-error-code SRE alerting; fixes broken metric contract | O-1 |
+| Promote ACL denials from `debug!` to `info!(target: "audit", ...)` in 12 sites | 30 minutes | Compliance audit trail at default log level | O-2 |
+| Add `stream.set_nodelay(true)` after each client `accept()` | 5 minutes | Up to 40 ms tail-latency reduction for small responses | P-10 |
+| Change `validate_batch_crc_async` signature from `&[u8]` to `&Bytes` | 30 minutes | Eliminates a full-payload memcpy per >64 KiB produce | P-9 |
+| Replace `cached_topic_name` `get_with` → `get`-then-insert | 15 minutes | Eliminates ~100+ String allocs per multi-partition request | P-3 |
+| Replace per-call `RwLock<Option<Arc<LoadMetricsCollector>>>` with `ArcSwapOption` | 1 hour | Removes one async lock per append/fetch | P-5 |
+| Reject `read_kafka_frame` `size < 8` early | 5 minutes | Cheap pre-allocation rejection | C-13 |
+| Add `forget_topic_metrics` and call from DeleteTopics path | 30 minutes | Prevents Prometheus cardinality leak on topic churn | O-13 |
+| Wire `record_consumer_lag` from `handle_offset_commit` | 30 minutes | Enables canonical "consumer lag" alert | O-12 |
+| Wrap user-controlled topic/group label sites in `bounded_*_label` helpers | 2 hours | Prevents Prometheus OOM from cardinality bombs | O-3 |
+| Cap SASL `auth_bytes` to 64 KiB at parse time | 5 minutes | Closes pre-auth DoS amplifier | C-6 |
+| Bound JoinGroup metadata at parse time using `MAX_MEMBER_METADATA_SIZE` | 15 minutes | Closes authenticated DoS | C-5 |
+| Return real timestamp in `ListOffsets` response when `ts >= 0` | 1 hour | Fixes `KafkaConsumer.offsetsForTimes()` for affected clients | C-2 |
+| Add `flush`/`shutdown` to handler-timeout error path | 5 minutes | Clients see typed `RequestTimedOut` instead of TCP RST | C-7 |
+| Move CRC validation above `get_for_write` on `acks>=1` path | 30 minutes | Removes Raft-load DoS amplifier on corrupt batches | C-4 |
+| Replace `partition.to_string()` in metric labels with stack-buffer formatting (`itoa`) | 1 hour | Eliminates per-request String alloc in metrics path | P-13 |
 
 ---
 
 ## Long-Term Recommendations
 
-### LR1. Establish replicated-state-machine hygiene as a hard invariant
+### Reliability hardening (1-3 months)
 
-* Forbid `HashMap`/`HashSet` in any type that is part of `apply_command`
-  output or snapshot — enforce via clippy lint and code review.
-* Adopt a snapshot-fingerprinting test: two replicas applying the same
-  command sequence must produce byte-identical snapshots. Add to CI.
-* Bind `last_applied_log` and `apply_command` under one write guard;
-  add a property test that checks "snapshot's `last_log_id` ⇔ all entries
-  ≤ that index visible in `state`".
+1. **Cancellation-safety review across all `await`s in mutating code.** The pattern of "lock a partition mutex, then `await` SlateDB" appears in multiple places (R-2, R-3, R-7, R-11). Treat every such await as a potential cancellation point that must leave invariants intact. The simplest mechanical fix is to wrap critical sequences in `tokio::spawn` + `JoinHandle::await` so the inner future is uncancellable.
 
-### LR2. Make leader-gating an architectural primitive
+2. **Replace the cached Raft RPC connection (R-1) with either short-lived connections or a properly committed pool.** This is the highest-leverage Raft correctness fix in the codebase. Until done, all subsequent Raft work is built on a foundation that can desynchronize under load.
 
-* Introduce `LeaderOnlyTask` newtype that takes a closure and an
-  `is_leader` callback. Convert `rebalance_loop`, `metrics_reset_loop`,
-  retention sweep (currently per-broker), and any future scheduled work
-  to use it. Reject reviews that spawn unguarded `loop` tasks doing
-  state-changing work.
+3. **Switch lease and ownership checks from `current_time_ms()` to the replicated `lease_clock_ms` (R-4).** The lease_clock is already replicated — using local wall clock for any check is a latent split-brain trigger.
 
-### LR3. Promote auth posture from configuration discipline to type-safe construction
+4. **Make all Raft state-machine commands idempotent at the apply layer (R-14, R-3).** Producer-id allocation and any non-monotonic command must carry a client-supplied operation ID and dedup at apply time.
 
-* Make the unauthenticated `RaftAuthKeys` variant impossible to construct
-  outside an explicit `dev_only_unauthenticated()` factory.
-* Enforce `User:*` ACL bindings to require an authenticated principal
-  — pass an `authenticated: bool` through `AuthorizeRequest` and reject
-  the wildcard match against `User:ANONYMOUS`.
-* Surface the mTLS subject as the authenticated principal when no SASL
-  layer is required; provide an `ssl.principal.mapping.rules`-equivalent
-  config knob.
-* Rotate to OWASP-floor PBKDF2 iterations and expose the knob; keep the
-  4096 default available only behind an explicit "kafka-1.x compatibility"
-  flag.
+5. **Replicate the rebalance coordinator's pending-failover set (R-5)** — or seed it from the failure detector on leader takeover. As-is, leader transitions during a failover storm strand partitions.
 
-### LR4. Decompose the four "god" files
+### Architecture & code-quality (3-6 months)
 
-* Split `cluster/error.rs`, `cluster/metrics.rs`, `cluster/config.rs`,
-  `cluster/handler/mod.rs` per the recommendations in §3.1. Most of the
-  work is mechanical and isolated; the shrunken files are easier to
-  re-architect afterward.
-* Decide on the `Handler`/`HandlerTraits` and `PartitionCoordinator`
-  abstractions — pick one, delete the other. Both abstractions are paid
-  for in lockstep maintenance and not actually used for substitution.
+6. **Decouple `server` from `cluster` (A-1).** Introduce a thin `ServerMetrics` trait and an explicit `infra/` for cross-cutting modules. The advertised "embeddable Kafka protocol library" must actually compile without the cluster stack.
 
-### LR5. Replace string-pattern fencing detection with typed errors
+7. **Unify TLS and plain server/connection paths (A-2).** Generic over the stream type with two acceptor impls; net deletion ~600 lines and elimination of a bug-drift surface.
 
-* Wrap `slatedb::Error`, `openraft::error::*`, and `object_store::Error`
-  variants directly in `SlateDBError` (use `#[from]`). The existing
-  pattern-matching at `error.rs:531-566` becomes structural and survives
-  upstream refactors.
+8. **Split `ClusterConfig` and `metrics.rs` into themed modules (A-3, A-4).** These two files alone are ~7,000 lines that block every change to a metric or a config knob. Replace `from_env` with a serde-driven loader.
 
-### LR6. Observability for SREs, not for developers
+9. **Replace `MockCoordinator` with a real-state-machine harness (A-7).** The 2,400-line parallel implementation has already drifted; the maintenance ratio is permanently negative. The real `apply()` functions in `cluster/raft/domains/*` are ~150 lines away from being usable as a single-node test backend.
 
-* Add `error_code` label to `requests_total`; sub-ms histogram buckets;
-  per-broker forget hooks; route every per-partition counter through
-  `bounded_partition_label`.
-* Ship `dashboards/grafana-*.json`, `alerts/prometheus-rules.yml`, and
-  `RUNBOOK.md` mapping each `// ALERT when …` comment in `metrics.rs` to
-  an alert and a runbook entry.
-* Add W3C trace-context to `RaftRpcMessage` envelope so a client request
-  can be followed across the leader and the followers in Jaeger.
-* Audit every `instrument`-decorated `Result`-returning function and add
-  `record_error!` on `Err` branches.
+10. **Pick one of `Handler` and `handler_traits.rs` and delete the other (A-6).** Both compile, only one is used in production, and the doc-comment recommends the dead path.
 
-### LR7. Lift the test bar to durability and failover claims
+11. **Extract background tasks from `partition_manager.rs` into per-task modules (A-5).** The six concurrent loops are the single biggest source of "where does this Arc come from" navigation pain.
 
-* Add the in-flight-produce-during-leader-failover test (top item).
-* Reuse `FailingPutStore` against `slatedb` writes through `PartitionStore`
-  to validate the retry framework.
-* Add `boot_from_snapshot ≡ replay_from_log` property test.
-* Replace `tokio::time::sleep(_)` with `assert_eventually` helpers.
-* Switch `MockCoordinator`-based integration tests to single-node
-  `RaftCoordinator` over an in-memory transport — kill the 2381 LOC of
-  parallel-but-divergent semantics.
+### Observability (1 month)
 
-### LR8. Decide on log compaction
+12. **Establish a metrics contract test.** Assert `REQUEST_COUNT` carries non-`NONE` `error_code` values; assert `bounded_*_label` is invoked at every user-controlled label site; assert `forget_topic_metrics` is called from `DeleteTopics`. This single test regression-locks O-1, O-3, O-13.
 
-* Either ship `cleanup.policy=compact` with a concurrent-writer test, or
-  document the gap and reflect it in the advertised API surface.
+13. **Extend `/ready` to include object-store and Raft health (O-4).** Health-check coverage is the dominant cause of "load balancer routes to bad node" incidents.
 
-### LR9. Reorganize tests out of giant files; align with project pattern
+14. **Wire OTel trace propagation through `tokio::spawn` (O-9).** Every long-running task should `.instrument(span)`; otherwise distributed traces fragment at every spawn boundary.
 
-* Move inline `#[cfg(test)] mod tests` to sibling `*_tests.rs` for
-  `error.rs`, `metrics.rs`, `config.rs`, `handler/mod.rs` — already the
-  pattern in `partition_store_tests.rs`.
-* Result: real source LOC drops to roughly half of the apparent number,
-  CI compile times improve, and review focus stays on production logic.
+15. **Migrate sleep-based test sync to polling (O-10).** A `wait_for(|| cond, timeout)` helper already exists; mechanical replacement reduces CI flake.
+
+### Testing (2-3 months)
+
+16. **Replace stub-based linearizability/chaos tests with real-component tests (O-5, O-6).** The harness already exists in `raft_integration_tests.rs` and `e2e_slatedb_tests.rs`. The promised guarantees are weaker than file names imply.
+
+17. **Round out ACL coverage to all 15 API authz surfaces (O-7).** One negative test per API. Without these, an authorize-call regression on any single API ships green.
+
+18. **Add a flaky-object-store test harness (O-8).** Wrap `ObjectStore` with a fault injector parameterized by per-call delay and error rate. Use it to verify produce backpressure, `/ready` flipping, and metric updates.
+
+19. **Add stateful SCRAM fuzzing (O-15).** Pre-auth state machines are the highest-priority fuzz targets.
+
+### Performance (2-3 months)
+
+20. **Implement vectored fetch response writes (P-1).** Single largest CPU + memory bandwidth win in the hot path. Touches `Response::encode_with_size` and the connection write-frame.
+
+21. **Refactor partition-store write critical section (P-2).** Pre-fetch validation outside the mutex; cache leader epoch as `AtomicI32`. Required to lift `acks=1` per-partition throughput beyond object-store latency.
+
+22. **Add bulk `coordinator::get_topic_owners` and use it in metadata path (P-6, P-17).** Reduces metadata-refresh latency from O(N partitions) to O(1) Raft reads.
+
+23. **Flatten produce/fetch concurrency over `(topic, partition)` pairs (P-8).** Multi-topic clients (Streams, Connect) see the largest improvement.
+
+24. **Remove per-request `Arc<str>` / `String` / `UUID` allocations (P-3, P-4, P-11, P-12).** Borrow-friendly `RequestContext`; borrowable `PartitionKey`. ~5-10 fewer allocations per request.
 
 ---
 
-## Closing assessment
+## Appendix: Audit methodology
 
-The codebase is meaningfully more rigorous than typical for a project of
-this scope: fuzz coverage is broad, fail-closed posture is the default,
-fencing detection has a circuit-breaker, the lease/epoch design has been
-thought through. The Critical findings are mostly "correctness on the
-unhappy path" — which is exactly where Kafka-compatible brokers earn or
-lose their reputation. With the **Top 17 critical items** addressed plus
-the 25 quick wins, kafkaesque is a credible candidate for production
-workloads inside an organization. The Long-Term Recommendations are
-investments to take it from "credible" to "boring" — the highest praise
-for a database/broker system.
+Five parallel audit agents ran against the live source tree, each tasked with one category:
 
+| Agent | Files most-read | Findings |
+|-------|-----------------|----------|
+| Correctness & bugs | `src/parser.rs`, `src/protocol.rs`, `src/server/{request,response}/*`, `src/cluster/handler/*`, `src/cluster/partition_store.rs`, `src/cluster/raft/auth.rs` | C-1 to C-14 |
+| Performance | `src/cluster/handler/{produce,fetch}.rs`, `src/cluster/partition_store.rs`, `src/cluster/partition_manager.rs`, `src/server/connection.rs`, `src/server/response/*`, `src/cluster/metrics.rs` | P-1 to P-17 |
+| Architecture & quality | `src/lib.rs`, `src/cluster/{traits,config,metrics,mock_coordinator}.rs`, `src/server/{handler,handler_traits}.rs`, `src/cluster/raft/storage.rs` | A-1 to A-15 |
+| Concurrency & reliability | `src/cluster/raft/{network,storage,state_machine}.rs`, `src/cluster/{partition_store,partition_manager,zombie_mode,rebalance_coordinator,failure_detector}.rs`, `src/server/connection.rs` | R-1 to R-16 |
+| Testing & observability | `tests/*` (51 files), `fuzz/fuzz_targets/*`, `src/cluster/metrics.rs`, `src/cluster/observability.rs`, `src/server/health.rs`, all handler `src/cluster/handler/*` for ACL log-level inspection | O-1 to O-19 |
+
+All file:line references in this report were verified against the source at audit time. Findings withdrawn during agent verification (where the alleged issue was guarded elsewhere) are not included.

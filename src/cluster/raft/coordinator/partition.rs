@@ -277,12 +277,21 @@ impl PartitionCoordinator for RaftCoordinator {
         let state = state_machine.read().await;
         let inner_state = state.state().await;
 
+        // Use the *replicated* lease clock (`inner_state.lease_clock_ms`)
+        // rather than the local wall clock. Local `SystemTime::now()` skew
+        // would make this broker disagree with the rest of the cluster about
+        // whether a lease has expired — a forward-skewed clock declares the
+        // lease dead and routes elsewhere while the cluster (and the actual
+        // owner) still consider it alive; reverse skew lets us serve stale
+        // reads from a partition that was already re-leased elsewhere. The
+        // replicated clock is monotonic and identical on every replica.
+        let now_ms = inner_state.lease_clock_ms;
         let owner = inner_state
             .partition_domain
             .partitions
             .get(&(Arc::from(topic), partition))
             .and_then(|p| {
-                if p.lease_expires_at_ms > current_time_ms() {
+                if p.lease_expires_at_ms > now_ms {
                     p.owner_broker_id
                 } else {
                     None
@@ -312,13 +321,15 @@ impl PartitionCoordinator for RaftCoordinator {
         let state = state_machine.read().await;
         let inner_state = state.state().await;
 
+        // See `get_partition_owner` above for why we use the replicated
+        // `lease_clock_ms` rather than `current_time_ms()`.
+        let now_ms = inner_state.lease_clock_ms;
         let owns = inner_state
             .partition_domain
             .partitions
             .get(&(Arc::from(topic), partition))
             .map(|p| {
-                p.owner_broker_id == Some(self.broker_id)
-                    && p.lease_expires_at_ms > current_time_ms()
+                p.owner_broker_id == Some(self.broker_id) && p.lease_expires_at_ms > now_ms
             })
             .unwrap_or(false);
 
@@ -565,7 +576,9 @@ impl PartitionCoordinator for RaftCoordinator {
             None => return Ok(Vec::new()),
         };
 
-        let now = current_time_ms();
+        // Use the replicated lease clock for ownership gating, see
+        // `get_partition_owner` for the rationale.
+        let now = inner_state.lease_clock_ms;
         let mut owners = Vec::new();
         for partition in 0..topic_state.partition_count {
             let owner = inner_state

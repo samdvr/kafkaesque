@@ -1488,35 +1488,39 @@ mod tests {
         }
     }
 
-    /// Test that epoch 0 (disabled fencing) allows any writes.
+    /// Test that opening with `leader_epoch(0)` self-claims a floor epoch of 1.
     ///
-    /// When leader_epoch is 0, epoch validation is disabled for backwards
-    /// compatibility with coordinators that don't track epochs.
+    /// Historically `leader_epoch(0)` disabled fencing entirely (no per-write
+    /// validation), which left legacy / mock-coordinator partitions vulnerable
+    /// to TOCTOU. The store now treats `leader_epoch(0)` on a fresh partition
+    /// as a request to self-claim epoch 1, so the per-write fencing check is
+    /// always armed. Re-opens of an already-claimed partition fall through to
+    /// the persisted epoch.
     #[tokio::test]
-    async fn test_epoch_zero_disables_fencing() {
+    async fn test_epoch_zero_self_claims_floor_epoch() {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
 
-        // Open with epoch 0 (fencing disabled)
+        // Open with epoch 0 on a fresh partition: should self-claim epoch 1.
         let store = PartitionStore::builder()
             .object_store(object_store.clone())
             .base_path("test")
             .topic("epoch-zero-test")
             .partition(0)
-            .leader_epoch(0) // Epoch 0 = fencing disabled
+            .leader_epoch(0)
             .build()
             .await
             .expect("Failed to open store");
 
-        // Writes should succeed
+        // Writes should succeed against the self-claimed epoch
         let batch = create_non_idempotent_batch(5);
         store
             .append_batch(&batch)
             .await
-            .expect("Write with epoch 0 should succeed");
+            .expect("Write against self-claimed epoch should succeed");
 
         store.close().await.expect("Failed to close");
 
-        // Reopen with epoch 0 - should still work (no stored epoch to conflict)
+        // Reopen with epoch 0: stored epoch is now 1, opens fine.
         let store2 = PartitionStore::builder()
             .object_store(object_store.clone())
             .base_path("test")

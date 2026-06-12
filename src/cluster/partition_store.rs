@@ -125,6 +125,17 @@ pub struct PartitionStore {
     /// Cached high watermark (also persisted in DB).
     high_watermark: AtomicI64,
 
+    /// Next offset to allocate for an in-flight write.
+    ///
+    /// Always >= `high_watermark`. The split exists for cancellation safety
+    /// (audit R-2): writers `fetch_add` here BEFORE the SlateDB write so a
+    /// cancelled future cannot lead the next caller to reuse the same
+    /// `base_offset`. `high_watermark` (the reader-visible bound) only
+    /// advances after a successful durable write, so consumers never see
+    /// uncommitted offsets — the worst case from a cancelled write is a gap
+    /// in the offset range, recoverable by the producer's retry.
+    next_offset: AtomicI64,
+
     /// Cached log start offset (also persisted under `_lso`).
     ///
     /// Starts at 0 and only advances when retention deletes a log prefix.
@@ -189,6 +200,15 @@ pub struct PartitionStore {
     /// Value of 0 indicates epoch validation is disabled (for backwards compat
     /// or mock coordinators that don't track epochs).
     leader_epoch: i32,
+
+    /// Guards the underlying `Db::close()` call so concurrent `close()` callers
+    /// (release_partition, zombie-entry, lease-loss, shutdown — all of which
+    /// can race) don't double-close SlateDB and panic in compaction.
+    ///
+    /// `OnceCell` semantics: the first caller runs the close and sets the
+    /// result; later callers see the cell is initialized and return immediately
+    /// without re-entering SlateDB.
+    close_once: tokio::sync::OnceCell<()>,
 }
 
 impl PartitionStore {
@@ -491,9 +511,9 @@ impl PartitionStore {
             }
         }
 
-        let base_offset = self.high_watermark.load(Ordering::SeqCst);
-
-        // Reject invalid record counts to prevent offset corruption
+        // Reject invalid record counts BEFORE we reserve any offsets — a
+        // bumped `next_offset` followed by an early-return would create a
+        // permanent offset gap for a request that was always going to fail.
         let record_count = parse_record_count(records);
         if record_count <= 0 {
             error!(
@@ -503,10 +523,29 @@ impl PartitionStore {
                 "Rejecting batch with invalid record count"
             );
             return Err(SlateDBError::Config(format!(
-                "Invalid record count {} in batch for {}/{}",
-                record_count, self.topic, self.partition
+                "Invalid record count: {}",
+                record_count
             )));
         }
+
+        // RESERVE the offset range for this batch BEFORE the SlateDB await.
+        //
+        // Cancellation safety (audit R-2): if we read the offset from
+        // `high_watermark` and *then* awaited the SlateDB write, a cancelled
+        // future would leave `high_watermark` unchanged and the next caller
+        // would reuse the same `base_offset`. SlateDB's queued cancelled
+        // write may still eventually persist at that offset — clobbered by
+        // the second caller's batch at the same key.
+        //
+        // Bumping `next_offset` here makes that impossible: every caller
+        // gets a unique offset range, even across cancellation. The reader-
+        // visible `high_watermark` only advances on a successful durable
+        // write below, so consumers never see uncommitted offsets — the
+        // failure mode degrades to a gap in the offset range, which the
+        // producer recovers from by retrying (idempotent producers de-dup
+        // by sequence number; non-idempotent producers accept Kafka's
+        // standard "may duplicate on error" contract).
+        let base_offset = self.next_offset.fetch_add(record_count as i64, Ordering::SeqCst);
 
         // Parse producer info once; reused by both the idempotency check here
         // and the producer-state persistence below (previously parsed twice
@@ -544,6 +583,8 @@ impl PartitionStore {
                     "Rejecting batch from fenced producer (stale epoch)"
                 );
                 super::metrics::record_idempotency_rejection("fenced_epoch");
+                // Roll back the reservation; no SlateDB write happened.
+                self.next_offset.store(base_offset, Ordering::SeqCst);
                 return Err(SlateDBError::FencedProducer {
                     producer_id: producer_info.producer_id,
                     expected_epoch: state.producer_epoch,
@@ -567,6 +608,7 @@ impl PartitionStore {
                         "Rejecting batch on epoch bump: first_sequence must be 0"
                     );
                     super::metrics::record_idempotency_rejection("out_of_order");
+                    self.next_offset.store(base_offset, Ordering::SeqCst);
                     return Err(SlateDBError::OutOfOrderSequence {
                         producer_id: producer_info.producer_id,
                         expected_sequence: 0,
@@ -594,6 +636,7 @@ impl PartitionStore {
                             last_sequence = state.last_sequence,
                             "Sequence number overflow detected"
                         );
+                        self.next_offset.store(base_offset, Ordering::SeqCst);
                         return Err(SlateDBError::SequenceOverflow {
                             producer_id: producer_info.producer_id,
                             topic: self.topic.clone(),
@@ -630,6 +673,9 @@ impl PartitionStore {
                             "Rejecting duplicate batch (no cached offset for retry)"
                         );
                         super::metrics::record_idempotency_rejection("duplicate");
+                        // Roll back our reservation — no SlateDB write
+                        // happened, no offset gap should remain.
+                        self.next_offset.store(base_offset, Ordering::SeqCst);
                         return Err(SlateDBError::DuplicateSequence {
                             producer_id: producer_info.producer_id,
                             expected_sequence: expected_seq,
@@ -648,6 +694,8 @@ impl PartitionStore {
                         "Rejecting out-of-order batch"
                     );
                     super::metrics::record_idempotency_rejection("out_of_order");
+                    // Roll back the reservation — no SlateDB write happened.
+                    self.next_offset.store(base_offset, Ordering::SeqCst);
                     return Err(SlateDBError::OutOfOrderSequence {
                         producer_id: producer_info.producer_id,
                         expected_sequence: expected_seq,
@@ -660,7 +708,12 @@ impl PartitionStore {
         // If this turned out to be a duplicate retry of the most recent batch,
         // return the cached base_offset without writing again. The records are
         // already durable from the first append.
+        //
+        // Roll back our `next_offset` reservation: we're not writing, so the
+        // offsets we reserved should be returned to the pool. Safe under the
+        // write_lock because no other writer can have advanced past us.
         if let Some(cached_offset) = idempotent_dup_offset {
+            self.next_offset.store(base_offset, Ordering::SeqCst);
             return Ok(cached_offset);
         }
 
@@ -1234,12 +1287,14 @@ impl PartitionStore {
     /// batch granularity — the same granularity Kafka's sparse time index
     /// provides before its final linear scan).
     ///
-    /// Returns `Ok(None)` when no such batch exists (all data is older than
-    /// the target), in which case Kafka reports offset -1.
+    /// Returns `Ok(Some((offset, max_timestamp)))` for a hit so the caller can
+    /// populate the `timestamp` field of `ListOffsets` v1+ responses (required
+    /// by `KafkaConsumer.offsetsForTimes()`), or `Ok(None)` when no such batch
+    /// exists (Kafka reports offset -1 in that case).
     pub async fn offset_for_timestamp(
         &self,
         target_timestamp_ms: i64,
-    ) -> SlateDBResult<Option<i64>> {
+    ) -> SlateDBResult<Option<(i64, i64)>> {
         use super::keys::{decode_record_offset, parse_batch_max_timestamp};
 
         let log_start = self.log_start_offset.load(Ordering::SeqCst);
@@ -1268,7 +1323,7 @@ impl PartitionStore {
             match parse_batch_max_timestamp(batch_data) {
                 // -1 = producer set no timestamps; skip (cannot match a time query)
                 Some(ts) if ts != -1 && ts >= target_timestamp_ms => {
-                    return Ok(Some(offset));
+                    return Ok(Some((offset, ts)));
                 }
                 _ => {}
             }
@@ -1435,12 +1490,29 @@ impl PartitionStore {
     /// Flushes pending writes before closing to ensure durability.
     /// This method takes `&self` (not `self`) so it can be called even when
     /// there are multiple Arc references to the store.
+    ///
+    /// Concurrent callers (release_partition, zombie-entry, lease-loss
+    /// loops, shutdown — all of which can race) are serialized by an
+    /// internal `OnceCell`: the first caller flushes + closes SlateDB; later
+    /// callers observe the cell is initialized and return immediately. This
+    /// prevents the double-close panic in SlateDB compaction.
     pub async fn close(&self) -> SlateDBResult<()> {
-        info!(topic = %self.topic, partition = self.partition, "Closing partition store");
-        // Flush pending writes before closing (needed since we use await_durable=false)
-        self.db.flush().await?;
-        self.db.close().await?;
-        Ok(())
+        let topic = &self.topic;
+        let partition = self.partition;
+        // `get_or_try_init` runs the closure exactly once, even under
+        // concurrent calls; later callers wait for the in-flight init and
+        // then return its result. We deliberately store `()` on success and
+        // surface errors to all racing callers (so a failed close isn't
+        // silently masked from the rest of the system).
+        self.close_once
+            .get_or_try_init(|| async {
+                info!(topic = %topic, partition, "Closing partition store");
+                self.db.flush().await?;
+                self.db.close().await?;
+                Ok(())
+            })
+            .await
+            .map(|_| ())
     }
 
     /// Validate that the remaining lease TTL is sufficient for a safe write.
@@ -1650,7 +1722,13 @@ impl PartitionStoreBuilder {
     /// If the stored epoch in SlateDB is higher than this value, the partition
     /// open will fail (another broker has acquired it).
     ///
-    /// Default: 0 (epoch validation disabled for backwards compatibility).
+    /// Default: 0 (legacy / mock-coordinator path). The open path treats 0 on
+    /// a fresh partition as a request to self-claim a floor epoch of 1, so
+    /// per-write fencing is *always* armed once the partition is open. (The
+    /// previous behavior of `0 = fencing disabled` was the source of audit
+    /// finding C-3 — partitions opened pre-coordinator could write with no
+    /// fencing whatsoever, leaving them exposed to TOCTOU regardless of the
+    /// per-call check.)
     pub fn leader_epoch(mut self, epoch: i32) -> Self {
         self.leader_epoch = epoch;
         self
@@ -1795,6 +1873,14 @@ impl PartitionStoreBuilder {
             // ==================================================================
             // This prevents TOCTOU races where we might write to a partition
             // that another broker has already acquired.
+            //
+            // INVARIANT: After this block, `final_epoch` is always >= 1, so
+            // the per-write fencing check (`if self.leader_epoch > 0`) is
+            // *always* armed. Previously, partitions opened with
+            // `expected_epoch == 0` (legacy / mock-coordinator paths) and a
+            // never-set `LEADER_EPOCH_KEY` would land at `final_epoch = 0`
+            // and silently skip per-write epoch validation entirely; this
+            // line raises that floor.
             let stored_epoch = match db.get(LEADER_EPOCH_KEY).await.map_err(SlateDBError::from)? {
                 Some(bytes) => decode_leader_epoch(&bytes).unwrap_or(0),
                 None => 0,
@@ -1837,12 +1923,37 @@ impl PartitionStoreBuilder {
                 );
             }
 
-            // Use the expected epoch if provided, otherwise use stored epoch
-            let final_epoch = if expected_epoch > 0 {
+            // Compute the working epoch and ensure the floor invariant.
+            //
+            // - With a coordinator-issued epoch, we use it.
+            // - Without one (legacy or mock paths), we fall back to whatever
+            //   was already stored. If neither is set we self-claim epoch 1,
+            //   which is safe: SlateDB's single-writer fencing prevents two
+            //   simultaneous opens from succeeding, so only one broker can
+            //   actually persist the floor value, and any genuine future
+            //   coordinator acquire is required to be > stored.
+            let mut final_epoch = if expected_epoch > 0 {
                 expected_epoch
             } else {
                 stored_epoch
             };
+            if final_epoch == 0 {
+                final_epoch = 1;
+                db.put_with_options(
+                    LEADER_EPOCH_KEY,
+                    &encode_leader_epoch(final_epoch),
+                    &PutOptions::default(),
+                    &WriteOptions {
+                        await_durable: true,
+                    },
+                )
+                .await
+                .map_err(SlateDBError::from)?;
+                info!(
+                    partition,
+                    "Epoch fencing: self-claimed floor epoch 1 (no coordinator-issued epoch)"
+                );
+            }
 
             // Load persisted high watermark from DB
             let persisted_hwm = match db
@@ -1994,6 +2105,7 @@ impl PartitionStoreBuilder {
         let store = PartitionStore {
             db,
             high_watermark: AtomicI64::new(hwm),
+            next_offset: AtomicI64::new(hwm),
             log_start_offset: AtomicI64::new(log_start_offset),
             appends_since_checkpoint: std::sync::atomic::AtomicU64::new(1),
             write_lock: Mutex::new(()),
@@ -2007,6 +2119,7 @@ impl PartitionStoreBuilder {
             min_lease_ttl_for_write_secs: self.min_lease_ttl_for_write_secs,
             load_collector: RwLock::new(None),
             leader_epoch: validated_epoch,
+            close_once: tokio::sync::OnceCell::new(),
         };
 
         // Warm the batch index cache from the recovery scan (one storage

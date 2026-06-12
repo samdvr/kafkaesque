@@ -1,6 +1,6 @@
 //! Producer ID initialization request handling.
 
-use tracing::{debug, error};
+use tracing::{error, info};
 
 use crate::error::KafkaCode;
 use crate::server::RequestContext;
@@ -25,9 +25,12 @@ pub(super) async fn handle_init_producer_id(
         .authorize_cluster_api(ctx, ApiKey::InitProducerId)
         .await
     {
-        debug!(
+        info!(
+            target: "audit",
             principal = %ctx.principal,
-            "Denied InitProducerId by ACL (cluster IdempotentWrite)"
+            api = "InitProducerId",
+            operation = "IdempotentWrite",
+            "ACL denied: InitProducerId (cluster IdempotentWrite)"
         );
         return InitProducerIdResponseData {
             throttle_time_ms: 0,

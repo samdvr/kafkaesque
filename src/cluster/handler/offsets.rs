@@ -1,6 +1,6 @@
 //! Offset request handling (list, commit, fetch).
 
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::error::KafkaCode;
 use crate::server::RequestContext;
@@ -95,10 +95,13 @@ pub(super) async fn handle_list_offsets(
             .await
             == AuthorizeResult::Denied
         {
-            debug!(
+            info!(
+                target: "audit",
                 topic = %topic.name,
                 principal = %ctx.principal,
-                "Denied ListOffsets by ACL"
+                api = "ListOffsets",
+                operation = "Describe",
+                "ACL denied: ListOffsets"
             );
             let partitions: Vec<_> = topic
                 .partitions
@@ -120,25 +123,34 @@ pub(super) async fn handle_list_offsets(
         let mut partitions = Vec::with_capacity(topic.partitions.len());
 
         for partition in topic.partitions {
-            let (error_code, offset) = match handler
+            let (error_code, offset, response_timestamp) = match handler
                 .partition_manager
                 .get_for_read(&topic.name, partition.partition_index)
                 .await
             {
                 Ok(store) => match partition.timestamp {
                     // Earliest (-2): log start offset.
-                    -2 => (KafkaCode::None, store.earliest_offset().await.unwrap_or(0)),
+                    -2 => (
+                        KafkaCode::None,
+                        store.earliest_offset().await.unwrap_or(0),
+                        -1,
+                    ),
                     // Latest (-1): high watermark.
-                    -1 => (KafkaCode::None, store.high_watermark()),
+                    -1 => (KafkaCode::None, store.high_watermark(), -1),
                     // Actual timestamp: first offset whose batch timestamp
                     // is >= the target. Previously this silently returned
                     // the HWM, which made timestamp-based seeks
                     // (`offsetsForTimes`) skip ALL existing data.
                     ts => match store.offset_for_timestamp(ts).await {
+                        // Hit: return both the matching offset AND the
+                        // batch's max_timestamp. Kafka v1+ ListOffsets
+                        // requires the response timestamp so the consumer
+                        // can build `OffsetAndTimestamp` entries; returning
+                        // -1 here would make clients filter out the result.
+                        Ok(Some((offset, batch_ts))) => (KafkaCode::None, offset, batch_ts),
                         // No batch at/after the timestamp: Kafka returns -1
                         // ("no offset") rather than an error.
-                        Ok(Some(offset)) => (KafkaCode::None, offset),
-                        Ok(None) => (KafkaCode::None, -1),
+                        Ok(None) => (KafkaCode::None, -1, -1),
                         Err(e) => {
                             error!(
                                 error = %e,
@@ -146,17 +158,17 @@ pub(super) async fn handle_list_offsets(
                                 partition = partition.partition_index,
                                 "Timestamp offset lookup failed"
                             );
-                            (e.to_kafka_code(), -1)
+                            (e.to_kafka_code(), -1, -1)
                         }
                     },
                 },
-                Err(_) => (KafkaCode::NotLeaderForPartition, -1),
+                Err(_) => (KafkaCode::NotLeaderForPartition, -1, -1),
             };
 
             partitions.push(ListOffsetsPartitionResponse {
                 partition_index: partition.partition_index,
                 error_code,
-                timestamp: -1,
+                timestamp: response_timestamp,
                 offset,
             });
         }
@@ -222,10 +234,14 @@ pub(super) async fn handle_offset_commit(
         .await
         == AuthorizeResult::Denied
     {
-        debug!(
+        info!(
+            target: "audit",
             group_id = %request.group_id,
             principal = %ctx.principal,
-            "Denied OffsetCommit by ACL (group)"
+            api = "OffsetCommit",
+            operation = "Read",
+            resource = "Group",
+            "ACL denied: OffsetCommit (group)"
         );
         let topics: Vec<_> = request
             .topics
@@ -456,10 +472,14 @@ pub(super) async fn handle_offset_commit(
             .await
             == AuthorizeResult::Denied
         {
-            debug!(
+            info!(
+                target: "audit",
                 topic = %topic.name,
                 principal = %ctx.principal,
-                "Denied OffsetCommit by ACL (topic)"
+                api = "OffsetCommit",
+                operation = "Read",
+                resource = "Topic",
+                "ACL denied: OffsetCommit (topic)"
             );
             let partition_responses: Vec<_> = topic
                 .partitions
@@ -636,10 +656,14 @@ pub(super) async fn handle_offset_fetch(
         .await
         == AuthorizeResult::Denied
     {
-        debug!(
+        info!(
+            target: "audit",
             group_id = %request.group_id,
             principal = %ctx.principal,
-            "Denied OffsetFetch by ACL"
+            api = "OffsetFetch",
+            operation = "Describe",
+            resource = "Group",
+            "ACL denied: OffsetFetch"
         );
         let topics: Vec<_> = request
             .topics
@@ -701,10 +725,14 @@ pub(super) async fn handle_offset_fetch(
             .await
             == AuthorizeResult::Denied
         {
-            debug!(
+            info!(
+                target: "audit",
                 topic = %topic.name,
                 principal = %ctx.principal,
-                "Denied OffsetFetch by ACL (topic)"
+                api = "OffsetFetch",
+                operation = "Describe",
+                resource = "Topic",
+                "ACL denied: OffsetFetch (topic)"
             );
             let partition_responses: Vec<_> = topic
                 .partition_indexes

@@ -1106,14 +1106,36 @@ impl RaftStorage<TypeConfig> for RaftStore {
         // regresses relative to what openraft was told.
         self.persist_snapshot(meta, &data).await?;
 
-        // Step 3: only now swap the in-memory state machine and indices.
-        self.sm.write().await.replace_state(new_state).await;
-        *self.last_applied_log.write().await = meta.last_log_id;
-        *self.last_membership.write().await =
-            StoredMembership::new(meta.last_log_id, meta.last_membership.membership().clone());
+        // Step 3: atomically swap the in-memory state machine, indices,
+        // membership, and snapshot cache.
+        //
+        // Cancellation safety (audit R-3): the previous version called four
+        // independent `.write().await` sites in sequence, so a cancellation
+        // between, say, `sm.replace_state` and `last_applied_log` would
+        // leave the SM with the new state but `last_applied_log` still at
+        // the OLD log id. openraft would then re-deliver entries it thinks
+        // are unapplied, double-applying them on top of the snapshot's
+        // already-included state — corruption for any non-idempotent command
+        // (counters, sequence allocations).
+        //
+        // We acquire ALL the write locks BEFORE the first mutation. Each
+        // `.write().await` is still a cancellation point, but cancellation
+        // between any of them happens BEFORE we mutate anything. Once all
+        // four guards are held, the mutation sequence is purely synchronous
+        // (`*guard = ...` assignments) — no awaits, hence no cancellation
+        // points — so it either runs to completion or doesn't run at all.
+        let mut sm_inner_state_guard = self.sm.read().await.state_arc().write_owned().await;
+        let mut last_applied_guard = self.last_applied_log.write().await;
+        let mut last_membership_guard = self.last_membership.write().await;
+        let mut cached_snapshot_guard = self.cached_snapshot.write().await;
 
-        // Update in-memory cache
-        *self.cached_snapshot.write().await = Some(CachedSnapshot {
+        // Synchronous block — no awaits below this line until all four
+        // mutations are committed.
+        *sm_inner_state_guard = new_state;
+        *last_applied_guard = meta.last_log_id;
+        *last_membership_guard =
+            StoredMembership::new(meta.last_log_id, meta.last_membership.membership().clone());
+        *cached_snapshot_guard = Some(CachedSnapshot {
             meta: meta.clone(),
             data,
         });

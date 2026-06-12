@@ -266,7 +266,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
             handler,
             max_connections_per_ip,
             max_total_connections,
-            connection::DEFAULT_MAX_MESSAGE_SIZE,
+            crate::constants::DEFAULT_MAX_MESSAGE_SIZE,
             data_runtime,
         )
         .await
@@ -623,7 +623,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
             tls_config,
             max_connections_per_ip,
             max_total_connections,
-            connection::DEFAULT_MAX_MESSAGE_SIZE,
+            crate::constants::DEFAULT_MAX_MESSAGE_SIZE,
             data_runtime,
         )
         .await
@@ -975,7 +975,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind (CI environments may have restrictions)
             }
@@ -996,7 +996,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }
@@ -1015,7 +1015,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }
@@ -1041,7 +1041,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }
@@ -1059,7 +1059,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }
@@ -1078,7 +1078,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }
@@ -1097,7 +1097,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }
@@ -1117,7 +1117,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }
@@ -1380,7 +1380,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }

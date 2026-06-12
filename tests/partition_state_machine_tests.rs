@@ -6,26 +6,8 @@ use kafkaesque::cluster::PartitionState;
 fn test_partition_state_unowned() {
     let state = PartitionState::unowned();
     assert!(!state.is_owned());
-    assert!(!state.is_transitioning());
     assert!(!state.is_fenced());
     assert_eq!(state.state_name(), "unowned");
-}
-
-#[test]
-fn test_partition_state_acquiring() {
-    let state = PartitionState::start_acquiring();
-    assert!(state.is_transitioning());
-    assert!(!state.is_owned());
-    assert!(!state.is_fenced());
-    assert_eq!(state.state_name(), "acquiring");
-}
-
-#[test]
-fn test_partition_state_releasing() {
-    let state = PartitionState::start_releasing();
-    assert!(state.is_transitioning());
-    assert!(!state.is_owned());
-    assert_eq!(state.state_name(), "releasing");
 }
 
 #[test]
@@ -40,7 +22,6 @@ fn test_partition_state_fenced() {
 fn test_partition_state_default() {
     let state = PartitionState::default();
     assert!(!state.is_owned());
-    assert!(!state.is_transitioning());
     assert_eq!(state.state_name(), "unowned");
 }
 
@@ -56,7 +37,7 @@ fn test_partition_state_debug() {
     let debug = format!("{:?}", state);
     assert!(debug.contains("Unowned"));
 
-    let acquiring = PartitionState::start_acquiring();
-    let debug = format!("{:?}", acquiring);
-    assert!(debug.contains("Acquiring"));
+    let fenced = PartitionState::fenced();
+    let debug = format!("{:?}", fenced);
+    assert!(debug.contains("Fenced"));
 }

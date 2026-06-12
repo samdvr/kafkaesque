@@ -15,8 +15,8 @@ use tokio::time::timeout;
 use tokio_rustls::server::TlsStream;
 
 use crate::constants::{
-    DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS, DEFAULT_REQUEST_READ_TIMEOUT_SECS,
-    DEFAULT_REQUEST_WRITE_TIMEOUT_SECS,
+    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS,
+    DEFAULT_REQUEST_READ_TIMEOUT_SECS, DEFAULT_REQUEST_WRITE_TIMEOUT_SECS,
 };
 use crate::error::{Error, KafkaCode, Result};
 
@@ -28,10 +28,6 @@ use super::response::Response;
 use crate::encode::ToByte;
 
 use std::time::Instant;
-
-/// Re-exported from [`crate::constants`] — single source of truth for the
-/// per-frame size cap.
-pub use crate::constants::DEFAULT_MAX_MESSAGE_SIZE;
 
 /// Default global inflight-bytes budget (1 GiB). Bounds the total memory
 /// the broker is willing to allocate for not-yet-parsed inbound frames so a

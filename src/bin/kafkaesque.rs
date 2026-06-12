@@ -74,7 +74,6 @@
 //! - `DATA_PLANE_THREADS`: Number of data plane threads (default: num_cpus)
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kafkaesque::cluster::{ClusterConfig, SlateDBClusterHandler};
@@ -198,34 +197,26 @@ async fn run_broker(
         SlateDBClusterHandler::with_runtime_handles(config.clone(), runtime_handles.clone())
             .await?;
 
-    // Mirror ZombieModeState into an AtomicBool the HealthServer can
-    // load on every probe. Polling on a 200ms tick is fast enough for K8s
-    // readiness (which probes on the order of seconds) and avoids changing
-    // HealthServer's public API.
-    let zombie_mode_flag = Arc::new(AtomicBool::new(false));
+    // Share the real `Arc<ZombieModeState>` from the partition manager with
+    // the health server so probes observe transitions on the next request
+    // rather than on the next polling tick.
     let zombie_state = handler.zombie_state();
-    let zombie_flag_clone = zombie_mode_flag.clone();
-    let zombie_mirror_task = runtime_handles.control.spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(200));
-        loop {
-            tick.tick().await;
-            zombie_flag_clone.store(zombie_state.is_active(), Ordering::SeqCst);
-        }
-    });
 
     let health_handle = if config.health_port > 0 {
         let health_addr = format!("{}:{}", config.host, config.health_port);
         match HealthServer::with_broker_id(
             &health_addr,
-            zombie_mode_flag.clone(),
+            zombie_state.clone(),
             Some(config.broker_id),
         )
         .await
         {
             Ok(server) => {
+                let server = server.with_metrics_auth(config.metrics_auth_token.clone());
                 info!(
                     broker_id = config.broker_id,
                     health_addr = %health_addr,
+                    metrics_auth_enabled = config.metrics_auth_token.is_some(),
                     "Health server started"
                 );
                 Some(runtime_handles.control.spawn(async move {
@@ -358,7 +349,6 @@ async fn run_broker(
     if let Some(handle) = health_handle {
         handle.abort();
     }
-    zombie_mirror_task.abort();
 
     info!("Graceful shutdown complete");
     Ok(())

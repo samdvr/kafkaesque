@@ -5,14 +5,20 @@
 //!
 //! - [`PartitionId`]: A strongly-typed partition identifier
 //! - [`PartitionHandle`]: A handle for performing operations on a partition
-//! - [`WriteGuard`]: An RAII guard for write operations with lease tracking
+//! - [`WriteGuard`]: A guard that bundles a partition handle with the lease TTL
+//!   captured at acquisition, so each write can re-check the lease without
+//!   another Raft round-trip
 //!
 //! # Design Goals
 //!
 //! 1. **Type Safety**: Prevent mixing up topic/partition arguments
 //! 2. **Reduced Boilerplate**: No more passing `(topic, partition)` tuples everywhere
-//! 3. **Automatic Resource Management**: Guards automatically release resources on drop
-//! 4. **Clear Ownership Semantics**: Guards make it clear when you have write access
+//! 3. **Local lease check**: `WriteGuard` carries the remaining-TTL snapshot so
+//!    `append`/`append_durable` can fail fast when the lease has nearly
+//!    expired, without an extra Raft call
+//! 4. **Drop-time observability**: guard drop records a `WRITE_GUARD_DURATION`
+//!    histogram observation; it does NOT release the lease (leases are
+//!    time-based and renewed by the partition manager)
 //!
 //! # Examples
 //!
@@ -24,8 +30,9 @@
 //! // Use:
 //! let partition = PartitionId::new("my-topic", 0);
 //! let guard = manager.acquire_for_write(&partition).await?;
-//! guard.append(&records).await?;
-//! // Lease tracking updated automatically on drop
+//! guard.append(&records).await?;          // acks=0 fast path
+//! guard.append_durable(&records).await?;  // acks>=1, awaits SlateDB durability
+//! // Guard drop records metrics; lease is renewed by the manager loop, not here.
 //! ```
 
 use bytes::Bytes;
@@ -214,24 +221,28 @@ impl fmt::Debug for PartitionHandle {
 // WriteGuard - RAII guard for write operations
 // =============================================================================
 
-/// An RAII guard for write operations on a partition.
+/// A guard that bundles a partition handle with the lease TTL captured at
+/// acquisition.
 ///
 /// This guard:
-/// 1. Tracks when the lease was verified
-/// 2. Provides write operations on the partition
-/// 3. Records metrics on drop
+/// 1. Records when the lease was verified (`acquired_at`) and the TTL the
+///    manager reported at that point (`lease_remaining_secs`)
+/// 2. Lets [`append`](Self::append) and [`append_durable`](Self::append_durable)
+///    re-check the lease locally without another Raft round-trip
+/// 3. Emits a `WRITE_GUARD_DURATION` histogram observation on drop and warns
+///    if the guard was held suspiciously long
 ///
-/// The guard does NOT automatically release the lease on drop because:
-/// - Leases are time-based and expire naturally
-/// - Releasing leases on every request would add Raft overhead
-/// - The partition manager handles lease renewal in the background
+/// The guard does NOT release the lease on drop — leases are time-based and
+/// renewed by the partition manager's background loop. Releasing per-request
+/// would add a Raft commit to every produce.
 ///
 /// # Example
 ///
 /// ```ignore
 /// let guard = manager.acquire_for_write(&partition).await?;
-/// let offset = guard.append(&records).await?;
-/// // Guard dropped here, metrics recorded
+/// let offset_fast = guard.append(&records).await?;             // acks=0
+/// let offset_durable = guard.append_durable(&records).await?;  // acks>=1
+/// // Guard dropped here; metrics recorded.
 /// ```
 pub struct WriteGuard {
     handle: PartitionHandle,
@@ -302,7 +313,18 @@ impl WriteGuard {
         self.estimated_remaining_lease() >= self.handle.store.min_lease_ttl_for_write_secs()
     }
 
-    /// Append a record batch to the partition.
+    /// Append a record batch without waiting for SlateDB durability.
+    ///
+    /// Suitable for `acks=0` produces. The base offset is allocated and the
+    /// batch is buffered into SlateDB's WAL, but the call returns before the
+    /// WAL is flushed to object storage — a broker crash inside the flush
+    /// window can lose the batch even though this returned `Ok`.
+    ///
+    /// Use [`append_durable`](Self::append_durable) for `acks>=1`.
+    ///
+    /// Fails with `LeaseTooShort` if the lease snapshot taken at acquisition
+    /// has aged below the configured `min_lease_ttl_for_write_secs` — see
+    /// [`lease_likely_valid`](Self::lease_likely_valid).
     ///
     /// # Arguments
     /// * `records` - The record batch bytes to append
@@ -310,17 +332,34 @@ impl WriteGuard {
     /// # Returns
     /// The base offset assigned to the batch, or error if append fails.
     pub async fn append(&self, records: &Bytes) -> SlateDBResult<i64> {
-        let required = self.handle.store.min_lease_ttl_for_write_secs();
-        if !self.lease_likely_valid() {
-            return Err(SlateDBError::LeaseTooShort {
-                topic: self.topic().to_string(),
-                partition: self.partition(),
-                remaining_secs: self.estimated_remaining_lease(),
-                required_secs: required,
-            });
-        }
-
+        self.check_lease()?;
         self.handle.store.append_batch(records).await
+    }
+
+    /// Append a record batch and wait for SlateDB to confirm WAL durability
+    /// before returning.
+    ///
+    /// Required for `acks>=1` to honor Kafka's ack contract. Throughput is
+    /// bounded by the SlateDB durable round-trip latency because offset
+    /// allocation, epoch verification, and the durability wait happen under
+    /// the same per-partition write lock — see [`PartitionStore::append_batch_durable`].
+    ///
+    /// Same `LeaseTooShort` failure mode as [`append`](Self::append).
+    pub async fn append_durable(&self, records: &Bytes) -> SlateDBResult<i64> {
+        self.check_lease()?;
+        self.handle.store.append_batch_durable(records).await
+    }
+
+    fn check_lease(&self) -> SlateDBResult<()> {
+        if self.lease_likely_valid() {
+            return Ok(());
+        }
+        Err(SlateDBError::LeaseTooShort {
+            topic: self.topic().to_string(),
+            partition: self.partition(),
+            remaining_secs: self.estimated_remaining_lease(),
+            required_secs: self.handle.store.min_lease_ttl_for_write_secs(),
+        })
     }
 
     /// Get the underlying store (for advanced use cases).

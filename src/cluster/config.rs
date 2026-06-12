@@ -286,6 +286,14 @@ pub struct ClusterConfig {
     /// Default: 8080
     pub health_port: i32,
 
+    /// Optional bearer token gating the `/metrics` endpoint. When set, the
+    /// health server requires `Authorization: Bearer <token>` on `/metrics`
+    /// and returns 401 otherwise. Liveness and readiness remain open so
+    /// load balancers and kubelet can probe without credentials.
+    ///
+    /// Set via `METRICS_AUTH_TOKEN`. Default: `None` (open).
+    pub metrics_auth_token: Option<String>,
+
     /// Cluster identifier for coordination.
     ///
     /// This ensures isolation between different clusters sharing
@@ -780,6 +788,7 @@ impl Default for ClusterConfig {
             advertised_host: "127.0.0.1".to_string(),
             port: 9092,
             health_port: 8080,
+            metrics_auth_token: None,
             cluster_id: "kafkaesque-cluster".to_string(),
             object_store: ObjectStoreType::default(),
             object_store_path: "kafkaesque-data".to_string(),
@@ -1425,6 +1434,13 @@ impl ClusterConfig {
             .into());
         }
 
+        // Optional bearer token for `/metrics`. Empty string is treated the
+        // same as unset so an operator clearing the value via shell doesn't
+        // accidentally configure an empty-string secret.
+        let metrics_auth_token = std::env::var("METRICS_AUTH_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+
         let cluster_id =
             std::env::var("CLUSTER_ID").unwrap_or_else(|_| "kafkaesque-cluster".to_string());
 
@@ -1660,6 +1676,7 @@ impl ClusterConfig {
             advertised_host: advertised_host.clone(),
             port,
             health_port,
+            metrics_auth_token: metrics_auth_token.clone(),
             cluster_id: cluster_id.clone(),
             raft_listen_addr: raft_listen_addr.clone(),
             raft_peers: raft_peers.clone(),
@@ -1711,6 +1728,14 @@ impl ClusterConfig {
                 "disabled".to_string()
             } else {
                 health_port.to_string()
+            }
+        );
+        eprintln!(
+            "Metrics Auth: {}",
+            if metrics_auth_token.is_some() {
+                "enabled (bearer token)"
+            } else {
+                "disabled (open)"
             }
         );
         eprintln!("Coordination: Raft (embedded consensus)");

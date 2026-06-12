@@ -34,6 +34,34 @@ echo -e "${BLUE}║         Kafkaesque E2E Tests (unit/integration passed at bui
 echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
+# Locate the broker binary. The CI image lays the release binary at
+# `/app/target/release/kafkaesque`; a local checkout lands it under the
+# repo's `target/release/`. Override with `KAFKAESQUE_BIN=...` for any
+# other layout. Failing here with a clear error beats running with an
+# stale binary on $PATH.
+if [ -z "${KAFKAESQUE_BIN:-}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+    for candidate in \
+        "/app/target/release/kafkaesque" \
+        "$REPO_ROOT/target/release/kafkaesque" \
+        "$REPO_ROOT/target/x86_64-unknown-linux-musl/release/kafkaesque"; do
+        if [ -x "$candidate" ]; then
+            KAFKAESQUE_BIN="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "${KAFKAESQUE_BIN:-}" ] || [ ! -x "$KAFKAESQUE_BIN" ]; then
+    echo -e "${RED}Could not locate kafkaesque binary.${NC}"
+    echo "  Tried: /app/target/release/kafkaesque, target/release/kafkaesque, target/x86_64-unknown-linux-musl/release/kafkaesque"
+    echo "  Set KAFKAESQUE_BIN=/path/to/kafkaesque to override, or run 'cargo build --release' first."
+    exit 1
+fi
+echo "Using broker binary: $KAFKAESQUE_BIN"
+echo ""
+
 KCAT_OPTS="-X api.version.request=false -X broker.version.fallback=2.0.0"
 E2E_FAILED=0
 
@@ -80,7 +108,7 @@ OBJECT_STORE_TYPE=local \
 DATA_PATH=/tmp/kafkaesque-data \
 AUTO_CREATE_TOPICS=true \
 RUST_LOG=kafkaesque=info \
-/app/target/release/kafkaesque > /tmp/server.log 2>&1 &
+"$KAFKAESQUE_BIN" > /tmp/server.log 2>&1 &
 SERVER_PID=$!
 
 # Wait for server
@@ -146,7 +174,7 @@ if [ "$RUN_CLUSTER" = true ]; then
     RAFT_PEERS="1=127.0.0.1:9095,2=127.0.0.1:9097" \
     OBJECT_STORE_TYPE=local DATA_PATH=/tmp/kafkaesque-cluster-test/broker0 \
     AUTO_CREATE_TOPICS=true RUST_LOG=kafkaesque=info \
-    /app/target/release/kafkaesque > /tmp/kafkaesque-cluster-test/broker0.log 2>&1 &
+    "$KAFKAESQUE_BIN" > /tmp/kafkaesque-cluster-test/broker0.log 2>&1 &
     BROKER0_PID=$!
 
     BROKER_ID=1 HOST=127.0.0.1 PORT=9094 \
@@ -154,7 +182,7 @@ if [ "$RUN_CLUSTER" = true ]; then
     RAFT_PEERS="0=127.0.0.1:9093,2=127.0.0.1:9097" \
     OBJECT_STORE_TYPE=local DATA_PATH=/tmp/kafkaesque-cluster-test/broker1 \
     AUTO_CREATE_TOPICS=true RUST_LOG=kafkaesque=info \
-    /app/target/release/kafkaesque > /tmp/kafkaesque-cluster-test/broker1.log 2>&1 &
+    "$KAFKAESQUE_BIN" > /tmp/kafkaesque-cluster-test/broker1.log 2>&1 &
     BROKER1_PID=$!
 
     BROKER_ID=2 HOST=127.0.0.1 PORT=9096 \
@@ -162,7 +190,7 @@ if [ "$RUN_CLUSTER" = true ]; then
     RAFT_PEERS="0=127.0.0.1:9093,1=127.0.0.1:9095" \
     OBJECT_STORE_TYPE=local DATA_PATH=/tmp/kafkaesque-cluster-test/broker2 \
     AUTO_CREATE_TOPICS=true RUST_LOG=kafkaesque=info \
-    /app/target/release/kafkaesque > /tmp/kafkaesque-cluster-test/broker2.log 2>&1 &
+    "$KAFKAESQUE_BIN" > /tmp/kafkaesque-cluster-test/broker2.log 2>&1 &
     BROKER2_PID=$!
 
     # Wait for all brokers

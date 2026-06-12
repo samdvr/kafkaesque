@@ -77,7 +77,40 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run integration tests
-        run: cargo test --tests
+        # Many integration tests bind localhost ports / share /tmp paths;
+        # let cargo's default (= num_cpus) and they collide on a beefy
+        # runner. Cap to 4 threads — same value the e2e setup tolerated
+        # without flake. Tune up after fixing the underlying collisions.
+        run: cargo test --tests -- --test-threads=4
+
+  doc-tests:
+    name: Doc Tests
+    runs-on: ubuntu-latest
+    # Doc tests previously lived in rust.yml; consolidated here so PRs
+    # don't run two near-identical workflows. The unique work is `cargo
+    # test --doc`; build-only checking is already covered by clippy/test.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run doc tests
+        run: cargo test --doc
 
   clippy:
     name: Clippy
@@ -229,7 +262,10 @@ jobs:
         run: docker build -f Dockerfile.minimal -t kafkaesque:ci .
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        # Pinned to a release tag so a `master` rewrite can't tamper with the
+        # scan. Like the rest of the workflow this is tag-pinned for now;
+        # see the audit P1-6 note above for the SHA-pinning follow-up.
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: kafkaesque:ci
           format: table

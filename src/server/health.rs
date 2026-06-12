@@ -5,28 +5,29 @@
 //!
 //! # Endpoints
 //!
-//! - `GET /health` - Liveness check (always returns 200 if server is running)
+//! - `GET /health` - Liveness check (always returns 200 if the server is running;
+//!   the response body surfaces zombie status for visibility)
 //! - `GET /ready` - Readiness check (returns 503 if in zombie mode)
-//! - `GET /metrics` - Prometheus metrics in text format
+//! - `GET /metrics` - Prometheus metrics in text format (optionally
+//!   bearer-token-gated via [`HealthServer::with_metrics_auth`])
 //!
 //! # Usage
 //!
 //! ```rust,no_run
+//! use kafkaesque::cluster::zombie_mode::ZombieModeState;
 //! use kafkaesque::server::health::HealthServer;
 //! use std::sync::Arc;
-//! use std::sync::atomic::AtomicBool;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let zombie_mode = Arc::new(AtomicBool::new(false));
-//!     let server = HealthServer::new("0.0.0.0:8080", zombie_mode).await.unwrap();
+//!     let zombie_state = Arc::new(ZombieModeState::new());
+//!     let server = HealthServer::new("0.0.0.0:8080", zombie_state).await.unwrap();
 //!     server.run().await.unwrap();
 //! }
 //! ```
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,6 +36,7 @@ use tokio::sync::{Semaphore, broadcast};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
+use crate::cluster::zombie_mode::ZombieModeState;
 use crate::error::{Error, Result};
 
 /// Read deadline for a single health-check request.
@@ -86,13 +88,19 @@ impl HealthStatus {
 /// for load balancers and orchestration systems like Kubernetes.
 pub struct HealthServer {
     listener: TcpListener,
-    /// Shared flag indicating whether the broker is in zombie mode.
-    /// When true, readiness checks will fail.
-    zombie_mode: Arc<AtomicBool>,
+    /// Shared zombie-mode state from `PartitionManager`. Probes read its
+    /// `is_active()` directly; no polling mirror is involved, so a transition
+    /// is visible on the next request rather than on the next tick.
+    zombie_state: Arc<ZombieModeState>,
     /// Shutdown signal sender.
     shutdown_tx: broadcast::Sender<()>,
     /// Broker ID for identification in responses.
     broker_id: Option<i32>,
+    /// Optional bearer token gating `/metrics`. When set, requests without a
+    /// matching `Authorization: Bearer <token>` header receive 401. Liveness
+    /// and readiness probes are intentionally never gated — load balancers
+    /// can't be expected to carry credentials.
+    metrics_auth_token: Option<Arc<str>>,
 }
 
 impl HealthServer {
@@ -100,20 +108,20 @@ impl HealthServer {
     ///
     /// # Arguments
     /// * `addr` - Address to bind to (e.g., "0.0.0.0:8080")
-    /// * `zombie_mode` - Shared flag from PartitionManager indicating zombie mode
-    pub async fn new(addr: &str, zombie_mode: Arc<AtomicBool>) -> Result<Self> {
-        Self::with_broker_id(addr, zombie_mode, None).await
+    /// * `zombie_state` - Shared state from `PartitionManager` indicating zombie mode
+    pub async fn new(addr: &str, zombie_state: Arc<ZombieModeState>) -> Result<Self> {
+        Self::with_broker_id(addr, zombie_state, None).await
     }
 
     /// Create a new health server with broker ID for identification.
     ///
     /// # Arguments
     /// * `addr` - Address to bind to (e.g., "0.0.0.0:8080")
-    /// * `zombie_mode` - Shared flag from PartitionManager indicating zombie mode
+    /// * `zombie_state` - Shared state from `PartitionManager` indicating zombie mode
     /// * `broker_id` - Optional broker ID for identification in responses
     pub async fn with_broker_id(
         addr: &str,
-        zombie_mode: Arc<AtomicBool>,
+        zombie_state: Arc<ZombieModeState>,
         broker_id: Option<i32>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr)
@@ -126,10 +134,21 @@ impl HealthServer {
 
         Ok(Self {
             listener,
-            zombie_mode,
+            zombie_state,
             shutdown_tx,
             broker_id,
+            metrics_auth_token: None,
         })
+    }
+
+    /// Require `Authorization: Bearer <token>` on `/metrics`. Pass `None` (or
+    /// an empty string) to leave the endpoint open. Liveness and readiness
+    /// remain unauthenticated regardless.
+    pub fn with_metrics_auth(mut self, token: Option<String>) -> Self {
+        self.metrics_auth_token = token
+            .filter(|t| !t.is_empty())
+            .map(|t| Arc::<str>::from(t.as_str()));
+        self
     }
 
     /// Get the local address the server is bound to.
@@ -150,12 +169,12 @@ impl HealthServer {
     /// Returns false if:
     /// - Broker is in zombie mode (lost cluster coordination)
     pub fn is_ready(&self) -> bool {
-        !self.zombie_mode.load(Ordering::SeqCst)
+        !self.zombie_state.is_active()
     }
 
     /// Get the current health status.
     pub fn health_status(&self) -> HealthStatus {
-        if self.zombie_mode.load(Ordering::SeqCst) {
+        if self.zombie_state.is_active() {
             HealthStatus::NotReady
         } else {
             HealthStatus::Healthy
@@ -190,8 +209,9 @@ impl HealthServer {
                                 }
                             };
 
-                            let zombie_mode = self.zombie_mode.clone();
+                            let zombie_state = self.zombie_state.clone();
                             let broker_id = self.broker_id;
+                            let metrics_auth = self.metrics_auth_token.clone();
 
                             // Handle request in a separate task to avoid blocking
                             tokio::spawn(async move {
@@ -200,7 +220,12 @@ impl HealthServer {
                                 match timeout(HEALTH_READ_TIMEOUT, stream.read(&mut buf)).await {
                                     Ok(Ok(n)) if n > 0 => {
                                         let request = String::from_utf8_lossy(&buf[..n]);
-                                        let response = handle_request(&request, &zombie_mode, broker_id);
+                                        let response = handle_request(
+                                            &request,
+                                            &zombie_state,
+                                            broker_id,
+                                            metrics_auth.as_deref(),
+                                        );
                                         if let Err(e) = timeout(
                                             HEALTH_WRITE_TIMEOUT,
                                             stream.write_all(response.as_bytes()),
@@ -233,7 +258,12 @@ impl HealthServer {
 }
 
 /// Handle an HTTP request and return the response.
-fn handle_request(request: &str, zombie_mode: &AtomicBool, broker_id: Option<i32>) -> String {
+fn handle_request(
+    request: &str,
+    zombie_state: &ZombieModeState,
+    broker_id: Option<i32>,
+    metrics_auth_token: Option<&str>,
+) -> String {
     // Parse the request line to get the path
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
@@ -241,12 +271,42 @@ fn handle_request(request: &str, zombie_mode: &AtomicBool, broker_id: Option<i32
     let path = if parts.len() >= 2 { parts[1] } else { "/" };
 
     match path {
-        "/health" | "/healthz" | "/health/" => health_response(broker_id),
-        "/ready" | "/readyz" | "/ready/" => ready_response(zombie_mode, broker_id),
-        "/metrics" => metrics_response(),
+        "/health" | "/healthz" | "/health/" => health_response(zombie_state, broker_id),
+        "/ready" | "/readyz" | "/ready/" => ready_response(zombie_state, broker_id),
+        "/metrics" => {
+            if let Some(token) = metrics_auth_token
+                && !request_has_bearer(request, token)
+            {
+                return unauthorized_response();
+            }
+            metrics_response()
+        }
         "/live" | "/livez" | "/live/" => liveness_response(broker_id),
         _ => not_found_response(),
     }
+}
+
+/// Whether the request carries a matching `Authorization: Bearer <token>`
+/// header. Header names are ASCII case-insensitive (RFC 7230 §3.2);
+/// the token comparison is constant-time-ish in length but exact-match in
+/// content — sufficient for an internal scrape token, not a user password.
+fn request_has_bearer(request: &str, expected: &str) -> bool {
+    for line in request.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let mut split = line.splitn(2, ':');
+        let name = split.next().unwrap_or("").trim();
+        let value = split.next().unwrap_or("").trim();
+        if name.eq_ignore_ascii_case("authorization")
+            && let Some(rest) = value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        {
+            return rest.trim() == expected;
+        }
+    }
+    false
 }
 
 /// Generate liveness response (always 200 if server is running).
@@ -266,11 +326,21 @@ fn liveness_response(broker_id: Option<i32>) -> String {
     )
 }
 
-/// Generate health response (always 200 if server is running).
-fn health_response(broker_id: Option<i32>) -> String {
+/// Generate health response.
+///
+/// Always returns 200 — `/health` is the Kubernetes liveness signal and
+/// failing it would have kubelet kill the pod even though zombie mode is
+/// recoverable. We surface zombie status in the body so dashboards and
+/// `curl` checks can see it without forcing a restart loop on the operator.
+fn health_response(zombie_state: &ZombieModeState, broker_id: Option<i32>) -> String {
     let broker_str = broker_id
         .map(|id| format!("broker_id: {}\n", id))
         .unwrap_or_default();
+    let zombie_str = if zombie_state.is_active() {
+        "zombie_mode: active\n"
+    } else {
+        "zombie_mode: inactive\n"
+    };
 
     format!(
         "HTTP/1.1 200 OK\r\n\
@@ -278,14 +348,14 @@ fn health_response(broker_id: Option<i32>) -> String {
          Connection: close\r\n\
          \r\n\
          status: healthy\n\
-         {}",
-        broker_str
+         {}{}",
+        zombie_str, broker_str
     )
 }
 
 /// Generate readiness response (503 if in zombie mode).
-fn ready_response(zombie_mode: &AtomicBool, broker_id: Option<i32>) -> String {
-    let is_zombie = zombie_mode.load(Ordering::SeqCst);
+fn ready_response(zombie_state: &ZombieModeState, broker_id: Option<i32>) -> String {
+    let is_zombie = zombie_state.is_active();
     let broker_str = broker_id
         .map(|id| format!("broker_id: {}\n", id))
         .unwrap_or_default();
@@ -312,6 +382,18 @@ fn ready_response(zombie_mode: &AtomicBool, broker_id: Option<i32>) -> String {
             broker_str
         )
     }
+}
+
+/// Generate 401 response for unauthenticated `/metrics` access when
+/// `metrics_auth_token` is configured.
+fn unauthorized_response() -> String {
+    "HTTP/1.1 401 Unauthorized\r\n\
+     Content-Type: text/plain\r\n\
+     WWW-Authenticate: Bearer realm=\"metrics\"\r\n\
+     Connection: close\r\n\
+     \r\n\
+     error: missing or invalid bearer token\n"
+        .to_string()
 }
 
 /// Generate Prometheus metrics response.
@@ -363,7 +445,16 @@ fn not_found_response() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+
+    fn healthy() -> ZombieModeState {
+        ZombieModeState::new()
+    }
+
+    fn zombie() -> ZombieModeState {
+        let s = ZombieModeState::new();
+        s.enter();
+        s
+    }
 
     #[test]
     fn test_health_status_codes() {
@@ -374,25 +465,36 @@ mod tests {
 
     #[test]
     fn test_handle_health_request() {
-        let zombie_mode = AtomicBool::new(false);
-        let response = handle_request("GET /health HTTP/1.1\r\n", &zombie_mode, Some(1));
+        let state = healthy();
+        let response = handle_request("GET /health HTTP/1.1\r\n", &state, Some(1), None);
         assert!(response.contains("200 OK"));
         assert!(response.contains("status: healthy"));
+        assert!(response.contains("zombie_mode: inactive"));
         assert!(response.contains("broker_id: 1"));
     }
 
     #[test]
+    fn test_handle_health_request_zombie() {
+        let state = zombie();
+        let response = handle_request("GET /health HTTP/1.1\r\n", &state, Some(1), None);
+        // /health stays 200 even in zombie mode (Kubernetes liveness),
+        // but the body surfaces the zombie state for visibility.
+        assert!(response.contains("200 OK"));
+        assert!(response.contains("zombie_mode: active"));
+    }
+
+    #[test]
     fn test_handle_ready_request_healthy() {
-        let zombie_mode = AtomicBool::new(false);
-        let response = handle_request("GET /ready HTTP/1.1\r\n", &zombie_mode, None);
+        let state = healthy();
+        let response = handle_request("GET /ready HTTP/1.1\r\n", &state, None, None);
         assert!(response.contains("200 OK"));
         assert!(response.contains("status: ready"));
     }
 
     #[test]
     fn test_handle_ready_request_zombie_mode() {
-        let zombie_mode = AtomicBool::new(true);
-        let response = handle_request("GET /ready HTTP/1.1\r\n", &zombie_mode, None);
+        let state = zombie();
+        let response = handle_request("GET /ready HTTP/1.1\r\n", &state, None, None);
         assert!(response.contains("503 Service Unavailable"));
         assert!(response.contains("status: not_ready"));
         assert!(response.contains("reason: zombie_mode"));
@@ -400,50 +502,112 @@ mod tests {
 
     #[test]
     fn test_handle_unknown_path() {
-        let zombie_mode = AtomicBool::new(false);
-        let response = handle_request("GET /unknown HTTP/1.1\r\n", &zombie_mode, None);
+        let state = healthy();
+        let response = handle_request("GET /unknown HTTP/1.1\r\n", &state, None, None);
         assert!(response.contains("404 Not Found"));
         assert!(response.contains("Available endpoints"));
     }
 
     #[test]
     fn test_handle_metrics_request() {
-        let zombie_mode = AtomicBool::new(false);
-        let response = handle_request("GET /metrics HTTP/1.1\r\n", &zombie_mode, None);
+        let state = healthy();
+        let response = handle_request("GET /metrics HTTP/1.1\r\n", &state, None, None);
         // Should return 200 OK with metrics
         assert!(response.contains("200 OK"));
         assert!(response.contains("text/plain"));
     }
 
     #[test]
+    fn test_metrics_auth_missing_token() {
+        let state = healthy();
+        let response = handle_request(
+            "GET /metrics HTTP/1.1\r\n\r\n",
+            &state,
+            None,
+            Some("secret-token"),
+        );
+        assert!(response.contains("401 Unauthorized"));
+        assert!(response.contains("WWW-Authenticate: Bearer"));
+    }
+
+    #[test]
+    fn test_metrics_auth_wrong_token() {
+        let state = healthy();
+        let response = handle_request(
+            "GET /metrics HTTP/1.1\r\nAuthorization: Bearer wrong-token\r\n\r\n",
+            &state,
+            None,
+            Some("secret-token"),
+        );
+        assert!(response.contains("401 Unauthorized"));
+    }
+
+    #[test]
+    fn test_metrics_auth_correct_token() {
+        let state = healthy();
+        let response = handle_request(
+            "GET /metrics HTTP/1.1\r\nAuthorization: Bearer secret-token\r\n\r\n",
+            &state,
+            None,
+            Some("secret-token"),
+        );
+        assert!(response.contains("200 OK"));
+        assert!(!response.contains("401"));
+    }
+
+    #[test]
+    fn test_metrics_auth_header_case_insensitive() {
+        let state = healthy();
+        // Header name is case-insensitive per RFC 7230.
+        let response = handle_request(
+            "GET /metrics HTTP/1.1\r\nauthorization: Bearer secret-token\r\n\r\n",
+            &state,
+            None,
+            Some("secret-token"),
+        );
+        assert!(response.contains("200 OK"));
+    }
+
+    #[test]
+    fn test_metrics_auth_does_not_gate_health_or_ready() {
+        let state = healthy();
+        // Even with a token configured, liveness/readiness must remain open
+        // for load balancers that can't carry credentials.
+        let h = handle_request("GET /health HTTP/1.1\r\n", &state, None, Some("secret"));
+        assert!(h.contains("200 OK"));
+        let r = handle_request("GET /ready HTTP/1.1\r\n", &state, None, Some("secret"));
+        assert!(r.contains("200 OK"));
+    }
+
+    #[test]
     fn test_kubernetes_style_paths() {
-        let zombie_mode = AtomicBool::new(false);
+        let state = healthy();
 
         // Test /healthz (Kubernetes style)
-        let response = handle_request("GET /healthz HTTP/1.1\r\n", &zombie_mode, None);
+        let response = handle_request("GET /healthz HTTP/1.1\r\n", &state, None, None);
         assert!(response.contains("200 OK"));
 
         // Test /readyz (Kubernetes style)
-        let response = handle_request("GET /readyz HTTP/1.1\r\n", &zombie_mode, None);
+        let response = handle_request("GET /readyz HTTP/1.1\r\n", &state, None, None);
         assert!(response.contains("200 OK"));
 
         // Test /livez (Kubernetes style)
-        let response = handle_request("GET /livez HTTP/1.1\r\n", &zombie_mode, None);
+        let response = handle_request("GET /livez HTTP/1.1\r\n", &state, None, None);
         assert!(response.contains("200 OK"));
     }
 
     #[tokio::test]
     async fn test_health_server_creation() {
-        let zombie_mode = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(ZombieModeState::new());
         // Use a random high port to avoid permission issues
-        match HealthServer::new("127.0.0.1:0", zombie_mode).await {
+        match HealthServer::new("127.0.0.1:0", state).await {
             Ok(server) => {
                 let addr = server.local_addr().unwrap();
                 assert!(addr.port() > 0);
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind (CI environments may have restrictions)
             }
@@ -453,19 +617,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_ready() {
-        let zombie_mode = Arc::new(AtomicBool::new(false));
-        match HealthServer::new("127.0.0.1:0", zombie_mode.clone()).await {
+        let state = Arc::new(ZombieModeState::new());
+        match HealthServer::new("127.0.0.1:0", state.clone()).await {
             Ok(server) => {
                 assert!(server.is_ready());
                 assert_eq!(server.health_status(), HealthStatus::Healthy);
 
-                zombie_mode.store(true, Ordering::SeqCst);
+                state.enter();
                 assert!(!server.is_ready());
                 assert_eq!(server.health_status(), HealthStatus::NotReady);
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind (CI environments may have restrictions)
             }
@@ -500,20 +664,22 @@ mod tests {
 
     #[test]
     fn test_health_response() {
-        let response = health_response(Some(1));
+        let state = healthy();
+        let response = health_response(&state, Some(1));
         assert!(response.contains("200 OK"));
         assert!(response.contains("status: healthy"));
+        assert!(response.contains("zombie_mode: inactive"));
         assert!(response.contains("broker_id: 1"));
 
-        let response_no_broker = health_response(None);
+        let response_no_broker = health_response(&state, None);
         assert!(response_no_broker.contains("status: healthy"));
         assert!(!response_no_broker.contains("broker_id"));
     }
 
     #[test]
     fn test_ready_response_healthy() {
-        let zombie_mode = AtomicBool::new(false);
-        let response = ready_response(&zombie_mode, Some(5));
+        let state = healthy();
+        let response = ready_response(&state, Some(5));
         assert!(response.contains("200 OK"));
         assert!(response.contains("status: ready"));
         assert!(response.contains("broker_id: 5"));
@@ -521,8 +687,8 @@ mod tests {
 
     #[test]
     fn test_ready_response_zombie() {
-        let zombie_mode = AtomicBool::new(true);
-        let response = ready_response(&zombie_mode, Some(5));
+        let state = zombie();
+        let response = ready_response(&state, Some(5));
         assert!(response.contains("503 Service Unavailable"));
         assert!(response.contains("status: not_ready"));
         assert!(response.contains("reason: zombie_mode"));
@@ -539,37 +705,37 @@ mod tests {
 
     #[test]
     fn test_handle_trailing_slash_paths() {
-        let zombie_mode = AtomicBool::new(false);
+        let state = healthy();
 
         // Test trailing slashes
-        let response = handle_request("GET /health/ HTTP/1.1\r\n", &zombie_mode, None);
+        let response = handle_request("GET /health/ HTTP/1.1\r\n", &state, None, None);
         assert!(response.contains("200 OK"));
 
-        let response = handle_request("GET /ready/ HTTP/1.1\r\n", &zombie_mode, None);
+        let response = handle_request("GET /ready/ HTTP/1.1\r\n", &state, None, None);
         assert!(response.contains("200 OK"));
 
-        let response = handle_request("GET /live/ HTTP/1.1\r\n", &zombie_mode, None);
+        let response = handle_request("GET /live/ HTTP/1.1\r\n", &state, None, None);
         assert!(response.contains("200 OK"));
     }
 
     #[test]
     fn test_handle_empty_request() {
-        let zombie_mode = AtomicBool::new(false);
-        let response = handle_request("", &zombie_mode, None);
+        let state = healthy();
+        let response = handle_request("", &state, None, None);
         assert!(response.contains("404 Not Found"));
     }
 
     #[test]
     fn test_handle_malformed_request() {
-        let zombie_mode = AtomicBool::new(false);
-        let response = handle_request("INVALID", &zombie_mode, None);
+        let state = healthy();
+        let response = handle_request("INVALID", &state, None, None);
         assert!(response.contains("404 Not Found"));
     }
 
     #[tokio::test]
     async fn test_health_server_with_broker_id() {
-        let zombie_mode = Arc::new(AtomicBool::new(false));
-        match HealthServer::with_broker_id("127.0.0.1:0", zombie_mode.clone(), Some(42)).await {
+        let state = Arc::new(ZombieModeState::new());
+        match HealthServer::with_broker_id("127.0.0.1:0", state.clone(), Some(42)).await {
             Ok(server) => {
                 assert!(server.is_ready());
                 let addr = server.local_addr().unwrap();
@@ -577,7 +743,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }
@@ -587,15 +753,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_server_shutdown() {
-        let zombie_mode = Arc::new(AtomicBool::new(false));
-        match HealthServer::new("127.0.0.1:0", zombie_mode).await {
+        let state = Arc::new(ZombieModeState::new());
+        match HealthServer::new("127.0.0.1:0", state).await {
             Ok(server) => {
                 // Shutdown should not panic
                 server.shutdown();
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }
@@ -645,8 +811,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_server_run_shutdown() {
-        let zombie_mode = Arc::new(AtomicBool::new(false));
-        match HealthServer::new("127.0.0.1:0", zombie_mode).await {
+        let state = Arc::new(ZombieModeState::new());
+        match HealthServer::new("127.0.0.1:0", state).await {
             Ok(server) => {
                 // Start run in background
                 let server = Arc::new(server);
@@ -666,7 +832,7 @@ mod tests {
             }
             Err(crate::error::Error::IoError(crate::error::PreservedIoError {
                 kind: std::io::ErrorKind::PermissionDenied,
-                message: String::new(),
+                ..
             })) => {
                 // Skip test if we can't bind
             }
@@ -689,13 +855,13 @@ mod tests {
 
     #[test]
     fn test_response_content_type_header() {
-        let zombie_mode = AtomicBool::new(false);
+        let state = healthy();
 
-        let health = handle_request("GET /health HTTP/1.1\r\n", &zombie_mode, None);
+        let health = handle_request("GET /health HTTP/1.1\r\n", &state, None, None);
         assert!(health.contains("Content-Type: text/plain"));
         assert!(health.contains("Connection: close"));
 
-        let ready = handle_request("GET /ready HTTP/1.1\r\n", &zombie_mode, None);
+        let ready = handle_request("GET /ready HTTP/1.1\r\n", &state, None, None);
         assert!(ready.contains("Content-Type: text/plain"));
         assert!(ready.contains("Connection: close"));
     }
@@ -706,18 +872,18 @@ mod tests {
 
     #[test]
     fn test_handle_head_request() {
-        let zombie_mode = AtomicBool::new(false);
+        let state = healthy();
         // HEAD requests should work the same as GET for health endpoints
-        let response = handle_request("HEAD /health HTTP/1.1\r\n", &zombie_mode, None);
+        let response = handle_request("HEAD /health HTTP/1.1\r\n", &state, None, None);
         // We parse the path from the request line, HEAD works like GET
         assert!(response.contains("200 OK"));
     }
 
     #[test]
     fn test_handle_post_request() {
-        let zombie_mode = AtomicBool::new(false);
+        let state = healthy();
         // POST to health endpoints still returns health (we only look at path)
-        let response = handle_request("POST /health HTTP/1.1\r\n", &zombie_mode, None);
+        let response = handle_request("POST /health HTTP/1.1\r\n", &state, None, None);
         assert!(response.contains("200 OK"));
     }
 }

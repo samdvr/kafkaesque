@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P3-1: Identifier-validator fuzzers.
+//! Identifier-validator fuzzers.
 //!
 //! `validate_topic_name` and `validate_group_id` flow into filesystem paths
 //! under SlateDB. Any string the validator accepts MUST satisfy the documented

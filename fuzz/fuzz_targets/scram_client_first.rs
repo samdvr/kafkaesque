@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P0-4: SCRAM-SHA-256 client-first message parser fuzzer.
+//! SCRAM-SHA-256 client-first message parser fuzzer.
 //!
 //! Drives [`handle_client_first`] with arbitrary attacker-supplied bytes.
 //! The function MUST never panic; the worst outcome on malformed input is a

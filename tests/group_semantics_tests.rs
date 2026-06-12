@@ -671,7 +671,7 @@ async fn test_metadata_reports_raft_leader_as_controller() {
                     replication_factor: 1,
                 }],
                 timeout_ms: 5000,
-        validate_only: false,
+                validate_only: false,
             },
         )
         .await;

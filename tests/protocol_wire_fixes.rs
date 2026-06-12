@@ -539,10 +539,7 @@ fn parse_kafka_string_decodes_topic_names_in_one_step() {
     let request = Request::parse(Bytes::from(buf.to_vec())).unwrap();
     match request {
         Request::Metadata(_, body) => {
-            assert_eq!(
-                body.topics,
-                Some(vec!["my-topic".to_string()])
-            );
+            assert_eq!(body.topics, Some(vec!["my-topic".to_string()]));
         }
         other => panic!("expected Metadata, got {:?}", other),
     }
@@ -550,10 +547,7 @@ fn parse_kafka_string_decodes_topic_names_in_one_step() {
 
 #[test]
 fn io_error_preserves_underlying_message() {
-    let io_err = std::io::Error::new(
-        std::io::ErrorKind::ConnectionReset,
-        "broken pipe on read",
-    );
+    let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "broken pipe on read");
     let err = kafkaesque::error::Error::from(io_err);
     let display = format!("{}", err);
     assert!(display.contains("broken pipe on read"));

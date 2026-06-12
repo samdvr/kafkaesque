@@ -379,8 +379,10 @@ impl SlateDBClusterHandler {
             let coordinator_for_hook = coordinator.clone();
             let runtime = runtime_handles.control.clone();
             let sm_arc = coordinator.node().state_machine();
-            sm_arc.read().await.set_ownership_change_hook(Arc::new(
-                move |invalidation| {
+            sm_arc
+                .read()
+                .await
+                .set_ownership_change_hook(Arc::new(move |invalidation| {
                     let coordinator = coordinator_for_hook.clone();
                     runtime.spawn(async move {
                         match invalidation {
@@ -397,8 +399,7 @@ impl SlateDBClusterHandler {
                             }
                         }
                     });
-                },
-            ));
+                }));
         }
 
         // Start background tasks
@@ -937,12 +938,12 @@ impl Handler for SlateDBClusterHandler {
         self.sasl_post_auth.remove(&client_addr).map(|(_k, v)| v)
     }
 
-    async fn on_connection_closed(&self, client_addr: std::net::SocketAddr) {
+    async fn on_connection_closed(&self, _client_addr: std::net::SocketAddr) {
         #[cfg(feature = "sasl")]
         {
-            self.sasl_post_auth.remove(&client_addr);
+            self.sasl_post_auth.remove(&_client_addr);
             if let Some(provider) = &self.sasl_provider {
-                provider.clear_session(client_addr).await;
+                provider.clear_session(_client_addr).await;
             }
         }
     }

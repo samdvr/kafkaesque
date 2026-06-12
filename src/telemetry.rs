@@ -66,9 +66,14 @@ use opentelemetry::trace::TracerProvider;
 #[cfg(feature = "otel")]
 use opentelemetry_otlp::WithExportConfig;
 #[cfg(feature = "otel")]
-use opentelemetry_sdk::{Resource, runtime, trace as sdktrace};
+use opentelemetry_sdk::{Resource, trace as sdktrace};
+#[cfg(feature = "otel")]
+use std::sync::OnceLock;
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetryLayer;
+
+#[cfg(feature = "otel")]
+static TRACER_PROVIDER: OnceLock<sdktrace::SdkTracerProvider> = OnceLock::new();
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -200,13 +205,10 @@ impl Default for TelemetryConfig {
 /// ```
 #[cfg(feature = "otel")]
 pub fn init_telemetry(config: TelemetryConfig) -> Result<(), Box<dyn std::error::Error>> {
-    use opentelemetry::KeyValue;
-
     // Create resource with service name
-    let resource = Resource::new(vec![KeyValue::new(
-        "service.name",
-        config.service_name.clone(),
-    )]);
+    let resource = Resource::builder()
+        .with_service_name(config.service_name.clone())
+        .build();
 
     // Create OTLP exporter
     let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -215,16 +217,17 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<(), Box<dyn std::error:
         .build()?;
 
     // Create tracer provider
-    let provider = sdktrace::TracerProvider::builder()
-        .with_batch_exporter(exporter, runtime::Tokio)
+    let provider = sdktrace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
 
     // Get tracer from provider
     let tracer = provider.tracer("kafkaesque");
 
-    // Register the provider globally
-    opentelemetry::global::set_tracer_provider(provider);
+    // Register the provider globally and stash it for shutdown
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    let _ = TRACER_PROVIDER.set(provider);
 
     // Create OpenTelemetry layer
     let otel_layer = OpenTelemetryLayer::new(tracer);
@@ -262,7 +265,11 @@ pub fn init_telemetry(_config: TelemetryConfig) -> Result<(), Box<dyn std::error
 /// Call this before application exit to ensure all pending traces are flushed.
 #[cfg(feature = "otel")]
 pub fn shutdown_telemetry() {
-    opentelemetry::global::shutdown_tracer_provider();
+    if let Some(provider) = TRACER_PROVIDER.get()
+        && let Err(e) = provider.shutdown()
+    {
+        tracing::warn!(error = %e, "Failed to shut down OpenTelemetry tracer provider");
+    }
     tracing::info!("OpenTelemetry tracing shut down");
 }
 
@@ -387,6 +394,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "otel"))]
     fn test_init_telemetry_without_otel() {
         // When otel feature is disabled, this should just return Ok
         let config = TelemetryConfig::default();

@@ -58,7 +58,9 @@ pub mod tls;
 #[cfg(feature = "sasl")]
 pub mod sasl;
 
-pub use connection::{read_kafka_frame_for_fuzz, set_global_inflight_byte_budget, ClientConnection};
+pub use connection::{
+    ClientConnection, read_kafka_frame_for_fuzz, set_global_inflight_byte_budget,
+};
 pub use handler::{Handler, RequestContext, SaslPostAuth};
 pub use rate_limiter::{AuthRateLimiter, RateLimiterConfig};
 
@@ -281,9 +283,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
         max_message_size: usize,
         data_runtime: Handle,
     ) -> Result<Self> {
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| Error::from(e))?;
+        let listener = TcpListener::bind(addr).await.map_err(Error::from)?;
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let (force_shutdown_tx, _) = watch::channel(false);
@@ -318,9 +318,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
 
     /// Get the local address the server is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(|e| Error::from(e))
+        self.listener.local_addr().map_err(Error::from)
     }
 
     /// Get the number of active connections.
@@ -431,7 +429,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                 }
                 // Accept new connections
                 accept_result = self.listener.accept() => {
-                    let (stream, addr) = accept_result.map_err(|e| Error::from(e))?;
+                    let (stream, addr) = accept_result.map_err(Error::from)?;
                     let ip = addr.ip();
 
                     // Check auth rate limit first
@@ -534,11 +532,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
 
     /// Run the server for a single connection (useful for testing).
     pub async fn accept_one(&self) -> Result<()> {
-        let (stream, addr) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|e| Error::from(e))?;
+        let (stream, addr) = self.listener.accept().await.map_err(Error::from)?;
 
         tracing::debug!(client_addr = %addr, "Accepted connection");
 
@@ -639,9 +633,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
         max_message_size: usize,
         data_runtime: Handle,
     ) -> Result<Self> {
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| Error::from(e))?;
+        let listener = TcpListener::bind(addr).await.map_err(Error::from)?;
 
         let (shutdown_tx, _) = broadcast::channel(1);
         let (force_shutdown_tx, _) = watch::channel(false);
@@ -678,9 +670,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
 
     /// Get the local address the server is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(|e| Error::from(e))
+        self.listener.local_addr().map_err(Error::from)
     }
 
     /// Get the number of active connections.
@@ -781,7 +771,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                     return Ok(());
                 }
                 accept_result = self.listener.accept() => {
-                    let (stream, addr) = accept_result.map_err(|e| Error::from(e))?;
+                    let (stream, addr) = accept_result.map_err(Error::from)?;
                     let ip = addr.ip();
 
                     // Check auth rate limit first
@@ -913,11 +903,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
 
     /// Run the server for a single connection (useful for testing).
     pub async fn accept_one(&self) -> Result<()> {
-        let (stream, addr) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|e| Error::from(e))?;
+        let (stream, addr) = self.listener.accept().await.map_err(Error::from)?;
 
         tracing::debug!(client_addr = %addr, "Accepted TLS connection");
 

@@ -1,4 +1,4 @@
-//! P2-2: ACL evaluator decision property tests.
+//! ACL evaluator decision property tests.
 //!
 //! `AclDomainState::is_authorized` mixes Allow/Deny precedence with literal,
 //! prefix, and wildcard matchers. A misordered check is a silent auth bypass,
@@ -88,17 +88,15 @@ fn arb_binding() -> impl Strategy<Value = AclBinding> {
         arb_operation(),
         arb_permission(),
     )
-        .prop_map(
-            |(rt, name, pt, principal, host, op, perm)| AclBinding {
-                resource_type: rt,
-                resource_name: name,
-                pattern_type: pt,
-                principal,
-                host,
-                operation: op,
-                permission: perm,
-            },
-        )
+        .prop_map(|(rt, name, pt, principal, host, op, perm)| AclBinding {
+            resource_type: rt,
+            resource_name: name,
+            pattern_type: pt,
+            principal,
+            host,
+            operation: op,
+            permission: perm,
+        })
 }
 
 fn arb_filter() -> impl Strategy<Value = AclFilter> {
@@ -111,17 +109,15 @@ fn arb_filter() -> impl Strategy<Value = AclFilter> {
         proptest::option::of(arb_operation()),
         proptest::option::of(arb_permission()),
     )
-        .prop_map(
-            |(rt, name, pt, principal, host, op, perm)| AclFilter {
-                resource_type: rt,
-                resource_name: name,
-                pattern_type: pt,
-                principal,
-                host,
-                operation: op,
-                permission: perm,
-            },
-        )
+        .prop_map(|(rt, name, pt, principal, host, op, perm)| AclFilter {
+            resource_type: rt,
+            resource_name: name,
+            pattern_type: pt,
+            principal,
+            host,
+            operation: op,
+            permission: perm,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -229,8 +225,13 @@ fn allowed_set(state: &AclDomainState, queries: &[Query]) -> HashSet<usize> {
         .iter()
         .enumerate()
         .filter(|(_, q)| {
-            state.is_authorized(&q.principal, &q.host, q.op, q.resource_type, &q.resource_name)
-                == AclDecision::Allowed
+            state.is_authorized(
+                &q.principal,
+                &q.host,
+                q.op,
+                q.resource_type,
+                &q.resource_name,
+            ) == AclDecision::Allowed
         })
         .map(|(i, _)| i)
         .collect()

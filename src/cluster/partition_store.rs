@@ -1710,7 +1710,11 @@ impl PartitionStoreBuilder {
             // open of a fresh partition means we never need to forensically
             // guess "is this v0 or v1?" — a missing key uniquely identifies
             // pre-versioning partitions and is treated as v1 (the current).
-            match db.get(FORMAT_VERSION_KEY).await.map_err(SlateDBError::from)? {
+            match db
+                .get(FORMAT_VERSION_KEY)
+                .await
+                .map_err(SlateDBError::from)?
+            {
                 Some(bytes) if bytes.len() >= 4 => {
                     let stored = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                     if stored > CURRENT_FORMAT_VERSION {
@@ -1794,7 +1798,11 @@ impl PartitionStoreBuilder {
             };
 
             // Load persisted high watermark from DB
-            let persisted_hwm = match db.get(HIGH_WATERMARK_KEY).await.map_err(SlateDBError::from)? {
+            let persisted_hwm = match db
+                .get(HIGH_WATERMARK_KEY)
+                .await
+                .map_err(SlateDBError::from)?
+            {
                 Some(bytes) => {
                     if bytes.len() >= 8 {
                         // Use expect() with descriptive message instead of unwrap().
@@ -1813,7 +1821,11 @@ impl PartitionStoreBuilder {
 
             // Load the persisted log start offset (0 when retention has
             // never deleted a prefix).
-            let log_start_offset = match db.get(super::keys::LOG_START_OFFSET_KEY).await.map_err(SlateDBError::from)? {
+            let log_start_offset = match db
+                .get(super::keys::LOG_START_OFFSET_KEY)
+                .await
+                .map_err(SlateDBError::from)?
+            {
                 Some(bytes) if bytes.len() >= 8 => i64::from_be_bytes(
                     bytes[..8]
                         .try_into()
@@ -1829,8 +1841,8 @@ impl PartitionStoreBuilder {
             // persisted too), so open latency tracks recent write volume,
             // not total log size.
             let scan_floor = log_start_offset.max(persisted_hwm);
-            let recovery = recover_hwm_from_records(&db, persisted_hwm, fail_on_gap, scan_floor)
-                .await?;
+            let recovery =
+                recover_hwm_from_records(&db, persisted_hwm, fail_on_gap, scan_floor).await?;
             let recovered_hwm = recovery.high_watermark;
 
             // If we recovered a higher HWM, persist it

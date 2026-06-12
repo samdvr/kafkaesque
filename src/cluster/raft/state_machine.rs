@@ -227,8 +227,9 @@ impl CoordinationStateMachine {
                 }
                 // Disjoint borrows of `partition_domain` and `lease_clock_ms`.
                 let state = &mut *state;
-                let response =
-                    state.partition_domain.apply(cmd.clone(), &mut state.lease_clock_ms);
+                let response = state
+                    .partition_domain
+                    .apply(cmd.clone(), &mut state.lease_clock_ms);
                 if let Some(invalidation) = ownership_invalidation_for_partition(&cmd, &response) {
                     self.fire_ownership_change_hook(invalidation);
                 }
@@ -342,7 +343,9 @@ fn ownership_invalidation_for_partition(
     use super::domains::{PartitionCommand, PartitionResponse};
 
     match response {
-        PartitionResponse::PartitionAcquired { topic, partition, .. }
+        PartitionResponse::PartitionAcquired {
+            topic, partition, ..
+        }
         | PartitionResponse::PartitionReleased { topic, partition } => {
             Some(OwnershipCacheInvalidation::Partition {
                 topic: topic.clone(),
@@ -354,9 +357,9 @@ fn ownership_invalidation_for_partition(
         }
         // A failed acquire against an active owner means our cached view
         // of who owns this partition may be stale.
-        PartitionResponse::PartitionOwnedByOther { topic, partition, .. }
-            if matches!(cmd, PartitionCommand::AcquirePartition { .. }) =>
-        {
+        PartitionResponse::PartitionOwnedByOther {
+            topic, partition, ..
+        } if matches!(cmd, PartitionCommand::AcquirePartition { .. }) => {
             Some(OwnershipCacheInvalidation::Partition {
                 topic: topic.clone(),
                 partition: *partition,
@@ -372,12 +375,12 @@ fn ownership_invalidation_for_transfer(
     use super::domains::TransferResponse;
 
     match response {
-        TransferResponse::PartitionTransferred { topic, partition, .. } => {
-            Some(OwnershipCacheInvalidation::Partition {
-                topic: topic.clone(),
-                partition: *partition,
-            })
-        }
+        TransferResponse::PartitionTransferred {
+            topic, partition, ..
+        } => Some(OwnershipCacheInvalidation::Partition {
+            topic: topic.clone(),
+            partition: *partition,
+        }),
         TransferResponse::BrokerMarkedFailed {
             partitions_affected,
             ..

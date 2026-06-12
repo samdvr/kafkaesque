@@ -579,11 +579,15 @@ mod tests {
         auth.add_user("alice", "secret").await;
 
         // Empty auth data
-        let result = auth.authenticate(SaslMechanism::Plain, &[], Some(b"tls")).await;
+        let result = auth
+            .authenticate(SaslMechanism::Plain, &[], Some(b"tls"))
+            .await;
         assert!(!result.is_success());
 
         // Only one NUL
-        let result = auth.authenticate(SaslMechanism::Plain, b"\0", Some(b"tls")).await;
+        let result = auth
+            .authenticate(SaslMechanism::Plain, b"\0", Some(b"tls"))
+            .await;
         assert!(!result.is_success());
     }
 

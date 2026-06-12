@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kubernetes StatefulSet E2E verification (audit P1-15).
+# Kubernetes StatefulSet E2E verification.
 #
 # Boots a 3-broker StatefulSet on a local `kind` cluster, deploys a
 # producer sidecar, and verifies that the broker addresses returned in
@@ -54,7 +54,7 @@ METADATA=$(kubectl -n "$NAMESPACE" exec kcat-producer -- \
 
 echo "$METADATA"
 
-# Audit P1-15 verification: every advertised broker address should be
+# Verification: every advertised broker address should be
 # reachable from inside the cluster. We grep the Metadata output for
 # the StatefulSet pod FQDNs (set via ADVERTISED_HOST in the manifest)
 # and probe each one.

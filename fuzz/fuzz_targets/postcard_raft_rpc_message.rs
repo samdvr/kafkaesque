@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P0-5: Postcard decode fuzzer for [`RaftRpcMessage`].
+//! Postcard decode fuzzer for [`RaftRpcMessage`].
 //!
 //! Raft RPC frames are HMAC-authenticated on the wire (see
 //! `cluster::raft::auth`), but the postcard decode runs *before* HMAC

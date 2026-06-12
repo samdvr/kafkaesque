@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P0-4: SCRAM-SHA-256 client-final message parser fuzzer.
+//! SCRAM-SHA-256 client-final message parser fuzzer.
 //!
 //! Seeds the SCRAM state machine with a valid `AwaitingClientFinal` produced
 //! by [`handle_client_first`], then feeds arbitrary bytes to

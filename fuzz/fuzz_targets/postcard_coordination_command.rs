@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P0-5: Postcard decode fuzzer for [`CoordinationCommand`].
+//! Postcard decode fuzzer for [`CoordinationCommand`].
 //!
 //! `CoordinationCommand` is the input variant of the Raft state machine:
 //! every replicated cluster operation flows through this enum. On the wire

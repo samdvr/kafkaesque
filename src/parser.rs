@@ -10,10 +10,7 @@ use nombytes::NomBytes;
 use crate::constants::MAX_PROTOCOL_ARRAY_SIZE;
 
 fn utf8_verify_err(input: NomBytes) -> nom::Err<nom::error::Error<NomBytes>> {
-    nom::Err::Failure(nom::error::Error::new(
-        input,
-        nom::error::ErrorKind::Verify,
-    ))
+    nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
 }
 
 /// Parse a Kafka `STRING` directly into a validated UTF-8 [`String`].

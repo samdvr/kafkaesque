@@ -54,13 +54,7 @@ fn parse_list_offsets_topic(s: NomBytes, version: i16) -> IResult<NomBytes, List
     let (s, name) = parse_kafka_string(s)?;
     let (s, partitions) = parse_array(|s| parse_list_offsets_partition(s, version))(s)?;
 
-    Ok((
-        s,
-        ListOffsetsTopicData {
-            name,
-            partitions,
-        },
-    ))
+    Ok((s, ListOffsetsTopicData { name, partitions }))
 }
 
 fn parse_list_offsets_partition(
@@ -168,13 +162,7 @@ fn parse_offset_commit_topic(
     let (s, name) = parse_kafka_string(s)?;
     let (s, partitions) = parse_array(|s| parse_offset_commit_partition(s, version))(s)?;
 
-    Ok((
-        s,
-        OffsetCommitTopicData {
-            name,
-            partitions,
-        },
-    ))
+    Ok((s, OffsetCommitTopicData { name, partitions }))
 }
 
 fn parse_offset_commit_partition(
@@ -223,13 +211,7 @@ pub fn parse_offset_fetch_request(
     let (s, group_id) = parse_kafka_string(s)?;
     let (s, topics) = parse_array(parse_offset_fetch_topic)(s)?;
 
-    Ok((
-        s,
-        OffsetFetchRequestData {
-            group_id,
-            topics,
-        },
-    ))
+    Ok((s, OffsetFetchRequestData { group_id, topics }))
 }
 
 fn parse_offset_fetch_topic(s: NomBytes) -> IResult<NomBytes, OffsetFetchTopicData> {

@@ -1,4 +1,4 @@
-//! P2-1: Raft state-machine determinism property tests.
+//! Raft state-machine determinism property tests.
 //!
 //! `CoordinationStateMachine::apply_command` is the single point of state
 //! mutation across the cluster. Any non-determinism here causes replica

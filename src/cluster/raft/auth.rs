@@ -220,7 +220,10 @@ pub struct RaftAuthKeys {
 impl std::fmt::Debug for RaftAuthKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RaftAuthKeys")
-            .field("cluster_secret_configured", &self.cluster_secret_configured())
+            .field(
+                "cluster_secret_configured",
+                &self.cluster_secret_configured(),
+            )
             .field("join_token_configured", &self.join_token_configured())
             .field("replay_cache", &self.replay_cache)
             .finish()
@@ -312,6 +315,7 @@ impl RaftAuthKeys {
     }
 
     /// Compute the HMAC tag for an unauthenticated (legacy) frame.
+    #[cfg(test)]
     pub(crate) fn sign(&self, purpose: FramePurpose, payload: &[u8]) -> [u8; HMAC_LEN] {
         self.sign_authenticated(purpose, None, None, payload)
     }
@@ -345,6 +349,7 @@ impl RaftAuthKeys {
     }
 
     /// Verify a received frame (legacy unauthenticated layout).
+    #[cfg(test)]
     pub(crate) fn verify(
         &self,
         purpose: FramePurpose,
@@ -413,10 +418,6 @@ impl RaftAuthKeys {
                 "Rejected Raft frame: HMAC mismatch",
             ))
         }
-    }
-
-    pub(crate) fn replay_cache(&self) -> &ReplayCache {
-        &self.replay_cache
     }
 }
 
@@ -495,13 +496,7 @@ pub(crate) async fn read_rpc_frame<S: AsyncReadExt + Unpin>(
     let mut payload = vec![0u8; payload_len];
     stream.read_exact(&mut payload).await?;
 
-    keys.verify_authenticated(
-        purpose,
-        timestamp_ms,
-        nonce.as_ref(),
-        &tag,
-        &payload,
-    )?;
+    keys.verify_authenticated(purpose, timestamp_ms, nonce.as_ref(), &tag, &payload)?;
     Ok((purpose, payload))
 }
 
@@ -522,12 +517,7 @@ pub(crate) async fn write_rpc_frame<S: AsyncWriteExt + Unpin>(
         let nonce = ReplayCache::fresh_nonce();
         (Some(ts), Some(nonce), AUTHENTICATED_FRAME_HEADER_LEN)
     };
-    let tag = keys.sign_authenticated(
-        purpose,
-        timestamp_ms,
-        nonce.as_ref(),
-        payload,
-    );
+    let tag = keys.sign_authenticated(purpose, timestamp_ms, nonce.as_ref(), payload);
     let total_len = payload
         .len()
         .checked_add(header_len)
@@ -597,7 +587,8 @@ mod tests {
         let payload = b"vote-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
-        let mut tag = keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
+        let mut tag =
+            keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
         tag[0] ^= 0xff;
         let err = keys
             .verify_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), &tag, payload)
@@ -633,7 +624,13 @@ mod tests {
         let cluster_tag =
             keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
         let err = keys
-            .verify_authenticated(FramePurpose::Join, Some(ts), Some(&nonce), &cluster_tag, payload)
+            .verify_authenticated(
+                FramePurpose::Join,
+                Some(ts),
+                Some(&nonce),
+                &cluster_tag,
+                payload,
+            )
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }

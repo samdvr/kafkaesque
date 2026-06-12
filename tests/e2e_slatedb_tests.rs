@@ -393,7 +393,7 @@ async fn test_e2e_slatedb_persistence_across_restart() {
                 replication_factor: 1,
             }],
             timeout_ms: 5000,
-        validate_only: false,
+            validate_only: false,
         };
         handler.handle_create_topics(&ctx, create_req).await;
 
@@ -711,7 +711,7 @@ async fn test_e2e_multiple_produce_cycles_with_persistence() {
                     replication_factor: 1,
                 }],
                 timeout_ms: 5000,
-        validate_only: false,
+                validate_only: false,
             };
             handler.handle_create_topics(&ctx, create_req).await;
         }

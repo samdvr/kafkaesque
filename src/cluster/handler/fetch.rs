@@ -322,7 +322,8 @@ async fn collect_fetch(
                                         let msg_count = crate::protocol::parse_record_count(
                                             record_bytes,
                                         )
-                                        .max(0) as u64;
+                                        .max(0)
+                                            as u64;
                                         crate::cluster::metrics::record_fetch(
                                             &topic_name,
                                             partition.partition_index,
@@ -677,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_fetch_multiple_partitions_mixed_results() {
-        let partitions = vec![
+        let partitions = [
             FetchPartitionResponse {
                 partition_index: 0,
                 error_code: KafkaCode::None,

@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P0-3: RecordBatch header validation + producer info extraction.
+//! RecordBatch header validation + producer info extraction.
 //!
 //! Drives every batch-header function the broker calls on attacker bytes:
 //!   - [`validate_batch_crc`]: CRC mismatch detection (production: corrupt-batch reject).

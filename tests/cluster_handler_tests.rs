@@ -467,10 +467,7 @@ async fn test_create_topics_validate_only_dry_run() {
         .handle_metadata(&ctx, MetadataRequestData { topics: None })
         .await;
     assert!(
-        !metadata
-            .topics
-            .iter()
-            .any(|t| t.name == "dry-run-topic"),
+        !metadata.topics.iter().any(|t| t.name == "dry-run-topic"),
         "validate_only must not register topic in coordinator"
     );
 }

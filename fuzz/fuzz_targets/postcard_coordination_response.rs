@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P0-5: Postcard decode fuzzer for [`CoordinationResponse`].
+//! Postcard decode fuzzer for [`CoordinationResponse`].
 //!
 //! Responses flow back over the same Raft channels and end up on disk in
 //! some retry/replay paths. Same threat model as `CoordinationCommand`.

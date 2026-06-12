@@ -1001,8 +1001,8 @@ impl RaftRpcServer {
                 Err(e) => return Err(e.into()),
             };
 
-            let response = Self::dispatch_rpc_message(&raft, &auth_keys, frame_purpose, &msg_buf)
-                .await?;
+            let response =
+                Self::dispatch_rpc_message(&raft, &auth_keys, frame_purpose, &msg_buf).await?;
 
             let response_data = postcard::to_stdvec(&response)?;
             write_rpc_frame(&mut stream, &auth_keys, false, &response_data).await?;

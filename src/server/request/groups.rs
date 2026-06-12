@@ -27,13 +27,7 @@ pub fn parse_find_coordinator_request(
     let (s, key) = parse_kafka_string(s)?;
     let (s, key_type) = if version >= 1 { be_i8(s)? } else { (s, 0i8) };
 
-    Ok((
-        s,
-        FindCoordinatorRequestData {
-            key,
-            key_type,
-        },
-    ))
+    Ok((s, FindCoordinatorRequestData { key, key_type }))
 }
 
 // ============================================================================

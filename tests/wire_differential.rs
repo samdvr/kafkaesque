@@ -1,4 +1,4 @@
-//! P1-1: Differential parser test against the [`kafka-protocol`] crate.
+//! Differential parser test against the [`kafka-protocol`] crate.
 //!
 //! Generates random structured request payloads via `proptest`, encodes
 //! them with the **independent** `kafka-protocol` implementation, and
@@ -20,12 +20,12 @@
 //! silent layout mismatch would mask a real parser bug.
 
 use bytes::BytesMut;
+use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::messages::{
     DescribeGroupsRequest, FindCoordinatorRequest, HeartbeatRequest, LeaveGroupRequest,
     ListGroupsRequest, MetadataRequest, SaslHandshakeRequest,
 };
 use kafka_protocol::messages::{GroupId, TopicName};
-use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::protocol::{Encodable, StrBytes};
 use nombytes::NomBytes;
 use proptest::prelude::*;

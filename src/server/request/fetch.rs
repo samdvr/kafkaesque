@@ -57,13 +57,7 @@ fn parse_fetch_topic(s: NomBytes) -> IResult<NomBytes, FetchTopicData> {
     let (s, name) = parse_kafka_string(s)?;
     let (s, partitions) = parse_array(parse_fetch_partition)(s)?;
 
-    Ok((
-        s,
-        FetchTopicData {
-            name,
-            partitions,
-        },
-    ))
+    Ok((s, FetchTopicData { name, partitions }))
 }
 
 fn parse_fetch_partition(s: NomBytes) -> IResult<NomBytes, FetchPartitionData> {

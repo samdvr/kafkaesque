@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P0-5: Postcard decode fuzzer for [`RaftRpcResponse`].
+//! Postcard decode fuzzer for [`RaftRpcResponse`].
 //!
 //! Mirror of the `RaftRpcMessage` target; same threat model. See that
 //! target's module docs for context.

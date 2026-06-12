@@ -208,7 +208,7 @@ impl RaftCoordinator {
 
                         // Subtract the configured skew tolerance from the
                         // expiry comparison so a leader whose clock jumps
-                        // forward doesn't mass-expire valid leases. P2-5.
+                        // forward doesn't mass-expire valid leases.
                         let now = current_time_ms().saturating_sub(clock_skew_tolerance_ms);
                         let command = CoordinationCommand::PartitionDomain(
                             super::domains::PartitionCommand::ExpireLeases { current_time_ms: now }

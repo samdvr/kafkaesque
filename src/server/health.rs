@@ -124,9 +124,7 @@ impl HealthServer {
         zombie_state: Arc<ZombieModeState>,
         broker_id: Option<i32>,
     ) -> Result<Self> {
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(Error::from)?;
+        let listener = TcpListener::bind(addr).await.map_err(Error::from)?;
 
         let (shutdown_tx, _) = broadcast::channel(1);
 
@@ -153,9 +151,7 @@ impl HealthServer {
 
     /// Get the local address the server is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(Error::from)
+        self.listener.local_addr().map_err(Error::from)
     }
 
     /// Initiate graceful shutdown.

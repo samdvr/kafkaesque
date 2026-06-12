@@ -1,4 +1,4 @@
-//! P5-3: Stateful broker fuzzing via proptest.
+//! Stateful broker fuzzing via proptest.
 //!
 //! Drives a single in-memory `Handler` through random sequences of
 //! produce / fetch / list-offsets / metadata calls and asserts the
@@ -353,11 +353,28 @@ impl Handler for StatefulHandler {
 /// of range partitions, fetch_offset past the high watermark).
 #[derive(Debug, Clone)]
 enum Op {
-    CreateTopic { name: String, num_partitions: i32 },
-    DeleteTopic { name: String },
-    Produce { topic: String, partition: i32, payload: Vec<u8> },
-    Fetch { topic: String, partition: i32, offset: i64 },
-    ListOffsets { topic: String, partition: i32, timestamp: i64 },
+    CreateTopic {
+        name: String,
+        num_partitions: i32,
+    },
+    DeleteTopic {
+        name: String,
+    },
+    Produce {
+        topic: String,
+        partition: i32,
+        payload: Vec<u8>,
+    },
+    Fetch {
+        topic: String,
+        partition: i32,
+        offset: i64,
+    },
+    ListOffsets {
+        topic: String,
+        partition: i32,
+        timestamp: i64,
+    },
     Metadata,
 }
 
@@ -395,13 +412,13 @@ fn arb_op() -> impl Strategy<Value = Op> {
                 payload,
             }
         ),
-        (arb_topic_name(), arb_partition(), -2i64..32i64).prop_map(
-            |(topic, partition, offset)| Op::Fetch {
+        (arb_topic_name(), arb_partition(), -2i64..32i64).prop_map(|(topic, partition, offset)| {
+            Op::Fetch {
                 topic,
                 partition,
                 offset,
             }
-        ),
+        }),
         (
             arb_topic_name(),
             arb_partition(),
@@ -647,13 +664,13 @@ async fn run_ops(ops: Vec<Op>) -> Result<(), String> {
                         // empty fetch (when the topic was created but
                         // never produced to) or UnknownTopicOrPartition
                         // (when it doesn't know the topic at all).
-                        if let Some(b) = &pr.records {
-                            if !b.is_empty() {
-                                return Err(format!(
-                                    "Fetch returned phantom records for unwritten {}:{}",
-                                    topic, partition
-                                ));
-                            }
+                        if let Some(b) = &pr.records
+                            && !b.is_empty()
+                        {
+                            return Err(format!(
+                                "Fetch returned phantom records for unwritten {}:{}",
+                                topic, partition
+                            ));
                         }
                     }
                 }

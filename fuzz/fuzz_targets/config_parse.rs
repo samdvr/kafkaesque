@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P3-2: Config-parsing fuzzers.
+//! Config-parsing fuzzers.
 //!
 //! Covers three parser surfaces used at broker startup:
 //!

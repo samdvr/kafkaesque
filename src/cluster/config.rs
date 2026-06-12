@@ -805,7 +805,7 @@ impl Default for ClusterConfig {
             max_partitions_per_topic: 1000, // Reasonable limit to prevent DoS
             max_auto_created_topics: 10_000, // Reasonable limit to prevent DoS
             // Network tuning
-            max_message_size: 100 * 1024 * 1024,  // 100 MB
+            max_message_size: 100 * 1024 * 1024, // 100 MB
             global_inflight_byte_budget: 1024 * 1024 * 1024, // 1 GiB
             max_fetch_response_size: 1024 * 1024, // 1 MB
             max_concurrent_partition_writes: 16,
@@ -1467,11 +1467,10 @@ impl ClusterConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.max_message_size);
 
-        let global_inflight_byte_budget: usize =
-            std::env::var("GLOBAL_INFLIGHT_BYTE_BUDGET")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(defaults.global_inflight_byte_budget);
+        let global_inflight_byte_budget: usize = std::env::var("GLOBAL_INFLIGHT_BYTE_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.global_inflight_byte_budget);
 
         let max_fetch_response_size: usize = std::env::var("MAX_FETCH_RESPONSE_SIZE")
             .ok()
@@ -1798,7 +1797,9 @@ impl ClusterConfig {
     /// of `ClusterConfig` — it must not appear in debug output or config
     /// dumps — and programmatic/test construction of configs should not
     /// require process-global env state.
-    fn validate_env_security_posture(config: &ClusterConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_env_security_posture(
+        config: &ClusterConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let profile = match std::env::var("CLUSTER_PROFILE") {
             Ok(raw) => raw
                 .parse::<ClusterProfile>()

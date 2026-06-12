@@ -1,4 +1,4 @@
-//! P5-2: Differential test against an Apache Kafka broker.
+//! Differential test against an Apache Kafka broker.
 //!
 //! For every wire-protocol request this test sends, the same bytes are
 //! delivered to (a) a kafkaesque server spun up in-process and (b) — when
@@ -18,7 +18,7 @@
 //! The differential check only fires when the env var is set, so the
 //! default `cargo test` smoke run passes without a JVM in the loop.
 //! Standing up Apache Kafka in CI is a separate (heavyweight) workflow
-//! step — see the P5-2 sidecar plan.
+//! step.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -178,9 +178,7 @@ async fn start_kafkaesque() -> Option<(SocketAddr, Arc<KafkaServer<DiffHandler>>
     let server = match KafkaServer::new("127.0.0.1:0", handler).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "Skipping P5-2 differential: cannot bind kafkaesque listener ({e})"
-            );
+            eprintln!("Skipping Apache Kafka differential: cannot bind kafkaesque listener ({e})");
             return None;
         }
     };
@@ -207,7 +205,7 @@ async fn kafka_broker_addr() -> Option<SocketAddr> {
         Ok(Ok(_)) => Some(addr),
         _ => {
             eprintln!(
-                "P5-2 differential: KAFKA_BOOTSTRAP_SERVERS={} is not reachable, skipping diff",
+                "Apache Kafka differential: KAFKA_BOOTSTRAP_SERVERS={} is not reachable, skipping diff",
                 raw
             );
             None
@@ -322,8 +320,7 @@ async fn diff_metadata_v0_all_topics() {
             .await
             .expect("Apache Kafka must respond to Metadata v0");
         assert_responses_align("Metadata v0", &ours, &theirs, 0xBEEF_u32 as i32);
-        let their_broker_count =
-            i32::from_be_bytes([theirs[4], theirs[5], theirs[6], theirs[7]]);
+        let their_broker_count = i32::from_be_bytes([theirs[4], theirs[5], theirs[6], theirs[7]]);
         assert!(
             their_broker_count >= 1,
             "Apache Kafka Metadata v0 returned {} brokers (want >=1)",

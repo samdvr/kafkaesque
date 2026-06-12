@@ -97,9 +97,9 @@ loom = { version = "0.7", optional = true }
 
 # OpenTelemetry for distributed tracing
 opentelemetry = { version = "0.31.0", optional = true }
-opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.31.0", features = ["tonic"], optional = true }
-tracing-opentelemetry = { version = "0.31.0", optional = true }
+opentelemetry_sdk = { version = "0.31.0", optional = true }
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
 crc32c = "0.6.8"
 
 [dev-dependencies]
@@ -111,7 +111,7 @@ criterion = { version = "0.8.1", features = ["html_reports"] }
 proptest = "1.5"
 # `kafka-protocol` is a separate Rust implementation of the Kafka wire
 # protocol — used by the differential roundtrip tests in
-# `tests/wire_differential.rs` (P1-1) so we verify our parsers against an
+# `tests/wire_differential.rs` so we verify our parsers against an
 # independent encoder, not just a hand-rolled reference. Newer 0.x
 # releases compile cleanly against `bytes 1.11+`; older ones (≤0.13) run
 # into a `try_get_u8` ambiguity with the bytes crate's now-native method.

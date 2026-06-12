@@ -523,7 +523,8 @@ enum ErrorCategory {
     Fenced,
     /// Safe/recoverable error - transient or expected
     Safe,
-    /// Unknown error — propagate without auto-fencing (see audit 5.7).
+    /// Unknown error — propagate without auto-fencing to avoid mass lease
+    /// release on transient glitches.
     Unknown,
 }
 
@@ -1815,7 +1816,8 @@ mod tests {
 
     #[test]
     fn test_is_fenced_unknown_slatedb_message() {
-        // Unknown patterns must not auto-fence (audit 5.7 — avoid mass release on glitches)
+        // Unknown patterns must not auto-fence — avoids mass lease release on
+        // transient glitches.
         let err = SlateDBError::SlateDB("Some completely unknown error xyz".to_string());
         assert!(!err.is_fenced());
     }

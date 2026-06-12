@@ -51,13 +51,7 @@ fn parse_produce_topic(s: NomBytes) -> IResult<NomBytes, ProduceTopicData> {
     let (s, name) = parse_kafka_string(s)?;
     let (s, partitions) = parse_array(parse_produce_partition)(s)?;
 
-    Ok((
-        s,
-        ProduceTopicData {
-            name,
-            partitions,
-        },
-    ))
+    Ok((s, ProduceTopicData { name, partitions }))
 }
 
 fn parse_produce_partition(s: NomBytes) -> IResult<NomBytes, ProducePartitionData> {

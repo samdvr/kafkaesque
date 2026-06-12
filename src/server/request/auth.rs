@@ -18,12 +18,7 @@ pub fn parse_sasl_handshake_request(
 ) -> IResult<NomBytes, SaslHandshakeRequestData> {
     let (s, mechanism) = parse_kafka_string(s)?;
 
-    Ok((
-        s,
-        SaslHandshakeRequestData {
-            mechanism,
-        },
-    ))
+    Ok((s, SaslHandshakeRequestData { mechanism }))
 }
 
 /// SaslAuthenticate request data.

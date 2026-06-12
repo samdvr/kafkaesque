@@ -1,13 +1,12 @@
-//! P1-2: Roundtrip property tests for Kafka request parsers.
+//! Roundtrip property tests for Kafka request parsers.
 //!
 //! For each of a representative set of request APIs, we generate an
 //! `Arbitrary` instance, encode it to bytes via a hand-rolled encoder, then
 //! parse it back through the production parser and assert structural
 //! equality. The hand-rolled encoder is intentionally a separate
 //! implementation from the parser — the test thus doubles as a
-//! differential check against an in-tree reference (P1-1, partial: full
-//! cross-implementation differential against `kafka-protocol` is deferred
-//! pending the dep being addable; see `fuzzy_testing_plan.md`).
+//! differential check against an in-tree reference (full cross-implementation
+//! differential lives in `wire_differential.rs`).
 //!
 //! Coverage:
 //!   - Heartbeat (v0–v1, no version-specific layout difference here)

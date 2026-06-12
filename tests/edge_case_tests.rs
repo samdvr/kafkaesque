@@ -1,11 +1,11 @@
 //! Edge case and failure scenario tests.
 //!
 //! These tests cover critical failure modes:
-//! - P0: Raft snapshot crash recovery
-//! - P0: Producer state persistence and recovery after cache eviction
-//! - P1: Lease expiry race conditions
-//! - P2: Consumer group rebalance during fetch
-//! - P2: Object store timeout handling
+//! - Raft snapshot crash recovery
+//! - Producer state persistence and recovery after cache eviction
+//! - Lease expiry race conditions
+//! - Consumer group rebalance during fetch
+//! - Object store timeout handling
 //!
 //! Run these tests with:
 //! ```bash
@@ -29,7 +29,7 @@ use kafkaesque::cluster::raft::{
 };
 
 // ============================================================================
-// P0: Raft Snapshot Crash Recovery Tests
+// Raft Snapshot Crash Recovery Tests
 // ============================================================================
 
 /// Test that orphaned temp files from a crashed snapshot write are cleaned up.
@@ -155,7 +155,7 @@ async fn test_valid_snapshot_survives_with_orphaned_temps() {
 }
 
 // ============================================================================
-// P0: Producer State Persistence and Recovery Tests
+// Producer State Persistence and Recovery Tests
 // ============================================================================
 
 /// Test that producer state is persisted to SlateDB and survives restart.
@@ -296,7 +296,7 @@ async fn test_producer_state_load_from_coordinator() {
 }
 
 // ============================================================================
-// P1: Lease Expiry Race Condition Tests
+// Lease Expiry Race Condition Tests
 // ============================================================================
 
 /// Test that zombie mode correctly blocks writes during lease transition.
@@ -381,7 +381,7 @@ async fn test_zombie_mode_reentry_detection() {
 }
 
 // ============================================================================
-// P2: Consumer Group Rebalance During Fetch Tests
+// Consumer Group Rebalance During Fetch Tests
 // ============================================================================
 
 /// Test that generation validation prevents stale consumers from committing.
@@ -508,7 +508,7 @@ async fn test_sync_group_leader_sets_assignments() {
 }
 
 // ============================================================================
-// P2: Object Store Timeout Tests
+// Object Store Timeout Tests
 // ============================================================================
 
 /// Test that flush failures are properly propagated.

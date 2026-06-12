@@ -48,7 +48,10 @@ async fn wait_for_raft_leader(coordinator: &RaftCoordinator) {
 }
 
 async fn assert_partition_ownership_contract<C: PartitionCoordinator>(coord: &C, topic: &str) {
-    coord.register_topic(topic, 1).await.expect("register topic");
+    coord
+        .register_topic(topic, 1)
+        .await
+        .expect("register topic");
 
     let owns_before = coord
         .owns_partition_for_read(topic, 0)
@@ -134,9 +137,15 @@ async fn raft_coordinator_satisfies_partition_contract() {
     let coordinator = RaftCoordinator::new(config, store, Handle::current())
         .await
         .expect("create coordinator");
-    coordinator.initialize_cluster().await.expect("init cluster");
+    coordinator
+        .initialize_cluster()
+        .await
+        .expect("init cluster");
     wait_for_raft_leader(&coordinator).await;
-    coordinator.register_broker().await.expect("register broker");
+    coordinator
+        .register_broker()
+        .await
+        .expect("register broker");
 
     assert_partition_ownership_contract(&coordinator, "raft-contract-topic").await;
 
@@ -152,9 +161,15 @@ async fn raft_coordinator_satisfies_group_generation_contract() {
     let coordinator = RaftCoordinator::new(config, store, Handle::current())
         .await
         .expect("create coordinator");
-    coordinator.initialize_cluster().await.expect("init cluster");
+    coordinator
+        .initialize_cluster()
+        .await
+        .expect("init cluster");
     wait_for_raft_leader(&coordinator).await;
-    coordinator.register_broker().await.expect("register broker");
+    coordinator
+        .register_broker()
+        .await
+        .expect("register broker");
 
     assert_group_join_generation_contract(&coordinator).await;
 

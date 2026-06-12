@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P0-2: Connection frame reader fuzzer.
+//! Connection frame reader fuzzer.
 //!
 //! Drives [`kafkaesque::server::read_kafka_frame_for_fuzz`] over a mock
 //! `AsyncRead` that returns the fuzz input in arbitrary chunks. The reader

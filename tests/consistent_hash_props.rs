@@ -1,4 +1,4 @@
-//! P2-3: Consistent-hash assignment stability property tests.
+//! Consistent-hash assignment stability property tests.
 //!
 //! `consistent_hash_assignment` (in `src/cluster/coordinator/mod.rs`) decides
 //! which broker owns each `(topic, partition)` key. Reassignment moves data,
@@ -64,25 +64,28 @@ fn arb_one_broker_change() -> impl Strategy<Value = (Vec<i32>, Vec<i32>)> {
         0i32..20,
         any::<bool>(),
     )
-        .prop_filter_map("changed broker must not already be in the smaller set", |(set, extra, add)| {
-            let smaller: BTreeSet<i32> = set.clone();
-            if smaller.contains(&extra) {
-                return None;
-            }
-            let mut larger = smaller.clone();
-            larger.insert(extra);
+        .prop_filter_map(
+            "changed broker must not already be in the smaller set",
+            |(set, extra, add)| {
+                let smaller: BTreeSet<i32> = set.clone();
+                if smaller.contains(&extra) {
+                    return None;
+                }
+                let mut larger = smaller.clone();
+                larger.insert(extra);
 
-            let smaller_v: Vec<i32> = smaller.into_iter().collect();
-            let larger_v: Vec<i32> = larger.into_iter().collect();
+                let smaller_v: Vec<i32> = smaller.into_iter().collect();
+                let larger_v: Vec<i32> = larger.into_iter().collect();
 
-            // `add == true` means the change is "smaller -> larger" (broker
-            // joins); `false` means "larger -> smaller" (broker leaves).
-            if add {
-                Some((smaller_v, larger_v))
-            } else {
-                Some((larger_v, smaller_v))
-            }
-        })
+                // `add == true` means the change is "smaller -> larger" (broker
+                // joins); `false` means "larger -> smaller" (broker leaves).
+                if add {
+                    Some((smaller_v, larger_v))
+                } else {
+                    Some((larger_v, smaller_v))
+                }
+            },
+        )
 }
 
 proptest! {

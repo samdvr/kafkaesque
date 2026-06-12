@@ -47,9 +47,6 @@ pub const DEFAULT_ITERATIONS: u32 = 4096;
 /// Salt length in bytes — 16 is the SCRAM convention and matches Kafka.
 pub const SALT_LEN: usize = 16;
 
-/// Nonce length used for both client and server nonces (in bytes).
-const NONCE_LEN: usize = 18;
-
 /// Per-user SCRAM credential set, derived once at `add_user` time and
 /// thereafter the only thing we keep about the password.
 #[derive(Debug, Clone)]

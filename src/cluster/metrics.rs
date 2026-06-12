@@ -1443,7 +1443,9 @@ fn bounded_topic_label(topic: &str) -> String {
         return topic.to_string();
     }
 
-    let mut tracked = TRACKED_LATENCY_TOPICS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tracked = TRACKED_LATENCY_TOPICS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if tracked.contains(topic) {
         return topic.to_string();
     }
@@ -1625,9 +1627,7 @@ pub fn record_fetch_latency(topic: &str, status: &str, duration_secs: f64) {
 /// * `count` - Number of records (or partition writes) dropped
 pub fn record_produce_dropped(reason: &str, count: u64) {
     if count > 0 {
-        PRODUCE_DROPPED
-            .with_label_values(&[reason])
-            .inc_by(count);
+        PRODUCE_DROPPED.with_label_values(&[reason]).inc_by(count);
     }
 }
 

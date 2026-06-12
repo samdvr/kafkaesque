@@ -737,7 +737,10 @@ fn test_from_env_production_open_broker_rejected() {
         ],
         || {
             let result = ClusterConfig::from_env();
-            assert!(result.is_err(), "open broker must fail in production profile");
+            assert!(
+                result.is_err(),
+                "open broker must fail in production profile"
+            );
             let err = result.unwrap_err().to_string();
             assert!(
                 err.contains("acl_enabled") || err.contains("SASL"),

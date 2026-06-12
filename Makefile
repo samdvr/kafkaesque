@@ -46,3 +46,10 @@ clean:
 outdated:
 	cargo install --locked cargo-outdated
 	cargo outdated -R
+
+# Run every cargo-fuzz target for FUZZ_TIME seconds (default 60). Useful for
+# CI smoke checks; long campaigns should target a single fuzzer directly.
+FUZZ_TIME ?= 60
+.PHONY: fuzz
+fuzz:
+	./scripts/fuzz-all.sh $(FUZZ_TIME)

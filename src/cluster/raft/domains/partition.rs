@@ -27,9 +27,32 @@
 //!    same sweep (or sweeps from multiple brokers) is a no-op after the first
 //!    application.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Serialize a `HashMap<String, String>` with entries sorted by key.
+///
+/// `HashMap` iteration order is randomized per process, so two replicas (or
+/// the same process re-encoding the same logical value) can produce different
+/// byte sequences for the same map. That breaks postcard's canonical-form
+/// invariant — a fuzz target caught this on `CreateTopic.config` — and is
+/// also load-bearing for Raft determinism: replicas that hash log entries
+/// (e.g. for snapshot diffing or wire integrity) must agree byte-for-byte.
+/// Wire format is unchanged from the default `Serialize` impl, so existing
+/// serialized data still round-trips.
+fn serialize_sorted_map<S>(map: &HashMap<String, String>, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut entries: Vec<(&String, &String)> = map.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut m = ser.serialize_map(Some(entries.len()))?;
+    for (k, v) in entries {
+        m.serialize_entry(k, v)?;
+    }
+    m.end()
+}
 
 /// Grace window in milliseconds applied symmetrically to lease-expiry
 /// comparisons on the grant (takeover) and renew paths.
@@ -57,6 +80,7 @@ pub struct TopicInfo {
     pub name: Arc<str>,
     pub partition_count: i32,
     pub created_at_ms: u64,
+    #[serde(serialize_with = "serialize_sorted_map")]
     pub config: HashMap<String, String>,
 }
 
@@ -77,6 +101,7 @@ pub enum PartitionCommand {
     CreateTopic {
         name: String,
         partitions: i32,
+        #[serde(serialize_with = "serialize_sorted_map")]
         config: HashMap<String, String>,
         timestamp_ms: u64,
     },
@@ -87,6 +112,7 @@ pub enum PartitionCommand {
     /// Update topic configuration.
     UpdateTopicConfig {
         name: String,
+        #[serde(serialize_with = "serialize_sorted_map")]
         config: HashMap<String, String>,
     },
 

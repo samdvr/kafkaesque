@@ -573,7 +573,7 @@ mod tests {
         }
 
         // ----------------------------------------------------------------
-        // P3-3: producer-state value decode robustness across mixed formats.
+        // Producer-state value decode robustness across mixed formats.
         //
         // `decode_producer_state_value` accepts both the current 18-byte
         // layout AND the legacy 6-byte prefix-only layout. A bad decode

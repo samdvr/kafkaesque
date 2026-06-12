@@ -237,11 +237,8 @@ async fn write_kafka_frame<S: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let write_deadline = Duration::from_secs(DEFAULT_REQUEST_WRITE_TIMEOUT_SECS);
     match timeout(write_deadline, async {
-        stream
-            .write_all(response)
-            .await
-            .map_err(|e| Error::from(e))?;
-        stream.flush().await.map_err(|e| Error::from(e))
+        stream.write_all(response).await.map_err(Error::from)?;
+        stream.flush().await.map_err(Error::from)
     })
     .await
     {
@@ -260,6 +257,7 @@ async fn write_kafka_frame<S: AsyncWrite + Unpin>(
 }
 
 /// Shared request loop for plain and TLS connections.
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection_requests<H, S>(
     stream: &mut S,
     client: SocketAddr,
@@ -278,25 +276,25 @@ where
     let handler_timeout = Duration::from_secs(DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS);
 
     let result = crate::cluster::buffer_pool::run_scoped(async {
-    loop {
-        let read_result =
-            match timeout(read_timeout, read_kafka_frame(stream, max_message_size)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!(
-                        client = %client,
-                        connection = connection_label,
-                        timeout_secs = DEFAULT_REQUEST_READ_TIMEOUT_SECS,
-                        "Request read timeout - closing connection"
-                    );
-                    return Err(Error::MissingData("Request read timeout".to_owned()));
-                }
-            };
+        loop {
+            let read_result =
+                match timeout(read_timeout, read_kafka_frame(stream, max_message_size)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            client = %client,
+                            connection = connection_label,
+                            timeout_secs = DEFAULT_REQUEST_READ_TIMEOUT_SECS,
+                            "Request read timeout - closing connection"
+                        );
+                        return Err(Error::MissingData("Request read timeout".to_owned()));
+                    }
+                };
 
-        match read_result {
-            Ok(data) => {
-                let correlation_id = peek_correlation_id(&data);
-                let dispatch_result = timeout(handler_timeout, async {
+            match read_result {
+                Ok(data) => {
+                    let correlation_id = peek_correlation_id(&data);
+                    let dispatch_result = timeout(handler_timeout, async {
                         let (result, auth_result) = dispatch_request_common(
                             handler.as_ref(),
                             data,
@@ -306,71 +304,72 @@ where
                             transport_tls,
                         )
                         .await;
-                    if let Some(limiter) = rate_limiter {
-                        match auth_result {
-                            AuthResult::Failure => {
-                                limiter.record_failure(client.ip()).await;
+                        if let Some(limiter) = rate_limiter {
+                            match auth_result {
+                                AuthResult::Failure => {
+                                    limiter.record_failure(client.ip()).await;
+                                }
+                                AuthResult::Success => {
+                                    limiter.record_success(client.ip()).await;
+                                }
+                                AuthResult::NotAuth => {}
                             }
-                            AuthResult::Success => {
-                                limiter.record_success(client.ip()).await;
-                            }
-                            AuthResult::NotAuth => {}
                         }
-                    }
-                    result
-                })
-                .await;
+                        result
+                    })
+                    .await;
 
-                match dispatch_result {
-                    Ok(Ok(response)) => write_kafka_frame(stream, &response, client).await?,
-                    Ok(Err(e)) => {
-                        tracing::error!(
-                            client = %client,
-                            connection = connection_label,
-                            error = ?e,
-                            "Failed to dispatch request"
-                        );
-                        if let Some(cid) = correlation_id
-                            && let Ok(err_resp) =
-                                encode_wire_error_response(cid, KafkaCode::InvalidRequest)
-                        {
-                            let _ = write_kafka_frame(stream, &err_resp, client).await;
+                    match dispatch_result {
+                        Ok(Ok(response)) => write_kafka_frame(stream, &response, client).await?,
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                client = %client,
+                                connection = connection_label,
+                                error = ?e,
+                                "Failed to dispatch request"
+                            );
+                            if let Some(cid) = correlation_id
+                                && let Ok(err_resp) =
+                                    encode_wire_error_response(cid, KafkaCode::InvalidRequest)
+                            {
+                                let _ = write_kafka_frame(stream, &err_resp, client).await;
+                            }
+                            return Err(e);
                         }
-                        return Err(e);
-                    }
-                    Err(_) => {
-                        tracing::error!(
-                            client = %client,
-                            connection = connection_label,
-                            timeout_secs = DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS,
-                            "Request handler timeout - closing connection"
-                        );
-                        if let Some(cid) = correlation_id
-                            && let Ok(err_resp) =
-                                encode_wire_error_response(cid, KafkaCode::InvalidRequest)
-                        {
-                            let _ = write_kafka_frame(stream, &err_resp, client).await;
+                        Err(_) => {
+                            tracing::error!(
+                                client = %client,
+                                connection = connection_label,
+                                timeout_secs = DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS,
+                                "Request handler timeout - closing connection"
+                            );
+                            if let Some(cid) = correlation_id
+                                && let Ok(err_resp) =
+                                    encode_wire_error_response(cid, KafkaCode::InvalidRequest)
+                            {
+                                let _ = write_kafka_frame(stream, &err_resp, client).await;
+                            }
+                            return Err(Error::MissingData("Request handler timeout".to_owned()));
                         }
-                        return Err(Error::MissingData("Request handler timeout".to_owned()));
                     }
                 }
-            }
-            Err(Error::MissingData(_)) => {
-                tracing::debug!(client = %client, "Client disconnected");
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::error!(
-                    client = %client,
-                    connection = connection_label,
-                    error = ?e,
-                    "Error reading request"
-                );
-                return Err(e);
+                Err(Error::MissingData(_)) => {
+                    tracing::debug!(client = %client, "Client disconnected");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::error!(
+                        client = %client,
+                        connection = connection_label,
+                        error = ?e,
+                        "Error reading request"
+                    );
+                    return Err(e);
+                }
             }
         }
-    }
-    }).await;
+    })
+    .await;
 
     handler.on_connection_closed(client).await;
     result

@@ -222,7 +222,13 @@ impl SaslProvider {
 
     /// Drop per-connection SCRAM state when a client disconnects.
     pub async fn clear_session(&self, client_addr: SocketAddr) {
-        if self.scram_sessions.write().await.remove(&client_addr).is_some() {
+        if self
+            .scram_sessions
+            .write()
+            .await
+            .remove(&client_addr)
+            .is_some()
+        {
             debug!(client = %client_addr, "Cleared abandoned SCRAM session");
         }
     }

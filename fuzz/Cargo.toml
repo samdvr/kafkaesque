@@ -19,13 +19,13 @@ num-traits = "0.2"
 
 [dependencies.kafkaesque]
 path = ".."
-# `sasl` is required for SCRAM-SHA-256 fuzzers (P0-4). It pulls in nothing
+# `sasl` is required for SCRAM-SHA-256 fuzzers. It pulls in nothing
 # beyond what's already a transitive dep, so enabling it crate-wide for fuzz
 # costs nothing and keeps target authoring uniform.
 features = ["sasl"]
 
 # ===========================================================================
-# Existing targets (kept for compatibility — see fuzzy_testing_plan.md)
+# Existing targets (kept for compatibility)
 # ===========================================================================
 
 [[bin]]
@@ -57,7 +57,7 @@ doc = false
 bench = false
 
 # ===========================================================================
-# P0-1: Per-API request fuzzers
+# Per-API request fuzzers
 #
 # Each target derives `Arbitrary` for `(version, body)`, clamps `version`
 # to the API's advertised range from `SUPPORTED_VERSIONS`, and feeds the
@@ -207,7 +207,7 @@ doc = false
 bench = false
 
 # ===========================================================================
-# P0-2: Connection frame reader
+# Connection frame reader
 # ===========================================================================
 
 [[bin]]
@@ -218,7 +218,7 @@ doc = false
 bench = false
 
 # ===========================================================================
-# P0-3: RecordBatch header validation + producer info extraction
+# RecordBatch header validation + producer info extraction
 # ===========================================================================
 
 [[bin]]
@@ -229,7 +229,7 @@ doc = false
 bench = false
 
 # ===========================================================================
-# P0-4: SCRAM-SHA-256 message parsers
+# SCRAM-SHA-256 message parsers
 # ===========================================================================
 
 [[bin]]
@@ -247,7 +247,7 @@ doc = false
 bench = false
 
 # ===========================================================================
-# P0-5: Postcard decoders for cluster RPC + on-disk Raft state
+# Postcard decoders for cluster RPC + on-disk Raft state
 # ===========================================================================
 
 [[bin]]
@@ -279,7 +279,7 @@ doc = false
 bench = false
 
 # ===========================================================================
-# P1-3: Compact-encoding + tagged-fields edge cases
+# Compact-encoding + tagged-fields edge cases
 # ===========================================================================
 
 [[bin]]
@@ -290,7 +290,7 @@ doc = false
 bench = false
 
 # ===========================================================================
-# P1-4: Encoder safety on adversarial response data
+# Encoder safety on adversarial response data
 # ===========================================================================
 
 [[bin]]
@@ -301,7 +301,7 @@ doc = false
 bench = false
 
 # ===========================================================================
-# P3-1: Identifier validators
+# Identifier validators
 # ===========================================================================
 
 [[bin]]
@@ -312,7 +312,7 @@ doc = false
 bench = false
 
 # ===========================================================================
-# P3-2: Config parsing (ClusterProfile::from_str, ObjectStoreType driver,
+# Config parsing (ClusterProfile::from_str, ObjectStoreType driver,
 # from_env-style (key, value) driver)
 # ===========================================================================
 

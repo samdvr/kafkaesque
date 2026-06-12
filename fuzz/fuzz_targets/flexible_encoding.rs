@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P1-3: Compact-encoding + tagged-fields edge cases.
+//! Compact-encoding + tagged-fields edge cases.
 //!
 //! KIP-482 flexible encoding has overflow corners that the existing
 //! `parser_primitives` target only brushes against:

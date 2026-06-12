@@ -1,6 +1,6 @@
 #![no_main]
 
-//! P1-4: Encoder safety on adversarial response data.
+//! Encoder safety on adversarial response data.
 //!
 //! Builds representative response types — Metadata (nested vecs +
 //! strings), Produce (vecs of partition responses), ApiVersions (varint-

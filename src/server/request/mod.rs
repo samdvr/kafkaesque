@@ -415,7 +415,10 @@ impl Request {
         // in one of our per-version layouts — is visible at debug level.
         let trailing = rest.into_bytes();
         if !trailing.is_empty() {
-            crate::cluster::metrics::record_request_trailing_bytes(api_key.as_str(), trailing.len());
+            crate::cluster::metrics::record_request_trailing_bytes(
+                api_key.as_str(),
+                trailing.len(),
+            );
             tracing::warn!(
                 api_key = api_key.as_str(),
                 api_version = version,

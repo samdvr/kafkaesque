@@ -125,7 +125,10 @@ async fn test_metadata_filters_unauthorized_topics() {
         .await;
 
     assert_eq!(response.topics.len(), 1);
-    assert_eq!(response.topics[0].error_code, KafkaCode::TopicAuthorizationFailed);
+    assert_eq!(
+        response.topics[0].error_code,
+        KafkaCode::TopicAuthorizationFailed
+    );
 }
 
 #[tokio::test]

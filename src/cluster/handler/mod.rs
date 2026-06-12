@@ -713,12 +713,18 @@ impl SlateDBClusterHandler {
             .await
         {
             Ok(s) => s,
-            Err(_) => {
-                // We don't own this partition - tell client to contact correct broker
-                // The client will refresh metadata and retry to the actual owner
+            Err(e) => {
+                // Map the storage error to its typed Kafka code. Collapsing
+                // every failure to NotLeaderForPartition triggers a metadata
+                // refresh storm on transient I/O — clients retry to a
+                // (correct) leader that's perfectly happy to keep failing
+                // because the underlying issue is timeout/storage, not
+                // ownership. The typed mapping returns NotLeader only on
+                // genuine NotOwned and surfaces RequestTimedOut /
+                // BrokerNotAvailable / etc. for everything else.
                 return ProducePartitionResponse {
                     partition_index: partition.partition_index,
-                    error_code: KafkaCode::NotLeaderForPartition,
+                    error_code: e.to_kafka_code(),
                     base_offset: -1,
                     log_append_time: -1,
                 };

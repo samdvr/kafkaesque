@@ -464,7 +464,7 @@ impl AutoBalancer {
         let max_throughput = broker_loads
             .values()
             .map(|b| b.total_bytes_per_sec)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or(1.0)
             .max(1.0);
 
@@ -497,12 +497,12 @@ impl AutoBalancer {
         let min_score = scores
             .iter()
             .copied()
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap();
         let max_score = scores
             .iter()
             .copied()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap();
         let avg_score: f64 = scores.iter().sum::<f64>() / scores.len() as f64;
 
@@ -556,8 +556,12 @@ impl AutoBalancer {
             "Identified load imbalance"
         );
 
-        // Generate candidate moves
+        // Generate candidate moves. Round-robin across underloaded targets so
+        // a batch of moves spreads across the available brokers; always
+        // picking `underloaded.first()` produces a thundering herd that
+        // double-loads one target until cooldown.
         let mut candidates: Vec<PartitionMove> = Vec::new();
+        let mut target_cursor: usize = 0;
 
         for &from_broker in &overloaded {
             // Get partitions on this broker
@@ -583,7 +587,20 @@ impl AutoBalancer {
                         continue;
                     }
 
-                    if let Some(&to_broker) = underloaded.first() {
+                    // Pick the next underloaded broker that isn't us. This
+                    // walks the list rather than picking [0], so consecutive
+                    // moves don't all flood the same target.
+                    let mut chosen: Option<i32> = None;
+                    for offset in 0..underloaded.len() {
+                        let idx = (target_cursor + offset) % underloaded.len();
+                        let candidate = underloaded[idx];
+                        if candidate != from_broker {
+                            chosen = Some(candidate);
+                            target_cursor = (idx + 1) % underloaded.len();
+                            break;
+                        }
+                    }
+                    if let Some(to_broker) = chosen {
                         if to_broker == from_broker {
                             continue;
                         }
@@ -605,7 +622,7 @@ impl AutoBalancer {
             }
         }
 
-        candidates.sort_by(|a, b| b.priority.partial_cmp(&a.priority).unwrap());
+        candidates.sort_by(|a, b| b.priority.partial_cmp(&a.priority).unwrap_or(std::cmp::Ordering::Equal));
         candidates.truncate(self.config.max_partitions_per_cycle);
 
         candidates

@@ -117,7 +117,30 @@ pub(super) async fn handle_metadata(
                     );
                     match handler.partition_manager.ensure_partition(&name, 0).await {
                         Ok(_) => {
-                            result.push(handler.build_topic_metadata(&name).await);
+                            // Confirm the topic survived a possible concurrent
+                            // DeleteTopics. Without this re-check the create
+                            // can race a delete and we'd advertise metadata
+                            // for a topic that has been removed from the SM,
+                            // resurrecting it for the next request and
+                            // surprising the operator who issued the delete.
+                            let still_exists = handler
+                                .coordinator
+                                .get_partition_count(&name)
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some();
+                            if still_exists {
+                                result.push(handler.build_topic_metadata(&name).await);
+                            } else {
+                                debug!(topic = %name, "Topic deleted concurrently with auto-create");
+                                result.push(TopicMetadata {
+                                    error_code: KafkaCode::UnknownTopicOrPartition,
+                                    name,
+                                    is_internal: false,
+                                    partitions: vec![],
+                                });
+                            }
                         }
                         Err(e) => {
                             debug!(topic = %name, error = %e, "Could not ensure partition for metadata");

@@ -16,7 +16,12 @@ use super::domains::{
 /// The complete coordination state managed by Raft.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CoordinationState {
-    /// State version (incremented on each change).
+    /// Total number of commands applied to this state machine.
+    /// Incremented on every applied command, including no-ops and rejections;
+    /// this is NOT a state-mutation version and must not be used as a
+    /// cache-invalidation token. Field name retained for snapshot
+    /// compatibility — postcard is positional, so renaming the field would
+    /// require a migration path.
     pub version: u64,
 
     /// Broker domain state (registration, heartbeat, fencing).

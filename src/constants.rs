@@ -86,6 +86,17 @@ pub const BATCH_FIRST_SEQUENCE_END: usize = 57;
 /// to have billions of elements. 100,000 is generous but bounded.
 pub const MAX_PROTOCOL_ARRAY_SIZE: i32 = 100_000;
 
+/// Maximum allowed string length in Kafka protocol parsing.
+///
+/// Bounds the byte count an attacker can ask the parser to allocate for a
+/// COMPACT_NULLABLE_STRING varint length. Without this cap a varint of
+/// `u32::MAX` asks `take` for ~4 GiB; nom returns InsufficientData on
+/// real inputs but the explicit cap fails fast with a clear error and
+/// keeps the parser unable to mutate large allocations on hostile input.
+/// 16 MiB is well above any legitimate Kafka string field (topic, group,
+/// principal, sasl auth bytes) and well below MAX_REQUEST_SIZE.
+pub const MAX_PROTOCOL_STRING_SIZE: u32 = 16 * 1024 * 1024;
+
 // =============================================================================
 // Network Constants
 // =============================================================================

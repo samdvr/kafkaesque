@@ -94,6 +94,24 @@ pub(super) async fn handle_find_coordinator(
     ctx: &RequestContext,
     request: FindCoordinatorRequestData,
 ) -> FindCoordinatorResponseData {
+    // For consumer-group lookups, validate the group id before any other
+    // work. Without this, `null \r ; group; etc` and similar control-character
+    // strings reach the ACL/state layers and (a) bypass log sanitization and
+    // (b) materialize entries in the replicated SM via subsequent commits.
+    if request.key_type == 0
+        && crate::cluster::coordinator::validate_group_id(&request.key).is_err()
+    {
+        debug!(group_id = %request.key, "Invalid group ID in find_coordinator");
+        return FindCoordinatorResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::InvalidGroupId,
+            error_message: Some("Invalid group ID".to_string()),
+            node_id: -1,
+            host: String::new(),
+            port: 0,
+        };
+    }
+
     // FindCoordinator for a consumer group (key_type 0) requires Describe
     // on that group, matching Kafka. Other key types (transactions) are not
     // supported by Kafkaesque, so only the group path is gated here.
@@ -162,6 +180,35 @@ pub(super) async fn handle_join_group(
         return JoinGroupResponseData {
             throttle_time_ms: 0,
             error_code: KafkaCode::GroupAuthorizationFailed,
+            generation_id: -1,
+            protocol_name: String::new(),
+            leader: String::new(),
+            member_id: request.member_id,
+            members: vec![],
+        };
+    }
+
+    // Validate session and rebalance timeouts. A negative value casts to
+    // u64::MAX in the state-machine layer and permanently holds a group slot
+    // (no member ever ages out); a zero or extremely small value would cause
+    // the failure detector to reap legitimate consumers between heartbeats.
+    // Bounds match Kafka's group.min/max.session.timeout.ms defaults.
+    const MIN_SESSION_TIMEOUT_MS: i32 = 6_000;
+    const MAX_SESSION_TIMEOUT_MS: i32 = 1_800_000;
+    if request.session_timeout_ms < MIN_SESSION_TIMEOUT_MS
+        || request.session_timeout_ms > MAX_SESSION_TIMEOUT_MS
+        || request.rebalance_timeout_ms < 0
+        || request.rebalance_timeout_ms > MAX_SESSION_TIMEOUT_MS
+    {
+        debug!(
+            group_id = %request.group_id,
+            session_timeout_ms = request.session_timeout_ms,
+            rebalance_timeout_ms = request.rebalance_timeout_ms,
+            "Rejecting JoinGroup with out-of-range timeouts"
+        );
+        return JoinGroupResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::InvalidSessionTimeout,
             generation_id: -1,
             protocol_name: String::new(),
             leader: String::new(),
@@ -316,6 +363,18 @@ pub(super) async fn handle_sync_group(
     ctx: &RequestContext,
     request: SyncGroupRequestData,
 ) -> SyncGroupResponseData {
+    // Reject malformed group ids before any state lookup. The group/offsets
+    // tables are inside the replicated state machine; an authenticated client
+    // could otherwise grow them with arbitrary or control-character strings.
+    if crate::cluster::coordinator::validate_group_id(&request.group_id).is_err() {
+        debug!(group_id = %request.group_id, "Invalid group ID in sync_group");
+        return SyncGroupResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::InvalidGroupId,
+            assignment: bytes::Bytes::new(),
+        };
+    }
+
     // SyncGroup requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
         debug!(
@@ -525,6 +584,13 @@ pub(super) async fn handle_heartbeat(
     ctx: &RequestContext,
     request: HeartbeatRequestData,
 ) -> HeartbeatResponseData {
+    if crate::cluster::coordinator::validate_group_id(&request.group_id).is_err() {
+        debug!(group_id = %request.group_id, "Invalid group ID in heartbeat");
+        return HeartbeatResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::InvalidGroupId,
+        };
+    }
     // Heartbeat requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
         debug!(
@@ -579,6 +645,13 @@ pub(super) async fn handle_leave_group(
     ctx: &RequestContext,
     request: LeaveGroupRequestData,
 ) -> LeaveGroupResponseData {
+    if crate::cluster::coordinator::validate_group_id(&request.group_id).is_err() {
+        debug!(group_id = %request.group_id, "Invalid group ID in leave_group");
+        return LeaveGroupResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::InvalidGroupId,
+        };
+    }
     // LeaveGroup requires Read on the Group resource.
     if !group_authorized(handler, ctx, AclOperation::Read, &request.group_id).await {
         debug!(

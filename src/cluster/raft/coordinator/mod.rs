@@ -329,10 +329,14 @@ fn jitter_duration(base: Duration, factor: f64) -> Duration {
 
 /// Get current time in milliseconds since UNIX epoch.
 pub(crate) fn current_time_ms() -> u64 {
+    // A clock set before 1970 (extremely rare, but possible from a misconfigured
+    // VM or container) would otherwise panic here and kill the coordinator
+    // background task. Treating that case as t=0 is benign — the timestamp is
+    // used for monotonically-clamped lease/heartbeat clocks downstream.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

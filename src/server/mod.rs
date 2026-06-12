@@ -67,12 +67,13 @@ pub use rate_limiter::{AuthRateLimiter, RateLimiterConfig};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
-use tokio::sync::{RwLock, broadcast, watch};
+use tokio::sync::{broadcast, watch};
 
 use crate::error::{Error, Result};
 
@@ -127,7 +128,7 @@ enum SlotReservation {
 /// non-`Reserved` outcome leaves both counters untouched.
 async fn try_reserve_connection_slots(
     active_connections: &AtomicUsize,
-    connections_per_ip: &RwLock<HashMap<IpAddr, usize>>,
+    connections_per_ip: &StdMutex<HashMap<IpAddr, usize>>,
     ip: IpAddr,
     max_connections_per_ip: usize,
     max_total_connections: usize,
@@ -144,9 +145,15 @@ async fn try_reserve_connection_slots(
         return SlotReservation::GlobalLimitReached { current };
     }
 
-    // Per-IP slot: check + increment under the same write-lock acquisition.
+    // Per-IP slot: check + increment under the same lock acquisition. We use
+    // a synchronous Mutex (not tokio::sync::RwLock) so the matching Drop
+    // path can decrement deterministically — an async spawn from Drop can be
+    // dropped on shutdown, leaving the per-IP counter stuck above the global
+    // counter and producing false rejections under churn.
     {
-        let mut counts = connections_per_ip.write().await;
+        let mut counts = connections_per_ip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let current = counts.get(&ip).copied().unwrap_or(0);
         if current >= max_connections_per_ip {
             drop(counts);
@@ -180,29 +187,26 @@ async fn force_cancelled(mut force_rx: watch::Receiver<bool>) {
 /// the connection-limit even though the slots are dead.
 struct ConnectionGuard {
     active_connections: Arc<AtomicUsize>,
-    connections_per_ip: Arc<RwLock<HashMap<IpAddr, usize>>>,
+    connections_per_ip: Arc<StdMutex<HashMap<IpAddr, usize>>>,
     ip: IpAddr,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.active_connections.fetch_sub(1, Ordering::SeqCst);
-        // Decrement under the async lock from a synchronous context by
-        // spawning a small cleanup future on the current runtime. If the
-        // runtime is gone (rare — only during process teardown) the
-        // counter resets are moot.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let map = self.connections_per_ip.clone();
-            let ip = self.ip;
-            handle.spawn(async move {
-                let mut counts = map.write().await;
-                if let Some(count) = counts.get_mut(&ip) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        counts.remove(&ip);
-                    }
-                }
-            });
+        // Decrement synchronously. The previous async-spawn path could be
+        // dropped on shutdown, leaving the per-IP counter stuck above the
+        // (just-decremented) global counter and rejecting subsequent
+        // legitimate connections from that IP.
+        let mut counts = self
+            .connections_per_ip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
         }
     }
 }
@@ -220,7 +224,7 @@ pub struct KafkaServer<H: Handler> {
     /// Active connection counter
     active_connections: Arc<AtomicUsize>,
     // Per-IP connection counter to prevent DoS
-    connections_per_ip: Arc<RwLock<HashMap<IpAddr, usize>>>,
+    connections_per_ip: Arc<StdMutex<HashMap<IpAddr, usize>>>,
     /// Maximum connections allowed per IP
     max_connections_per_ip: usize,
     /// Maximum total connections across all clients
@@ -302,7 +306,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
             shutdown_tx,
             force_shutdown_tx,
             active_connections: Arc::new(AtomicUsize::new(0)),
-            connections_per_ip: Arc::new(RwLock::new(HashMap::new())),
+            connections_per_ip: Arc::new(StdMutex::new(HashMap::new())),
             max_connections_per_ip,
             max_total_connections,
             max_message_size,
@@ -564,7 +568,7 @@ pub struct TlsKafkaServer<H: Handler> {
     /// Active connection counter
     active_connections: Arc<AtomicUsize>,
     /// Per-IP connection counter to prevent DoS
-    connections_per_ip: Arc<RwLock<HashMap<IpAddr, usize>>>,
+    connections_per_ip: Arc<StdMutex<HashMap<IpAddr, usize>>>,
     /// Maximum connections allowed per IP
     max_connections_per_ip: usize,
     /// Maximum total connections across all clients
@@ -654,7 +658,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
             force_shutdown_tx,
             tls_handshake_timeout: Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
             active_connections: Arc::new(AtomicUsize::new(0)),
-            connections_per_ip: Arc::new(RwLock::new(HashMap::new())),
+            connections_per_ip: Arc::new(StdMutex::new(HashMap::new())),
             max_connections_per_ip,
             max_total_connections,
             max_message_size,
@@ -1131,37 +1135,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_per_ip_connection_map() {
-        let connections_per_ip: Arc<RwLock<HashMap<IpAddr, usize>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let connections_per_ip: Arc<StdMutex<HashMap<IpAddr, usize>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
         let ip = "192.168.1.1".parse::<IpAddr>().unwrap();
 
         // Add connection
         {
-            let mut counts = connections_per_ip.write().await;
+            let mut counts = connections_per_ip.lock().unwrap();
             *counts.entry(ip).or_insert(0) += 1;
         }
 
         // Verify count
         {
-            let counts = connections_per_ip.read().await;
+            let counts = connections_per_ip.lock().unwrap();
             assert_eq!(*counts.get(&ip).unwrap_or(&0), 1);
         }
 
         // Add another
         {
-            let mut counts = connections_per_ip.write().await;
+            let mut counts = connections_per_ip.lock().unwrap();
             *counts.entry(ip).or_insert(0) += 1;
         }
 
         // Verify
         {
-            let counts = connections_per_ip.read().await;
+            let counts = connections_per_ip.lock().unwrap();
             assert_eq!(*counts.get(&ip).unwrap_or(&0), 2);
         }
 
         // Remove one
         {
-            let mut counts = connections_per_ip.write().await;
+            let mut counts = connections_per_ip.lock().unwrap();
             if let Some(count) = counts.get_mut(&ip) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
@@ -1172,7 +1176,7 @@ mod tests {
 
         // Verify
         {
-            let counts = connections_per_ip.read().await;
+            let counts = connections_per_ip.lock().unwrap();
             assert_eq!(*counts.get(&ip).unwrap_or(&0), 1);
         }
     }
@@ -1184,19 +1188,19 @@ mod tests {
     #[tokio::test]
     async fn test_reserve_slots_accepts_below_limits() {
         let active = AtomicUsize::new(0);
-        let per_ip = RwLock::new(HashMap::new());
+        let per_ip = StdMutex::new(HashMap::new());
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         let outcome = try_reserve_connection_slots(&active, &per_ip, ip, 2, 2).await;
         assert!(matches!(outcome, SlotReservation::Reserved));
         assert_eq!(active.load(Ordering::SeqCst), 1);
-        assert_eq!(*per_ip.read().await.get(&ip).unwrap(), 1);
+        assert_eq!(*per_ip.lock().unwrap().get(&ip).unwrap(), 1);
     }
 
     #[tokio::test]
     async fn test_reserve_slots_rejects_at_global_limit() {
         let active = AtomicUsize::new(3);
-        let per_ip = RwLock::new(HashMap::new());
+        let per_ip = StdMutex::new(HashMap::new());
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         let outcome = try_reserve_connection_slots(&active, &per_ip, ip, 100, 3).await;
@@ -1206,15 +1210,15 @@ mod tests {
         ));
         // Nothing incremented on rejection.
         assert_eq!(active.load(Ordering::SeqCst), 3);
-        assert!(per_ip.read().await.is_empty());
+        assert!(per_ip.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn test_reserve_slots_rolls_back_global_on_per_ip_reject() {
         let active = AtomicUsize::new(0);
-        let per_ip = RwLock::new(HashMap::new());
+        let per_ip = StdMutex::new(HashMap::new());
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        per_ip.write().await.insert(ip, 5);
+        per_ip.lock().unwrap().insert(ip, 5);
 
         let outcome = try_reserve_connection_slots(&active, &per_ip, ip, 5, 100).await;
         assert!(matches!(
@@ -1223,13 +1227,13 @@ mod tests {
         ));
         // The speculative global increment must be rolled back.
         assert_eq!(active.load(Ordering::SeqCst), 0);
-        assert_eq!(*per_ip.read().await.get(&ip).unwrap(), 5);
+        assert_eq!(*per_ip.lock().unwrap().get(&ip).unwrap(), 5);
     }
 
     #[tokio::test]
     async fn test_reserve_slots_unlimited_total() {
         let active = AtomicUsize::new(usize::MAX / 2);
-        let per_ip = RwLock::new(HashMap::new());
+        let per_ip = StdMutex::new(HashMap::new());
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         // max_total_connections == 0 means unlimited.
@@ -1244,7 +1248,7 @@ mod tests {
         const ATTEMPTS: usize = 100;
 
         let active = Arc::new(AtomicUsize::new(0));
-        let per_ip = Arc::new(RwLock::new(HashMap::new()));
+        let per_ip = Arc::new(StdMutex::new(HashMap::new()));
 
         let mut tasks = Vec::with_capacity(ATTEMPTS);
         for i in 0..ATTEMPTS {
@@ -1277,7 +1281,7 @@ mod tests {
         const ATTEMPTS: usize = 64;
 
         let active = Arc::new(AtomicUsize::new(0));
-        let per_ip = Arc::new(RwLock::new(HashMap::new()));
+        let per_ip = Arc::new(StdMutex::new(HashMap::new()));
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         let mut tasks = Vec::with_capacity(ATTEMPTS);
@@ -1302,7 +1306,7 @@ mod tests {
         assert_eq!(accepted, MAX_PER_IP, "exactly max_per_ip slots reserved");
         // Per-IP rejections must roll the global counter back.
         assert_eq!(active.load(Ordering::SeqCst), MAX_PER_IP);
-        assert_eq!(*per_ip.read().await.get(&ip).unwrap(), MAX_PER_IP);
+        assert_eq!(*per_ip.lock().unwrap().get(&ip).unwrap(), MAX_PER_IP);
     }
 
     // ========================================================================

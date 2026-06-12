@@ -197,6 +197,20 @@ impl BrokerRuntimes {
         // Then shutdown control plane
         drop(self.control);
     }
+
+    /// Gracefully shutdown both runtimes with a per-runtime timeout.
+    ///
+    /// Calls [`tokio::runtime::Runtime::shutdown_timeout`] on each owned
+    /// runtime so spawned tasks are force-cancelled after the deadline
+    /// instead of blocking the caller indefinitely. Use this from `main`
+    /// during graceful shutdown to bound process exit latency.
+    pub fn shutdown_timeout(self, timeout: std::time::Duration) {
+        let Self { control, data, handles: _ } = self;
+        let half = timeout / 2;
+        // Data plane first so it stops accepting new work, then control.
+        data.shutdown_timeout(half);
+        control.shutdown_timeout(timeout - half);
+    }
 }
 
 #[cfg(test)]

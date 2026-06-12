@@ -114,7 +114,7 @@ define_counter_vec!(
     REQUEST_COUNT,
     "requests_total",
     "Total number of Kafka API requests",
-    ["api", "status"]
+    ["api", "status", "error_code"]
 );
 define_histogram_vec!(
     REQUEST_DURATION,
@@ -122,7 +122,12 @@ define_histogram_vec!(
     "Request processing duration in seconds",
     ["api"],
     [
-        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+        // Sub-millisecond buckets — well-tuned p99 produce/fetch on a hot
+        // partition is in the 100–800 µs range, so a histogram starting at
+        // 1ms collapses every quick request into the first bucket and the
+        // SRE loses all signal on tail-latency regressions.
+        0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+        0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
     ]
 );
 define_counter_vec!(
@@ -782,6 +787,22 @@ pub static PRODUCE_DROPPED: Lazy<IntCounterVec> = Lazy::new(|| {
     )
 });
 
+/// Per-principal authorization-denial counter.
+///
+/// Tracked separately from `produce_dropped_total{reason=acl_denied}` so an
+/// operator can answer "which principal is being denied and on which API"
+/// without grepping logs. Cardinality is bounded by the active principal
+/// set; principals beyond the cap fall back to "_other" via
+/// `bounded_principal_label`.
+pub static ACL_DENIAL_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec_safe(
+        &REGISTRY,
+        "acl_denial_total",
+        "ACL denials counted per principal and API surface",
+        &["principal", "api", "resource_type"],
+    )
+});
+
 /// Consumer group operation latency by operation type
 ///
 /// Tracks latency for specific consumer group operations:
@@ -1342,8 +1363,20 @@ pub fn gather_metrics() -> Vec<prometheus::proto::MetricFamily> {
 }
 
 /// Record a Kafka API request.
+///
+/// `error_code` should be the wire-level Kafka error code as a short string
+/// (e.g. "NONE", "NOT_LEADER_FOR_PARTITION"). Cardinality is bounded by the
+/// API surface (~25) × Kafka error codes (~80), well below
+/// MAX_METRIC_CARDINALITY for any reasonable workload.
 pub fn record_request(api: &str, status: &str, duration_secs: f64) {
-    REQUEST_COUNT.with_label_values(&[api, status]).inc();
+    record_request_with_code(api, status, "NONE", duration_secs);
+}
+
+/// Record a Kafka API request with a typed error code label.
+pub fn record_request_with_code(api: &str, status: &str, error_code: &str, duration_secs: f64) {
+    REQUEST_COUNT
+        .with_label_values(&[api, status, error_code])
+        .inc();
     REQUEST_DURATION
         .with_label_values(&[api])
         .observe(duration_secs);
@@ -1375,6 +1408,12 @@ static TRACKED_PARTITIONS: Lazy<TokioRwLock<HashSet<(String, i32)>>> =
 
 /// Tracks unique topic labels used on latency histograms.
 static TRACKED_LATENCY_TOPICS: Lazy<std::sync::Mutex<HashSet<String>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Tracks unique principals seen on labelled metrics. Bounded so a hostile
+/// or buggy client can't blow up cardinality by churning through random
+/// `User:<uuid>` strings.
+static TRACKED_PRINCIPALS: Lazy<std::sync::Mutex<HashSet<String>>> =
     Lazy::new(|| std::sync::Mutex::new(HashSet::new()));
 
 /// Configure metrics cardinality settings.
@@ -1454,6 +1493,50 @@ fn bounded_topic_label(topic: &str) -> String {
     }
     tracked.insert(topic.to_string());
     topic.to_string()
+}
+
+/// Bound principal labels on metrics that include the principal as a
+/// dimension. Same overflow semantics as [`bounded_topic_label`].
+pub(crate) fn bounded_principal_label(principal: &str) -> String {
+    let max_cardinality = MAX_METRIC_CARDINALITY.load(Ordering::Relaxed);
+    if max_cardinality == 0 {
+        return principal.to_string();
+    }
+    let mut tracked = TRACKED_PRINCIPALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if tracked.contains(principal) {
+        return principal.to_string();
+    }
+    if tracked.len() >= max_cardinality {
+        return "_other".to_string();
+    }
+    tracked.insert(principal.to_string());
+    principal.to_string()
+}
+
+/// Bound (topic, partition) labels for per-partition counters/gauges. Same
+/// overflow semantics as [`bounded_topic_label`].
+pub(crate) fn bounded_partition_label(topic: &str, partition: i32) -> (String, String) {
+    let max_cardinality = MAX_METRIC_CARDINALITY.load(Ordering::Relaxed);
+    if max_cardinality == 0 {
+        return (topic.to_string(), partition.to_string());
+    }
+    // Use a blocking std::Mutex via TokioRwLock would deadlock; this helper
+    // is sync, so fall back to try_write. If we can't get the lock now, just
+    // pass the labels through — better one slightly-late accounting check
+    // than a contended bottleneck on the produce/fetch hot path.
+    if let Ok(mut tracked) = TRACKED_PARTITIONS.try_write() {
+        let key = (topic.to_string(), partition);
+        if tracked.contains(&key) {
+            return (topic.to_string(), partition.to_string());
+        }
+        if tracked.len() >= max_cardinality {
+            return ("_overflow".to_string(), "_overflow".to_string());
+        }
+        tracked.insert(key);
+    }
+    (topic.to_string(), partition.to_string())
 }
 
 /// Synchronous version of partition label for non-async contexts.
@@ -1548,8 +1631,9 @@ pub fn record_idempotency_rejection(reason: &str) {
 /// * `topic` - The topic name
 /// * `partition` - The partition index
 pub fn record_epoch_mismatch(topic: &str, partition: i32) {
+    let (t, p) = bounded_partition_label(topic, partition);
     EPOCH_MISMATCH_DETECTIONS
-        .with_label_values(&[topic, &partition.to_string()])
+        .with_label_values(&[&t, &p])
         .inc();
 }
 
@@ -1629,6 +1713,15 @@ pub fn record_produce_dropped(reason: &str, count: u64) {
     if count > 0 {
         PRODUCE_DROPPED.with_label_values(&[reason]).inc_by(count);
     }
+}
+
+/// Record an ACL denial. Caller passes the principal, the API surface
+/// (`Produce`, `Fetch`, etc) and the resource type (`Topic`, `Group`, `Cluster`).
+pub fn record_acl_denial(principal: &str, api: &str, resource_type: &str) {
+    let principal_label = bounded_principal_label(principal);
+    ACL_DENIAL_TOTAL
+        .with_label_values(&[principal_label.as_str(), api, resource_type])
+        .inc();
 }
 
 /// Record a consumer group operation latency.
@@ -1838,8 +1931,9 @@ pub fn record_storage_operation(operation: &str, duration_secs: f64) {
 /// * `recovered` - True if HWM was recovered (orphaned records found), false otherwise
 pub fn record_hwm_recovery(topic: &str, partition: i32, recovered: bool) {
     let result = if recovered { "recovered" } else { "no_change" };
+    let (t, p) = bounded_partition_label(topic, partition);
     HWM_RECOVERY_EVENTS
-        .with_label_values(&[topic, &partition.to_string(), result])
+        .with_label_values(&[t.as_str(), p.as_str(), result])
         .inc();
 }
 
@@ -1948,9 +2042,8 @@ pub fn record_batch_index_miss() {
 /// * `partition` - The partition ID
 /// * `size` - Current number of entries in the index
 pub fn set_batch_index_size(topic: &str, partition: i32, size: i64) {
-    BATCH_INDEX_SIZE
-        .with_label_values(&[topic, &partition.to_string()])
-        .set(size);
+    let (t, p) = bounded_partition_label(topic, partition);
+    BATCH_INDEX_SIZE.with_label_values(&[&t, &p]).set(size);
 }
 
 /// Record batch index evictions.
@@ -1960,8 +2053,9 @@ pub fn set_batch_index_size(topic: &str, partition: i32, size: i64) {
 /// * `partition` - The partition ID
 /// * `count` - Number of entries evicted
 pub fn record_batch_index_eviction(topic: &str, partition: i32, count: u64) {
+    let (t, p) = bounded_partition_label(topic, partition);
     BATCH_INDEX_EVICTIONS
-        .with_label_values(&[topic, &partition.to_string()])
+        .with_label_values(&[&t, &p])
         .inc_by(count);
 }
 
@@ -1975,8 +2069,9 @@ pub fn record_batch_index_warm_entries(count: i64) {
 
 /// Record batches deleted by the retention task for a partition.
 pub fn record_retention_deleted_batches(topic: &str, partition: i32, count: u64) {
+    let (t, p) = bounded_partition_label(topic, partition);
     RETENTION_DELETED_BATCHES
-        .with_label_values(&[topic, &partition.to_string()])
+        .with_label_values(&[&t, &p])
         .inc_by(count);
 }
 

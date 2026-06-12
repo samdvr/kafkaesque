@@ -57,11 +57,12 @@ pub struct SaslProvider {
     users: Arc<RwLock<HashMap<String, UserRecord>>>,
     /// In-flight SCRAM sessions keyed by the client's `SocketAddr`. Each
     /// SCRAM exchange is two round-trips, so we hold per-connection state
-    /// between them. Cleared on success/failure to bound memory; abandoned
-    /// connections fall off when the connection drops (the Kafka handler
-    /// has no hook here, but the map is bounded by max client connections
-    /// elsewhere).
-    scram_sessions: Arc<RwLock<HashMap<SocketAddr, ScramServerState>>>,
+    /// between them. Bounded by `SCRAM_MAX_SESSIONS` and a per-entry TTL so
+    /// half-open exchanges (client drops before sending client-final)
+    /// cannot accumulate; without those bounds the map grows until the OS
+    /// eventually notifies the connection layer that the socket is closed,
+    /// which can take minutes per leaked entry.
+    scram_sessions: Arc<moka::sync::Cache<SocketAddr, ScramServerState>>,
     /// Supported SASL mechanisms (advertised in SaslHandshake).
     mechanisms: Vec<String>,
     /// Whether authentication is required.
@@ -79,9 +80,20 @@ impl SaslProvider {
 
     /// Create a SASL provider with explicit TLS and requirement settings.
     pub fn with_options(required: bool, plain_require_tls: bool) -> Self {
+        // Cap the in-flight SCRAM session map and expire entries that don't
+        // complete within 60s (the client should follow client-first with
+        // client-final immediately; minutes-old half-open entries are
+        // abandoned by the client). 1024 entries is well above any
+        // legitimate concurrent-handshake count.
+        const SCRAM_MAX_SESSIONS: u64 = 1024;
+        const SCRAM_SESSION_TTL_SECS: u64 = 60;
+        let scram_sessions = moka::sync::Cache::builder()
+            .max_capacity(SCRAM_MAX_SESSIONS)
+            .time_to_live(std::time::Duration::from_secs(SCRAM_SESSION_TTL_SECS))
+            .build();
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
-            scram_sessions: Arc::new(RwLock::new(HashMap::new())),
+            scram_sessions: Arc::new(scram_sessions),
             mechanisms: vec!["SCRAM-SHA-256".to_string(), "PLAIN".to_string()],
             required,
             plain_require_tls,
@@ -217,18 +229,12 @@ impl SaslProvider {
     /// the GS2 header) is correctly routed to the SCRAM path even though
     /// the bytes themselves don't say "I am SCRAM".
     pub async fn has_scram_session(&self, client_addr: SocketAddr) -> bool {
-        self.scram_sessions.read().await.contains_key(&client_addr)
+        self.scram_sessions.contains_key(&client_addr)
     }
 
     /// Drop per-connection SCRAM state when a client disconnects.
     pub async fn clear_session(&self, client_addr: SocketAddr) {
-        if self
-            .scram_sessions
-            .write()
-            .await
-            .remove(&client_addr)
-            .is_some()
-        {
+        if self.scram_sessions.remove(&client_addr).is_some() {
             debug!(client = %client_addr, "Cleared abandoned SCRAM session");
         }
     }
@@ -282,7 +288,23 @@ impl SaslProvider {
         } else {
             // Single, uniform log line for *any* authentication failure so
             // operators can't grep `wrong password` to enumerate accounts.
-            warn!(username = %username, "SASL PLAIN authentication failed");
+            // The username is intentionally NOT logged: interactive clients
+            // commonly type the password into the username field by mistake,
+            // and a leaked log of failed auth attempts then leaks every typo
+            // password. A SHA-256 prefix gives operators correlation power
+            // without identifying the value.
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(username.as_bytes());
+            let hash = hasher.finalize();
+            let prefix: String = hash[..8]
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            warn!(
+                username_hash_prefix = %prefix,
+                "SASL PLAIN authentication failed"
+            );
             (false, None)
         }
     }
@@ -306,8 +328,9 @@ impl SaslProvider {
     ) -> (bool, Option<String>, Vec<u8>) {
         // Look up existing session; if none, this is the client-first step.
         let existing = {
-            let mut sessions = self.scram_sessions.write().await;
-            sessions.remove(&client_addr)
+            let prev = self.scram_sessions.get(&client_addr);
+            self.scram_sessions.remove(&client_addr);
+            prev
         };
         match existing {
             None => {
@@ -320,7 +343,7 @@ impl SaslProvider {
                 // just return the failure response.
                 match &state {
                     ScramServerState::AwaitingClientFinal { .. } => {
-                        self.scram_sessions.write().await.insert(client_addr, state);
+                        self.scram_sessions.insert(client_addr, state);
                         debug!(client = %client_addr, "SCRAM client-first accepted");
                         // Not authenticated yet — handler still needs to
                         // send the response. We mark failure here so the

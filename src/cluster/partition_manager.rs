@@ -966,6 +966,16 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         topic: &str,
         partition: i32,
     ) -> SlateDBResult<Arc<PartitionStore>> {
+        // Reject negative partition indices at the boundary. Without this a
+        // bug or malicious caller can create a SlateDB instance under
+        // `topic-X/partition--1/`, which downstream code never garbage
+        // collects and fencing assumes does not exist.
+        if partition < 0 {
+            return Err(SlateDBError::Config(format!(
+                "Invalid partition index {} for topic {}: must be non-negative",
+                partition, topic
+            )));
+        }
         if self.is_zombie() {
             return Err(SlateDBError::Config(
                 "Broker in zombie mode - cannot acquire partitions".to_string(),
@@ -1167,6 +1177,19 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         {
             Ok(ttl) => ttl,
             Err(e) => {
+                // Distinguish a definitive ownership-loss signal (NotOwned —
+                // the Raft state machine says we are no longer the owner) from
+                // a transient Raft hiccup (timeout, leader hand-off, network
+                // blip). Closing the store on every error tears down the
+                // SlateDB instance and forces a full recovery scan on the next
+                // write — for a partition with millions of records that's a
+                // multi-second pause, and during a leader hand-off it cascades
+                // across every partition. Only explicit NotOwned ejects.
+                let is_ownership_loss = matches!(&e, SlateDBError::NotOwned { .. });
+                if !is_ownership_loss {
+                    warn!(topic, partition, error = %e, "Transient Raft error during lease verification - propagating without ejecting partition");
+                    return Err(e);
+                }
                 warn!(topic, partition, error = %e, "Ownership verification failed during write - releasing partition");
                 // Close the store too: removing the entry without close()
                 // leaks SlateDB memtables, object-store connections, and
@@ -1217,7 +1240,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
 
     /// Delete all data for a partition from object storage.
     pub async fn delete_partition_data(&self, topic: &str, partition: i32) -> SlateDBResult<()> {
-        use futures::TryStreamExt;
+        use futures::StreamExt;
         use object_store::path::Path as ObjectPath;
         if self.owns_partition(topic, partition).await {
             self.release_partition(topic, partition).await?;
@@ -1230,14 +1253,14 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         let path_prefix = format!("topic-{}/partition-{}", topic, partition);
         let prefix = ObjectPath::from(path_prefix.as_str());
         info!(topic, partition, path = %path_prefix, base_path = %self.base_path, "Deleting partition data from object store");
-        let objects: Vec<_> = self
-            .object_store
-            .list(Some(&prefix))
-            .try_collect()
-            .await
-            .map_err(|e| SlateDBError::Storage(e.to_string()))?;
-        let object_count = objects.len();
-        for obj in objects {
+        // Stream the listing instead of `try_collect()`. A busy partition
+        // can have tens of thousands of SST objects; collecting every
+        // ObjectMeta into a Vec briefly pins all of them in memory at once.
+        let mut stream = self.object_store.list(Some(&prefix));
+        let mut object_count: usize = 0;
+        while let Some(item) = stream.next().await {
+            let obj = item.map_err(|e| SlateDBError::Storage(e.to_string()))?;
+            object_count += 1;
             if let Err(e) = self.object_store.delete(&obj.location).await {
                 warn!(topic, partition, path = %obj.location, error = %e, "Failed to delete object");
             }
@@ -1880,6 +1903,21 @@ async fn release_partition_for_deleted_topic<C: ClusterCoordinator>(
         store.clear_load_metrics().await;
         // close() takes &self so this always works
         let _ = store.close().await;
+    }
+    // Drop the cluster lease too. Skipping the coordinator release leaves the
+    // owner record in the Raft state machine until natural lease expiry; with
+    // the default 60s lease the partition is unrecoverable for that window
+    // even though the topic is gone, and the metric label below claims a
+    // release happened.
+    ctx.lease_cache.remove(&key);
+    if let Err(e) = ctx.coordinator.release_partition(topic, partition).await {
+        warn!(
+            ctx.broker_id,
+            topic,
+            partition,
+            error = %e,
+            "Failed to release coordinator lease for deleted topic - lease will expire naturally"
+        );
     }
     super::metrics::record_lease_operation("release", "topic_deleted");
     super::metrics::OWNED_PARTITIONS

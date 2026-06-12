@@ -168,6 +168,12 @@ pub struct FailureDetector {
     failures_detected: AtomicU64,
     /// Counter for false positives (broker recovered from suspected).
     false_positives_avoided: AtomicU64,
+    /// Last time `check_brokers` ran. Used to detect "the monitor itself was
+    /// paused" — e.g. a long GC stall, a paused VM, the runtime starved by
+    /// another task. Without this a 3s pause looks like every broker
+    /// missed 6 heartbeats at the default 500ms interval, false-positively
+    /// declaring the entire cluster dead.
+    last_tick: std::sync::Mutex<Option<Instant>>,
 }
 
 impl FailureDetector {
@@ -186,6 +192,7 @@ impl FailureDetector {
             brokers: DashMap::new(),
             failures_detected: AtomicU64::new(0),
             false_positives_avoided: AtomicU64::new(0),
+            last_tick: std::sync::Mutex::new(None),
         }
     }
 
@@ -243,6 +250,34 @@ impl FailureDetector {
     /// Returns a list of broker IDs that have newly transitioned to the Failed state.
     pub fn check_brokers(&self) -> Vec<HealthStateChange> {
         let now = Instant::now();
+        // Detect long pauses in the monitor itself (GC stall, VM pause,
+        // runtime starvation). If the wall-clock gap between successive
+        // ticks exceeds both 10× the configured check interval AND an
+        // absolute minimum (500 ms), advance every broker's
+        // `last_heartbeat` by the gap so we don't bill the brokers for
+        // time *we* spent paused. The dual threshold keeps tests with very
+        // small intervals from tripping pause detection on a normal tick
+        // jitter.
+        {
+            let mut last = self.last_tick.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(prev) = *last {
+                let gap = now.saturating_duration_since(prev);
+                let multiplier_threshold = self.config.heartbeat_interval.saturating_mul(10);
+                let absolute_threshold = std::time::Duration::from_millis(500);
+                let pause_threshold = multiplier_threshold.max(absolute_threshold);
+                if gap > pause_threshold {
+                    warn!(
+                        gap_ms = gap.as_millis() as u64,
+                        threshold_ms = pause_threshold.as_millis() as u64,
+                        "Failure detector tick gap exceeded threshold; treating as monitor pause"
+                    );
+                    for mut entry in self.brokers.iter_mut() {
+                        entry.value_mut().last_heartbeat += gap;
+                    }
+                }
+            }
+            *last = Some(now);
+        }
         let mut state_changes = Vec::new();
 
         for mut entry in self.brokers.iter_mut() {

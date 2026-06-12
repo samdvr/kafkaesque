@@ -209,16 +209,31 @@ async fn read_kafka_frame<S: AsyncRead + Unpin>(
         }
     };
 
-    let mut data = vec![0u8; size];
-    stream.read_exact(&mut data).await.map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            Error::MissingData("Connection closed mid-message".to_owned())
-        } else {
-            Error::from(e)
+    // Avoid zero-initializing the buffer before `read_exact` overwrites it.
+    // For a 100 MB produce frame the previous `vec![0u8; size]` zero-fills
+    // 100 MB on every read just to immediately overwrite — measurable on
+    // the produce hot path. `BytesMut::with_capacity` allocates uninitialized
+    // capacity and `read_buf` writes directly into it.
+    let mut buf = bytes::BytesMut::with_capacity(size);
+    {
+        use tokio::io::AsyncReadExt;
+        // `read_buf` advances the buffer's length as it reads. Loop until we
+        // have all `size` bytes; treat 0-length reads as a closed connection
+        // mid-message (matches the previous read_exact semantics).
+        while buf.len() < size {
+            match stream.read_buf(&mut buf).await {
+                Ok(0) => {
+                    return Err(Error::MissingData(
+                        "Connection closed mid-message".to_owned(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => return Err(Error::from(e)),
+            }
         }
-    })?;
+    }
 
-    Ok((Bytes::from(data), permit))
+    Ok((buf.freeze(), permit))
 }
 
 /// Public re-export of [`read_kafka_frame`] for fuzz harnesses.
@@ -282,17 +297,34 @@ where
 {
     let read_timeout = Duration::from_secs(DEFAULT_REQUEST_READ_TIMEOUT_SECS);
     let handler_timeout = Duration::from_secs(DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS);
+    // Bound the FIRST frame's read with a tighter timeout. A client that
+    // connects but never sends a byte ties up a connection slot for the full
+    // per-frame `read_timeout` (30s by default); at the default 1024 max
+    // total connections a steady ~34 conn/s pins the broker. The first-byte
+    // window is generous enough for slow startup paths but short enough that
+    // an idle attacker rotates through slots fast.
+    let first_byte_timeout = Duration::from_secs(5).min(read_timeout);
+    let mut is_first_frame = true;
 
     let result = crate::cluster::buffer_pool::run_scoped(async {
         loop {
+            let effective_read_timeout = if is_first_frame {
+                first_byte_timeout
+            } else {
+                read_timeout
+            };
             let read_result =
-                match timeout(read_timeout, read_kafka_frame(stream, max_message_size)).await {
-                    Ok(result) => result,
+                match timeout(effective_read_timeout, read_kafka_frame(stream, max_message_size)).await {
+                    Ok(result) => {
+                        is_first_frame = false;
+                        result
+                    }
                     Err(_) => {
                         tracing::warn!(
                             client = %client,
                             connection = connection_label,
-                            timeout_secs = DEFAULT_REQUEST_READ_TIMEOUT_SECS,
+                            timeout_secs = effective_read_timeout.as_secs(),
+                            first_frame = is_first_frame,
                             "Request read timeout - closing connection"
                         );
                         return Err(Error::MissingData("Request read timeout".to_owned()));
@@ -341,6 +373,15 @@ where
                                     encode_wire_error_response(cid, KafkaCode::InvalidRequest)
                             {
                                 let _ = write_kafka_frame(stream, &err_resp, client).await;
+                                // Flush and shutdown the write half so the
+                                // client actually receives the typed error
+                                // before our connection close races a TCP
+                                // RST: without this the client may see only
+                                // the RST and log the request as a transport
+                                // bug rather than the typed Kafka code.
+                                use tokio::io::AsyncWriteExt;
+                                let _ = stream.flush().await;
+                                let _ = stream.shutdown().await;
                             }
                             return Err(e);
                         }
@@ -353,7 +394,7 @@ where
                             );
                             if let Some(cid) = correlation_id
                                 && let Ok(err_resp) =
-                                    encode_wire_error_response(cid, KafkaCode::InvalidRequest)
+                                    encode_wire_error_response(cid, KafkaCode::RequestTimedOut)
                             {
                                 let _ = write_kafka_frame(stream, &err_resp, client).await;
                             }

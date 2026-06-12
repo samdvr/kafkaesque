@@ -314,6 +314,10 @@ pub struct RebalanceCoordinator {
     /// Whether the coordinator is running.
     running: AtomicBool,
 
+    /// Wakes background loops on shutdown so they don't sit in a long
+    /// `sleep` past the requested stop.
+    shutdown_notify: Arc<tokio::sync::Notify>,
+
     /// Counter for total failovers handled.
     total_failovers: AtomicU64,
 
@@ -351,6 +355,7 @@ impl RebalanceCoordinator {
             )),
             auto_balancer: RwLock::new(AutoBalancer::new(config.auto_balancer.clone())),
             running: AtomicBool::new(false),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             total_failovers: AtomicU64::new(0),
             total_rebalances: AtomicU64::new(0),
             config,
@@ -784,8 +789,13 @@ impl RebalanceCoordinator {
     }
 
     /// Stop background tasks.
+    ///
+    /// Flips the `running` flag and notifies the shutdown listener so loops
+    /// wake immediately instead of waiting out their next sleep tick. The
+    /// caller is still responsible for joining the spawned task handles.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
     }
 
     /// Check if the coordinator is running.
@@ -798,7 +808,14 @@ impl RebalanceCoordinator {
         let check_interval = self.config.failure_detector.check_interval;
 
         while self.running.load(Ordering::SeqCst) {
-            tokio::time::sleep(check_interval).await;
+            // Sleep but wake immediately if `stop()` is called.
+            tokio::select! {
+                _ = tokio::time::sleep(check_interval) => {}
+                _ = self.shutdown_notify.notified() => break,
+            }
+            if !self.running.load(Ordering::SeqCst) {
+                break;
+            }
 
             let state_changes = self.check_broker_health();
 
@@ -857,7 +874,13 @@ impl RebalanceCoordinator {
         let evaluation_interval = self.config.auto_balancer.evaluation_interval();
 
         while self.running.load(Ordering::SeqCst) {
-            tokio::time::sleep(evaluation_interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(evaluation_interval) => {}
+                _ = self.shutdown_notify.notified() => break,
+            }
+            if !self.running.load(Ordering::SeqCst) {
+                break;
+            }
 
             // Only the coordination leader proposes rebalance moves.
             // Followers wake on the same interval but skip the body so N
@@ -875,7 +898,13 @@ impl RebalanceCoordinator {
     /// Background loop for resetting metrics at window boundaries.
     async fn metrics_reset_loop<E: PartitionTransferExecutor>(&self, executor: Arc<E>) {
         while self.running.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                _ = self.shutdown_notify.notified() => break,
+            }
+            if !self.running.load(Ordering::SeqCst) {
+                break;
+            }
 
             if self.load_collector.should_reset() {
                 self.load_collector.reset_all();

@@ -153,10 +153,25 @@ pub(super) async fn handle_produce(
                 .await
                 == crate::cluster::authorizer::AuthorizeResult::Denied
             {
-                debug!(
+                // Emit a per-principal audit at warn level — operators rely on
+                // this to detect mis-configured producers and credential
+                // theft. The drop counter is bumped twice with different
+                // resolutions: the existing `produce_dropped_total{reason}`
+                // for top-line dashboards, and a per-principal counter for
+                // attribution.
+                tracing::warn!(
+                    target: "audit",
                     topic = %topic.name,
                     principal = %ctx.principal,
-                    "Denied acks=0 produce by ACL"
+                    client = %ctx.client_addr,
+                    api = "Produce",
+                    acks = 0,
+                    "ACL denied: dropped acks=0 produce"
+                );
+                crate::cluster::metrics::record_acl_denial(
+                    &ctx.principal,
+                    "Produce",
+                    "Topic",
                 );
                 crate::cluster::metrics::record_produce_dropped(
                     "acl_denied",
@@ -372,6 +387,21 @@ async fn fire_and_forget_produce(
         return Err(());
     }
 
+    // CRC-validate at ingress, before any partition lookup or lease check.
+    // A flood of corrupt batches would otherwise force a per-partition
+    // lookup, lease verification, and ownership check on every record before
+    // rejection — multiplying the attacker's CPU draw on the broker by an
+    // order of magnitude.
+    if validate_crc {
+        match validate_batch_crc_async(&partition.records).await {
+            CrcValidationResult::Valid => {}
+            _ => {
+                crate::cluster::metrics::record_produce_dropped("crc_invalid", 1);
+                return Err(());
+            }
+        }
+    }
+
     // Get partition store - for acks=0, don't try to acquire if we don't own
     // IMPORTANT: We do NOT try to acquire partitions here. Partition acquisition
     // happens only in the background ownership loop.
@@ -385,17 +415,6 @@ async fn fire_and_forget_produce(
             return Err(());
         } // We don't own this partition
     };
-
-    // Optional CRC validation
-    if validate_crc {
-        match validate_batch_crc_async(&partition.records).await {
-            CrcValidationResult::Valid => {}
-            _ => {
-                crate::cluster::metrics::record_produce_dropped("crc_invalid", 1);
-                return Err(());
-            }
-        }
-    }
 
     // Append batch (ignore result for fire-and-forget)
     let _ = store.append_batch(&partition.records).await;

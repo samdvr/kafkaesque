@@ -212,7 +212,12 @@ impl HealthServer {
                             // Handle request in a separate task to avoid blocking
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                let mut buf = [0u8; 1024];
+                                // 1024 bytes truncated long Authorization
+                                // headers (forwarded JWTs from a gateway easily
+                                // exceed that), causing legitimate metrics
+                                // requests to get a 401. 8 KiB is the bound
+                                // most reverse proxies use for header size.
+                                let mut buf = [0u8; 8192];
                                 match timeout(HEALTH_READ_TIMEOUT, stream.read(&mut buf)).await {
                                     Ok(Ok(n)) if n > 0 => {
                                         let request = String::from_utf8_lossy(&buf[..n]);
@@ -299,7 +304,13 @@ fn request_has_bearer(request: &str, expected: &str) -> bool {
                 .strip_prefix("Bearer ")
                 .or_else(|| value.strip_prefix("bearer "))
         {
-            return rest.trim() == expected;
+            // Constant-time compare: a timing-leaking byte comparison gives
+            // an attacker a side channel to extract the token one byte at a
+            // time over enough probes.
+            use subtle::ConstantTimeEq;
+            let provided = rest.trim().as_bytes();
+            let expected_bytes = expected.as_bytes();
+            return provided.ct_eq(expected_bytes).unwrap_u8() == 1;
         }
     }
     false

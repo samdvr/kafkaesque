@@ -139,10 +139,19 @@ pub async fn recover_hwm_from_records(
         }
     }
 
-    // Validate offset continuity from the scan floor
+    // Validate offset continuity from the scan floor.
+    //
+    // Use `highest_found` (the max of the standalone `_hwm` checkpoint and
+    // every batch-embedded HWM observed during the scan) as the reference
+    // line between "confirmed gap" and "potential unflushed write". The
+    // standalone checkpoint advances every 64 batches, so a fresh-crash
+    // partition with two batches written but no checkpoint would have all
+    // its gaps mis-classified as potential and the broker would come online
+    // silently. Batch-embedded HWMs are written atomically with the batch,
+    // so they accurately reflect what the broker had committed.
     validate_offset_continuity_from(
         &batches,
-        persisted_hwm,
+        highest_found,
         fail_on_gap,
         highest_found,
         scan_floor,

@@ -63,7 +63,14 @@ pub(super) async fn handle_fetch(
         "_multi".to_string()
     };
 
-    let max_wait = Duration::from_millis(request.max_wait_ms.max(0) as u64);
+    // Cap `max_wait_ms` to a sane upper bound. Without this, a misbehaving
+    // (or hostile) client requesting i32::MAX pins a connection task for
+    // ~24.8 days; with a typical max_total_connections of ~1k that is a
+    // trivial denial-of-service. 60s matches Kafka's default `fetch.max.wait.ms`
+    // ceiling-of-reasonable.
+    const MAX_FETCH_WAIT_MS: i32 = 60_000;
+    let bounded_wait_ms = request.max_wait_ms.clamp(0, MAX_FETCH_WAIT_MS);
+    let max_wait = Duration::from_millis(bounded_wait_ms as u64);
     let min_bytes = request.min_bytes.max(0) as usize;
     let deadline = if max_wait.is_zero() {
         None
@@ -71,13 +78,11 @@ pub(super) async fn handle_fetch(
         Some(tokio::time::Instant::now() + max_wait)
     };
 
-    // First pass: build the response with whatever's currently available.
-    let mut responses = collect_fetch(handler, ctx, &request).await;
-
-    // Resolve the per-partition notifies once: the partition set is fixed
-    // for the lifetime of the request. Waiting on exactly these (instead of
-    // the old broker-wide notify) means a produce to an unrelated partition
-    // no longer wakes this fetcher into a pointless re-scan.
+    // Resolve the per-partition notifies BEFORE the first `collect_fetch`
+    // and stash a `Notified` future on each one. `Notify::notify_waiters()`
+    // only wakes futures that already exist when it fires, so a producer
+    // commit landing between the read and the wait would otherwise be lost
+    // and the fetch would block until `max_wait_ms` for no reason.
     let watched: Vec<Arc<tokio::sync::Notify>> = request
         .topics
         .iter()
@@ -89,9 +94,19 @@ pub(super) async fn handle_fetch(
                 .collect::<Vec<_>>()
         })
         .collect();
+    // Pre-arm a notification per watched partition. `Notified` is held
+    // across the loop so a wake that fires before we await still counts.
+    let pre_armed: Vec<_> = watched
+        .iter()
+        .map(|n| Box::pin(n.notified()))
+        .collect();
+
+    // First pass: build the response with whatever's currently available.
+    let mut responses = collect_fetch(handler, ctx, &request).await;
 
     // Long-poll loop: if min_bytes isn't satisfied and we have time left,
     // wait for any requested partition's HWM to advance, then re-check.
+    let mut armed = pre_armed;
     while min_bytes > 0
         && total_record_bytes(&responses) < min_bytes
         && let Some(deadline) = deadline
@@ -101,16 +116,13 @@ pub(super) async fn handle_fetch(
         if now >= deadline {
             break;
         }
-        // `Notify::notified()` must be created before `notify_waiters()` is
-        // called for it to wake — but we hold the futures across the wait so
-        // any concurrent producer wake counts. Re-acquired each loop so we
-        // don't miss notifications between iterations.
-        let any_advanced =
-            futures::future::select_all(watched.iter().map(|n| Box::pin(n.notified())));
         let remaining = deadline - now;
+        let any_advanced = futures::future::select_all(armed);
         match tokio::time::timeout(remaining, any_advanced).await {
             Ok(_) => {
-                // A requested partition advanced — re-fetch.
+                // A requested partition advanced — re-arm before re-fetching
+                // so a wake during `collect_fetch` is not lost.
+                armed = watched.iter().map(|n| Box::pin(n.notified())).collect();
                 responses = collect_fetch(handler, ctx, &request).await;
             }
             Err(_) => {

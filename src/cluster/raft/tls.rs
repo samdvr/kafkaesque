@@ -89,6 +89,13 @@ impl RaftTlsConfig {
         ca_path: &Path,
         server_name: String,
     ) -> SlateDBResult<Self> {
+        // Mirror the data-plane TLS config: install a default crypto
+        // provider before building any rustls config. With multiple
+        // providers in the dependency graph (aws-lc-rs and ring),
+        // `ServerConfig::builder()` panics at runtime if neither has been
+        // registered. Idempotent — first writer wins.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
         let certs = load_certs(cert_path)?;
         let key = load_private_key(key_path)?;
         let ca_certs = load_certs(ca_path)?;
@@ -107,16 +114,18 @@ impl RaftTlsConfig {
         let client_verifier = WebPkiClientVerifier::builder(roots.clone())
             .build()
             .map_err(|e| SlateDBError::Config(format!("Invalid Raft client verifier: {}", e)))?;
-        let server_config = ServerConfig::builder()
-            .with_client_cert_verifier(client_verifier)
-            .with_single_cert(certs.clone(), key.clone_key())
-            .map_err(|e| SlateDBError::Config(format!("Invalid Raft server cert: {}", e)))?;
+        let server_config =
+            ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_client_cert_verifier(client_verifier)
+                .with_single_cert(certs.clone(), key.clone_key())
+                .map_err(|e| SlateDBError::Config(format!("Invalid Raft server cert: {}", e)))?;
 
         // Client side: same identity, same trust roots.
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(Arc::try_unwrap(roots).unwrap_or_else(|a| (*a).clone()))
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| SlateDBError::Config(format!("Invalid Raft client cert: {}", e)))?;
+        let client_config =
+            ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(Arc::try_unwrap(roots).unwrap_or_else(|a| (*a).clone()))
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| SlateDBError::Config(format!("Invalid Raft client cert: {}", e)))?;
 
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(server_config)),

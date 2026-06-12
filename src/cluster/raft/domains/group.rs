@@ -340,8 +340,21 @@ impl GroupDomainState {
                 // derive one deterministically from the command inputs so every
                 // replica produces the same value when applying this log entry.
                 // Using Uuid::new_v4() here would diverge state across replicas.
+                //
+                // Rejoin coalescing: if an existing member already has the same
+                // (client_id, client_host), reuse its id rather than minting a
+                // new one. Without this a flapping client (lost session token,
+                // re-connecting after a network blip) accumulates a fresh
+                // member entry every join, bloating the group and the
+                // generation counter.
                 let final_member_id = if member_id.is_empty() {
-                    format!("{}-{}-{}", client_id, timestamp_ms, group.members.len())
+                    if let Some(existing) = group.members.values().find(|m| {
+                        m.client_id == client_id && m.client_host == client_host
+                    }) {
+                        existing.member_id.clone()
+                    } else {
+                        format!("{}-{}-{}", client_id, timestamp_ms, group.members.len())
+                    }
                 } else {
                     member_id
                 };

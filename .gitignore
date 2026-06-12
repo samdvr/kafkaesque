@@ -1,3 +1,4 @@
 /.idea
 /target
 /etc/redpanda/certs
+fuzz.log

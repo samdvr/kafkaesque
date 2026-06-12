@@ -161,7 +161,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Created separate control plane and data plane runtimes"
     );
 
-    runtimes.block_on_control(run_broker(config, handles))
+    let result = runtimes.block_on_control(run_broker(config, handles));
+
+    // Explicitly shut down both broker runtimes within a bounded timeout.
+    // Letting the implicit `Drop` path handle shutdown blocks the calling
+    // thread silently for up to 30s while tokio drains spawned tasks; an
+    // explicit `shutdown_timeout` returns control quickly and logs if the
+    // drain didn't complete in time so operators see the cause.
+    let runtime_shutdown_deadline = std::time::Duration::from_secs(10);
+    let runtime_shutdown_start = std::time::Instant::now();
+    runtimes.shutdown_timeout(runtime_shutdown_deadline);
+    let elapsed = runtime_shutdown_start.elapsed();
+    if elapsed >= runtime_shutdown_deadline {
+        eprintln!(
+            "WARN: Runtime shutdown hit {}ms timeout; spawned tasks may have been force-cancelled",
+            runtime_shutdown_deadline.as_millis()
+        );
+    }
+
+    result
 }
 
 async fn run_broker(

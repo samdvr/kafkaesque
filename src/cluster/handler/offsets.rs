@@ -29,6 +29,37 @@ pub(super) async fn handle_list_offsets(
     ctx: &RequestContext,
     request: ListOffsetsRequestData,
 ) -> ListOffsetsResponseData {
+    // Refuse on a fenced/zombie broker. Without this gate the broker keeps
+    // serving offset metadata after losing leadership; clients use those
+    // values to drive consumption from the (real) new owner and can race
+    // ahead of the new owner's recovered HWM.
+    if handler.partition_manager.is_zombie() {
+        let topics: Vec<_> = request
+            .topics
+            .into_iter()
+            .map(|t| {
+                let partitions = t
+                    .partitions
+                    .into_iter()
+                    .map(|p| ListOffsetsPartitionResponse {
+                        partition_index: p.partition_index,
+                        error_code: KafkaCode::NotLeaderForPartition,
+                        timestamp: -1,
+                        offset: -1,
+                    })
+                    .collect();
+                ListOffsetsTopicResponse {
+                    name: t.name,
+                    partitions,
+                }
+            })
+            .collect();
+        return ListOffsetsResponseData {
+            throttle_time_ms: 0,
+            topics,
+        };
+    }
+
     let mut topics = Vec::with_capacity(request.topics.len());
 
     for topic in request.topics {
@@ -448,6 +479,30 @@ pub(super) async fn handle_offset_commit(
         let mut partition_responses = Vec::with_capacity(topic.partitions.len());
 
         for partition in &topic.partitions {
+            // Cap offset-commit metadata size. The bytes go straight into the
+            // replicated state machine on every commit; an unbounded blob
+            // bloats Raft snapshots and stretches every subsequent
+            // append-entries call. 4 KiB matches Kafka's
+            // `offset.metadata.max.bytes` default.
+            const OFFSET_METADATA_MAX_BYTES: usize = 4096;
+            if let Some(ref m) = partition.committed_metadata
+                && m.len() > OFFSET_METADATA_MAX_BYTES
+            {
+                debug!(
+                    group_id = %request.group_id,
+                    topic = %topic.name,
+                    partition = partition.partition_index,
+                    metadata_bytes = m.len(),
+                    "Rejecting OffsetCommit: metadata exceeds {} bytes",
+                    OFFSET_METADATA_MAX_BYTES
+                );
+                partition_responses.push(OffsetCommitPartitionResponse {
+                    partition_index: partition.partition_index,
+                    error_code: KafkaCode::OffsetMetadataTooLarge,
+                });
+                continue;
+            }
+
             // Bound the committed offset against the partition's live
             // [log_start_offset, high_watermark] window. Without this,
             // committing `i64::MAX` makes a consumer silently skip every
@@ -560,6 +615,14 @@ pub(super) async fn handle_offset_fetch(
     ctx: &RequestContext,
     request: OffsetFetchRequestData,
 ) -> OffsetFetchResponseData {
+    if validate_group_id(&request.group_id).is_err() {
+        debug!(group_id = %request.group_id, "Invalid group ID in offset_fetch");
+        return OffsetFetchResponseData {
+            throttle_time_ms: 0,
+            topics: vec![],
+            error_code: KafkaCode::InvalidGroupId,
+        };
+    }
     // OffsetFetch requires Describe on the Group resource.
     if handler
         .authorizer
@@ -663,17 +726,35 @@ pub(super) async fn handle_offset_fetch(
         let mut partition_responses = Vec::with_capacity(topic.partition_indexes.len());
 
         for partition_index in topic.partition_indexes {
-            let (committed_offset, metadata) = handler
+            // Distinguish "no offset committed" (Ok(-1)) from a coordinator
+            // failure (Err). Collapsing both to committed_offset=-1 with no
+            // error code makes the consumer interpret a transient Raft hiccup
+            // as "consume from the configured reset policy" — which on
+            // `auto.offset.reset=earliest` re-reads the entire log, and on
+            // `latest` silently skips records produced before the next poll.
+            let (committed_offset, metadata, error_code) = match handler
                 .coordinator
                 .fetch_offset(&request.group_id, &topic.name, partition_index)
                 .await
-                .unwrap_or((-1, None));
+            {
+                Ok((offset, metadata)) => (offset, metadata, KafkaCode::None),
+                Err(e) => {
+                    debug!(
+                        topic = %topic.name,
+                        partition = partition_index,
+                        group = %request.group_id,
+                        error = %e,
+                        "Coordinator failure during fetch_offset - returning typed error"
+                    );
+                    (-1, None, e.to_kafka_code())
+                }
+            };
 
             partition_responses.push(OffsetFetchPartitionResponse {
                 partition_index,
                 committed_offset,
                 metadata,
-                error_code: KafkaCode::None,
+                error_code,
             });
         }
 

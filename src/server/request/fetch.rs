@@ -32,12 +32,24 @@ pub struct FetchPartitionData {
     pub partition_max_bytes: i32,
 }
 
-pub fn parse_fetch_request(s: NomBytes, _version: i16) -> IResult<NomBytes, FetchRequestData> {
+pub fn parse_fetch_request(s: NomBytes, version: i16) -> IResult<NomBytes, FetchRequestData> {
     let (s, replica_id) = be_i32(s)?;
     let (s, max_wait_ms) = be_i32(s)?;
     let (s, min_bytes) = be_i32(s)?;
-    let (s, max_bytes) = be_i32(s)?;
-    let (s, isolation_level) = be_i8(s)?;
+    // `max_bytes` was added in Fetch v3, `isolation_level` in v4. A
+    // version-blind parser silently misaligns the byte stream once we ever
+    // accept v0..v2, treating partition data as `max_bytes` and corrupting
+    // every field downstream.
+    let (s, max_bytes) = if version >= 3 {
+        be_i32(s)?
+    } else {
+        (s, i32::MAX)
+    };
+    let (s, isolation_level) = if version >= 4 {
+        be_i8(s)?
+    } else {
+        (s, 0)
+    };
     let (s, topics) = parse_array(parse_fetch_topic)(s)?;
 
     Ok((

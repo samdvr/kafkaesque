@@ -82,9 +82,15 @@ pub(crate) const AUTHENTICATED_FRAME_HEADER_LEN: usize =
     PURPOSE_LEN + TIMESTAMP_LEN + NONCE_LEN + HMAC_LEN;
 
 /// How long signed frames stay valid and how long nonces are remembered.
-const REPLAY_WINDOW: Duration = Duration::from_secs(300);
+///
+/// Tightened from 5 minutes / 60 s — a control plane between collocated
+/// brokers does not need a 5-minute replay window. NTP-disciplined hosts
+/// stay within sub-second skew; a generous 60s window still tolerates a VM
+/// snapshot/migration or a brief NTP outage. The smaller window also bounds
+/// the in-memory replay-cache size proportionally.
+const REPLAY_WINDOW: Duration = Duration::from_secs(60);
 /// Maximum clock skew tolerated on incoming frame timestamps.
-const MAX_CLOCK_SKEW: Duration = Duration::from_secs(60);
+const MAX_CLOCK_SKEW: Duration = Duration::from_secs(5);
 
 /// Maximum size in bytes of any single Raft RPC message (request or response)
 /// we will allocate for. The wire format is `[u32 length][purpose][hmac][bincode]`,
@@ -254,20 +260,31 @@ impl Default for RaftAuthKeys {
 impl RaftAuthKeys {
     /// Build keys from raw bytes. Empty/whitespace-only strings count as
     /// "not set" so that a `RAFT_CLUSTER_SECRET=""` env var doesn't enable a
-    /// trivially-guessable empty secret.
+    /// trivially-guessable empty secret. Secrets shorter than
+    /// `MIN_SECRET_BYTES` (32) are also rejected — a one-byte secret offers
+    /// no meaningful authentication and is almost always an operator typo.
     pub fn from_strings(cluster_secret: Option<String>, join_token: Option<String>) -> Self {
-        let normalize = |s: Option<String>| -> Option<Arc<[u8]>> {
+        const MIN_SECRET_BYTES: usize = 32;
+        let normalize = |s: Option<String>, label: &str| -> Option<Arc<[u8]>> {
             s.and_then(|v| {
                 let trimmed = v.trim();
                 if trimmed.is_empty() {
+                    None
+                } else if trimmed.len() < MIN_SECRET_BYTES {
+                    tracing::warn!(
+                        secret = label,
+                        len = trimmed.len(),
+                        min = MIN_SECRET_BYTES,
+                        "Rejecting Raft auth secret: shorter than minimum length"
+                    );
                     None
                 } else {
                     Some(Arc::<[u8]>::from(trimmed.as_bytes()))
                 }
             })
         };
-        let cluster_secret = normalize(cluster_secret);
-        let join_token = normalize(join_token);
+        let cluster_secret = normalize(cluster_secret, "cluster_secret");
+        let join_token = normalize(join_token, "join_token");
         // Without a configured secret we deny by default: see the
         // `unauthenticated_ok` field doc. Operators that genuinely want an
         // open Raft port (single-node dev, sandbox tests) must set
@@ -628,7 +645,7 @@ mod tests {
 
     #[test]
     fn configured_keys_reject_unsigned() {
-        let keys = RaftAuthKeys::from_strings(Some("hunter2".into()), None);
+        let keys = RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
         let payload = b"hello";
         let tag = [0u8; HMAC_LEN];
         let err = keys
@@ -639,7 +656,7 @@ mod tests {
 
     #[test]
     fn cluster_signed_roundtrip() {
-        let keys = RaftAuthKeys::from_strings(Some("hunter2".into()), None);
+        let keys = RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
         let payload = b"vote-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
@@ -650,7 +667,7 @@ mod tests {
 
     #[test]
     fn cluster_signed_rejects_tamper() {
-        let keys = RaftAuthKeys::from_strings(Some("hunter2".into()), None);
+        let keys = RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
         let payload = b"vote-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
@@ -665,7 +682,7 @@ mod tests {
 
     #[test]
     fn cluster_signed_rejects_replay() {
-        let keys = RaftAuthKeys::from_strings(Some("hunter2".into()), None);
+        let keys = RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
         let payload = b"vote-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
@@ -684,7 +701,7 @@ mod tests {
         // Signing with Cluster but presenting as Join must not validate, even
         // when both keys exist (this is why we mix the purpose byte into the
         // HMAC input).
-        let keys = RaftAuthKeys::from_strings(Some("clusterkey".into()), Some("joinkey".into()));
+        let keys = RaftAuthKeys::from_strings(Some("clusterkey-with-32-bytes-minimum-len".into()), Some("joinkey-with-32-bytes-minimum-len-padding".into()));
         let payload = b"join-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
@@ -704,7 +721,7 @@ mod tests {
 
     #[test]
     fn join_falls_back_to_cluster_secret_when_token_missing() {
-        let keys = RaftAuthKeys::from_strings(Some("clusterkey".into()), None);
+        let keys = RaftAuthKeys::from_strings(Some("clusterkey-with-32-bytes-minimum-len".into()), None);
         let payload = b"join-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
@@ -723,7 +740,7 @@ mod tests {
     #[tokio::test]
     async fn frame_roundtrip_over_pipe() {
         use tokio::io::duplex;
-        let keys = RaftAuthKeys::from_strings(Some("hunter2".into()), None);
+        let keys = RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
         let (mut a, mut b) = duplex(1024);
         let payload = b"hello-raft".to_vec();
 

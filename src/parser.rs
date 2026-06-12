@@ -7,7 +7,7 @@ use nom::{
 };
 use nombytes::NomBytes;
 
-use crate::constants::MAX_PROTOCOL_ARRAY_SIZE;
+use crate::constants::{MAX_PROTOCOL_ARRAY_SIZE, MAX_PROTOCOL_STRING_SIZE};
 
 fn utf8_verify_err(input: NomBytes) -> nom::Err<nom::error::Error<NomBytes>> {
     nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
@@ -97,6 +97,13 @@ pub fn parse_string(s: NomBytes) -> IResult<NomBytes, Bytes> {
     Ok((s, string.into_bytes()))
 }
 
+/// Parse a Kafka non-nullable ARRAY: 4-byte length then `length` items.
+///
+/// `length == -1` is a protocol error in this position — null is not legal
+/// for non-nullable arrays. Use [`parse_nullable_array`] for fields the
+/// Kafka schema marks as `(NULLABLE_)ARRAY`. Treating -1 as an empty array
+/// silently turns a malformed Produce/Fetch into a no-op success rather
+/// than the protocol error the client expects.
 pub fn parse_array<O, E, F>(mut f: F) -> impl FnMut(NomBytes) -> IResult<NomBytes, Vec<O>, E>
 where
     F: FnMut(NomBytes) -> IResult<NomBytes, O, E>,
@@ -105,12 +112,41 @@ where
     move |input: NomBytes| {
         let (mut rest, length) = be_i32(input)?;
 
-        // Null array
+        // Validate array size bounds. Reject negative lengths (including -1)
+        // because this parser is for non-nullable arrays.
+        if !(0..=MAX_PROTOCOL_ARRAY_SIZE).contains(&length) {
+            return Err(nom::Err::Failure(E::from_error_kind(
+                rest,
+                nom::error::ErrorKind::TooLarge,
+            )));
+        }
+
+        let mut out = Vec::with_capacity(length as usize);
+        for _ in 0..length {
+            let (r, item) = f(rest)?;
+            out.push(item);
+            rest = r;
+        }
+        Ok((rest, out))
+    }
+}
+
+/// Parse a Kafka NULLABLE_ARRAY: same as [`parse_array`] but `length == -1`
+/// decodes as an empty Vec without error.
+pub fn parse_nullable_array<O, E, F>(
+    mut f: F,
+) -> impl FnMut(NomBytes) -> IResult<NomBytes, Vec<O>, E>
+where
+    F: FnMut(NomBytes) -> IResult<NomBytes, O, E>,
+    E: nom::error::ParseError<NomBytes>,
+{
+    move |input: NomBytes| {
+        let (mut rest, length) = be_i32(input)?;
+
         if length == -1 {
             return Ok((rest, vec![]));
         }
 
-        // Validate array size bounds
         if !(0..=MAX_PROTOCOL_ARRAY_SIZE).contains(&length) {
             return Err(nom::Err::Failure(E::from_error_kind(
                 rest,
@@ -197,6 +233,17 @@ pub fn parse_compact_nullable_string(s: NomBytes) -> IResult<NomBytes, Option<By
 
     if actual_length == 0 {
         return Ok((s, Some(Bytes::new())));
+    }
+
+    // Bound the allocation. A length varint of u32::MAX would otherwise ask
+    // for a ~4 GiB take; nom fails on insufficient bytes, but the explicit
+    // cap fails earlier with a clear error and protects against the case
+    // where the caller chains parsers over a large pre-buffered request.
+    if actual_length > MAX_PROTOCOL_STRING_SIZE {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            s,
+            nom::error::ErrorKind::TooLarge,
+        )));
     }
 
     let (s, string) = take(actual_length as usize)(s)?;
@@ -380,13 +427,17 @@ mod tests {
 
     #[test]
     fn test_parse_array_null() {
-        // Null array (length = -1)
+        // -1 length is rejected by the non-nullable parser; the nullable
+        // parser must accept it and return an empty Vec.
         let data = (-1i32).to_be_bytes();
         let input = NomBytes::new(Bytes::from(data.to_vec()));
-
         let mut parser = parse_array(be_i32::<_, nom::error::Error<NomBytes>>);
-        let (_, parsed): (_, Vec<i32>) = parser(input).unwrap();
+        let result: Result<(_, Vec<i32>), _> = parser(input);
+        assert!(result.is_err(), "parse_array should reject -1 length");
 
+        let input = NomBytes::new(Bytes::from(data.to_vec()));
+        let mut nullable = parse_nullable_array(be_i32::<_, nom::error::Error<NomBytes>>);
+        let (_, parsed): (_, Vec<i32>) = nullable(input).unwrap();
         assert!(parsed.is_empty());
     }
 

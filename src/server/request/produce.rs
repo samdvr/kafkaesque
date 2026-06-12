@@ -57,9 +57,21 @@ fn parse_produce_topic(s: NomBytes) -> IResult<NomBytes, ProduceTopicData> {
 fn parse_produce_partition(s: NomBytes) -> IResult<NomBytes, ProducePartitionData> {
     let (s, partition_index) = be_i32(s)?;
     let (s, record_set_size) = be_i32(s)?;
-    // A negative i32 cast to usize wraps to ~4 GiB on 32-bit and to
-    // 18 EiB on 64-bit, so an attacker-controlled negative length here would
-    // ask `take` for a colossal slice. Reject negative lengths up front.
+    // The Kafka protocol types this field as NULLABLE_BYTES: -1 is a legal
+    // null encoding meaning "no records this partition". Treating it as a
+    // hard parse error breaks any client that sends -1 (the canonical
+    // librdkafka encoding for an empty partition slot in a multi-partition
+    // batch). Negative values other than -1 are still rejected because they
+    // would cast to enormous unsigned takes.
+    if record_set_size == -1 {
+        return Ok((
+            s,
+            ProducePartitionData {
+                partition_index,
+                records: Bytes::new(),
+            },
+        ));
+    }
     if record_set_size < 0 {
         return Err(nom::Err::Error(nom::error::Error::new(
             s,

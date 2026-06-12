@@ -915,6 +915,11 @@ impl RaftRpcServer {
 
     /// Start the RPC server.
     pub async fn run(self) -> Result<(), std::io::Error> {
+        use std::collections::HashMap;
+        use std::net::IpAddr;
+        use std::sync::Mutex as StdMutex;
+        use tokio::sync::Semaphore;
+
         let listener = tokio::net::TcpListener::bind(&self.listen_addr).await?;
         tracing::info!(
             addr = %self.listen_addr,
@@ -933,13 +938,70 @@ impl RaftRpcServer {
             );
         }
 
+        // Bound concurrent inbound Raft RPC handshakes. Without an accept
+        // semaphore an attacker that can route to the Raft port — even if
+        // the HMAC gate rejects every frame — can exhaust file descriptors
+        // and CPU on the TLS handshake. Per-IP cap further limits the
+        // damage from a single hostile peer.
+        const MAX_CONCURRENT_HANDSHAKES: usize = 128;
+        const MAX_PER_IP: usize = 16;
+        let accept_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+        let per_ip_counts: Arc<StdMutex<HashMap<IpAddr, usize>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let raft = self.raft.clone();
             let auth_keys = self.auth_keys.clone();
             let tls = self.tls.clone();
+            let accept_semaphore = accept_semaphore.clone();
+            let per_ip_counts = per_ip_counts.clone();
+            let peer_ip = peer_addr.ip();
+
+            // Per-IP gate: drop the connection synchronously on overflow so
+            // we never spawn a task for a known-flooding peer.
+            let per_ip_admitted = {
+                let mut counts = per_ip_counts.lock().unwrap_or_else(|e| e.into_inner());
+                let n = counts.entry(peer_ip).or_insert(0);
+                if *n >= MAX_PER_IP {
+                    tracing::warn!(peer = %peer_addr, "Rejecting Raft RPC: per-IP connection cap reached");
+                    false
+                } else {
+                    *n += 1;
+                    true
+                }
+            };
+            if !per_ip_admitted {
+                continue;
+            }
 
             self.runtime.spawn(async move {
+                // Limit concurrent in-flight TLS handshakes globally.
+                let _accept_permit = match accept_semaphore.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return, // semaphore closed; runtime tearing down
+                };
+                // Decrement the per-IP counter when this task ends, no matter
+                // how it ends (normal return, panic, drop on shutdown).
+                struct PerIpGuard {
+                    counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+                    ip: IpAddr,
+                }
+                impl Drop for PerIpGuard {
+                    fn drop(&mut self) {
+                        let mut c = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(n) = c.get_mut(&self.ip) {
+                            *n = n.saturating_sub(1);
+                            if *n == 0 {
+                                c.remove(&self.ip);
+                            }
+                        }
+                    }
+                }
+                let _ip_guard = PerIpGuard {
+                    counts: per_ip_counts.clone(),
+                    ip: peer_ip,
+                };
                 let wrapped = match Self::accept_stream(stream, tls.as_ref()).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -1017,7 +1079,20 @@ impl RaftRpcServer {
         frame_purpose: super::auth::FramePurpose,
         msg_buf: &[u8],
     ) -> Result<RaftRpcResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let message: RaftRpcMessage = postcard::from_bytes(msg_buf)?;
+        // Convert deserialize failures into a typed RPC response instead of
+        // bubbling them up as a connection-fatal error. The previous path
+        // closed the socket without responding; clients then retried 3× with
+        // backoff against a closing socket and saw only timeouts.
+        let message: RaftRpcMessage = match postcard::from_bytes(msg_buf) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to deserialize Raft RPC frame");
+                return Ok(RaftRpcResponse::ErrorV2(RpcErrorInfo::new(
+                    RpcErrorKind::InvalidRequest,
+                    format!("Malformed Raft RPC frame: {}", e),
+                )));
+            }
+        };
 
         // Cross-check the wire purpose tag against the deserialized variant.
         // Join purpose → JoinCluster only. PromoteMember and ClientWrite
@@ -1074,8 +1149,14 @@ impl RaftRpcServer {
                 // 1. Processing requests forwarded to a stale leader
                 // 2. Infinite forwarding loops during leadership instability
 
-                // Check hop limit
-                if forward_hops > MAX_FORWARD_HOPS {
+                // Check hop limit. Both this check and the symmetric pre-send
+                // check on the client side use `>= MAX_FORWARD_HOPS` so the
+                // boundary is identical: a request that has already taken
+                // MAX_FORWARD_HOPS hops is rejected, never one hop earlier or
+                // later. Mismatched operators previously let the server accept
+                // a packet the client would refuse to send (or vice versa)
+                // during a transient forwarding storm.
+                if forward_hops >= MAX_FORWARD_HOPS {
                     // Use structured error type
                     RaftRpcResponse::ErrorV2(RpcErrorInfo::new(
                         RpcErrorKind::ForwardLoopDetected,
@@ -1168,6 +1249,18 @@ impl RaftRpcServer {
         node_id: RaftNodeId,
         raft_addr: String,
     ) -> Result<(), String> {
+        // Idempotency is checked structurally against the current membership
+        // before issuing the change. Inspecting the openraft error string
+        // would couple us to upstream wording and silently break on a minor
+        // crate bump.
+        {
+            let metrics = raft.metrics().borrow().clone();
+            let membership = metrics.membership_config.membership();
+            if membership.get_node(&node_id).is_some() {
+                tracing::info!(node_id = node_id, "Node already in cluster");
+                return Ok(());
+            }
+        }
         let node = BasicNode { addr: raft_addr };
 
         match raft.add_learner(node_id, node, true).await {
@@ -1176,14 +1269,8 @@ impl RaftRpcServer {
                 Ok(())
             }
             Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("already") {
-                    tracing::info!(node_id = node_id, "Node already in cluster");
-                    Ok(())
-                } else {
-                    tracing::warn!(node_id = node_id, error = %e, "Failed to add learner");
-                    Err(format!("Failed to add learner: {}", e))
-                }
+                tracing::warn!(node_id = node_id, error = %e, "Failed to add learner");
+                Err(format!("Failed to add learner: {}", e))
             }
         }
     }
@@ -1200,6 +1287,10 @@ impl RaftRpcServer {
 
         let mut voters: std::collections::BTreeSet<RaftNodeId> =
             metrics.membership_config.membership().voter_ids().collect();
+        if voters.contains(&node_id) {
+            tracing::info!(node_id = node_id, "Node already a voter");
+            return Ok(());
+        }
         voters.insert(node_id);
 
         match raft.change_membership(voters, false).await {
@@ -1208,14 +1299,8 @@ impl RaftRpcServer {
                 Ok(())
             }
             Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("already") {
-                    tracing::info!(node_id = node_id, "Node already a voter");
-                    Ok(())
-                } else {
-                    tracing::warn!(node_id = node_id, error = %e, "Failed to promote to voter");
-                    Err(format!("Failed to promote to voter: {}", e))
-                }
+                tracing::warn!(node_id = node_id, error = %e, "Failed to promote to voter");
+                Err(format!("Failed to promote to voter: {}", e))
             }
         }
     }

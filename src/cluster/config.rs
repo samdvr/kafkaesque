@@ -1600,6 +1600,30 @@ impl ClusterConfig {
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+            .filter_map(|s| {
+                // Require the `User:` principal-type prefix so a stray
+                // `KAFKAESQUE_SUPER_USERS=*` cannot grant cluster-admin to
+                // every authenticated principal. The wildcard form
+                // `User:*` matches every authenticated principal *except*
+                // `User:ANONYMOUS` (see ACL host matching) and is
+                // intentionally still rejected here — a global super-user
+                // wildcard is almost always an operator mistake.
+                if s == "User:*" {
+                    tracing::error!(
+                        super_user = %s,
+                        "Refusing to install wildcard super-user; this would grant cluster-admin to every authenticated principal"
+                    );
+                    return None;
+                }
+                if !s.starts_with("User:") {
+                    tracing::error!(
+                        super_user = %s,
+                        "Refusing super-user without `User:` prefix; expected e.g. `User:alice`"
+                    );
+                    return None;
+                }
+                Some(s)
+            })
             .collect();
 
         let acl_bootstrap_file = std::env::var("KAFKAESQUE_ACL_BOOTSTRAP_FILE").ok();

@@ -664,7 +664,14 @@ impl PartitionStore {
             return Ok(cached_offset);
         }
 
-        let new_hwm = base_offset + record_count as i64;
+        let new_hwm = (record_count as i64)
+            .checked_add(base_offset)
+            .ok_or_else(|| {
+                SlateDBError::Config(format!(
+                    "HWM overflow: base_offset={} + record_count={} would overflow i64",
+                    base_offset, record_count
+                ))
+            })?;
 
         // Build value with metadata using pooled buffer to reduce allocations.
         // Format: [new_hwm: i64][record_batch: bytes]

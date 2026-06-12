@@ -72,7 +72,7 @@ impl TlsConfig {
         key: PrivateKeyDer<'static>,
     ) -> Result<Self> {
         ensure_crypto_provider();
-        let config = ServerConfig::builder()
+        let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| Error::MissingData(format!("TLS configuration error: {}", e)))?;
@@ -110,7 +110,7 @@ impl TlsConfig {
             .build()
             .map_err(|e| Error::MissingData(format!("Failed to build client verifier: {}", e)))?;
 
-        let config = ServerConfig::builder()
+        let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(certs, key)
             .map_err(|e| Error::MissingData(format!("TLS configuration error: {}", e)))?;

@@ -39,10 +39,30 @@ type HmacSha256 = Hmac<Sha256>;
 /// Length of a SHA-256 digest in bytes.
 const SHA256_LEN: usize = 32;
 
-/// Default iteration count for PBKDF2 — matches Kafka's default minimum.
-/// Higher means more CPU at credential-derivation time but harder for an
-/// offline attacker who has stolen `stored_key`.
-pub const DEFAULT_ITERATIONS: u32 = 4096;
+/// Default iteration count for PBKDF2.
+///
+/// Kafka's historical floor is 4096 — too low for modern hardware: a stolen
+/// `stored_key`+`salt` pair from a leaked SlateDB snapshot is cheaply
+/// crackable at that count. We default to OWASP's 2023 PBKDF2-SHA256 floor
+/// (600,000) and let operators override with `SASL_SCRAM_ITERATIONS` for
+/// kafka-1.x compatibility.
+pub const DEFAULT_ITERATIONS: u32 = 600_000;
+
+/// Lowest iteration count that still satisfies the SCRAM-SHA-256 spec
+/// (RFC 5802 §5.1).
+pub const MIN_ITERATIONS: u32 = 4_096;
+
+/// Read the configured iteration count from `SASL_SCRAM_ITERATIONS`,
+/// falling back to [`DEFAULT_ITERATIONS`]. Values below
+/// [`MIN_ITERATIONS`] are rounded up — accepting them would undercut the
+/// SCRAM spec and silently produce credentials weaker than any compliant
+/// client expects.
+pub fn configured_iterations() -> u32 {
+    match std::env::var("SASL_SCRAM_ITERATIONS") {
+        Ok(s) => s.parse::<u32>().unwrap_or(DEFAULT_ITERATIONS).max(MIN_ITERATIONS),
+        Err(_) => DEFAULT_ITERATIONS,
+    }
+}
 
 /// Salt length in bytes — 16 is the SCRAM convention and matches Kafka.
 pub const SALT_LEN: usize = 16;
@@ -75,12 +95,12 @@ impl ScramCredentials {
         }
     }
 
-    /// Generate fresh credentials with a random salt and the default
-    /// iteration count.
+    /// Generate fresh credentials with a random salt and the configured
+    /// iteration count (falls back to the default if no env override).
     pub fn generate(password: &[u8]) -> Self {
         // OS-random salt (16 bytes from uuid v4), matching the nonce path.
         let salt = uuid::Uuid::new_v4();
-        Self::derive(password, salt.as_bytes(), DEFAULT_ITERATIONS)
+        Self::derive(password, salt.as_bytes(), configured_iterations())
     }
 }
 

@@ -77,9 +77,13 @@ pub(super) async fn handle_init_producer_id(
         },
         Err(e) => {
             error!(error = %e, "Failed to initialize producer ID");
+            // Pass through the typed Kafka code rather than collapsing to
+            // Unknown. Clients distinguish ClusterAuthorizationFailed,
+            // CoordinatorNotAvailable, etc. and back off appropriately;
+            // Unknown forces them into a generic retry-storm path.
             InitProducerIdResponseData {
                 throttle_time_ms: 0,
-                error_code: KafkaCode::Unknown,
+                error_code: e.to_kafka_code(),
                 producer_id: -1,
                 producer_epoch: -1,
             }

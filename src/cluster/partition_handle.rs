@@ -297,17 +297,21 @@ impl WriteGuard {
 
     /// Get the remaining lease time (estimated).
     ///
-    /// This is an estimate based on the lease TTL at acquisition time
-    /// minus the time the guard has been held.
+    /// Optimistic estimate based on the cached `lease_remaining_secs` at
+    /// acquisition minus the wall-clock time the guard has been held. The
+    /// underlying lease may have already expired or been revoked; this
+    /// number is NOT a safety check, only a hint. The real safeguard is the
+    /// per-write epoch check in `append_batch_inner`.
     #[inline]
     pub fn estimated_remaining_lease(&self) -> u64 {
         let held_secs = self.held_for().as_secs();
         self.lease_remaining_secs.saturating_sub(held_secs)
     }
 
-    /// Check if the lease is still likely valid.
-    ///
-    /// Returns true if the estimated remaining lease is above the safety threshold.
+    /// Returns true when the cached lease estimate is still above the safety
+    /// threshold. Best-effort hint only — see [`Self::estimated_remaining_lease`]
+    /// for caveats. The authoritative ownership check happens at write time
+    /// inside the partition store.
     #[inline]
     pub fn lease_likely_valid(&self) -> bool {
         self.estimated_remaining_lease() >= self.handle.store.min_lease_ttl_for_write_secs()

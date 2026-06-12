@@ -122,7 +122,11 @@ impl BrokerDomainState {
                 reported_local_timestamp_ms,
             } => {
                 if let Some(broker) = self.brokers.get_mut(&broker_id) {
-                    broker.last_heartbeat_ms = timestamp_ms;
+                    // Heartbeat timestamps must move forward only — a backdated
+                    // command (delayed proposal, replayed log entry) must not
+                    // pull `last_heartbeat_ms` back, or the failure detector
+                    // will erroneously age the broker out.
+                    broker.last_heartbeat_ms = broker.last_heartbeat_ms.max(timestamp_ms);
                     // A fenced broker MUST NOT come back via a heartbeat —
                     // its partitions have been transferred to other owners
                     // and resuming as Active would let it write to logs the

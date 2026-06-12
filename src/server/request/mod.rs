@@ -410,9 +410,14 @@ impl Request {
             _ => return Ok(Request::Unknown(header, remaining.into_bytes())),
         };
 
-        // Trailing bytes after a successful body parse are tolerated (some
-        // clients pad frames) but logged so a mis-framed client — or a gap
-        // in one of our per-version layouts — is visible at debug level.
+        // Trailing bytes after a successful body parse must be rejected.
+        // Tolerating them lets a mis-framed client (or one of our per-version
+        // layouts that drifted) silently dispatch a partially-parsed request,
+        // and lets an attacker append bytes to a valid request that the next
+        // request-on-the-same-connection would have parsed. The dispatch
+        // path treats InvalidRequest as a clean rejection rather than a
+        // protocol-fatal frame, so the connection stays open for the next
+        // well-formed request.
         let trailing = rest.into_bytes();
         if !trailing.is_empty() {
             crate::cluster::metrics::record_request_trailing_bytes(
@@ -423,8 +428,9 @@ impl Request {
                 api_key = api_key.as_str(),
                 api_version = version,
                 trailing_bytes = trailing.len(),
-                "Request body parse left trailing bytes"
+                "Rejecting request with trailing bytes after body parse"
             );
+            return Err(parsing_error(&data));
         }
 
         Ok(request)

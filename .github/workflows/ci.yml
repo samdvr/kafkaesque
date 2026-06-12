@@ -273,6 +273,57 @@ jobs:
           ignore-unfixed: true
           severity: CRITICAL,HIGH
 
+  fuzz-smoke:
+    name: Fuzz smoke (5 min/target)
+    runs-on: ubuntu-latest
+    # P4-1: keep regressions in newly added parser branches from drifting
+    # — every fuzz target gets a short 5-minute libFuzzer pass on PRs.
+    # Corpus is cached across runs so coverage compounds. Nightly should
+    # run a longer `fuzz-extended` job (P4-2 follow-up).
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry + fuzz target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            fuzz/target/
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-
+
+      - name: Cache fuzz corpus
+        # Persist the corpus across runs so libFuzzer's coverage compounds
+        # over time — a fresh corpus every PR loses most of the signal.
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run each target for 5 minutes
+        run: |
+          set -euo pipefail
+          for target_path in fuzz/fuzz_targets/*.rs; do
+            target=$(basename "$target_path" .rs)
+            echo "::group::fuzz-smoke $target"
+            cargo fuzz run "$target" -- -max_total_time=300
+            echo "::endgroup::"
+          done
+
   multiarch-image:
     name: Multi-arch release image (linux/amd64,linux/arm64)
     runs-on: ubuntu-latest

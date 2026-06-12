@@ -1020,27 +1020,36 @@ impl RaftStorage<TypeConfig> for RaftStore {
         let mut responses = Vec::new();
 
         for entry in entries {
-            *self.last_applied_log.write().await = Some(entry.log_id);
+            // Hold the `last_applied_log` write guard across the apply so a
+            // concurrent `build_snapshot` (which takes `last_applied_log` as
+            // a read guard before serializing state) cannot witness state
+            // that includes this apply but a `last_applied_log` index that
+            // excludes it, or vice versa. The mutation runs FIRST, then the
+            // index advances under the same guard — a cancellation or panic
+            // before the index update simply re-applies on restart, which is
+            // safe given Raft re-delivery semantics.
+            let mut last_applied_guard = self.last_applied_log.write().await;
 
             match &entry.payload {
                 EntryPayload::Blank => {
+                    *last_applied_guard = Some(entry.log_id);
                     responses.push(CoordinationResponse::Ok);
                 }
                 EntryPayload::Normal(command) => {
-                    // Read lock only: `apply_command` serializes on the inner
-                    // state-machine lock. Holding the outer write lock here
-                    // blocked snapshot builds and coordinator reads for the
-                    // whole apply batch.
                     let sm = self.sm.read().await;
                     let response = sm.apply_command(command.clone()).await;
+                    *last_applied_guard = Some(entry.log_id);
+                    drop(sm);
                     responses.push(response);
                 }
                 EntryPayload::Membership(membership) => {
                     *self.last_membership.write().await =
                         StoredMembership::new(Some(entry.log_id), membership.clone());
+                    *last_applied_guard = Some(entry.log_id);
                     responses.push(CoordinationResponse::Ok);
                 }
             }
+            drop(last_applied_guard);
         }
 
         Ok(responses)
@@ -1128,11 +1137,18 @@ impl RaftStorage<TypeConfig> for RaftStore {
 
 impl openraft::RaftSnapshotBuilder<TypeConfig> for RaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<RaftNodeId>> {
+        // Capture state and `last_applied_log` under a single read guard on
+        // `last_applied_log` to fence concurrent applies — applies hold the
+        // matching write guard across `apply_command` + index update, so the
+        // captured snapshot bytes and the meta index agree on which entries
+        // are reflected.
+        let last_applied_guard = self.last_applied_log.read().await;
         let sm = self.sm.read().await;
         let data = sm.snapshot().await;
-
-        let last_applied = *self.last_applied_log.read().await;
+        let last_applied = *last_applied_guard;
         let membership = self.last_membership.read().await.clone();
+        drop(sm);
+        drop(last_applied_guard);
 
         let snapshot_id = format!("snapshot-{}", last_applied.map(|l| l.index).unwrap_or(0));
 

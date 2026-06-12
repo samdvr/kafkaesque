@@ -205,8 +205,8 @@ impl ReplayCache {
 #[derive(Clone)]
 pub struct RaftAuthKeys {
     /// Cluster-wide HMAC key. When `Some`, every steady-state RPC must be
-    /// signed with this key; when `None`, unsigned frames are accepted (legacy
-    /// behavior).
+    /// signed with this key; when `None`, unsigned frames are accepted only
+    /// if `unauthenticated_ok` is also `true`.
     cluster_secret: Option<Arc<[u8]>>,
     /// Join-only HMAC key. When `Some`, `JoinCluster` requests must be signed
     /// with this key; when `None`, the join path falls back to
@@ -215,6 +215,12 @@ pub struct RaftAuthKeys {
     join_token: Option<Arc<[u8]>>,
     /// Replay cache shared across all connections on this broker.
     replay_cache: Arc<ReplayCache>,
+    /// Explicit opt-in for the no-secret path. `false` everywhere except
+    /// `dev_unauthenticated()` and tests. Required because programmatic
+    /// constructions (`RaftAuthKeys::default()`, embedded use, tests that
+    /// forget `from_env`) used to silently expose the Raft control plane
+    /// to any host that could route a TCP packet.
+    unauthenticated_ok: bool,
 }
 
 impl std::fmt::Debug for RaftAuthKeys {
@@ -232,10 +238,15 @@ impl std::fmt::Debug for RaftAuthKeys {
 
 impl Default for RaftAuthKeys {
     fn default() -> Self {
+        // Deny-by-default: programmatic construction (tests, embedded use,
+        // `default()` callers that never go through `from_env`) must NOT
+        // silently accept unauthenticated Raft frames. Use
+        // `dev_unauthenticated()` to opt into the legacy permissive variant.
         Self {
             cluster_secret: None,
             join_token: None,
             replay_cache: Arc::new(ReplayCache::new()),
+            unauthenticated_ok: false,
         }
     }
 }
@@ -255,20 +266,45 @@ impl RaftAuthKeys {
                 }
             })
         };
+        let cluster_secret = normalize(cluster_secret);
+        let join_token = normalize(join_token);
+        // Without a configured secret we deny by default: see the
+        // `unauthenticated_ok` field doc. Operators that genuinely want an
+        // open Raft port (single-node dev, sandbox tests) must set
+        // `RAFT_ALLOW_UNAUTHENTICATED=1` or build via `dev_unauthenticated()`.
+        let unauthenticated_ok = cluster_secret.is_none()
+            && std::env::var("RAFT_ALLOW_UNAUTHENTICATED")
+                .ok()
+                .as_deref()
+                .map(|v| matches!(v, "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false);
         Self {
-            cluster_secret: normalize(cluster_secret),
-            join_token: normalize(join_token),
+            cluster_secret,
+            join_token,
             replay_cache: Arc::new(ReplayCache::new()),
+            unauthenticated_ok,
         }
     }
 
-    /// Load keys from the standard env vars. Returns the zero-key
-    /// (unauthenticated, backwards-compatible) value if neither is set.
+    /// Load keys from the standard env vars. Returns the deny-by-default
+    /// value if neither secret is set and `RAFT_ALLOW_UNAUTHENTICATED` is
+    /// not opted in.
     pub fn from_env() -> Self {
         Self::from_strings(
             std::env::var("RAFT_CLUSTER_SECRET").ok(),
             std::env::var("RAFT_JOIN_TOKEN").ok(),
         )
+    }
+
+    /// Build a permissive (no-secret, no-auth) variant for development and
+    /// tests. Production paths must never call this.
+    pub fn dev_unauthenticated() -> Self {
+        Self {
+            cluster_secret: None,
+            join_token: None,
+            replay_cache: Arc::new(ReplayCache::new()),
+            unauthenticated_ok: true,
+        }
     }
 
     /// True when the cluster secret has been configured. Server-side this
@@ -377,6 +413,15 @@ impl RaftAuthKeys {
                          (set RAFT_CLUSTER_SECRET on every node)",
                     ));
                 }
+                if !self.unauthenticated_ok {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Rejected unauthenticated Raft frame: no cluster secret configured \
+                         and the unauthenticated path is not enabled. Set RAFT_CLUSTER_SECRET, \
+                         or for development build via RaftAuthKeys::dev_unauthenticated() / \
+                         set RAFT_ALLOW_UNAUTHENTICATED=1.",
+                    ));
+                }
                 return Ok(());
             }
             FramePurpose::Cluster => self.cluster_secret(),
@@ -392,32 +437,43 @@ impl RaftAuthKeys {
             ));
         };
 
-        if purpose != FramePurpose::Unauthenticated {
+        let (ts, nonce) = if purpose != FramePurpose::Unauthenticated {
             let (Some(ts), Some(nonce)) = (timestamp_ms, nonce) else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Authenticated Raft frame missing timestamp/nonce replay fields",
                 ));
             };
-            self.replay_cache.check_and_record(ts, nonce)?;
-        }
+            (Some(ts), Some(nonce))
+        } else {
+            (None, None)
+        };
 
+        // Verify HMAC BEFORE touching the replay cache. Inserting an
+        // attacker-chosen nonce into the cache before authenticating the
+        // frame lets an unauthenticated peer (a) flood the cache with
+        // garbage and (b) probe whether a target nonce is already present
+        // — i.e. a replay-cache DoS plus a timing oracle on live nonces.
         let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
         mac.update(&[purpose as u8]);
-        if let (Some(ts), Some(nonce)) = (timestamp_ms, nonce) {
+        if let (Some(ts), Some(nonce)) = (ts, nonce) {
             mac.update(&ts.to_be_bytes());
             mac.update(nonce);
         }
         mac.update(payload);
         let expected = mac.finalize().into_bytes();
-        if expected.ct_eq(tag.as_ref()).into() {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
+        if !bool::from(expected.ct_eq(tag.as_ref())) {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "Rejected Raft frame: HMAC mismatch",
-            ))
+            ));
         }
+
+        if let (Some(ts), Some(nonce)) = (ts, nonce) {
+            self.replay_cache.check_and_record(ts, nonce)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -551,12 +607,23 @@ mod tests {
 
     #[test]
     fn unauthenticated_keys_accept_unsigned() {
-        let keys = RaftAuthKeys::default();
+        let keys = RaftAuthKeys::dev_unauthenticated();
         let payload = b"hello";
         let tag = keys.sign(FramePurpose::Unauthenticated, payload);
         assert_eq!(tag, [0u8; HMAC_LEN]);
         keys.verify(FramePurpose::Unauthenticated, &tag, payload)
             .expect("unauthenticated traffic accepted with no key set");
+    }
+
+    #[test]
+    fn default_keys_reject_unsigned() {
+        let keys = RaftAuthKeys::default();
+        let payload = b"hello";
+        let tag = [0u8; HMAC_LEN];
+        let err = keys
+            .verify(FramePurpose::Unauthenticated, &tag, payload)
+            .expect_err("default RaftAuthKeys must deny unauthenticated frames");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

@@ -26,8 +26,9 @@ use once_cell::sync::Lazy;
 use tokio::sync::Semaphore;
 
 use crate::error::KafkaCode;
+use crate::protocol::parse_producer_info;
 use crate::server::RequestContext;
-use crate::server::request::{ProducePartitionData, ProduceRequestData};
+use crate::server::request::{ApiKey, ProducePartitionData, ProduceRequestData};
 use crate::server::response::{
     ProducePartitionResponse, ProduceResponseData, ProduceTopicResponse,
 };
@@ -55,6 +56,16 @@ static FIRE_AND_FORGET_SEMAPHORE: Lazy<Semaphore> =
 #[cfg(test)]
 pub(crate) fn available_fire_and_forget_permits() -> usize {
     FIRE_AND_FORGET_SEMAPHORE.available_permits()
+}
+
+/// True iff the batch payload carries a valid (non-default) producer-id /
+/// epoch combination, i.e. the producer is using the idempotent path.
+/// Kafka requires `IdempotentWrite` on the cluster resource for these
+/// batches even when the principal already has `Write` on the topic; without
+/// the check, a denied principal could still send batches under a stolen
+/// producer-id and fence the legitimate producer.
+fn batch_is_idempotent(records: &bytes::Bytes) -> bool {
+    parse_producer_info(records).is_some_and(|info| info.is_idempotent())
 }
 
 /// Handle a produce request.
@@ -159,6 +170,21 @@ pub(super) async fn handle_produce(
             let validate_crc = handler.validate_record_crc;
 
             for partition in topic.partitions {
+                if batch_is_idempotent(&partition.records)
+                    && !handler
+                        .authorize_cluster_api(ctx, ApiKey::InitProducerId)
+                        .await
+                {
+                    debug!(
+                        topic = %topic_name,
+                        partition = partition.partition_index,
+                        principal = %ctx.principal,
+                        "Denied acks=0 idempotent produce by cluster ACL"
+                    );
+                    crate::cluster::metrics::record_produce_dropped("idempotent_acl_denied", 1);
+                    continue;
+                }
+
                 let permit = match FIRE_AND_FORGET_SEMAPHORE.try_acquire() {
                     Ok(p) => p,
                     Err(_) => {
@@ -271,11 +297,42 @@ pub(super) async fn handle_produce(
 
         let topic_name: Arc<str> = handler.cached_topic_name(&topic.name);
 
+        // Per-partition idempotent gate: only batches that carry a valid
+        // producer-id/epoch require IdempotentWrite on the cluster resource.
+        // Resolve the cluster ACL once and reuse the verdict; skip the
+        // resolve entirely if no partition in this topic is idempotent.
+        let has_idempotent_batch = topic
+            .partitions
+            .iter()
+            .any(|p| batch_is_idempotent(&p.records));
+        let idempotent_allowed = if has_idempotent_batch {
+            handler
+                .authorize_cluster_api(ctx, ApiKey::InitProducerId)
+                .await
+        } else {
+            true
+        };
+
         // Use buffer_unordered for bounded concurrency instead of join_all
         let partition_responses: Vec<_> = stream::iter(topic.partitions)
             .map(|partition| {
                 let topic_name = Arc::clone(&topic_name);
+                let principal = ctx.principal.clone();
                 async move {
+                    if !idempotent_allowed && batch_is_idempotent(&partition.records) {
+                        debug!(
+                            topic = %topic_name,
+                            partition = partition.partition_index,
+                            principal = %principal,
+                            "Denied idempotent produce by cluster ACL"
+                        );
+                        return ProducePartitionResponse {
+                            partition_index: partition.partition_index,
+                            error_code: KafkaCode::ClusterAuthorizationFailed,
+                            base_offset: -1,
+                            log_append_time: -1,
+                        };
+                    }
                     handler
                         .produce_to_partition(&topic_name, partition, acks)
                         .await

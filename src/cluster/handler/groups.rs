@@ -35,7 +35,7 @@ use super::SlateDBClusterHandler;
 use crate::cluster::authorizer::{AuthorizeRequest, AuthorizeResult};
 use crate::cluster::error::HeartbeatResult;
 use crate::cluster::raft::{AclOperation, AclResourceType};
-use crate::cluster::traits::{ConsumerGroupCoordinator, GroupJoinOutcome, PartitionCoordinator};
+use crate::cluster::traits::{ConsumerGroupCoordinator, GroupJoinOutcome};
 
 /// Run an ACL check for an operation on a consumer-group resource.
 ///
@@ -67,6 +67,7 @@ async fn group_authorized(
 /// ensuring minimal group reassignment when the cluster topology changes.
 ///
 /// Returns the broker_id of the selected coordinator, or None if no brokers available.
+#[allow(dead_code)]
 fn select_coordinator_id(key: &str, brokers: &[BrokerInfo]) -> Option<i32> {
     if brokers.is_empty() {
         return None;
@@ -114,65 +115,20 @@ pub(super) async fn handle_find_coordinator(
         };
     }
 
-    // Get live brokers and select coordinator using consistent hashing
-    let brokers = match handler.coordinator.get_live_brokers().await {
-        Ok(broker_list) => broker_list,
-        Err(e) => {
-            // Return error immediately instead of continuing with empty list
-            // This ensures clients get accurate error information and can retry
-            error!(error = %e, "Failed to get live brokers for coordinator selection");
-            return FindCoordinatorResponseData {
-                throttle_time_ms: 0,
-                error_code: KafkaCode::GroupCoordinatorNotAvailable,
-                error_message: Some(format!("Failed to get broker list: {}", e)),
-                node_id: -1,
-                host: String::new(),
-                port: 0,
-            };
-        }
-    };
-
-    if brokers.is_empty() {
-        return FindCoordinatorResponseData {
-            throttle_time_ms: 0,
-            error_code: KafkaCode::GroupCoordinatorNotAvailable,
-            error_message: Some("No brokers available".to_string()),
-            node_id: -1,
-            host: String::new(),
-            port: 0,
-        };
-    }
-
-    // Use consistent hashing instead of simple modulo.
-    // This ensures minimal group reassignment when brokers join/leave.
-    let coordinator_id = match select_coordinator_id(&request.key, &brokers) {
-        Some(id) => id,
-        None => {
-            // Fallback (should never happen since we checked brokers.is_empty())
-            return FindCoordinatorResponseData {
-                throttle_time_ms: 0,
-                error_code: KafkaCode::GroupCoordinatorNotAvailable,
-                error_message: Some("No coordinator available".to_string()),
-                node_id: -1,
-                host: String::new(),
-                port: 0,
-            };
-        }
-    };
-
-    // Find the broker info for the selected coordinator
-    let coordinator = brokers
-        .iter()
-        .find(|b| b.broker_id == coordinator_id)
-        .unwrap_or(&brokers[0]); // Fallback to first broker
-
+    // Group state is fully replicated through Raft, so every healthy broker
+    // can serve every group operation. Pointing the client at *this* broker
+    // — the one that just received the connection — keeps op-routing and
+    // routing-advice consistent: a sticky session won't ricochet between
+    // brokers via consistent-hash advice while ops keep landing locally,
+    // which previously let two brokers concurrently drive the same group's
+    // transitions.
     FindCoordinatorResponseData {
         throttle_time_ms: 0,
         error_code: KafkaCode::None,
         error_message: None,
-        node_id: coordinator.broker_id,
-        host: coordinator.host.clone(),
-        port: coordinator.port,
+        node_id: handler.broker_id.value(),
+        host: handler.host.clone(),
+        port: handler.port,
     }
 }
 
@@ -499,14 +455,27 @@ pub(super) async fn handle_sync_group(
                     return sync_group_error(KafkaCode::UnknownMemberId);
                 }
                 // Generation and membership are intact, so the caller is a
-                // non-leader that sent assignments. Kafka only consumes the
-                // assignment field from the leader; ignore it and fall
-                // through to return this member's own assignment.
+                // non-leader that sent assignments. This is the
+                // "leader-failover-mid-rebalance" path: the client *thought*
+                // it was leader, computed assignments, and the coordinator
+                // disagreed. Silently keeping its own assignment and
+                // returning success would let two clients believe they
+                // produced the canonical assignment for the same generation.
+                // Surface the conflict instead so the client rejoins and
+                // re-derives the correct assignment, and emit a metric so
+                // operators can see the rate of these races.
+                crate::cluster::metrics::record_group_operation(
+                    "sync_non_leader_assignment_rejected",
+                    "error",
+                );
                 debug!(
                     group_id = %request.group_id,
                     member_id = %request.member_id,
-                    "Ignoring assignments from non-leader member"
+                    generation = request.generation_id,
+                    assignment_count = request.assignments.len(),
+                    "Rejecting assignments from non-leader; instructing client to rejoin"
                 );
+                return sync_group_error(KafkaCode::RebalanceInProgress);
             }
             Err(e) => {
                 error!(error = %e, "Failed to store assignments atomically");

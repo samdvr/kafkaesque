@@ -1813,13 +1813,24 @@ impl ClusterConfig {
             return Ok(());
         }
 
-        if !config.sasl_required && !config.acl_enabled {
+        if !config.sasl_required {
             return Err(format!(
-                "Neither SASL nor ACL enforcement is enabled (profile: {}). A broker with \
-                 sasl_required=false and acl_enabled=false accepts unauthenticated, \
-                 unauthorized clients. Enable SASL_REQUIRED (with SASL_ENABLED) and/or \
-                 ACL_ENABLED, or explicitly opt into an open broker for local development \
-                 with CLUSTER_PROFILE=development.",
+                "SASL is not required for client connections (profile: {}). A broker that \
+                 accepts unauthenticated clients exposes every authorization decision to the \
+                 `User:ANONYMOUS` principal — `acl_enabled` alone does not close the gap. \
+                 Enable SASL_REQUIRED (with SASL_ENABLED), or explicitly opt into an open \
+                 broker for local development with CLUSTER_PROFILE=development.",
+                profile
+            )
+            .into());
+        }
+
+        if !config.acl_enabled {
+            return Err(format!(
+                "ACL enforcement is not enabled (profile: {}). Authentication alone leaves \
+                 every authenticated principal able to act on every resource — enable \
+                 ACL_ENABLED so authorization is actually checked, or explicitly opt into an \
+                 open broker for local development with CLUSTER_PROFILE=development.",
                 profile
             )
             .into());

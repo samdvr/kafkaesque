@@ -84,7 +84,7 @@ use kafkaesque::server::TlsKafkaServer;
 use kafkaesque::server::health::HealthServer;
 #[cfg(feature = "tls")]
 use kafkaesque::server::tls::TlsConfig;
-use kafkaesque::telemetry::{LogFormat, init_logging};
+use kafkaesque::telemetry::{LogFormat, init_logging, shutdown_telemetry};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
@@ -220,7 +220,21 @@ async fn run_broker(
                     "Health server started"
                 );
                 Some(runtime_handles.control.spawn(async move {
-                    let _ = server.run().await;
+                    use futures::FutureExt;
+                    use std::panic::AssertUnwindSafe;
+                    // Catch panics in the health server so a bug in the
+                    // health endpoint doesn't silently leave K8s liveness
+                    // probes passing at the LB while the metrics endpoint
+                    // is dead and nothing logs.
+                    if let Err(panic_payload) =
+                        AssertUnwindSafe(server.run()).catch_unwind().await
+                    {
+                        tracing::error!(
+                            task = "health_server",
+                            payload = ?panic_payload,
+                            "Background task panicked"
+                        );
+                    }
                 }))
             }
             Err(e) => {
@@ -349,6 +363,11 @@ async fn run_broker(
     if let Some(handle) = health_handle {
         handle.abort();
     }
+
+    // Flush any pending OTLP spans before exit. The batch exporter buffers
+    // up to a few hundred ms of spans; without an explicit shutdown those
+    // are dropped on process exit.
+    shutdown_telemetry();
 
     info!("Graceful shutdown complete");
     Ok(())

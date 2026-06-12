@@ -30,10 +30,12 @@
 //! ```
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -43,6 +45,23 @@ use super::failure_detector::{
 };
 use super::load_metrics::{LoadMetricsCollector, LoadMetricsConfig};
 use super::raft::domains::{PartitionTransfer, TransferReason};
+
+/// Wrap a background-task body so panics are caught and logged. Without
+/// this, a `tokio::spawn` body that panics has its stack unwound and the
+/// task simply ends — `tokio::task::JoinHandle::await` would surface the
+/// panic, but no caller awaits these long-running loops, so the failure is
+/// silent and K8s liveness probes still pass even though the broker has
+/// stopped doing the work the task represented.
+async fn supervised<F>(name: &'static str, fut: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    if let Err(panic_payload) = AssertUnwindSafe(fut).catch_unwind().await {
+        tracing::error!(task = name, payload = ?panic_payload, "Background task panicked");
+    }
+}
 
 /// Configuration for the rebalance coordinator.
 #[derive(Debug, Clone)]
@@ -306,6 +325,12 @@ pub struct RebalanceCoordinator {
 
     /// Runtime handle for spawning control plane tasks.
     runtime: Handle,
+
+    /// Brokers detected as failed whose handoff has not yet been
+    /// successfully proposed to Raft. Re-driven on every failure-check tick
+    /// so a single transient `mark_broker_failed` error does not strand the
+    /// broker's partitions.
+    pending_failovers: Mutex<HashSet<i32>>,
 }
 
 impl RebalanceCoordinator {
@@ -331,6 +356,7 @@ impl RebalanceCoordinator {
             config,
             broker_id,
             runtime,
+            pending_failovers: Mutex::new(HashSet::new()),
         }
     }
 
@@ -725,9 +751,9 @@ impl RebalanceCoordinator {
         let failure_check_handle = if self.config.fast_failover_enabled {
             let coordinator = Arc::clone(self);
             let exec = Arc::clone(&executor);
-            Some(self.runtime.spawn(async move {
+            Some(self.runtime.spawn(supervised("failure_check", async move {
                 coordinator.failure_check_loop(exec).await;
-            }))
+            })))
         } else {
             None
         };
@@ -735,18 +761,19 @@ impl RebalanceCoordinator {
         let rebalance_handle = if self.config.auto_balancer.enabled {
             let coordinator = Arc::clone(self);
             let exec = Arc::clone(&executor);
-            Some(self.runtime.spawn(async move {
+            Some(self.runtime.spawn(supervised("rebalance", async move {
                 coordinator.rebalance_loop(exec).await;
-            }))
+            })))
         } else {
             None
         };
 
         let metrics_reset_handle = {
             let coordinator = Arc::clone(self);
-            Some(self.runtime.spawn(async move {
-                coordinator.metrics_reset_loop().await;
-            }))
+            let exec = Arc::clone(&executor);
+            Some(self.runtime.spawn(supervised("metrics_reset", async move {
+                coordinator.metrics_reset_loop(exec).await;
+            })))
         };
 
         BackgroundTaskHandles {
@@ -775,30 +802,49 @@ impl RebalanceCoordinator {
 
             let state_changes = self.check_broker_health();
 
-            for change in state_changes {
-                if change.new_state == BrokerHealthState::Failed {
-                    if !executor.should_initiate_failover().await {
-                        debug!(
-                            broker_id = change.broker_id,
-                            "Skipping failover initiation on non-leader broker"
-                        );
-                        continue;
+            // Newly Failed brokers join the pending set; from there each
+            // tick re-attempts the handoff until Raft accepts it. A single
+            // transient `mark_broker_failed` error must not strand the
+            // broker's partitions — `check_brokers` only re-emits on state
+            // transitions, so without this set the next tick would see
+            // `state == Failed (no event)` and never retry.
+            {
+                let mut pending = self.pending_failovers.lock().await;
+                for change in &state_changes {
+                    if change.new_state == BrokerHealthState::Failed {
+                        pending.insert(change.broker_id);
                     }
+                }
+            }
 
-                    info!(
-                        broker_id = change.broker_id,
-                        missed_heartbeats = change.missed_heartbeats,
-                        "Broker failure detected, initiating failover"
-                    );
+            if !executor.should_initiate_failover().await {
+                debug!("Skipping failover initiation on non-leader broker");
+                continue;
+            }
 
-                    if let Err(e) = self
-                        .handle_broker_failure(change.broker_id, &*executor)
-                        .await
-                    {
+            let to_retry: Vec<i32> = {
+                let pending = self.pending_failovers.lock().await;
+                pending.iter().copied().collect()
+            };
+
+            for broker_id in to_retry {
+                info!(
+                    broker_id,
+                    "Driving broker failure handling"
+                );
+
+                match self
+                    .handle_broker_failure(broker_id, &*executor)
+                    .await
+                {
+                    Ok(_) => {
+                        self.pending_failovers.lock().await.remove(&broker_id);
+                    }
+                    Err(e) => {
                         error!(
-                            broker_id = change.broker_id,
+                            broker_id,
                             error = %e,
-                            "Failed to handle broker failure"
+                            "Failed to handle broker failure; will retry on next tick"
                         );
                     }
                 }
@@ -813,6 +859,13 @@ impl RebalanceCoordinator {
         while self.running.load(Ordering::SeqCst) {
             tokio::time::sleep(evaluation_interval).await;
 
+            // Only the coordination leader proposes rebalance moves.
+            // Followers wake on the same interval but skip the body so N
+            // brokers don't fight over the same partitions every tick.
+            if !executor.should_initiate_failover().await {
+                continue;
+            }
+
             if let Err(e) = self.evaluate_and_rebalance(&*executor).await {
                 warn!(error = %e, "Rebalance evaluation failed");
             }
@@ -820,7 +873,7 @@ impl RebalanceCoordinator {
     }
 
     /// Background loop for resetting metrics at window boundaries.
-    async fn metrics_reset_loop(&self) {
+    async fn metrics_reset_loop<E: PartitionTransferExecutor>(&self, executor: Arc<E>) {
         while self.running.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_secs(10)).await;
 
@@ -829,9 +882,14 @@ impl RebalanceCoordinator {
                 debug!("Reset load metrics at window boundary");
             }
 
-            // Cleanup cooldowns
-            let balancer = self.auto_balancer.read().await;
-            balancer.cleanup_cooldowns();
+            // Cooldowns are populated by the leader's rebalance loop, so
+            // their cleanup is leader-only too — followers' cooldown maps
+            // are empty and contending for the auto-balancer write lock
+            // here just starves the leader's rebalance pass.
+            if executor.should_initiate_failover().await {
+                let balancer = self.auto_balancer.read().await;
+                balancer.cleanup_cooldowns();
+            }
         }
     }
 

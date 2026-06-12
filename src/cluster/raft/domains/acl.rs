@@ -141,7 +141,14 @@ impl AclBinding {
     }
 
     fn matches_principal(&self, principal: &str) -> bool {
-        self.principal == "User:*" || self.principal == principal
+        if self.principal == "User:*" {
+            // The wildcard binding must NOT authorize unauthenticated
+            // (`User:ANONYMOUS`) requests; otherwise a common "grant
+            // User:* describe on cluster" rule silently exposes the broker
+            // to TCP clients that never completed SASL.
+            return principal != "User:ANONYMOUS";
+        }
+        self.principal == principal
     }
 
     fn matches_host(&self, host: &str) -> bool {

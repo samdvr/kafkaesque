@@ -92,7 +92,7 @@ pub fn global_inflight_byte_budget() -> usize {
 
 /// Permit guard returned by the inflight-bytes acquire helper. Forgotten on
 /// purpose: see `with_inflight_bytes`.
-struct InflightPermit {
+pub(crate) struct InflightPermit {
     bytes: usize,
 }
 
@@ -169,10 +169,15 @@ fn encode_versioned_raw_response(
 }
 
 /// Read one length-prefixed Kafka request frame from any async stream.
+///
+/// Returns the decoded frame plus the inflight-byte permit that reserved
+/// `frame_size` bytes against the global budget. The caller MUST keep the
+/// permit alive until dispatch (parse + handler + response encode) completes
+/// — dropping it the moment the frame is read defeats the bound it advertises.
 async fn read_kafka_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     max_message_size: usize,
-) -> Result<Bytes> {
+) -> Result<(Bytes, InflightPermit)> {
     let mut size_buf = [0u8; 4];
     stream.read_exact(&mut size_buf).await.map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -195,7 +200,7 @@ async fn read_kafka_frame<S: AsyncRead + Unpin>(
         )));
     }
 
-    let _budget = match try_reserve_inflight_bytes(size) {
+    let permit = match try_reserve_inflight_bytes(size) {
         Some(p) => p,
         None => {
             return Err(Error::MissingData(format!(
@@ -213,7 +218,7 @@ async fn read_kafka_frame<S: AsyncRead + Unpin>(
         }
     })?;
 
-    Ok(Bytes::from(data))
+    Ok((Bytes::from(data), permit))
 }
 
 /// Public re-export of [`read_kafka_frame`] for fuzz harnesses.
@@ -221,12 +226,15 @@ async fn read_kafka_frame<S: AsyncRead + Unpin>(
 /// The production callers live inside this module; the frame reader itself
 /// is the broker's first contact with attacker bytes, so a fuzz target
 /// against it is part of the security boundary. This thin wrapper lets the
-/// `kafkaesque-fuzz` crate drive the reader without re-implementing it.
+/// `kafkaesque-fuzz` crate drive the reader without re-implementing it. The
+/// permit is dropped here because fuzz drivers don't run dispatch.
 pub async fn read_kafka_frame_for_fuzz<S: AsyncRead + Unpin>(
     stream: &mut S,
     max_message_size: usize,
 ) -> Result<Bytes> {
-    read_kafka_frame(stream, max_message_size).await
+    read_kafka_frame(stream, max_message_size)
+        .await
+        .map(|(bytes, _permit)| bytes)
 }
 
 /// Write a length-prefixed Kafka response frame.
@@ -292,7 +300,7 @@ where
                 };
 
             match read_result {
-                Ok(data) => {
+                Ok((data, inflight_permit)) => {
                     let correlation_id = peek_correlation_id(&data);
                     let dispatch_result = timeout(handler_timeout, async {
                         let (result, auth_result) = dispatch_request_common(
@@ -352,6 +360,10 @@ where
                             return Err(Error::MissingData("Request handler timeout".to_owned()));
                         }
                     }
+                    // Drop the permit only AFTER dispatch + write are done so
+                    // the budget actually bounds bytes-allocated-but-not-yet
+                    // -dispatched, not just bytes-currently-being-read.
+                    drop(inflight_permit);
                 }
                 Err(Error::MissingData(_)) => {
                     tracing::debug!(client = %client, "Client disconnected");

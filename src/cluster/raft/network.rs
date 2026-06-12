@@ -356,7 +356,7 @@ pub struct RaftNetworkFactoryImpl {
 impl RaftNetworkFactoryImpl {
     /// Create a new network factory with no auth keys (legacy / dev).
     pub fn new() -> Self {
-        Self::with_keys(Arc::new(RaftAuthKeys::default()))
+        Self::with_keys(Arc::new(RaftAuthKeys::dev_unauthenticated()))
     }
 
     /// Create a new network factory using the given HMAC keys.

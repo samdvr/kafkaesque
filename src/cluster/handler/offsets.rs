@@ -15,7 +15,7 @@ use crate::server::response::{
 
 use super::SlateDBClusterHandler;
 use crate::cluster::authorizer::{AuthorizeRequest, AuthorizeResult};
-use crate::cluster::coordinator::validate_topic_name;
+use crate::cluster::coordinator::{validate_group_id, validate_topic_name};
 use crate::cluster::raft::{AclOperation, AclResourceType};
 use crate::cluster::traits::ConsumerGroupCoordinator;
 
@@ -150,6 +150,32 @@ pub(super) async fn handle_offset_commit(
 ) -> OffsetCommitResponseData {
     use crate::cluster::error::HeartbeatResult;
 
+    // Reject malformed group IDs at the door so an authenticated client
+    // cannot grow the replicated state machine by spamming arbitrary or
+    // control-character-laden `group_id` strings.
+    if validate_group_id(&request.group_id).is_err() {
+        debug!(group_id = %request.group_id, "Invalid group ID in offset_commit request");
+        let topics: Vec<_> = request
+            .topics
+            .iter()
+            .map(|topic| OffsetCommitTopicResponse {
+                name: topic.name.clone(),
+                partitions: topic
+                    .partitions
+                    .iter()
+                    .map(|p| OffsetCommitPartitionResponse {
+                        partition_index: p.partition_index,
+                        error_code: KafkaCode::InvalidGroupId,
+                    })
+                    .collect(),
+            })
+            .collect();
+        return OffsetCommitResponseData {
+            throttle_time_ms: 0,
+            topics,
+        };
+    }
+
     // OffsetCommit requires Read on the Group resource (per
     // Kafka). Topic-level Read is also required and is enforced inline
     // per topic below.
@@ -203,8 +229,49 @@ pub(super) async fn handle_offset_commit(
     //   member_id claims group membership and MUST be validated against the
     //   group's current generation/membership (IllegalGeneration /
     //   UnknownMemberId on mismatch).
-    let is_simple_consumer_commit = request.generation_id < 0 && request.member_id.is_empty();
-    if !is_simple_consumer_commit {
+    // Only the canonical "no membership claimed" sentinel — `generation_id == -1`
+    // AND empty `member_id` — counts as a simple-consumer commit. A buggy or
+    // malicious client setting `generation_id = -2` with an empty member id
+    // must NOT bypass fencing.
+    let is_simple_consumer_commit = request.generation_id == -1 && request.member_id.is_empty();
+    if is_simple_consumer_commit {
+        // Refuse simple commits against a group that already has active
+        // members: the caller would otherwise clobber the rebalance-managed
+        // offsets with no fencing.
+        match handler
+            .coordinator
+            .get_group_members(&request.group_id)
+            .await
+        {
+            Ok(members) if !members.is_empty() => {
+                debug!(
+                    group_id = %request.group_id,
+                    member_count = members.len(),
+                    "Rejecting simple-consumer offset commit on a group with active members"
+                );
+                let topics: Vec<_> = request
+                    .topics
+                    .iter()
+                    .map(|topic| OffsetCommitTopicResponse {
+                        name: topic.name.clone(),
+                        partitions: topic
+                            .partitions
+                            .iter()
+                            .map(|p| OffsetCommitPartitionResponse {
+                                partition_index: p.partition_index,
+                                error_code: KafkaCode::UnknownMemberId,
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                return OffsetCommitResponseData {
+                    throttle_time_ms: 0,
+                    topics,
+                };
+            }
+            _ => {}
+        }
+    } else {
         match handler
             .coordinator
             .validate_member_for_commit(
@@ -381,50 +448,91 @@ pub(super) async fn handle_offset_commit(
         let mut partition_responses = Vec::with_capacity(topic.partitions.len());
 
         for partition in &topic.partitions {
-            let error_code = match handler
-                .coordinator
-                .commit_offset(
-                    &request.group_id,
-                    &topic.name,
-                    partition.partition_index,
-                    partition.committed_offset,
-                    partition.committed_metadata.as_deref(),
-                )
+            // Bound the committed offset against the partition's live
+            // [log_start_offset, high_watermark] window. Without this,
+            // committing `i64::MAX` makes a consumer silently skip every
+            // future record; committing below the LSO commits an offset
+            // whose data has already been retention-purged, surfacing as a
+            // delayed `OFFSET_OUT_OF_RANGE` on the next fetch.
+            let bounds_error = match handler
+                .partition_manager
+                .get_for_read(&topic.name, partition.partition_index)
                 .await
             {
-                Ok(_) => {
-                    crate::cluster::metrics::record_offset_commit(
+                Ok(store) => {
+                    let hwm = store.high_watermark();
+                    let log_start = store.log_start_offset();
+                    if partition.committed_offset < log_start
+                        || partition.committed_offset > hwm
+                    {
+                        debug!(
+                            group_id = %request.group_id,
+                            topic = %topic.name,
+                            partition = partition.partition_index,
+                            committed_offset = partition.committed_offset,
+                            log_start,
+                            hwm,
+                            "Rejecting OffsetCommit: offset outside [log_start, hwm]"
+                        );
+                        Some(KafkaCode::OffsetOutOfRange)
+                    } else {
+                        None
+                    }
+                }
+                // Partition not locally available — defer to the existing
+                // commit path; if the topic itself is unknown the commit
+                // call will surface the right error.
+                Err(_) => None,
+            };
+
+            let error_code = if let Some(code) = bounds_error {
+                code
+            } else {
+                match handler
+                    .coordinator
+                    .commit_offset(
                         &request.group_id,
                         &topic.name,
-                        "success",
-                    );
-
-                    // Record consumer lag if we can get the high watermark
-                    if let Ok(store) = handler
-                        .partition_manager
-                        .get_for_read(&topic.name, partition.partition_index)
-                        .await
-                    {
-                        let hwm = store.high_watermark();
-                        crate::cluster::metrics::record_consumer_lag(
+                        partition.partition_index,
+                        partition.committed_offset,
+                        partition.committed_metadata.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        crate::cluster::metrics::record_offset_commit(
                             &request.group_id,
                             &topic.name,
-                            partition.partition_index,
-                            partition.committed_offset,
-                            hwm,
+                            "success",
                         );
-                    }
 
-                    KafkaCode::None
-                }
-                Err(e) => {
-                    error!(error = %e, "Failed to commit offset");
-                    crate::cluster::metrics::record_offset_commit(
-                        &request.group_id,
-                        &topic.name,
-                        "error",
-                    );
-                    e.to_kafka_code()
+                        // Record consumer lag if we can get the high watermark
+                        if let Ok(store) = handler
+                            .partition_manager
+                            .get_for_read(&topic.name, partition.partition_index)
+                            .await
+                        {
+                            let hwm = store.high_watermark();
+                            crate::cluster::metrics::record_consumer_lag(
+                                &request.group_id,
+                                &topic.name,
+                                partition.partition_index,
+                                partition.committed_offset,
+                                hwm,
+                            );
+                        }
+
+                        KafkaCode::None
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to commit offset");
+                        crate::cluster::metrics::record_offset_commit(
+                            &request.group_id,
+                            &topic.name,
+                            "error",
+                        );
+                        e.to_kafka_code()
+                    }
                 }
             };
 

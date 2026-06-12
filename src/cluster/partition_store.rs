@@ -1286,11 +1286,51 @@ impl PartitionStore {
     ///
     /// Returns the number of deleted batches.
     pub async fn apply_retention(&self, retention_ms: i64, now_ms: i64) -> SlateDBResult<u64> {
-        use super::keys::{decode_record_offset, parse_batch_max_timestamp};
+        use super::keys::{LEADER_EPOCH_KEY, decode_leader_epoch, decode_record_offset, parse_batch_max_timestamp};
 
         if retention_ms <= 0 {
             return Ok(0); // Retention disabled
         }
+
+        // Refuse retention writes the moment another broker has acquired
+        // ownership: retention advances LSO with `await_durable=true`, so a
+        // stale owner running past a hand-off can delete records the new
+        // owner has already acked reads on.
+        if let Some(ref zombie_state) = self.zombie_mode
+            && zombie_state.is_active()
+        {
+            return Err(SlateDBError::NotOwned {
+                topic: self.topic.clone(),
+                partition: self.partition,
+            });
+        }
+
+        if self.leader_epoch > 0 {
+            let stored_epoch = match self.db.get(LEADER_EPOCH_KEY).await {
+                Ok(Some(bytes)) => decode_leader_epoch(&bytes).unwrap_or(0),
+                Ok(None) => 0,
+                Err(e) => {
+                    let err = SlateDBError::from(e);
+                    if err.is_fenced() {
+                        return Err(err);
+                    }
+                    return Err(SlateDBError::Storage(format!(
+                        "Cannot verify epoch for retention on {}/{}: {}",
+                        self.topic, self.partition, err
+                    )));
+                }
+            };
+            if stored_epoch != self.leader_epoch {
+                super::metrics::record_epoch_mismatch(&self.topic, self.partition);
+                return Err(SlateDBError::EpochMismatch {
+                    topic: self.topic.clone(),
+                    partition: self.partition,
+                    expected_epoch: self.leader_epoch,
+                    stored_epoch,
+                });
+            }
+        }
+
         let cutoff_ms = now_ms.saturating_sub(retention_ms);
 
         let log_start = self.log_start_offset.load(Ordering::SeqCst);

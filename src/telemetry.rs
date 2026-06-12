@@ -238,11 +238,15 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<(), Box<dyn std::error:
 
     // Always use fmt layer with OpenTelemetry
     let fmt_layer = tracing_subscriber::fmt::layer();
+    // `try_init` instead of `init`: panicking on a previously-installed
+    // subscriber would crash startup whenever both `init_logging` and the
+    // otel feature are wired up. Surface as an error so main can log and
+    // continue without telemetry instead of aborting the broker.
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_layer)
         .with(otel_layer)
-        .init();
+        .try_init()?;
 
     tracing::info!(
         service_name = %config.service_name,

@@ -437,20 +437,36 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                                         topic = &*topic,
                                         partition, "Releasing partition due to zombie mode"
                                     );
-                                    if let Err(e) =
-                                        coordinator.release_partition(&topic, partition).await
+                                    // Flush + close the local store BEFORE telling the
+                                    // coordinator we no longer own the partition. Once
+                                    // the coordinator releases ownership, the next
+                                    // owner can begin writing immediately, so any
+                                    // unflushed `acks=0` writes still in our memtable
+                                    // would be silently lost. If close/flush fails,
+                                    // skip the release so the lease lingers (until
+                                    // expiry or operator intervention) rather than
+                                    // handing ownership over with data still pinned
+                                    // here.
+                                    let close_ok = match &store_opt {
+                                        Some(store) => match store.close().await {
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                error!(
+                                                    topic = &*topic,
+                                                    partition,
+                                                    error = %e,
+                                                    "Failed to close partition store on zombie entry; skipping release"
+                                                );
+                                                false
+                                            }
+                                        },
+                                        None => true,
+                                    };
+                                    if close_ok
+                                        && let Err(e) =
+                                            coordinator.release_partition(&topic, partition).await
                                     {
                                         error!(topic = &*topic, partition, error = %e, "Failed to release partition during zombie mode");
-                                    }
-                                    if let Some(store) = store_opt
-                                        && let Err(e) = store.close().await
-                                    {
-                                        warn!(
-                                            topic = &*topic,
-                                            partition,
-                                            error = %e,
-                                            "Failed to close partition store on zombie entry"
-                                        );
                                     }
                                 }
                                 super::metrics::record_coordinator_failure("zombie_mode");

@@ -571,5 +571,98 @@ mod tests {
             key[1..9].copy_from_slice(&offset.to_be_bytes());
             prop_assert_eq!(decode_record_offset(&key), None);
         }
+
+        // ----------------------------------------------------------------
+        // P3-3: producer-state value decode robustness across mixed formats.
+        //
+        // `decode_producer_state_value` accepts both the current 18-byte
+        // layout AND the legacy 6-byte prefix-only layout. A bad decode
+        // here is silent data loss for idempotent producers, so the
+        // boundary cases (lengths 0..=32, including 5 / 6 / 17 / 18) need
+        // explicit coverage that point examples can't supply.
+        // ----------------------------------------------------------------
+
+        #[test]
+        fn producer_state_decode_arbitrary_short_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=32)
+        ) {
+            // Catch-all robustness: any input up to twice the v2 size must
+            // return `Some`/`None` without panicking. Lengths 0..6 are
+            // None; ≥6 are Some.
+            let decoded = decode_producer_state_value(&bytes);
+            match bytes.len() {
+                0..=5 => prop_assert!(decoded.is_none()),
+                _ => prop_assert!(decoded.is_some()),
+            }
+        }
+
+        #[test]
+        fn producer_state_decode_legacy_6_byte(
+            seq in any::<i32>(),
+            epoch in any::<i16>(),
+        ) {
+            // Legacy-format guarantee: a 6-byte value must decode with
+            // both retry-dedup fields at the "unknown" sentinel (-1).
+            let mut legacy = Vec::with_capacity(6);
+            legacy.extend_from_slice(&seq.to_be_bytes());
+            legacy.extend_from_slice(&epoch.to_be_bytes());
+            let decoded = decode_producer_state_value(&legacy)
+                .expect("6-byte value decodes");
+            prop_assert_eq!(decoded.last_sequence, seq);
+            prop_assert_eq!(decoded.producer_epoch, epoch);
+            prop_assert_eq!(decoded.last_first_sequence, -1);
+            prop_assert_eq!(decoded.last_base_offset, -1);
+        }
+
+        #[test]
+        fn producer_state_decode_v2_prefix_matches_legacy(
+            seq in any::<i32>(),
+            epoch in any::<i16>(),
+            first_seq in any::<i32>(),
+            base_offset in any::<i64>(),
+        ) {
+            // For length ≥18, the (last_sequence, producer_epoch) prefix
+            // must match what the legacy 6-byte decode would produce.
+            // This is the contract that lets a broker upgraded mid-flight
+            // read either format without confusion.
+            let state = PersistedProducerState {
+                last_sequence: seq,
+                producer_epoch: epoch,
+                last_first_sequence: first_seq,
+                last_base_offset: base_offset,
+            };
+            let v2 = encode_producer_state_value(&state);
+            let v2_decoded = decode_producer_state_value(&v2)
+                .expect("v2 value decodes");
+            let legacy_decoded = decode_producer_state_value(&v2[..6])
+                .expect("legacy prefix decodes");
+            prop_assert_eq!(v2_decoded.last_sequence, legacy_decoded.last_sequence);
+            prop_assert_eq!(v2_decoded.producer_epoch, legacy_decoded.producer_epoch);
+            // Legacy decode treats the v2 retry fields as unknown.
+            prop_assert_eq!(legacy_decoded.last_first_sequence, -1);
+            prop_assert_eq!(legacy_decoded.last_base_offset, -1);
+        }
+
+        #[test]
+        fn producer_state_decode_partial_v2_returns_legacy_fields(
+            seq in any::<i32>(),
+            epoch in any::<i16>(),
+            extra in proptest::collection::vec(any::<u8>(), 0..12),
+        ) {
+            // Lengths 6..=17 are "between" formats: the 6-byte prefix is
+            // honored; trailing bytes < 12 are not enough for v2 retry
+            // fields, so retry fields stay at -1.
+            let mut v = Vec::with_capacity(6 + extra.len());
+            v.extend_from_slice(&seq.to_be_bytes());
+            v.extend_from_slice(&epoch.to_be_bytes());
+            v.extend_from_slice(&extra);
+            prop_assume!(v.len() < 18);
+            let decoded = decode_producer_state_value(&v)
+                .expect("≥6-byte value decodes");
+            prop_assert_eq!(decoded.last_sequence, seq);
+            prop_assert_eq!(decoded.producer_epoch, epoch);
+            prop_assert_eq!(decoded.last_first_sequence, -1);
+            prop_assert_eq!(decoded.last_base_offset, -1);
+        }
     }
 }

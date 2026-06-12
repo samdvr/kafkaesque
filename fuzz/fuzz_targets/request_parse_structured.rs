@@ -5,12 +5,12 @@ use libfuzzer_sys::fuzz_target;
 
 use kafkaesque::server::request::Request;
 
-/// Structured fuzz target: first 4 bytes select `(api_key, api_version)`,
-/// remainder is treated as the request body after a minimal header.
-///
-/// This exercises the version gate and per-API parsers with arbitrary
-/// payloads for advertised version boundaries — higher yield than raw
-/// `Request::parse` on random bytes alone.
+// Structured fuzz target: first 4 bytes select `(api_key, api_version)`,
+// remainder is treated as the request body after a minimal header.
+//
+// This exercises the version gate and per-API parsers with arbitrary
+// payloads for advertised version boundaries — higher yield than raw
+// `Request::parse` on random bytes alone.
 fuzz_target!(|data: &[u8]| {
     if data.len() < 4 {
         return;

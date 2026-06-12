@@ -203,11 +203,17 @@ fn validate_identifier(value: &str, max_len: usize, field_name: &str) -> SlateDB
 /// Truncate a string for display in error messages.
 ///
 /// This prevents overly long identifiers from cluttering error output.
+/// Snaps `max_len` down to the nearest char boundary so we never slice
+/// through a multi-byte UTF-8 sequence (which would panic).
 fn truncate_for_display(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        let mut idx = max_len;
+        while idx > 0 && !s.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        format!("{}...", &s[..idx])
     }
 }
 

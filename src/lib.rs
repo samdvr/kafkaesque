@@ -80,9 +80,9 @@
 
 #![forbid(unsafe_code)]
 
-mod encode;
+pub mod encode;
 pub mod error;
-mod parser;
+pub mod parser;
 pub mod protocol;
 pub mod server;
 pub mod types;

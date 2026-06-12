@@ -69,7 +69,7 @@ mod coordinator;
 mod error;
 pub mod failure_detector;
 mod handler;
-mod keys;
+pub mod keys;
 pub mod load_metrics;
 pub mod metrics;
 mod object_store;

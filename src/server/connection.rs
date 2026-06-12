@@ -216,6 +216,19 @@ async fn read_kafka_frame<S: AsyncRead + Unpin>(
     Ok(Bytes::from(data))
 }
 
+/// Public re-export of [`read_kafka_frame`] for fuzz harnesses.
+///
+/// The production callers live inside this module; the frame reader itself
+/// is the broker's first contact with attacker bytes, so a fuzz target
+/// against it is part of the security boundary. This thin wrapper lets the
+/// `kafkaesque-fuzz` crate drive the reader without re-implementing it.
+pub async fn read_kafka_frame_for_fuzz<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    max_message_size: usize,
+) -> Result<Bytes> {
+    read_kafka_frame(stream, max_message_size).await
+}
+
 /// Write a length-prefixed Kafka response frame.
 async fn write_kafka_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,

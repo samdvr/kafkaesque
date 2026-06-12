@@ -58,7 +58,7 @@ pub mod tls;
 #[cfg(feature = "sasl")]
 pub mod sasl;
 
-pub use connection::{set_global_inflight_byte_budget, ClientConnection};
+pub use connection::{read_kafka_frame_for_fuzz, set_global_inflight_byte_budget, ClientConnection};
 pub use handler::{Handler, RequestContext, SaslPostAuth};
 pub use rate_limiter::{AuthRateLimiter, RateLimiterConfig};
 

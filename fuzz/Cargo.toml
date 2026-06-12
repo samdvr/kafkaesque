@@ -9,9 +9,24 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1.11.1"
+nombytes = "0.1.1"
+tokio = { version = "1.48.0", features = ["io-util", "macros", "rt"] }
+postcard = { version = "1.0", features = ["use-std"] }
+serde = { version = "1.0", features = ["derive"] }
+num-traits = "0.2"
 
 [dependencies.kafkaesque]
 path = ".."
+# `sasl` is required for SCRAM-SHA-256 fuzzers (P0-4). It pulls in nothing
+# beyond what's already a transitive dep, so enabling it crate-wide for fuzz
+# costs nothing and keeps target authoring uniform.
+features = ["sasl"]
+
+# ===========================================================================
+# Existing targets (kept for compatibility — see fuzzy_testing_plan.md)
+# ===========================================================================
 
 [[bin]]
 name = "request_parse"
@@ -37,6 +52,273 @@ bench = false
 [[bin]]
 name = "request_parse_structured"
 path = "fuzz_targets/request_parse_structured.rs"
+test = false
+doc = false
+bench = false
+
+# ===========================================================================
+# P0-1: Per-API request fuzzers
+#
+# Each target derives `Arbitrary` for `(version, body)`, clamps `version`
+# to the API's advertised range from `SUPPORTED_VERSIONS`, and feeds the
+# body to the parser directly. Higher coverage signal than the shared
+# `request_parse_structured` target since libFuzzer's coverage map is
+# per-target.
+# ===========================================================================
+
+[[bin]]
+name = "api_produce"
+path = "fuzz_targets/api_produce.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_fetch"
+path = "fuzz_targets/api_fetch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_metadata"
+path = "fuzz_targets/api_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_list_offsets"
+path = "fuzz_targets/api_list_offsets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_offset_commit"
+path = "fuzz_targets/api_offset_commit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_offset_fetch"
+path = "fuzz_targets/api_offset_fetch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_find_coordinator"
+path = "fuzz_targets/api_find_coordinator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_join_group"
+path = "fuzz_targets/api_join_group.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_heartbeat"
+path = "fuzz_targets/api_heartbeat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_leave_group"
+path = "fuzz_targets/api_leave_group.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_sync_group"
+path = "fuzz_targets/api_sync_group.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_describe_groups"
+path = "fuzz_targets/api_describe_groups.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_list_groups"
+path = "fuzz_targets/api_list_groups.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_sasl_handshake"
+path = "fuzz_targets/api_sasl_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_sasl_authenticate"
+path = "fuzz_targets/api_sasl_authenticate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_versions"
+path = "fuzz_targets/api_versions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_create_topics"
+path = "fuzz_targets/api_create_topics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_delete_topics"
+path = "fuzz_targets/api_delete_topics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_init_producer_id"
+path = "fuzz_targets/api_init_producer_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_delete_groups"
+path = "fuzz_targets/api_delete_groups.rs"
+test = false
+doc = false
+bench = false
+
+# ===========================================================================
+# P0-2: Connection frame reader
+# ===========================================================================
+
+[[bin]]
+name = "frame_reader"
+path = "fuzz_targets/frame_reader.rs"
+test = false
+doc = false
+bench = false
+
+# ===========================================================================
+# P0-3: RecordBatch header validation + producer info extraction
+# ===========================================================================
+
+[[bin]]
+name = "record_batch"
+path = "fuzz_targets/record_batch.rs"
+test = false
+doc = false
+bench = false
+
+# ===========================================================================
+# P0-4: SCRAM-SHA-256 message parsers
+# ===========================================================================
+
+[[bin]]
+name = "scram_client_first"
+path = "fuzz_targets/scram_client_first.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scram_client_final"
+path = "fuzz_targets/scram_client_final.rs"
+test = false
+doc = false
+bench = false
+
+# ===========================================================================
+# P0-5: Postcard decoders for cluster RPC + on-disk Raft state
+# ===========================================================================
+
+[[bin]]
+name = "postcard_coordination_command"
+path = "fuzz_targets/postcard_coordination_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "postcard_coordination_response"
+path = "fuzz_targets/postcard_coordination_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "postcard_raft_rpc_message"
+path = "fuzz_targets/postcard_raft_rpc_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "postcard_raft_rpc_response"
+path = "fuzz_targets/postcard_raft_rpc_response.rs"
+test = false
+doc = false
+bench = false
+
+# ===========================================================================
+# P1-3: Compact-encoding + tagged-fields edge cases
+# ===========================================================================
+
+[[bin]]
+name = "flexible_encoding"
+path = "fuzz_targets/flexible_encoding.rs"
+test = false
+doc = false
+bench = false
+
+# ===========================================================================
+# P1-4: Encoder safety on adversarial response data
+# ===========================================================================
+
+[[bin]]
+name = "response_encode"
+path = "fuzz_targets/response_encode.rs"
+test = false
+doc = false
+bench = false
+
+# ===========================================================================
+# P3-1: Identifier validators
+# ===========================================================================
+
+[[bin]]
+name = "validators"
+path = "fuzz_targets/validators.rs"
+test = false
+doc = false
+bench = false
+
+# ===========================================================================
+# P3-2: Config parsing (ClusterProfile::from_str, ObjectStoreType driver,
+# from_env-style (key, value) driver)
+# ===========================================================================
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
 test = false
 doc = false
 bench = false

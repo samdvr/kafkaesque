@@ -109,6 +109,13 @@ serial_test = "3.2"
 kafkaesque = { path = ".", features = ["test-utilities"] }
 criterion = { version = "0.8.1", features = ["html_reports"] }
 proptest = "1.5"
+# `kafka-protocol` is a separate Rust implementation of the Kafka wire
+# protocol — used by the differential roundtrip tests in
+# `tests/wire_differential.rs` (P1-1) so we verify our parsers against an
+# independent encoder, not just a hand-rolled reference. Newer 0.x
+# releases compile cleanly against `bytes 1.11+`; older ones (≤0.13) run
+# into a `try_get_u8` ambiguity with the bytes crate's now-native method.
+kafka-protocol = "0.17"
 
 [[bench]]
 name = "produce_bench"

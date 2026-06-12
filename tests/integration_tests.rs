@@ -351,10 +351,30 @@ async fn start_test_server(
         let _ = server_clone.run().await;
     });
 
-    // Give server time to start
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait until the listener is accepting rather than sleeping a fixed interval.
+    let ready = wait_for(
+        || async { TcpStream::connect(addr).await.is_ok() },
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(ready, "server should accept connections within timeout");
 
     Some((addr, server))
+}
+
+async fn wait_for<F, Fut>(mut cond: F, timeout: Duration) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if cond().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cond().await
 }
 
 /// Send a raw Kafka request and receive a response.

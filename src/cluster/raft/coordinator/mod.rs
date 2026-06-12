@@ -40,6 +40,16 @@ use crate::cluster::error::{SlateDBError, SlateDBResult};
 
 pub use state_accessor::StateAccessor;
 
+/// Cached partition owner with the generation stamp from when it was inserted.
+/// Entries whose generation lags [`RaftCoordinator::owner_cache_generation`]
+/// are treated as stale so ownership hooks can invalidate synchronously
+/// without waiting for async cache eviction to finish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CachedOwnerEntry {
+    broker_id: i32,
+    generation: u64,
+}
+
 /// Raft-based coordinator for cluster state.
 pub struct RaftCoordinator {
     /// The underlying Raft node.
@@ -49,7 +59,10 @@ pub struct RaftCoordinator {
     /// Broker info for this node.
     broker_info: BrokerInfo,
     /// Cache of partition owners for fast local lookups.
-    owner_cache: Cache<PartitionKey, i32>,
+    owner_cache: Cache<PartitionKey, CachedOwnerEntry>,
+    /// Monotonic stamp bumped on every ownership change so readers can reject
+    /// entries inserted before a hook fired.
+    owner_cache_generation: std::sync::atomic::AtomicU64,
     /// Configuration.
     config: RaftConfig,
     /// Background task handles.
@@ -97,6 +110,7 @@ impl RaftCoordinator {
             broker_id: config.broker_id,
             broker_info,
             owner_cache,
+            owner_cache_generation: std::sync::atomic::AtomicU64::new(0),
             config,
             task_handles: RwLock::new(Vec::new()),
             shutdown_tx,
@@ -347,6 +361,51 @@ impl RaftCoordinator {
 
             tokio::time::sleep(poll_interval).await;
         }
+    }
+
+    /// Bump the owner-cache generation synchronously. Called from the
+    /// ownership-change hook before async invalidation so concurrent readers
+    /// cannot observe a stale cached owner after a release/reassign.
+    pub(crate) fn bump_owner_cache_generation(&self) {
+        use std::sync::atomic::Ordering;
+        self.owner_cache_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn owner_cache_insert(&self, key: PartitionKey, broker_id: i32) {
+        use std::sync::atomic::Ordering;
+        let generation = self.owner_cache_generation.load(Ordering::SeqCst);
+        self.owner_cache
+            .insert(
+                key,
+                CachedOwnerEntry {
+                    broker_id,
+                    generation,
+                },
+            )
+            .await;
+    }
+
+    async fn owner_cache_get(&self, key: &PartitionKey) -> Option<i32> {
+        use std::sync::atomic::Ordering;
+        let current = self.owner_cache_generation.load(Ordering::SeqCst);
+        self.owner_cache.get(key).await.and_then(|entry| {
+            if entry.generation == current {
+                Some(entry.broker_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn owner_cache_invalidate(&self, key: &PartitionKey) {
+        self.bump_owner_cache_generation();
+        self.owner_cache.invalidate(key).await;
+    }
+
+    async fn owner_cache_invalidate_all(&self) {
+        self.bump_owner_cache_generation();
+        self.owner_cache.invalidate_all();
+        self.owner_cache.run_pending_tasks().await;
     }
 }
 

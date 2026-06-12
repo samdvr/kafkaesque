@@ -1382,6 +1382,14 @@ pub fn record_request_with_code(api: &str, status: &str, error_code: &str, durat
         .observe(duration_secs);
 }
 
+/// Hidden accessor for integration tests asserting metric values.
+#[doc(hidden)]
+pub fn request_count_for_test(api: &str, status: &str, error_code: &str) -> u64 {
+    REQUEST_COUNT
+        .with_label_values(&[api, status, error_code])
+        .get()
+}
+
 /// Record trailing bytes left after a successful request-body parse.
 pub fn record_request_trailing_bytes(api: &str, trailing_bytes: usize) {
     REQUEST_TRAILING_BYTES

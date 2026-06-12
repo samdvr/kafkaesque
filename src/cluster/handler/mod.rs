@@ -21,10 +21,9 @@ use async_trait::async_trait;
 use moka::sync::Cache;
 use object_store::ObjectStore;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::error::KafkaCode;
-use crate::protocol::{CrcValidationResult, validate_batch_crc_async};
 use crate::runtime::RuntimeHandles;
 use crate::server::request::*;
 use crate::server::response::*;
@@ -386,6 +385,7 @@ impl SlateDBClusterHandler {
                 .read()
                 .await
                 .set_ownership_change_hook(Arc::new(move |invalidation| {
+                    coordinator_for_hook.bump_owner_cache_generation();
                     let coordinator = coordinator_for_hook.clone();
                     runtime.spawn(async move {
                         match invalidation {
@@ -686,176 +686,6 @@ impl SlateDBClusterHandler {
         }
     }
 
-    /// Produce records to a single partition.
-    ///
-    /// This method handles the complete produce flow for a single partition:
-    /// 1. Checks if broker is in zombie mode (rejects with NotLeaderForPartition)
-    /// 2. Attempts to get an existing partition store from the local cache
-    /// 3. If not cached, tries to acquire ownership of the partition
-    /// 4. Appends the record batch to the partition's log
-    /// 5. Records produce metrics on success
-    ///
-    /// Produce a batch to a single partition.
-    ///
-    /// # Arguments
-    /// * `topic` - The topic name
-    /// * `partition` - The partition data containing records
-    /// * `acks` - Acknowledgment level (0=fire-and-forget, 1/-1=wait for flush)
-    pub(crate) async fn produce_to_partition(
-        &self,
-        topic: &str,
-        partition: ProducePartitionData,
-        acks: i16,
-    ) -> ProducePartitionResponse {
-        // Time the full per-partition produce path so the
-        // pre-existing PRODUCE_DURATION histogram is actually populated.
-        let start = std::time::Instant::now();
-        let response = self
-            .produce_to_partition_inner(topic, partition, acks)
-            .await;
-        let status = if response.error_code == KafkaCode::None {
-            "success"
-        } else {
-            "error"
-        };
-        super::metrics::record_produce_latency(topic, status, start.elapsed().as_secs_f64());
-        response
-    }
-
-    async fn produce_to_partition_inner(
-        &self,
-        topic: &str,
-        partition: ProducePartitionData,
-        acks: i16,
-    ) -> ProducePartitionResponse {
-        // Reject writes when in zombie mode
-        if self.partition_manager.is_zombie() {
-            return ProducePartitionResponse {
-                partition_index: partition.partition_index,
-                error_code: KafkaCode::NotLeaderForPartition,
-                base_offset: -1,
-                log_append_time: -1,
-            };
-        }
-
-        // Validate CRC before lease acquisition so corrupt batches cannot
-        // drive Raft load on the acks>=1 path.
-        if self.validate_record_crc {
-            match validate_batch_crc_async(&partition.records).await {
-                CrcValidationResult::Valid => {}
-                CrcValidationResult::Invalid { expected, actual } => {
-                    warn!(
-                        topic = %topic,
-                        partition = partition.partition_index,
-                        expected_crc = format!("{:#x}", expected),
-                        actual_crc = format!("{:#x}", actual),
-                        "Rejecting batch with invalid CRC"
-                    );
-                    super::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse {
-                        partition_index: partition.partition_index,
-                        error_code: KafkaCode::CorruptMessage,
-                        base_offset: -1,
-                        log_append_time: -1,
-                    };
-                }
-                CrcValidationResult::TooSmall => {
-                    warn!(
-                        topic = %topic,
-                        partition = partition.partition_index,
-                        batch_size = partition.records.len(),
-                        "Rejecting batch too small to contain valid CRC"
-                    );
-                    super::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse {
-                        partition_index: partition.partition_index,
-                        error_code: KafkaCode::CorruptMessage,
-                        base_offset: -1,
-                        log_append_time: -1,
-                    };
-                }
-            }
-        }
-
-        // Use get_for_write which verifies fresh ownership with coordinator
-        // IMPORTANT: We do NOT try to acquire partitions here. Partition acquisition
-        // happens only in the background ownership loop. This prevents "partition stealing"
-        // where produce requests cause brokers to compete for partition ownership.
-        let store = match self
-            .partition_manager
-            .get_for_write(topic, partition.partition_index)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                // Map the storage error to its typed Kafka code. Collapsing
-                // every failure to NotLeaderForPartition triggers a metadata
-                // refresh storm on transient I/O — clients retry to a
-                // (correct) leader that's perfectly happy to keep failing
-                // because the underlying issue is timeout/storage, not
-                // ownership. The typed mapping returns NotLeader only on
-                // genuine NotOwned and surfaces RequestTimedOut /
-                // BrokerNotAvailable / etc. for everything else.
-                return ProducePartitionResponse {
-                    partition_index: partition.partition_index,
-                    error_code: e.to_kafka_code(),
-                    base_offset: -1,
-                    log_append_time: -1,
-                };
-            }
-        };
-
-        // For acks>=1 ("leader" / "all") Kafka clients are guaranteed durability
-        // once the produce response returns success. Use the durable write path.
-        // acks=0 was already short-circuited in handle_produce.
-        let append_result = if acks == 0 {
-            store.append_batch(&partition.records).await
-        } else {
-            store.append_batch_durable(&partition.records).await
-        };
-
-        // Append the batch
-        match append_result {
-            Ok(base_offset) => {
-                let bytes = partition.records.len() as u64;
-                super::metrics::record_produce(topic, partition.partition_index, 1, bytes);
-
-                // Wake fetch handlers long-polling THIS partition under
-                // max_wait_ms / min_bytes. `Notify::notify_waiters` is a
-                // no-op when no one is waiting.
-                let topic_arc = self.cached_topic_name(topic);
-                self.hwm_notifier(&topic_arc, partition.partition_index)
-                    .notify_waiters();
-
-                ProducePartitionResponse {
-                    partition_index: partition.partition_index,
-                    error_code: KafkaCode::None,
-                    base_offset,
-                    log_append_time: -1,
-                }
-            }
-            Err(e) => {
-                // Use unified error-to-Kafka-code mapping (R3 refactoring)
-                let error_code = e.to_kafka_code();
-                if e.is_not_leader() {
-                    error!(
-                        topic,
-                        partition = partition.partition_index,
-                        error = %e,
-                        "Fenced during produce - returning NotLeaderForPartition"
-                    );
-                } else {
-                    error!(error = %e, "Failed to append batch");
-                }
-                ProducePartitionResponse {
-                    partition_index: partition.partition_index,
-                    error_code,
-                    base_offset: -1,
-                    log_append_time: -1,
-                }
-            }
-        }
-    }
 }
 
 #[async_trait]
@@ -1175,6 +1005,7 @@ fn pick_sasl_mechanism(has_scram_session: bool, auth_bytes: &[u8]) -> &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::CrcValidationResult;
 
     // ========================================================================
     // HealthStatus Tests

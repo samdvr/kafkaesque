@@ -1740,62 +1740,65 @@ impl ClusterConfig {
             ..defaults
         };
 
-        eprintln!("=== Kafkaesque Configuration ===");
-        eprintln!("Broker ID: {}", broker_id);
-        eprintln!("Host (bind): {}", host);
-        eprintln!("Advertised Host: {}", advertised_host);
-        eprintln!("Port: {}", port);
-        eprintln!(
-            "Health Port: {}",
-            if health_port == 0 {
-                "disabled".to_string()
-            } else {
-                health_port.to_string()
+        #[cfg(not(fuzzing))]
+        {
+            eprintln!("=== Kafkaesque Configuration ===");
+            eprintln!("Broker ID: {}", broker_id);
+            eprintln!("Host (bind): {}", host);
+            eprintln!("Advertised Host: {}", advertised_host);
+            eprintln!("Port: {}", port);
+            eprintln!(
+                "Health Port: {}",
+                if health_port == 0 {
+                    "disabled".to_string()
+                } else {
+                    health_port.to_string()
+                }
+            );
+            eprintln!(
+                "Metrics Auth: {}",
+                if metrics_auth_token.is_some() {
+                    "enabled (bearer token)"
+                } else {
+                    "disabled (open)"
+                }
+            );
+            eprintln!("Coordination: Raft (embedded consensus)");
+            eprintln!("Cluster ID: {}", cluster_id);
+            eprintln!("Raft Listen Addr: {}", raft_listen_addr);
+            if let Some(ref peers) = raft_peers {
+                eprintln!("Raft Peers: {}", peers);
             }
-        );
-        eprintln!(
-            "Metrics Auth: {}",
-            if metrics_auth_token.is_some() {
-                "enabled (bearer token)"
-            } else {
-                "disabled (open)"
-            }
-        );
-        eprintln!("Coordination: Raft (embedded consensus)");
-        eprintln!("Cluster ID: {}", cluster_id);
-        eprintln!("Raft Listen Addr: {}", raft_listen_addr);
-        if let Some(ref peers) = raft_peers {
-            eprintln!("Raft Peers: {}", peers);
+            eprintln!("Object Store: {:?}", object_store_type);
+            eprintln!("Data Path: {}", data_path);
+            eprintln!("Auto Create Topics: {}", auto_create_topics);
+            eprintln!("Default Num Partitions: {}", default_num_partitions);
+            eprintln!("Max Message Size: {} bytes", max_message_size);
+            eprintln!(
+                "Global Inflight Byte Budget: {} bytes",
+                global_inflight_byte_budget
+            );
+            eprintln!("Max Fetch Response Size: {} bytes", max_fetch_response_size);
+            eprintln!("Broker Heartbeat TTL: {}s", broker_heartbeat_ttl_secs);
+            eprintln!("SASL Enabled: {}", sasl_enabled);
+            eprintln!("Fail on Recovery Gap: {}", fail_on_recovery_gap);
+            eprintln!(
+                "Log Retention: {}",
+                if log_retention_ms > 0 {
+                    format!(
+                        "{} ms (checked every {}s)",
+                        log_retention_ms, log_retention_check_interval_secs
+                    )
+                } else {
+                    "disabled (infinite)".to_string()
+                }
+            );
+            eprintln!(
+                "Runtime: control_plane={} threads, data_plane={} threads",
+                control_plane_threads, data_plane_threads
+            );
+            eprintln!("==========================");
         }
-        eprintln!("Object Store: {:?}", object_store_type);
-        eprintln!("Data Path: {}", data_path);
-        eprintln!("Auto Create Topics: {}", auto_create_topics);
-        eprintln!("Default Num Partitions: {}", default_num_partitions);
-        eprintln!("Max Message Size: {} bytes", max_message_size);
-        eprintln!(
-            "Global Inflight Byte Budget: {} bytes",
-            global_inflight_byte_budget
-        );
-        eprintln!("Max Fetch Response Size: {} bytes", max_fetch_response_size);
-        eprintln!("Broker Heartbeat TTL: {}s", broker_heartbeat_ttl_secs);
-        eprintln!("SASL Enabled: {}", sasl_enabled);
-        eprintln!("Fail on Recovery Gap: {}", fail_on_recovery_gap);
-        eprintln!(
-            "Log Retention: {}",
-            if log_retention_ms > 0 {
-                format!(
-                    "{} ms (checked every {}s)",
-                    log_retention_ms, log_retention_check_interval_secs
-                )
-            } else {
-                "disabled (infinite)".to_string()
-            }
-        );
-        eprintln!(
-            "Runtime: control_plane={} threads, data_plane={} threads",
-            control_plane_threads, data_plane_threads
-        );
-        eprintln!("==========================");
 
         // Run validation
         if let Err(errors) = config.validate() {

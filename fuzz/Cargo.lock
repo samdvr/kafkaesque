@@ -1592,6 +1592,7 @@ dependencies = [
  "fastrand",
  "futures",
  "hmac",
+ "itoa",
  "moka",
  "nom",
  "nombytes",

@@ -20,13 +20,13 @@
 //! Durability is provided by the object storage backend's own replication.
 
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use once_cell::sync::Lazy;
 use tokio::sync::Semaphore;
 
 use crate::error::KafkaCode;
-use crate::protocol::parse_producer_info;
+use crate::protocol::{parse_producer_info, validate_batch_crc_async, CrcValidationResult};
 use crate::server::RequestContext;
 use crate::server::request::{ApiKey, ProducePartitionData, ProduceRequestData};
 use crate::server::response::{
@@ -429,6 +429,140 @@ async fn fire_and_forget_produce(
     // Append batch (ignore result for fire-and-forget)
     let _ = store.append_batch(&partition.records).await;
     Ok(())
+}
+
+impl SlateDBClusterHandler {
+    /// Produce records to a single partition.
+    pub(crate) async fn produce_to_partition(
+        &self,
+        topic: &str,
+        partition: ProducePartitionData,
+        acks: i16,
+    ) -> ProducePartitionResponse {
+        let start = std::time::Instant::now();
+        let response = self
+            .produce_to_partition_inner(topic, partition, acks)
+            .await;
+        let status = if response.error_code == KafkaCode::None {
+            "success"
+        } else {
+            "error"
+        };
+        crate::cluster::metrics::record_produce_latency(topic, status, start.elapsed().as_secs_f64());
+        response
+    }
+
+    async fn produce_to_partition_inner(
+        &self,
+        topic: &str,
+        partition: ProducePartitionData,
+        acks: i16,
+    ) -> ProducePartitionResponse {
+        if self.partition_manager.is_zombie() {
+            return ProducePartitionResponse {
+                partition_index: partition.partition_index,
+                error_code: KafkaCode::NotLeaderForPartition,
+                base_offset: -1,
+                log_append_time: -1,
+            };
+        }
+
+        if self.validate_record_crc {
+            match validate_batch_crc_async(&partition.records).await {
+                CrcValidationResult::Valid => {}
+                CrcValidationResult::Invalid { expected, actual } => {
+                    warn!(
+                        topic = %topic,
+                        partition = partition.partition_index,
+                        expected_crc = format!("{:#x}", expected),
+                        actual_crc = format!("{:#x}", actual),
+                        "Rejecting batch with invalid CRC"
+                    );
+                    crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
+                    return ProducePartitionResponse {
+                        partition_index: partition.partition_index,
+                        error_code: KafkaCode::CorruptMessage,
+                        base_offset: -1,
+                        log_append_time: -1,
+                    };
+                }
+                CrcValidationResult::TooSmall => {
+                    warn!(
+                        topic = %topic,
+                        partition = partition.partition_index,
+                        batch_size = partition.records.len(),
+                        "Rejecting batch too small to contain valid CRC"
+                    );
+                    crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
+                    return ProducePartitionResponse {
+                        partition_index: partition.partition_index,
+                        error_code: KafkaCode::CorruptMessage,
+                        base_offset: -1,
+                        log_append_time: -1,
+                    };
+                }
+            }
+        }
+
+        let store = match self
+            .partition_manager
+            .get_for_write(topic, partition.partition_index)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return ProducePartitionResponse {
+                    partition_index: partition.partition_index,
+                    error_code: e.to_kafka_code(),
+                    base_offset: -1,
+                    log_append_time: -1,
+                };
+            }
+        };
+
+        let append_result = if acks == 0 {
+            store.append_batch(&partition.records).await
+        } else {
+            store.append_batch_durable(&partition.records).await
+        };
+
+        match append_result {
+            Ok(base_offset) => {
+                let bytes = partition.records.len() as u64;
+                crate::cluster::metrics::record_produce(topic, partition.partition_index, 1, bytes);
+
+                let topic_arc = self.cached_topic_name(topic);
+                self.hwm_notifier(&topic_arc, partition.partition_index)
+                    .notify_waiters();
+
+                ProducePartitionResponse {
+                    partition_index: partition.partition_index,
+                    error_code: KafkaCode::None,
+                    base_offset,
+                    log_append_time: -1,
+                }
+            }
+            Err(e) => {
+                let error_code = e.to_kafka_code();
+                if e.is_not_leader() {
+                    error!(
+                        topic,
+                        partition = partition.partition_index,
+                        error = %e,
+                        "Fenced during produce - returning NotLeaderForPartition"
+                    );
+                } else {
+                    error!(error = %e, "Failed to append batch");
+                }
+                ProducePartitionResponse {
+                    partition_index: partition.partition_index,
+                    error_code,
+                    base_offset: -1,
+                    log_append_time: -1,
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

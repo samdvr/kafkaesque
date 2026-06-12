@@ -83,9 +83,13 @@ pub use domains::{
     ProducerDomainState, ProducerResponse, TransferCommand, TransferDomainState, TransferReason,
     TransferResponse,
 };
-pub use network::{RaftNetworkFactoryImpl, RaftRpcMessage, RaftRpcResponse, request_cluster_join};
+pub use network::{RaftNetworkFactoryImpl, request_cluster_join};
+#[doc(hidden)]
+pub use network::{RaftRpcMessage, RaftRpcResponse};
 pub use node::RaftNode;
+#[doc(hidden)]
 pub use state_machine::{CoordinationStateMachine, OwnershipCacheInvalidation};
+#[doc(hidden)]
 pub use storage::RaftStore;
 pub use tls::RaftTlsConfig;
 pub use types::{RaftNodeId, TypeConfig};

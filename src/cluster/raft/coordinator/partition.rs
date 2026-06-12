@@ -185,8 +185,7 @@ impl PartitionCoordinator for RaftCoordinator {
                 },
             ) => {
                 // Update cache
-                self.owner_cache
-                    .insert((Arc::from(topic.as_str()), partition), self.broker_id)
+                self.owner_cache_insert((Arc::from(topic.as_str()), partition), self.broker_id)
                     .await;
                 Ok(Some(leader_epoch))
             }
@@ -228,8 +227,7 @@ impl PartitionCoordinator for RaftCoordinator {
             CoordinationResponse::PartitionDomainResponse(
                 PartitionResponse::PartitionNotOwned { .. },
             ) => {
-                self.owner_cache
-                    .invalidate(&(Arc::from(topic), partition))
+                self.owner_cache_invalidate(&(Arc::from(topic), partition))
                     .await;
                 Ok(false)
             }
@@ -237,8 +235,7 @@ impl PartitionCoordinator for RaftCoordinator {
             CoordinationResponse::PartitionDomainResponse(PartitionResponse::BrokerNotActive {
                 ..
             }) => {
-                self.owner_cache
-                    .invalidate(&(Arc::from(topic), partition))
+                self.owner_cache_invalidate(&(Arc::from(topic), partition))
                     .await;
                 Ok(false)
             }
@@ -257,14 +254,14 @@ impl PartitionCoordinator for RaftCoordinator {
         });
 
         self.node.write(command).await?;
-        self.owner_cache
-            .invalidate(&(Arc::from(topic), partition))
+        self.owner_cache_invalidate(&(Arc::from(topic), partition))
             .await;
         Ok(())
     }
 
     async fn get_partition_owner(&self, topic: &str, partition: i32) -> SlateDBResult<Option<i32>> {
-        if let Some(cached_owner) = self.owner_cache.get(&(Arc::from(topic), partition)).await
+        let key = (Arc::from(topic), partition);
+        if let Some(cached_owner) = self.owner_cache_get(&key).await
             && self
                 .verify_cached_owner(topic, partition, cached_owner)
                 .await
@@ -302,8 +299,7 @@ impl PartitionCoordinator for RaftCoordinator {
             });
 
         if let Some(owner_id) = owner {
-            self.owner_cache
-                .insert((Arc::from(topic), partition), owner_id)
+            self.owner_cache_insert((Arc::from(topic), partition), owner_id)
                 .await;
         }
 
@@ -311,7 +307,8 @@ impl PartitionCoordinator for RaftCoordinator {
     }
 
     async fn owns_partition_for_read(&self, topic: &str, partition: i32) -> SlateDBResult<bool> {
-        if let Some(cached_owner) = self.owner_cache.get(&(Arc::from(topic), partition)).await
+        let key = (Arc::from(topic), partition);
+        if let Some(cached_owner) = self.owner_cache_get(&key).await
             && self
                 .verify_cached_owner(topic, partition, cached_owner)
                 .await
@@ -340,9 +337,7 @@ impl PartitionCoordinator for RaftCoordinator {
             .unwrap_or(false);
 
         if owns {
-            self.owner_cache
-                .insert((Arc::from(topic), partition), self.broker_id)
-                .await;
+            self.owner_cache_insert(key, self.broker_id).await;
         }
 
         Ok(owns)
@@ -388,8 +383,7 @@ impl PartitionCoordinator for RaftCoordinator {
             CoordinationResponse::PartitionDomainResponse(
                 PartitionResponse::PartitionNotOwned { topic, partition },
             ) => {
-                self.owner_cache
-                    .invalidate(&(Arc::from(topic.as_str()), partition))
+                self.owner_cache_invalidate(&(Arc::from(topic.as_str()), partition))
                     .await;
                 Err(SlateDBError::NotOwned { topic, partition })
             }
@@ -398,8 +392,7 @@ impl PartitionCoordinator for RaftCoordinator {
             CoordinationResponse::PartitionDomainResponse(PartitionResponse::BrokerNotActive {
                 ..
             }) => {
-                self.owner_cache
-                    .invalidate(&(Arc::from(topic), partition))
+                self.owner_cache_invalidate(&(Arc::from(topic), partition))
                     .await;
                 Err(SlateDBError::NotOwned {
                     topic: topic.to_string(),
@@ -414,14 +407,12 @@ impl PartitionCoordinator for RaftCoordinator {
     }
 
     async fn invalidate_ownership_cache(&self, topic: &str, partition: i32) {
-        self.owner_cache
-            .invalidate(&(Arc::from(topic), partition))
+        self.owner_cache_invalidate(&(Arc::from(topic), partition))
             .await;
     }
 
     async fn invalidate_all_ownership_cache(&self) {
-        self.owner_cache.invalidate_all();
-        self.owner_cache.run_pending_tasks().await;
+        self.owner_cache_invalidate_all().await;
     }
 
     async fn should_own_partition(&self, topic: &str, partition: i32) -> SlateDBResult<bool> {
@@ -623,7 +614,7 @@ impl RaftCoordinator {
                 })
         };
         if !still_valid {
-            self.owner_cache.invalidate(&key).await;
+            self.owner_cache_invalidate(&key).await;
         }
         still_valid
     }

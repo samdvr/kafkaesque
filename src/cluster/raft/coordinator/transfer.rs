@@ -48,8 +48,7 @@ impl PartitionTransferCoordinator for RaftCoordinator {
                 TransferResponse::PartitionTransferred { .. },
             ) => {
                 // Update cache to reflect new ownership
-                self.owner_cache
-                    .insert((Arc::from(topic), partition), to_broker_id)
+                self.owner_cache_insert((Arc::from(topic), partition), to_broker_id)
                     .await;
                 Ok(())
             }
@@ -130,7 +129,7 @@ impl PartitionTransferCoordinator for RaftCoordinator {
                         .iter()
                         .any(|(t, p, _)| t == &transfer.topic && *p == transfer.partition);
                     if !is_failed {
-                        self.owner_cache.insert(key, transfer.to_broker_id).await;
+                        self.owner_cache_insert(key, transfer.to_broker_id).await;
                     }
                 }
                 Ok((successful_transfers, failed_transfers))
@@ -169,8 +168,7 @@ impl PartitionTransferCoordinator for RaftCoordinator {
                 },
             ) => {
                 // Invalidate any cached ownership for this broker
-                self.owner_cache.invalidate_all();
-                self.owner_cache.run_pending_tasks().await;
+                self.owner_cache_invalidate_all().await;
                 Ok(released_partitions)
             }
             CoordinationResponse::TransferDomainResponse(

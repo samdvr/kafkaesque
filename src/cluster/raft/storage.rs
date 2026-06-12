@@ -18,7 +18,7 @@ use openraft::{
     StorageError, StorageIOError, StoredMembership, Vote,
 };
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use super::commands::CoordinationResponse;
 use super::state_machine::CoordinationStateMachine;
@@ -296,12 +296,14 @@ impl RaftStore {
                     .and_then(|s| s.to_str())
                     .and_then(|s| s.parse::<u64>().ok())
                 else {
-                    warn!(
-                        path = %path.display(),
-                        "Skipping Raft log file with unparseable index; \
-                         remove or rename to recover"
-                    );
-                    continue;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Raft log file has unparseable index in name {}; \
+                             remove or rename before restart",
+                            path.display()
+                        ),
+                    ));
                 };
 
                 let below_purge_floor = purged_index.is_some_and(|floor| idx <= floor);

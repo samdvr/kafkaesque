@@ -73,6 +73,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 use tokio::sync::{broadcast, watch};
+use tracing::Instrument;
 
 use crate::error::{Error, Result};
 
@@ -509,7 +510,8 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                     };
                     let force_rx = self.force_shutdown_tx.subscribe();
 
-                    self.data_runtime.spawn(async move {
+                    self.data_runtime.spawn(
+                        async move {
                         let _guard = guard;
                         let serve = async move {
                             let mut conn = ClientConnection::new_with_rate_limiter(stream, addr, rate_limiter);
@@ -537,7 +539,9 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                         // ConnectionGuard's Drop decrements active_connections
                         // and connections_per_ip — on normal completion,
                         // force-cancel, and panic alike.
-                    });
+                    }
+                    .instrument(tracing::info_span!("kafka_connection", client = %addr)),
+                    );
                 }
             }
         }
@@ -859,7 +863,8 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                     };
                     let force_rx = self.force_shutdown_tx.subscribe();
 
-                    self.data_runtime.spawn(async move {
+                    self.data_runtime.spawn(
+                        async move {
                         let _guard = guard;
                         let serve = async move {
                             // Bound the handshake: a client that connects and
@@ -916,7 +921,9 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                         // ConnectionGuard handles counter cleanup — on normal
                         // completion, handshake timeout, force-cancel, and
                         // panic alike.
-                    });
+                    }
+                    .instrument(tracing::info_span!("kafka_connection", client = %addr, tls = true)),
+                    );
                 }
             }
         }

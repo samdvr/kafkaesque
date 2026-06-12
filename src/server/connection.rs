@@ -234,6 +234,12 @@ async fn read_kafka_frame<S: AsyncRead + Unpin>(
         )));
     }
     let size = size as usize;
+    const MIN_REQUEST_BODY_SIZE: usize = 8; // api_key + api_version + correlation_id
+    if size < MIN_REQUEST_BODY_SIZE {
+        return Err(Error::MissingData(format!(
+            "Message size {size} is below minimum frame body size {MIN_REQUEST_BODY_SIZE}"
+        )));
+    }
     if size > max_message_size {
         return Err(Error::MissingData(format!(
             "Message size {size} exceeds maximum allowed size {max_message_size}"
@@ -1935,5 +1941,53 @@ mod tests {
         // Both should be reasonable durations (at least 1 second)
         assert!(read_timeout.as_secs() >= 1);
         assert!(handler_timeout.as_secs() >= 1);
+    }
+
+    #[tokio::test]
+    async fn read_kafka_frame_rejects_body_shorter_than_minimum() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&4i32.to_be_bytes()).await.unwrap();
+        client.write_all(&[0u8; 4]).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let result = read_kafka_frame_for_fuzz(&mut server, 1024).await;
+        assert!(
+            matches!(result, Err(Error::MissingData(_))),
+            "frames shorter than 8 bytes should be rejected before allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_kafka_frame_accepts_minimum_valid_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&8i32.to_be_bytes()).await.unwrap();
+        client.write_all(&[0u8; 8]).await.unwrap();
+
+        let frame = read_kafka_frame_for_fuzz(&mut server, 1024)
+            .await
+            .expect("minimum-size frame should parse");
+        assert_eq!(frame.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn read_kafka_frame_rejects_oversized_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        let max = 1024usize;
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client
+            .write_all(&((max + 1) as i32).to_be_bytes())
+            .await
+            .unwrap();
+
+        let result = read_kafka_frame_for_fuzz(&mut server, max).await;
+        assert!(
+            matches!(result, Err(Error::MissingData(_))),
+            "frames above max_message_size should be rejected before allocation"
+        );
     }
 }

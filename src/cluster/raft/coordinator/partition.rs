@@ -331,9 +331,7 @@ impl PartitionCoordinator for RaftCoordinator {
             .partition_domain
             .partitions
             .get(&(Arc::from(topic), partition))
-            .map(|p| {
-                p.owner_broker_id == Some(self.broker_id) && p.lease_expires_at_ms > now_ms
-            })
+            .map(|p| p.owner_broker_id == Some(self.broker_id) && p.lease_expires_at_ms > now_ms)
             .unwrap_or(false);
 
         if owns {

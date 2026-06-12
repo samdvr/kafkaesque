@@ -63,7 +63,11 @@ fn test_record_request() {
     let before = metrics::request_count_for_test("Produce", "success", "NONE");
     metrics::record_request_with_code("Produce", "success", "NONE", 0.1);
     let after = metrics::request_count_for_test("Produce", "success", "NONE");
-    assert_eq!(after, before + 1, "record_request_with_code should increment REQUEST_COUNT");
+    assert_eq!(
+        after,
+        before + 1,
+        "record_request_with_code should increment REQUEST_COUNT"
+    );
 
     metrics::record_request_with_code("Fetch", "error", "OFFSET_OUT_OF_RANGE", 0.5);
     let fetch_err = metrics::request_count_for_test("Fetch", "error", "OFFSET_OUT_OF_RANGE");

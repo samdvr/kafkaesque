@@ -205,7 +205,11 @@ impl BrokerRuntimes {
     /// instead of blocking the caller indefinitely. Use this from `main`
     /// during graceful shutdown to bound process exit latency.
     pub fn shutdown_timeout(self, timeout: std::time::Duration) {
-        let Self { control, data, handles: _ } = self;
+        let Self {
+            control,
+            data,
+            handles: _,
+        } = self;
         let half = timeout / 2;
         // Data plane first so it stops accepting new work, then control.
         data.shutdown_timeout(half);

@@ -247,8 +247,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             return (cached.clone(), partition);
         }
         let arc: Arc<str> = Arc::from(topic);
-        self.topic_name_cache
-            .insert(topic.to_string(), arc.clone());
+        self.topic_name_cache.insert(topic.to_string(), arc.clone());
         (arc, partition)
     }
 

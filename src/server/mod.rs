@@ -151,9 +151,7 @@ async fn try_reserve_connection_slots(
     // dropped on shutdown, leaving the per-IP counter stuck above the global
     // counter and producing false rejections under churn.
     {
-        let mut counts = connections_per_ip
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut counts = connections_per_ip.lock().unwrap_or_else(|e| e.into_inner());
         let current = counts.get(&ip).copied().unwrap_or(0);
         if current >= max_connections_per_ip {
             drop(counts);

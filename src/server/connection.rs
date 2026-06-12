@@ -187,10 +187,7 @@ fn encode_versioned_response_into_frame<F>(
 where
     F: FnOnce(&mut Vec<u8>) -> Result<()>,
 {
-    let flexible = matches!(
-        api_key.response_style(api_version),
-        ResponseStyle::Flexible
-    );
+    let flexible = matches!(api_key.response_style(api_version), ResponseStyle::Flexible);
     let header_len: usize = if flexible { 9 } else { 8 };
 
     let mut framed = Vec::with_capacity(header_len + 1024);
@@ -361,23 +358,27 @@ where
             } else {
                 read_timeout
             };
-            let read_result =
-                match timeout(effective_read_timeout, read_kafka_frame(reader, max_message_size)).await {
-                    Ok(result) => {
-                        is_first_frame = false;
-                        result
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            client = %client,
-                            connection = connection_label,
-                            timeout_secs = effective_read_timeout.as_secs(),
-                            first_frame = is_first_frame,
-                            "Request read timeout - closing connection"
-                        );
-                        return Err(Error::MissingData("Request read timeout".to_owned()));
-                    }
-                };
+            let read_result = match timeout(
+                effective_read_timeout,
+                read_kafka_frame(reader, max_message_size),
+            )
+            .await
+            {
+                Ok(result) => {
+                    is_first_frame = false;
+                    result
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        client = %client,
+                        connection = connection_label,
+                        timeout_secs = effective_read_timeout.as_secs(),
+                        first_frame = is_first_frame,
+                        "Request read timeout - closing connection"
+                    );
+                    return Err(Error::MissingData("Request read timeout".to_owned()));
+                }
+            };
 
             match read_result {
                 Ok((data, inflight_permit)) => {
@@ -1175,9 +1176,7 @@ impl AuthRateLimited for ClientConnection {
 /// A TLS client connection to the Kafka server.
 #[cfg(feature = "tls")]
 pub struct TlsClientConnection {
-    reader: tokio::io::BufReader<
-        tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
-    >,
+    reader: tokio::io::BufReader<tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>>,
     writer: tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>,
     addr: SocketAddr,
     /// Rate limiter for auth failures (optional for backwards compat)

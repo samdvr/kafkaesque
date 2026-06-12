@@ -33,7 +33,7 @@ pub fn parse_sasl_authenticate_request(
     _version: i16,
 ) -> IResult<NomBytes, SaslAuthenticateRequestData> {
     let (s, auth_len) = be_i32(s)?;
-    if auth_len < 0 || auth_len > MAX_SASL_AUTH_BYTES_SIZE {
+    if !(0..=MAX_SASL_AUTH_BYTES_SIZE).contains(&auth_len) {
         return Err(nom::Err::Error(nom::error::Error::new(
             s,
             nom::error::ErrorKind::Verify,

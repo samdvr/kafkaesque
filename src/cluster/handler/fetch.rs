@@ -96,10 +96,7 @@ pub(super) async fn handle_fetch(
         .collect();
     // Pre-arm a notification per watched partition. `Notified` is held
     // across the loop so a wake that fires before we await still counts.
-    let pre_armed: Vec<_> = watched
-        .iter()
-        .map(|n| Box::pin(n.notified()))
-        .collect();
+    let pre_armed: Vec<_> = watched.iter().map(|n| Box::pin(n.notified())).collect();
 
     // Validate topic names and authorize once per request — these results
     // are stable across long-poll iterations, but the previous version
@@ -249,8 +246,11 @@ async fn collect_fetch(
         partition: crate::server::request::FetchPartitionData,
     }
     let mut pending: Vec<PendingPartition> = Vec::new();
-    let mut topic_partitions: Vec<Vec<FetchPartitionResponse>> =
-        request.topics.iter().map(|t| Vec::with_capacity(t.partitions.len())).collect();
+    let mut topic_partitions: Vec<Vec<FetchPartitionResponse>> = request
+        .topics
+        .iter()
+        .map(|t| Vec::with_capacity(t.partitions.len()))
+        .collect();
 
     for (topic_idx, (topic, plan)) in request.topics.iter().zip(topic_plans.iter()).enumerate() {
         match plan {

@@ -158,15 +158,15 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   msrv:
-    name: MSRV Check (1.89)
+    name: MSRV Check (1.91)
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.89
-        uses: dtolnay/rust-toolchain@1.89
+      - name: Install Rust 1.91
+        uses: dtolnay/rust-toolchain@1.91
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -269,7 +269,7 @@ jobs:
         with:
           image-ref: kafkaesque:ci
           format: table
-          exit-code: '1'
+          exit-code: "1"
           ignore-unfixed: true
           severity: CRITICAL,HIGH
 
@@ -320,7 +320,7 @@ jobs:
           for target_path in fuzz/fuzz_targets/*.rs; do
             target=$(basename "$target_path" .rs)
             echo "::group::fuzz-smoke $target"
-            cargo fuzz run "$target" -- -max_total_time=300
+            cargo +nightly fuzz run "$target" -- -max_total_time=300
             echo "::endgroup::"
           done
 

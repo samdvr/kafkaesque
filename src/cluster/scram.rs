@@ -59,7 +59,10 @@ pub const MIN_ITERATIONS: u32 = 4_096;
 /// client expects.
 pub fn configured_iterations() -> u32 {
     match std::env::var("SASL_SCRAM_ITERATIONS") {
-        Ok(s) => s.parse::<u32>().unwrap_or(DEFAULT_ITERATIONS).max(MIN_ITERATIONS),
+        Ok(s) => s
+            .parse::<u32>()
+            .unwrap_or(DEFAULT_ITERATIONS)
+            .max(MIN_ITERATIONS),
         Err(_) => DEFAULT_ITERATIONS,
     }
 }

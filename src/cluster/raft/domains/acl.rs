@@ -160,9 +160,10 @@ impl AclBinding {
         // `host.parse::<IpAddr>()` comparisons hit. Without this an ACL bound
         // to `1.2.3.4` silently misses a connection presented as
         // `::ffff:1.2.3.4` (common on dual-stack hosts).
-        if let (Ok(rule_ip), Ok(host_ip)) =
-            (self.host.parse::<std::net::IpAddr>(), host.parse::<std::net::IpAddr>())
-        {
+        if let (Ok(rule_ip), Ok(host_ip)) = (
+            self.host.parse::<std::net::IpAddr>(),
+            host.parse::<std::net::IpAddr>(),
+        ) {
             let rule_canonical = match rule_ip {
                 std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
                     Some(v4) => std::net::IpAddr::V4(v4),

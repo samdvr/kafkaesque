@@ -126,8 +126,8 @@ define_histogram_vec!(
         // partition is in the 100–800 µs range, so a histogram starting at
         // 1ms collapses every quick request into the first bucket and the
         // SRE loses all signal on tail-latency regressions.
-        0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
-        0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+        0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+        5.0, 10.0
     ]
 );
 define_counter_vec!(
@@ -1520,9 +1520,7 @@ pub(crate) fn bounded_principal_label(principal: &str) -> String {
     if max_cardinality == 0 {
         return principal.to_string();
     }
-    let mut tracked = TRACKED_PRINCIPALS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut tracked = TRACKED_PRINCIPALS.lock().unwrap_or_else(|e| e.into_inner());
     if tracked.contains(principal) {
         return principal.to_string();
     }
@@ -1668,9 +1666,7 @@ pub fn record_idempotency_rejection(reason: &str) {
 /// * `partition` - The partition index
 pub fn record_epoch_mismatch(topic: &str, partition: i32) {
     let (t, p) = bounded_partition_label(topic, partition);
-    EPOCH_MISMATCH_DETECTIONS
-        .with_label_values(&[&t, &p])
-        .inc();
+    EPOCH_MISMATCH_DETECTIONS.with_label_values(&[&t, &p]).inc();
 }
 
 /// Record a cache lookup operation.

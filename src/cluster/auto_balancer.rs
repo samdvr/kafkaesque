@@ -622,7 +622,11 @@ impl AutoBalancer {
             }
         }
 
-        candidates.sort_by(|a, b| b.priority.partial_cmp(&a.priority).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.priority
+                .partial_cmp(&a.priority)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         candidates.truncate(self.config.max_partitions_per_cycle);
 
         candidates

@@ -45,11 +45,7 @@ pub fn parse_fetch_request(s: NomBytes, version: i16) -> IResult<NomBytes, Fetch
     } else {
         (s, i32::MAX)
     };
-    let (s, isolation_level) = if version >= 4 {
-        be_i8(s)?
-    } else {
-        (s, 0)
-    };
+    let (s, isolation_level) = if version >= 4 { be_i8(s)? } else { (s, 0) };
     let (s, topics) = parse_array(parse_fetch_topic)(s)?;
 
     Ok((

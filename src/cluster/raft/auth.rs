@@ -645,7 +645,8 @@ mod tests {
 
     #[test]
     fn configured_keys_reject_unsigned() {
-        let keys = RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
+        let keys =
+            RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
         let payload = b"hello";
         let tag = [0u8; HMAC_LEN];
         let err = keys
@@ -656,7 +657,8 @@ mod tests {
 
     #[test]
     fn cluster_signed_roundtrip() {
-        let keys = RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
+        let keys =
+            RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
         let payload = b"vote-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
@@ -667,7 +669,8 @@ mod tests {
 
     #[test]
     fn cluster_signed_rejects_tamper() {
-        let keys = RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
+        let keys =
+            RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
         let payload = b"vote-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
@@ -682,7 +685,8 @@ mod tests {
 
     #[test]
     fn cluster_signed_rejects_replay() {
-        let keys = RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
+        let keys =
+            RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
         let payload = b"vote-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
@@ -701,7 +705,10 @@ mod tests {
         // Signing with Cluster but presenting as Join must not validate, even
         // when both keys exist (this is why we mix the purpose byte into the
         // HMAC input).
-        let keys = RaftAuthKeys::from_strings(Some("clusterkey-with-32-bytes-minimum-len".into()), Some("joinkey-with-32-bytes-minimum-len-padding".into()));
+        let keys = RaftAuthKeys::from_strings(
+            Some("clusterkey-with-32-bytes-minimum-len".into()),
+            Some("joinkey-with-32-bytes-minimum-len-padding".into()),
+        );
         let payload = b"join-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
@@ -721,7 +728,8 @@ mod tests {
 
     #[test]
     fn join_falls_back_to_cluster_secret_when_token_missing() {
-        let keys = RaftAuthKeys::from_strings(Some("clusterkey-with-32-bytes-minimum-len".into()), None);
+        let keys =
+            RaftAuthKeys::from_strings(Some("clusterkey-with-32-bytes-minimum-len".into()), None);
         let payload = b"join-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
@@ -740,7 +748,8 @@ mod tests {
     #[tokio::test]
     async fn frame_roundtrip_over_pipe() {
         use tokio::io::duplex;
-        let keys = RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
+        let keys =
+            RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
         let (mut a, mut b) = duplex(1024);
         let payload = b"hello-raft".to_vec();
 

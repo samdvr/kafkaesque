@@ -879,15 +879,9 @@ impl RebalanceCoordinator {
             };
 
             for broker_id in to_retry {
-                info!(
-                    broker_id,
-                    "Driving broker failure handling"
-                );
+                info!(broker_id, "Driving broker failure handling");
 
-                match self
-                    .handle_broker_failure(broker_id, &*executor)
-                    .await
-                {
+                match self.handle_broker_failure(broker_id, &*executor).await {
                     Ok(_) => {
                         self.pending_failovers.lock().await.remove(&broker_id);
                     }

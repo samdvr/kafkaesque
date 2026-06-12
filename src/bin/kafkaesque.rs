@@ -244,8 +244,7 @@ async fn run_broker(
                     // health endpoint doesn't silently leave K8s liveness
                     // probes passing at the LB while the metrics endpoint
                     // is dead and nothing logs.
-                    if let Err(panic_payload) =
-                        AssertUnwindSafe(server.run()).catch_unwind().await
+                    if let Err(panic_payload) = AssertUnwindSafe(server.run()).catch_unwind().await
                     {
                         tracing::error!(
                             task = "health_server",

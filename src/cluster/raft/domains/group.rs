@@ -348,9 +348,11 @@ impl GroupDomainState {
                 // member entry every join, bloating the group and the
                 // generation counter.
                 let final_member_id = if member_id.is_empty() {
-                    if let Some(existing) = group.members.values().find(|m| {
-                        m.client_id == client_id && m.client_host == client_host
-                    }) {
+                    if let Some(existing) = group
+                        .members
+                        .values()
+                        .find(|m| m.client_id == client_id && m.client_host == client_host)
+                    {
                         existing.member_id.clone()
                     } else {
                         format!("{}-{}-{}", client_id, timestamp_ms, group.members.len())

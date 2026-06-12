@@ -563,7 +563,9 @@ impl PartitionStore {
         // producer recovers from by retrying (idempotent producers de-dup
         // by sequence number; non-idempotent producers accept Kafka's
         // standard "may duplicate on error" contract).
-        let base_offset = self.next_offset.fetch_add(record_count as i64, Ordering::SeqCst);
+        let base_offset = self
+            .next_offset
+            .fetch_add(record_count as i64, Ordering::SeqCst);
 
         // Parse producer info once; reused by both the idempotency check here
         // and the producer-state persistence below (previously parsed twice
@@ -1354,7 +1356,9 @@ impl PartitionStore {
     ///
     /// Returns the number of deleted batches.
     pub async fn apply_retention(&self, retention_ms: i64, now_ms: i64) -> SlateDBResult<u64> {
-        use super::keys::{LEADER_EPOCH_KEY, decode_leader_epoch, decode_record_offset, parse_batch_max_timestamp};
+        use super::keys::{
+            LEADER_EPOCH_KEY, decode_leader_epoch, decode_record_offset, parse_batch_max_timestamp,
+        };
 
         if retention_ms <= 0 {
             return Ok(0); // Retention disabled

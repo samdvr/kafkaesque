@@ -287,10 +287,7 @@ impl SaslProvider {
             let mut hasher = Sha256::new();
             hasher.update(username.as_bytes());
             let hash = hasher.finalize();
-            let prefix: String = hash[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
+            let prefix: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
             info!(username_hash_prefix = %prefix, "SASL PLAIN authentication successful");
             (true, Some(username.to_string()))
         } else {
@@ -305,10 +302,7 @@ impl SaslProvider {
             let mut hasher = Sha256::new();
             hasher.update(username.as_bytes());
             let hash = hasher.finalize();
-            let prefix: String = hash[..8]
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect();
+            let prefix: String = hash[..8].iter().map(|b| format!("{:02x}", b)).collect();
             warn!(
                 username_hash_prefix = %prefix,
                 "SASL PLAIN authentication failed"

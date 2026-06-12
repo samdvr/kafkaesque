@@ -26,7 +26,7 @@ use once_cell::sync::Lazy;
 use tokio::sync::Semaphore;
 
 use crate::error::KafkaCode;
-use crate::protocol::{parse_producer_info, validate_batch_crc_async, CrcValidationResult};
+use crate::protocol::{CrcValidationResult, parse_producer_info, validate_batch_crc_async};
 use crate::server::RequestContext;
 use crate::server::request::{ApiKey, ProducePartitionData, ProduceRequestData};
 use crate::server::response::{
@@ -168,11 +168,7 @@ pub(super) async fn handle_produce(
                     acks = 0,
                     "ACL denied: dropped acks=0 produce"
                 );
-                crate::cluster::metrics::record_acl_denial(
-                    &ctx.principal,
-                    "Produce",
-                    "Topic",
-                );
+                crate::cluster::metrics::record_acl_denial(&ctx.principal, "Produce", "Topic");
                 crate::cluster::metrics::record_produce_dropped(
                     "acl_denied",
                     topic.partitions.len() as u64,
@@ -448,7 +444,11 @@ impl SlateDBClusterHandler {
         } else {
             "error"
         };
-        crate::cluster::metrics::record_produce_latency(topic, status, start.elapsed().as_secs_f64());
+        crate::cluster::metrics::record_produce_latency(
+            topic,
+            status,
+            start.elapsed().as_secs_f64(),
+        );
         response
     }
 

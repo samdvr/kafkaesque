@@ -12,6 +12,9 @@ documentation = "https://docs.rs/kafkaesque"
 keywords = ["kafka", "redpanda", "server", "protocol"]
 categories = ["network-programming"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [features]
 default = []
 tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
@@ -109,7 +112,7 @@ crc32c = "0.6.8"
 
 [dev-dependencies]
 tempfile = "3.8"
-rdkafka = { version = "0.38.0", features = ["cmake-build"] }
+rdkafka = "0.38.0"
 serial_test = "3.2"
 kafkaesque = { path = ".", features = ["test-utilities"] }
 criterion = { version = "0.8.1", features = ["html_reports"] }

@@ -89,9 +89,6 @@ pub struct SlateDBClusterHandler {
     /// Cache for topic name Arc<str> allocations to reduce hot path allocations.
     topic_name_cache: Cache<String, Arc<str>>,
 
-    /// Runtime handle for spawning data plane tasks (fire-and-forget produce).
-    pub(crate) data_runtime: tokio::runtime::Handle,
-
     /// Whether SASL must complete before any non-handshake API key is served.
     /// Mirrors `ClusterConfig::sasl_required`. The connection-accept loop
     /// reads this via `Handler::sasl_required` and arms the per-connection
@@ -485,7 +482,6 @@ impl SlateDBClusterHandler {
             max_concurrent_partition_writes: config.max_concurrent_partition_writes,
             max_concurrent_partition_reads: config.max_concurrent_partition_reads,
             topic_name_cache: Cache::new(10_000),
-            data_runtime: runtime_handles.data,
             sasl_required: config.sasl_required,
             authorizer,
             hwm_notifiers: dashmap::DashMap::new(),
@@ -621,10 +617,11 @@ impl SlateDBClusterHandler {
     /// `get_partition_owner` calls — at e.g. 1 ms per Raft read this turned
     /// a 1k-partition Metadata refresh into a 1-second sequential stall.
     pub(crate) async fn build_topic_metadata(&self, topic: &str) -> TopicMetadata {
-        let owners = match self.coordinator.get_partition_owners(topic).await {
-            Ok(o) => o,
-            Err(_) => Vec::new(),
-        };
+        let owners = self
+            .coordinator
+            .get_partition_owners(topic)
+            .await
+            .unwrap_or_default();
 
         // Fall back to `get_partition_count` only if the bulk read returned
         // nothing — e.g. an unknown topic, or a coordinator backend that
@@ -685,7 +682,6 @@ impl SlateDBClusterHandler {
             partitions,
         }
     }
-
 }
 
 #[async_trait]

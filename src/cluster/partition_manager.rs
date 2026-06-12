@@ -102,6 +102,9 @@ pub struct PartitionManager<C: ClusterCoordinator> {
     /// - When entering zombie mode
     lease_cache: Arc<DashMap<PartitionKey, Instant>>,
 
+    /// Cached `Arc<str>` topic names to avoid per-lookup allocations.
+    topic_name_cache: Arc<DashMap<String, Arc<str>>>,
+
     /// Rebalance coordinator for fast failover and auto-balancing.
     ///
     /// This is responsible for:
@@ -208,6 +211,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             shutdown_tx,
             zombie_state: Arc::new(ZombieModeState::new()),
             lease_cache: Arc::new(DashMap::new()),
+            topic_name_cache: Arc::new(DashMap::new()),
             rebalance_coordinator,
             rebalance_task_handles: RwLock::new(None),
             control_runtime,
@@ -236,6 +240,16 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
 
     pub fn config(&self) -> &ClusterConfig {
         &self.config
+    }
+
+    fn partition_key(&self, topic: &str, partition: i32) -> PartitionKey {
+        if let Some(cached) = self.topic_name_cache.get(topic) {
+            return (cached.clone(), partition);
+        }
+        let arc: Arc<str> = Arc::from(topic);
+        self.topic_name_cache
+            .insert(topic.to_string(), arc.clone());
+        (arc, partition)
     }
 
     pub fn coordinator(&self) -> &Arc<C> {
@@ -1152,7 +1166,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                 })?;
 
         // Fast path: Check lease cache first to avoid Raft overhead
-        let cache_key: PartitionKey = (Arc::from(topic), partition);
+        let cache_key = self.partition_key(topic, partition);
         if let Some(cached_expiry) = self.lease_cache.get(&cache_key) {
             let now = Instant::now();
             if *cached_expiry > now {

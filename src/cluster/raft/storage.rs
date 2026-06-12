@@ -18,7 +18,7 @@ use openraft::{
     StorageError, StorageIOError, StoredMembership, Vote,
 };
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::commands::CoordinationResponse;
 use super::state_machine::CoordinationStateMachine;
@@ -296,6 +296,11 @@ impl RaftStore {
                     .and_then(|s| s.to_str())
                     .and_then(|s| s.parse::<u64>().ok())
                 else {
+                    warn!(
+                        path = %path.display(),
+                        "Skipping Raft log file with unparseable index; \
+                         remove or rename to recover"
+                    );
                     continue;
                 };
 
@@ -763,7 +768,12 @@ impl RaftStore {
         let data_object = format!("gen-{}-{}.snapshot", meta.snapshot_id, uuid::Uuid::new_v4());
         let data_path = ObjectPath::from(format!("{}/{}", self.snapshot_path, data_object));
 
-        // Step 1: write the new generation's data object.
+        // Hold the pointer lock across the data write so concurrent persists
+        // cannot orphan generation objects racing on the commit point.
+        let mut pointer_guard = self.snapshot_pointer.write().await;
+        let previous = pointer_guard.as_ref().map(|p| p.current.clone());
+        let evicted = pointer_guard.as_ref().and_then(|p| p.previous.clone());
+
         self.object_store
             .put(&data_path, Bytes::copy_from_slice(data).into())
             .await
@@ -775,12 +785,6 @@ impl RaftStore {
                     std::io::Error::other(e.to_string()),
                 )
             })?;
-
-        // Step 2: commit by overwriting the pointer. Hold the pointer lock
-        // across the PUT so concurrent persists serialize.
-        let mut pointer_guard = self.snapshot_pointer.write().await;
-        let previous = pointer_guard.as_ref().map(|p| p.current.clone());
-        let evicted = pointer_guard.as_ref().and_then(|p| p.previous.clone());
 
         let new_pointer = SnapshotPointer {
             current: SnapshotPointerEntry {
@@ -1020,36 +1024,23 @@ impl RaftStorage<TypeConfig> for RaftStore {
         let mut responses = Vec::new();
 
         for entry in entries {
-            // Hold the `last_applied_log` write guard across the apply so a
-            // concurrent `build_snapshot` (which takes `last_applied_log` as
-            // a read guard before serializing state) cannot witness state
-            // that includes this apply but a `last_applied_log` index that
-            // excludes it, or vice versa. The mutation runs FIRST, then the
-            // index advances under the same guard — a cancellation or panic
-            // before the index update simply re-applies on restart, which is
-            // safe given Raft re-delivery semantics.
-            let mut last_applied_guard = self.last_applied_log.write().await;
-
-            match &entry.payload {
-                EntryPayload::Blank => {
-                    *last_applied_guard = Some(entry.log_id);
-                    responses.push(CoordinationResponse::Ok);
-                }
+            let response = match &entry.payload {
+                EntryPayload::Blank => CoordinationResponse::Ok,
                 EntryPayload::Normal(command) => {
                     let sm = self.sm.read().await;
                     let response = sm.apply_command(command.clone()).await;
-                    *last_applied_guard = Some(entry.log_id);
                     drop(sm);
-                    responses.push(response);
+                    response
                 }
                 EntryPayload::Membership(membership) => {
                     *self.last_membership.write().await =
                         StoredMembership::new(Some(entry.log_id), membership.clone());
-                    *last_applied_guard = Some(entry.log_id);
-                    responses.push(CoordinationResponse::Ok);
+                    CoordinationResponse::Ok
                 }
-            }
-            drop(last_applied_guard);
+            };
+
+            *self.last_applied_log.write().await = Some(entry.log_id);
+            responses.push(response);
         }
 
         Ok(responses)

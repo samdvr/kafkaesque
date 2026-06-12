@@ -7,6 +7,7 @@ use nom::{
 };
 use nombytes::NomBytes;
 
+use crate::constants::MAX_MEMBER_METADATA_SIZE;
 use crate::parser::{parse_array, parse_kafka_string};
 
 // ============================================================================
@@ -97,7 +98,7 @@ pub fn parse_join_group_request(
 fn parse_join_group_protocol(s: NomBytes) -> IResult<NomBytes, JoinGroupProtocolData> {
     let (s, name) = parse_kafka_string(s)?;
     let (s, metadata_len) = be_i32(s)?;
-    if metadata_len < 0 {
+    if metadata_len < 0 || metadata_len as usize > MAX_MEMBER_METADATA_SIZE {
         return Err(nom::Err::Error(nom::error::Error::new(
             s,
             nom::error::ErrorKind::Verify,
@@ -213,7 +214,7 @@ pub fn parse_sync_group_request(
 fn parse_sync_group_assignment(s: NomBytes) -> IResult<NomBytes, SyncGroupAssignmentData> {
     let (s, member_id) = parse_kafka_string(s)?;
     let (s, assignment_len) = be_i32(s)?;
-    if assignment_len < 0 {
+    if assignment_len < 0 || assignment_len as usize > MAX_MEMBER_METADATA_SIZE {
         return Err(nom::Err::Error(nom::error::Error::new(
             s,
             nom::error::ErrorKind::Verify,

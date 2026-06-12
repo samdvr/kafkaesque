@@ -321,8 +321,9 @@ async fn write_kafka_frame<S: AsyncWrite + Unpin>(
 
 /// Shared request loop for plain and TLS connections.
 #[allow(clippy::too_many_arguments)]
-async fn serve_connection_requests<H, S>(
-    stream: &mut S,
+async fn serve_connection_requests<H, R, W>(
+    reader: &mut R,
+    writer: &mut W,
     client: SocketAddr,
     max_message_size: usize,
     handler: Arc<H>,
@@ -333,7 +334,8 @@ async fn serve_connection_requests<H, S>(
 ) -> Result<()>
 where
     H: Handler,
-    S: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
     let read_timeout = Duration::from_secs(DEFAULT_REQUEST_READ_TIMEOUT_SECS);
     let handler_timeout = Duration::from_secs(DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS);
@@ -354,7 +356,7 @@ where
                 read_timeout
             };
             let read_result =
-                match timeout(effective_read_timeout, read_kafka_frame(stream, max_message_size)).await {
+                match timeout(effective_read_timeout, read_kafka_frame(reader, max_message_size)).await {
                     Ok(result) => {
                         is_first_frame = false;
                         result
@@ -400,7 +402,7 @@ where
                     .await;
 
                     match dispatch_result {
-                        Ok(Ok(response)) => write_kafka_frame(stream, &response, client).await?,
+                        Ok(Ok(response)) => write_kafka_frame(writer, &response, client).await?,
                         Ok(Err(e)) => {
                             tracing::error!(
                                 client = %client,
@@ -412,16 +414,10 @@ where
                                 && let Ok(err_resp) =
                                     encode_wire_error_response(cid, KafkaCode::InvalidRequest)
                             {
-                                let _ = write_kafka_frame(stream, &err_resp, client).await;
-                                // Flush and shutdown the write half so the
-                                // client actually receives the typed error
-                                // before our connection close races a TCP
-                                // RST: without this the client may see only
-                                // the RST and log the request as a transport
-                                // bug rather than the typed Kafka code.
+                                let _ = write_kafka_frame(writer, &err_resp, client).await;
                                 use tokio::io::AsyncWriteExt;
-                                let _ = stream.flush().await;
-                                let _ = stream.shutdown().await;
+                                let _ = writer.flush().await;
+                                let _ = writer.shutdown().await;
                             }
                             return Err(e);
                         }
@@ -436,7 +432,10 @@ where
                                 && let Ok(err_resp) =
                                     encode_wire_error_response(cid, KafkaCode::RequestTimedOut)
                             {
-                                let _ = write_kafka_frame(stream, &err_resp, client).await;
+                                let _ = write_kafka_frame(writer, &err_resp, client).await;
+                                use tokio::io::AsyncWriteExt;
+                                let _ = writer.flush().await;
+                                let _ = writer.shutdown().await;
                             }
                             return Err(Error::MissingData("Request handler timeout".to_owned()));
                         }
@@ -676,6 +675,19 @@ async fn dispatch_request_common<H: Handler>(
 
     let request = match Request::parse(data.clone()) {
         Ok(r) => r,
+        Err(Error::TrailingBytes) => {
+            tracing::warn!(
+                client = %client_addr,
+                "Rejecting request with trailing bytes after body parse"
+            );
+            if let Some(correlation_id) = peek_correlation_id(&data) {
+                return (
+                    encode_wire_error_response(correlation_id, KafkaCode::InvalidRequest),
+                    AuthResult::NotAuth,
+                );
+            }
+            return (Err(Error::TrailingBytes), AuthResult::NotAuth);
+        }
         Err(e) => {
             tracing::error!(
                 client = %client_addr,
@@ -719,17 +731,24 @@ async fn dispatch_request_common<H: Handler>(
     // matching real Kafka's identity for a non-SASL connection. ACL
     // bindings against `User:ANONYMOUS` let operators allow specific things
     // through without enabling SASL.
-    let principal = auth_gate
+    let principal: Arc<str> = auth_gate
         .principal
-        .clone()
-        .unwrap_or_else(|| "User:ANONYMOUS".to_string());
-    let client_host = client_addr.ip().to_string();
+        .as_deref()
+        .map(Arc::from)
+        .unwrap_or_else(|| Arc::from("User:ANONYMOUS"));
+    let client_host: Arc<str> = Arc::from(client_addr.ip().to_string());
+
+    let request_id = if tracing::enabled!(tracing::Level::DEBUG) {
+        uuid::Uuid::new_v4()
+    } else {
+        uuid::Uuid::nil()
+    };
 
     let ctx = RequestContext {
         client_addr,
         api_version: header.api_version,
         client_id: header.client_id.clone(),
-        request_id: uuid::Uuid::new_v4(),
+        request_id,
         principal,
         client_host,
         transport_tls,
@@ -1032,7 +1051,8 @@ fn principal_from_sasl_plain(auth_bytes: &[u8]) -> Option<String> {
 
 /// A client connection to the Kafka server.
 pub struct ClientConnection {
-    stream: TcpStream,
+    reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: tokio::net::tcp::OwnedWriteHalf,
     addr: SocketAddr,
     /// Rate limiter for auth failures (optional for backwards compat)
     rate_limiter: Option<Arc<AuthRateLimiter>>,
@@ -1047,8 +1067,10 @@ pub struct ClientConnection {
 impl ClientConnection {
     /// Create a new client connection (without rate limiter).
     pub fn new(stream: TcpStream, addr: SocketAddr) -> Self {
+        let (read_half, write_half) = stream.into_split();
         Self {
-            stream,
+            reader: tokio::io::BufReader::with_capacity(64 * 1024, read_half),
+            writer: write_half,
             addr,
             rate_limiter: None,
             auth_gate: AuthGate::default(),
@@ -1065,8 +1087,10 @@ impl ClientConnection {
         addr: SocketAddr,
         rate_limiter: Arc<AuthRateLimiter>,
     ) -> Self {
+        let (read_half, write_half) = stream.into_split();
         Self {
-            stream,
+            reader: tokio::io::BufReader::with_capacity(64 * 1024, read_half),
+            writer: write_half,
             addr,
             rate_limiter: Some(rate_limiter),
             auth_gate: AuthGate::default(),
@@ -1118,7 +1142,8 @@ impl ClientConnection {
 
     async fn handle_requests_inner<H: Handler>(&mut self, handler: Arc<H>) -> Result<()> {
         serve_connection_requests(
-            &mut self.stream,
+            &mut self.reader,
+            &mut self.writer,
             self.addr,
             self.max_message_size,
             handler,
@@ -1144,7 +1169,10 @@ impl AuthRateLimited for ClientConnection {
 /// A TLS client connection to the Kafka server.
 #[cfg(feature = "tls")]
 pub struct TlsClientConnection {
-    stream: TlsStream<TcpStream>,
+    reader: tokio::io::BufReader<
+        tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
+    >,
+    writer: tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>,
     addr: SocketAddr,
     /// Rate limiter for auth failures (optional for backwards compat)
     rate_limiter: Option<Arc<AuthRateLimiter>>,
@@ -1160,8 +1188,10 @@ impl TlsClientConnection {
     /// Create a new TLS client connection (without rate limiter).
     #[allow(dead_code)]
     pub fn new(stream: TlsStream<TcpStream>, addr: SocketAddr) -> Self {
+        let (read_half, write_half) = tokio::io::split(stream);
         Self {
-            stream,
+            reader: tokio::io::BufReader::with_capacity(64 * 1024, read_half),
+            writer: write_half,
             addr,
             rate_limiter: None,
             auth_gate: AuthGate::default(),
@@ -1178,8 +1208,10 @@ impl TlsClientConnection {
         addr: SocketAddr,
         rate_limiter: Arc<AuthRateLimiter>,
     ) -> Self {
+        let (read_half, write_half) = tokio::io::split(stream);
         Self {
-            stream,
+            reader: tokio::io::BufReader::with_capacity(64 * 1024, read_half),
+            writer: write_half,
             addr,
             rate_limiter: Some(rate_limiter),
             auth_gate: AuthGate::default(),
@@ -1213,7 +1245,8 @@ impl TlsClientConnection {
 
     async fn handle_requests_inner<H: Handler>(&mut self, handler: Arc<H>) -> Result<()> {
         serve_connection_requests(
-            &mut self.stream,
+            &mut self.reader,
+            &mut self.writer,
             self.addr,
             self.max_message_size,
             handler,

@@ -8,6 +8,7 @@ use kafkaesque::error::KafkaCode;
 use kafkaesque::server::request::*;
 use kafkaesque::server::{Handler, RequestContext};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// A minimal handler implementation that uses all default methods.
 struct DefaultHandler;
@@ -22,8 +23,8 @@ fn create_context() -> RequestContext {
         api_version: 8,
         client_id: Some("test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),
-        principal: "User:ANONYMOUS".to_string(),
-        client_host: "127.0.0.1".to_string(),
+        principal: Arc::from("User:ANONYMOUS"),
+        client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
     }
 }

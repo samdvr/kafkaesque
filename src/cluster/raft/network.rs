@@ -941,7 +941,13 @@ impl RaftRpcServer {
     }
 
     /// Start the RPC server.
-    pub async fn run(self) -> Result<(), std::io::Error> {
+    ///
+    /// Stops accepting new connections when `shutdown` fires. In-flight
+    /// connection tasks continue until they finish naturally.
+    pub async fn run(
+        self,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> Result<(), std::io::Error> {
         use std::collections::HashMap;
         use std::net::IpAddr;
         use std::sync::Mutex as StdMutex;
@@ -977,69 +983,76 @@ impl RaftRpcServer {
             Arc::new(StdMutex::new(HashMap::new()));
 
         loop {
-            let (stream, peer_addr) = listener.accept().await?;
-            let raft = self.raft.clone();
-            let auth_keys = self.auth_keys.clone();
-            let tls = self.tls.clone();
-            let accept_semaphore = accept_semaphore.clone();
-            let per_ip_counts = per_ip_counts.clone();
-            let peer_ip = peer_addr.ip();
-
-            // Per-IP gate: drop the connection synchronously on overflow so
-            // we never spawn a task for a known-flooding peer.
-            let per_ip_admitted = {
-                let mut counts = per_ip_counts.lock().unwrap_or_else(|e| e.into_inner());
-                let n = counts.entry(peer_ip).or_insert(0);
-                if *n >= MAX_PER_IP {
-                    tracing::warn!(peer = %peer_addr, "Rejecting Raft RPC: per-IP connection cap reached");
-                    false
-                } else {
-                    *n += 1;
-                    true
+            tokio::select! {
+                biased;
+                _ = shutdown.recv() => {
+                    tracing::info!(addr = %self.listen_addr, "Raft RPC server shutting down");
+                    return Ok(());
                 }
-            };
-            if !per_ip_admitted {
-                continue;
-            }
+                accept_result = listener.accept() => {
+                    let (stream, peer_addr) = match accept_result {
+                        Ok(v) => v,
+                        Err(e) => return Err(e),
+                    };
+                    let raft = self.raft.clone();
+                    let auth_keys = self.auth_keys.clone();
+                    let tls = self.tls.clone();
+                    let accept_semaphore = accept_semaphore.clone();
+                    let per_ip_counts = per_ip_counts.clone();
+                    let peer_ip = peer_addr.ip();
 
-            self.runtime.spawn(async move {
-                // Limit concurrent in-flight TLS handshakes globally.
-                let _accept_permit = match accept_semaphore.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return, // semaphore closed; runtime tearing down
-                };
-                // Decrement the per-IP counter when this task ends, no matter
-                // how it ends (normal return, panic, drop on shutdown).
-                struct PerIpGuard {
-                    counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
-                    ip: IpAddr,
-                }
-                impl Drop for PerIpGuard {
-                    fn drop(&mut self) {
-                        let mut c = self.counts.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(n) = c.get_mut(&self.ip) {
-                            *n = n.saturating_sub(1);
-                            if *n == 0 {
-                                c.remove(&self.ip);
+                    let per_ip_admitted = {
+                        let mut counts = per_ip_counts.lock().unwrap_or_else(|e| e.into_inner());
+                        let n = counts.entry(peer_ip).or_insert(0);
+                        if *n >= MAX_PER_IP {
+                            tracing::warn!(peer = %peer_addr, "Rejecting Raft RPC: per-IP connection cap reached");
+                            false
+                        } else {
+                            *n += 1;
+                            true
+                        }
+                    };
+                    if !per_ip_admitted {
+                        continue;
+                    }
+
+                    self.runtime.spawn(async move {
+                        let _accept_permit = match accept_semaphore.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        struct PerIpGuard {
+                            counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+                            ip: IpAddr,
+                        }
+                        impl Drop for PerIpGuard {
+                            fn drop(&mut self) {
+                                let mut c = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(n) = c.get_mut(&self.ip) {
+                                    *n = n.saturating_sub(1);
+                                    if *n == 0 {
+                                        c.remove(&self.ip);
+                                    }
+                                }
                             }
                         }
-                    }
+                        let _ip_guard = PerIpGuard {
+                            counts: per_ip_counts.clone(),
+                            ip: peer_ip,
+                        };
+                        let wrapped = match Self::accept_stream(stream, tls.as_ref()).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!(peer = %peer_addr, error = %e, "Raft TLS accept failed");
+                                return;
+                            }
+                        };
+                        if let Err(e) = Self::handle_connection(raft, wrapped, auth_keys).await {
+                            tracing::warn!(peer = %peer_addr, error = %e, "Error handling Raft RPC");
+                        }
+                    });
                 }
-                let _ip_guard = PerIpGuard {
-                    counts: per_ip_counts.clone(),
-                    ip: peer_ip,
-                };
-                let wrapped = match Self::accept_stream(stream, tls.as_ref()).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(peer = %peer_addr, error = %e, "Raft TLS accept failed");
-                        return;
-                    }
-                };
-                if let Err(e) = Self::handle_connection(raft, wrapped, auth_keys).await {
-                    tracing::warn!(peer = %peer_addr, error = %e, "Error handling Raft RPC");
-                }
-            });
+            }
         }
     }
 

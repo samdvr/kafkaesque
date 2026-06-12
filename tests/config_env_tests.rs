@@ -659,6 +659,9 @@ fn test_from_env_validates_config() {
 // Security Posture Tests (secure-by-default startup gate)
 // ============================================================================
 
+/// Must meet `RaftAuthKeys`' minimum secret length (32 bytes).
+const TEST_RAFT_CLUSTER_SECRET: &str = "test-raft-cluster-secret-32-bytes-min!!";
+
 #[test]
 fn test_from_env_default_profile_requires_raft_cluster_secret() {
     // No CLUSTER_PROFILE => production posture => secret required.
@@ -712,7 +715,7 @@ fn test_from_env_production_profile_with_secret_succeeds() {
             ("HOST", "localhost"),
             ("PORT", "9092"),
             ("CLUSTER_PROFILE", "production"),
-            ("RAFT_CLUSTER_SECRET", "test-secret-value"),
+            ("RAFT_CLUSTER_SECRET", TEST_RAFT_CLUSTER_SECRET),
             ("ACL_ENABLED", "true"),
         ],
         || {
@@ -731,7 +734,7 @@ fn test_from_env_production_open_broker_rejected() {
             ("HOST", "localhost"),
             ("PORT", "9092"),
             ("CLUSTER_PROFILE", "production"),
-            ("RAFT_CLUSTER_SECRET", "test-secret-value"),
+            ("RAFT_CLUSTER_SECRET", TEST_RAFT_CLUSTER_SECRET),
             ("ACL_ENABLED", "false"),
             ("SASL_REQUIRED", "false"),
         ],

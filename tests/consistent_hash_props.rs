@@ -16,7 +16,9 @@
 
 use std::collections::BTreeSet;
 
+use conhash::ConsistentHash;
 use kafkaesque::cluster::{BrokerInfo, consistent_hash_assignment};
+use kafkaesque::constants::VIRTUAL_NODES_PER_BROKER;
 use proptest::prelude::*;
 
 const TOPICS: &[&str] = &["orders", "billing", "payments", "events", "logs"];
@@ -36,9 +38,33 @@ fn broker(id: i32) -> BrokerInfo {
 
 fn assignment_map(brokers: &[BrokerInfo]) -> Vec<((String, i32), i32)> {
     let mut out = Vec::with_capacity((TOPICS.len() as i32 * KEYS_PER_CASE) as usize);
+
+    if brokers.is_empty() {
+        return out;
+    }
+
+    // Build the ring once per broker set. `consistent_hash_assignment` rebuilds
+    // it on every key lookup, which makes proptest (especially shrinking) crawl.
+    let mut ring: Option<ConsistentHash<BrokerInfo>> = None;
+    if brokers.len() > 1 {
+        let mut r = ConsistentHash::new();
+        for broker in brokers {
+            r.add(broker, VIRTUAL_NODES_PER_BROKER);
+        }
+        ring = Some(r);
+    }
+
     for t in TOPICS {
         for p in 0..KEYS_PER_CASE {
-            let owner = consistent_hash_assignment(t, p, brokers);
+            let owner = if brokers.len() == 1 {
+                brokers[0].broker_id
+            } else {
+                let partition_key = format!("{t}:{p}");
+                ring.as_ref()
+                    .and_then(|r| r.get_str(&partition_key))
+                    .map(|b| b.broker_id)
+                    .unwrap_or(brokers[0].broker_id)
+            };
             out.push((((*t).to_string(), p), owner));
         }
     }

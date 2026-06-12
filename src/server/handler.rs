@@ -2,19 +2,9 @@
 //!
 //! Implement the `Handler` trait to provide custom logic for handling
 //! each type of Kafka request.
-//!
-//! The Handler trait is composed of several sub-traits organized by functionality:
-//! - `MetadataHandler`: API versions and metadata
-//! - `ProduceHandler`: Produce requests
-//! - `FetchHandler`: Fetch and list offsets
-//! - `ConsumerGroupHandler`: Consumer group operations
-//! - `AdminHandler`: Topic management
-//! - `AuthHandler`: SASL authentication
-//! - `ProducerHandler`: Producer ID initialization
-//!
-//! See `handler_traits` module for the sub-trait definitions.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -54,10 +44,10 @@ pub struct RequestContext {
     /// `User:ANONYMOUS` for connections that have not (yet) completed
     /// SaslAuthenticate. The cluster-handler authorizer keys ACL
     /// decisions against this value.
-    pub principal: String,
+    pub principal: Arc<str>,
     /// Client host string used for ACL host matching. Mirrors the IP from
     /// `client_addr`; ACL bindings can wildcard with `*`.
-    pub client_host: String,
+    pub client_host: Arc<str>,
     /// True when the request arrived over a TLS-wrapped transport.
     pub transport_tls: bool,
 }
@@ -73,18 +63,6 @@ impl RequestContext {
 ///
 /// Implement this trait to provide custom behavior for your Kafka-compatible server.
 /// Default implementations return appropriate error responses.
-///
-/// This trait is composed of several sub-traits organized by functionality.
-/// For better organization, consider implementing the sub-traits:
-/// - `MetadataHandler` for API versions and metadata
-/// - `ProduceHandler` for produce requests
-/// - `FetchHandler` for fetch and list offsets
-/// - `ConsumerGroupHandler` for consumer group operations
-/// - `AdminHandler` for topic management
-/// - `AuthHandler` for SASL authentication
-/// - `ProducerHandler` for producer ID initialization
-///
-/// Types that implement all sub-traits automatically implement `Handler` via blanket implementation.
 #[async_trait]
 pub trait Handler: Send + Sync {
     /// Handle an ApiVersions request.

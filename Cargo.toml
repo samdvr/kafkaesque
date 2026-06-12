@@ -53,6 +53,7 @@ chrono = "0.4.45"
 base64 = "0.22"
 futures = "0.3"
 fastrand = "2.3.0"  # Lightweight RNG for jitter calculations
+itoa = "1.0.15"
 
 # Metrics and monitoring
 prometheus = "0.14.0"

@@ -120,7 +120,7 @@ define_histogram_vec!(
     REQUEST_DURATION,
     "request_duration_seconds",
     "Request processing duration in seconds",
-    ["api"],
+    ["api", "status"],
     [
         // Sub-millisecond buckets — well-tuned p99 produce/fetch on a hot
         // partition is in the 100–800 µs range, so a histogram starting at
@@ -1378,7 +1378,7 @@ pub fn record_request_with_code(api: &str, status: &str, error_code: &str, durat
         .with_label_values(&[api, status, error_code])
         .inc();
     REQUEST_DURATION
-        .with_label_values(&[api])
+        .with_label_values(&[api, status])
         .observe(duration_secs);
 }
 
@@ -1447,8 +1447,7 @@ async fn get_partition_label(topic: &str, partition: i32) -> String {
 
     let max_cardinality = MAX_METRIC_CARDINALITY.load(Ordering::Relaxed);
     if max_cardinality == 0 {
-        // Unlimited cardinality
-        return partition.to_string();
+        return format_partition_label(partition);
     }
 
     let key = (topic.to_string(), partition);
@@ -1457,7 +1456,7 @@ async fn get_partition_label(topic: &str, partition: i32) -> String {
     {
         let tracked = TRACKED_PARTITIONS.read().await;
         if tracked.contains(&key) {
-            return partition.to_string();
+            return format_partition_label(partition);
         }
         if tracked.len() >= max_cardinality {
             return "_overflow".to_string();
@@ -1469,11 +1468,16 @@ async fn get_partition_label(topic: &str, partition: i32) -> String {
         let mut tracked = TRACKED_PARTITIONS.write().await;
         if tracked.len() < max_cardinality {
             tracked.insert(key);
-            return partition.to_string();
+            return format_partition_label(partition);
         }
     }
 
     "_overflow".to_string()
+}
+
+fn format_partition_label(partition: i32) -> String {
+    let mut buf = itoa::Buffer::new();
+    buf.format(partition).to_string()
 }
 
 /// Bound topic labels on latency histograms to avoid unbounded Prometheus
@@ -1571,9 +1575,7 @@ fn get_partition_label_sync(_topic: &str, partition: i32) -> String {
     if !PARTITION_METRICS_ENABLED.load(Ordering::Relaxed) {
         return "_all".to_string();
     }
-    // In sync context, just use the partition number
-    // Cardinality limiting is best-effort in sync contexts
-    partition.to_string()
+    format_partition_label(partition)
 }
 
 /// Record produced messages with cardinality awareness.
@@ -1933,6 +1935,24 @@ pub fn set_group_generation(group: &str, generation: i64) {
 pub fn forget_group_metrics(group: &str) {
     let _ = GROUP_MEMBER_COUNT.remove_label_values(&[group]);
     let _ = GROUP_GENERATION.remove_label_values(&[group]);
+}
+
+/// Remove per-topic time series for the named topic.
+///
+/// Called from the DeleteTopics path so the Prometheus registry doesn't
+/// accumulate dead labels for deleted topics.
+pub fn forget_topic_metrics(topic: &str, partition_count: i32) {
+    let topic_lbl = bounded_topic_label(topic);
+    let _ = TOPIC_PARTITION_COUNT.remove_label_values(&[topic_lbl.as_str()]);
+    let mut buf = itoa::Buffer::new();
+    for partition in 0..partition_count {
+        let partition_str = buf.format(partition).to_string();
+        let _ = MESSAGES_PRODUCED.remove_label_values(&[topic_lbl.as_str(), &partition_str]);
+        let _ = BYTES_PRODUCED.remove_label_values(&[topic_lbl.as_str(), &partition_str]);
+        let _ = MESSAGES_FETCHED.remove_label_values(&[topic_lbl.as_str(), &partition_str]);
+        let _ = BYTES_FETCHED.remove_label_values(&[topic_lbl.as_str(), &partition_str]);
+        let _ = PARTITION_HIGH_WATERMARK.remove_label_values(&[topic_lbl.as_str(), &partition_str]);
+    }
 }
 
 /// Increment pending rebalances count.

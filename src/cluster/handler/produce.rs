@@ -221,24 +221,24 @@ pub(super) async fn handle_produce(
                 let topic_name = Arc::clone(&topic_name);
                 let partition_manager = partition_manager.clone();
                 let hwm_notify = handler.hwm_notifier(&topic_name, partition.partition_index);
-                handler.data_runtime.spawn(async move {
-                    let _permit = permit;
-                    if fire_and_forget_produce(
-                        &partition_manager,
-                        &topic_name,
-                        partition,
-                        validate_crc,
-                    )
-                    .await
-                    .is_ok()
-                    {
-                        // Wake long-poll fetches even on the acks=0 path.
-                        // Without this, consumers using
-                        // min_bytes>0 only see records after `max_wait_ms`
-                        // expires.
-                        hwm_notify.notify_waiters();
-                    }
-                });
+                let fire_and_forget_tasks = handler.fire_and_forget_tasks.clone();
+                {
+                    let mut tasks = fire_and_forget_tasks.lock().await;
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        if fire_and_forget_produce(
+                            &partition_manager,
+                            &topic_name,
+                            partition,
+                            validate_crc,
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            hwm_notify.notify_waiters();
+                        }
+                    });
+                }
             }
 
             responses.push(ProduceTopicResponse {

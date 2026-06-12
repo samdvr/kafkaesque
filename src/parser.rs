@@ -196,6 +196,13 @@ pub fn parse_unsigned_varint(s: NomBytes) -> IResult<NomBytes, u32> {
         let b = byte.into_bytes()[0];
         remaining = s;
 
+        if shift == 28 && (b & 0x7F) > 0x0F {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                remaining,
+                nom::error::ErrorKind::TooLarge,
+            )));
+        }
+
         result |= ((b & 0x7F) as u32) << shift;
 
         if (b & 0x80) == 0 {
@@ -204,7 +211,6 @@ pub fn parse_unsigned_varint(s: NomBytes) -> IResult<NomBytes, u32> {
 
         shift += 7;
         if shift > 28 {
-            // Overflow protection
             return Err(nom::Err::Failure(nom::error::Error::new(
                 remaining,
                 nom::error::ErrorKind::TooLarge,

@@ -439,8 +439,8 @@ fn ctx() -> RequestContext {
         api_version: 0,
         client_id: Some("p5-3-stateful".to_string()),
         request_id: uuid::Uuid::new_v4(),
-        principal: "User:ANONYMOUS".to_string(),
-        client_host: "127.0.0.1".to_string(),
+        principal: Arc::from("User:ANONYMOUS"),
+        client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
     }
 }

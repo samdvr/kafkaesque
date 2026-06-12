@@ -36,8 +36,8 @@ fn test_context(principal: &str) -> RequestContext {
         api_version: 8,
         client_id: Some("acl-test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),
-        principal: principal.to_string(),
-        client_host: "127.0.0.1".to_string(),
+        principal: Arc::from(principal),
+        client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
     }
 }

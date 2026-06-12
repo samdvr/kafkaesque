@@ -12,6 +12,7 @@ use kafkaesque::error::KafkaCode;
 use kafkaesque::server::request::*;
 use kafkaesque::server::{Handler, RequestContext};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 /// Helper to create a Kafka RecordBatch with actual message content.
@@ -159,8 +160,8 @@ fn create_test_context() -> RequestContext {
         api_version: 8,
         client_id: Some("e2e-test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),
-        principal: "User:ANONYMOUS".to_string(),
-        client_host: "127.0.0.1".to_string(),
+        principal: Arc::from("User:ANONYMOUS"),
+        client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
     }
 }

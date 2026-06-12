@@ -1141,8 +1141,7 @@ impl PartitionStore {
     ///
     /// Strategy:
     /// 1. Check if fetch_offset is exactly a batch start in the cache (fast path)
-    /// 2. Try exact match in SlateDB
-    /// 3. Bounded back-scan: scan forward from a window before `fetch_offset`,
+    /// 2. Bounded back-scan: scan forward from a window before `fetch_offset`,
     ///    doubling the window down to the log start offset on a miss.
     ///
     /// The bounded back-scan replaces the old fallback that scanned from
@@ -1171,16 +1170,7 @@ impl PartitionStore {
 
         super::metrics::record_batch_index_miss();
 
-        // Strategy 2: Try exact match in SlateDB
-        let key = encode_record_key(fetch_offset);
-        if let Some(data) = self.db.get(&key).await? {
-            // Add to index for future lookups
-            let record_count = parse_record_count(&data);
-            self.add_to_batch_index(fetch_offset, record_count);
-            return Ok(Some(fetch_offset));
-        }
-
-        // Strategy 3: Bounded back-scan with widening window.
+        // Bounded back-scan with widening window.
         let log_start = self.log_start_offset.load(Ordering::SeqCst);
         let mut window = INITIAL_BATCH_BACKSCAN_WINDOW;
 

@@ -430,7 +430,7 @@ impl Request {
                 trailing_bytes = trailing.len(),
                 "Rejecting request with trailing bytes after body parse"
             );
-            return Err(parsing_error(&data));
+            return Err(Error::TrailingBytes);
         }
 
         Ok(request)

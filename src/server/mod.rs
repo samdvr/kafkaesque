@@ -45,7 +45,6 @@
 pub mod codec;
 mod connection;
 mod handler;
-mod handler_traits;
 pub mod health;
 pub mod rate_limiter;
 pub mod request;

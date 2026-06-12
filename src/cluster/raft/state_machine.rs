@@ -190,9 +190,6 @@ impl CoordinationStateMachine {
             CoordinationCommand::Noop => CoordinationResponse::Ok,
 
             CoordinationCommand::BrokerDomain(cmd) => {
-                // Capture the broker_id before `cmd` is moved into apply,
-                // so the heartbeat hook below can pass it to the local
-                // failure detector.
                 let heartbeat_broker =
                     if let super::domains::BrokerCommand::Heartbeat { broker_id, .. } = &cmd {
                         Some(*broker_id)
@@ -201,6 +198,7 @@ impl CoordinationStateMachine {
                     };
                 let response =
                     CoordinationResponse::BrokerDomainResponse(state.broker_domain.apply(cmd));
+                drop(state);
                 if let Some(broker_id) = heartbeat_broker
                     && let Some(hook) = self.heartbeat_hook.get()
                 {

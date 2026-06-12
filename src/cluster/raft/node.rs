@@ -181,17 +181,10 @@ impl RaftNode {
             config.auth_keys.clone(),
             config.tls.clone(),
         );
-        let mut shutdown_rx = node.shutdown_tx.subscribe();
+        let shutdown_rx = node.shutdown_tx.subscribe();
         runtime.spawn(async move {
-            tokio::select! {
-                result = rpc_server.run() => {
-                    if let Err(e) = result {
-                        tracing::error!(error = %e, "Raft RPC server error");
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    info!("Raft RPC server shutting down");
-                }
+            if let Err(e) = rpc_server.run(shutdown_rx).await {
+                tracing::error!(error = %e, "Raft RPC server error");
             }
         });
 

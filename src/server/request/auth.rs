@@ -4,6 +4,7 @@ use bytes::Bytes;
 use nom::{IResult, number::complete::be_i32};
 use nombytes::NomBytes;
 
+use crate::constants::MAX_SASL_AUTH_BYTES_SIZE;
 use crate::parser::parse_kafka_string;
 
 /// SaslHandshake request data.
@@ -32,7 +33,7 @@ pub fn parse_sasl_authenticate_request(
     _version: i16,
 ) -> IResult<NomBytes, SaslAuthenticateRequestData> {
     let (s, auth_len) = be_i32(s)?;
-    if auth_len < 0 {
+    if auth_len < 0 || auth_len > MAX_SASL_AUTH_BYTES_SIZE {
         return Err(nom::Err::Error(nom::error::Error::new(
             s,
             nom::error::ErrorKind::Verify,

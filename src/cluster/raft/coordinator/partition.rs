@@ -264,9 +264,12 @@ impl PartitionCoordinator for RaftCoordinator {
     }
 
     async fn get_partition_owner(&self, topic: &str, partition: i32) -> SlateDBResult<Option<i32>> {
-        // Check cache first (for read-path operations that can tolerate slight staleness)
-        if let Some(owner) = self.owner_cache.get(&(Arc::from(topic), partition)).await {
-            return Ok(Some(owner));
+        if let Some(cached_owner) = self.owner_cache.get(&(Arc::from(topic), partition)).await
+            && self
+                .verify_cached_owner(topic, partition, cached_owner)
+                .await
+        {
+            return Ok(Some(cached_owner));
         }
 
         // Cache miss on routing-critical metadata: confirm we've applied
@@ -308,9 +311,12 @@ impl PartitionCoordinator for RaftCoordinator {
     }
 
     async fn owns_partition_for_read(&self, topic: &str, partition: i32) -> SlateDBResult<bool> {
-        // Check cache first (fast path for read operations)
-        if let Some(owner) = self.owner_cache.get(&(Arc::from(topic), partition)).await {
-            return Ok(owner == self.broker_id);
+        if let Some(cached_owner) = self.owner_cache.get(&(Arc::from(topic), partition)).await
+            && self
+                .verify_cached_owner(topic, partition, cached_owner)
+                .await
+        {
+            return Ok(cached_owner == self.broker_id);
         }
 
         // Cache miss: use a read-index barrier so ownership checks reflect
@@ -596,5 +602,29 @@ impl PartitionCoordinator for RaftCoordinator {
         }
 
         Ok(owners)
+    }
+}
+
+impl RaftCoordinator {
+    /// Confirm a cached owner entry still matches local state-machine data.
+    async fn verify_cached_owner(&self, topic: &str, partition: i32, cached_owner: i32) -> bool {
+        let key = (Arc::from(topic), partition);
+        let still_valid = {
+            let state_machine = self.node.state_machine();
+            let state = state_machine.read().await;
+            let inner_state = state.state().await;
+            let now_ms = inner_state.lease_clock_ms;
+            inner_state
+                .partition_domain
+                .partitions
+                .get(&key)
+                .is_some_and(|p| {
+                    p.lease_expires_at_ms > now_ms && p.owner_broker_id == Some(cached_owner)
+                })
+        };
+        if !still_valid {
+            self.owner_cache.invalidate(&key).await;
+        }
+        still_valid
     }
 }

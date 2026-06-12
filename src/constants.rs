@@ -97,6 +97,12 @@ pub const MAX_PROTOCOL_ARRAY_SIZE: i32 = 100_000;
 /// principal, sasl auth bytes) and well below MAX_REQUEST_SIZE.
 pub const MAX_PROTOCOL_STRING_SIZE: u32 = 16 * 1024 * 1024;
 
+/// Maximum SASL authenticate payload size accepted at parse time.
+///
+/// Pre-auth requests must not allocate unbounded buffers. 64 KiB is ample
+/// for SCRAM/PLAIN payloads and well below the frame cap.
+pub const MAX_SASL_AUTH_BYTES_SIZE: i32 = 64 * 1024;
+
 // =============================================================================
 // Network Constants
 // =============================================================================

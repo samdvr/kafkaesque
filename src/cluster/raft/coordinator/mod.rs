@@ -224,6 +224,42 @@ impl RaftCoordinator {
             }
         });
         self.task_handles.write().await.push(handle);
+
+        let node = self.node.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let handle = self.runtime.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    _ = interval.tick() => {
+                        let metrics = node.metrics();
+                        let state_val = match metrics.state {
+                            openraft::ServerState::Follower => 0,
+                            openraft::ServerState::Candidate => 1,
+                            openraft::ServerState::Leader => 2,
+                            openraft::ServerState::Learner => 0,
+                            openraft::ServerState::Shutdown => -1,
+                        };
+                        crate::cluster::metrics::set_raft_state(state_val);
+                        crate::cluster::metrics::set_raft_term(metrics.current_term as i64);
+                        crate::cluster::metrics::set_raft_commit_index(
+                            metrics.last_log_index.unwrap_or(0) as i64,
+                        );
+                        crate::cluster::metrics::set_raft_applied_index(
+                            metrics.last_applied.as_ref().map(|l| l.index).unwrap_or(0) as i64,
+                        );
+                        crate::cluster::metrics::set_raft_log_entries(
+                            metrics.last_log_index.unwrap_or(0) as i64,
+                        );
+                        crate::cluster::metrics::set_raft_pending_proposals(
+                            node.pending_proposals() as i64,
+                        );
+                    }
+                }
+            }
+        });
+        self.task_handles.write().await.push(handle);
     }
 
     /// Shutdown the coordinator.

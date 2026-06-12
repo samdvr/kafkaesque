@@ -75,6 +75,10 @@ pub enum Error {
     #[error("Parsing error: invalid data ({} bytes)", .0.len())]
     ParsingError(Bytes),
 
+    /// Request body parsed successfully but left trailing bytes on the wire.
+    #[error("Trailing bytes after request body")]
+    TrailingBytes,
+
     /// Missing data or connection closed.
     #[error("Missing data: {0}")]
     MissingData(String),
@@ -95,6 +99,7 @@ impl PartialEq for Error {
         match (self, other) {
             (Error::IoError(a), Error::IoError(b)) => a.kind == b.kind && a.message == b.message,
             (Error::ParsingError(a), Error::ParsingError(b)) => a == b,
+            (Error::TrailingBytes, Error::TrailingBytes) => true,
             (Error::MissingData(a), Error::MissingData(b)) => a == b,
             (Error::Config(a), Error::Config(b)) => a == b,
             (Error::Authentication(a), Error::Authentication(b)) => a == b,

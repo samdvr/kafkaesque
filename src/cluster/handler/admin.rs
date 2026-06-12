@@ -274,6 +274,7 @@ pub(super) async fn handle_delete_topics(
                         if has_error {
                             Err("Partial deletion - some partition data may remain")
                         } else {
+                            crate::cluster::metrics::forget_topic_metrics(&topic_name, partitions);
                             Ok(())
                         }
                     }

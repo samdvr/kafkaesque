@@ -116,6 +116,9 @@ pub struct SlateDBClusterHandler {
     /// partition count.
     pub(crate) hwm_notifiers: dashmap::DashMap<(Arc<str>, i32), Arc<tokio::sync::Notify>>,
 
+    /// In-flight acks=0 produce tasks drained during shutdown.
+    pub(crate) fire_and_forget_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
+
     /// SASL provider. Holds the in-memory user table when the
     /// `sasl` feature is compiled in. `None` when the feature is off.
     #[cfg(feature = "sasl")]
@@ -486,6 +489,7 @@ impl SlateDBClusterHandler {
             sasl_required: config.sasl_required,
             authorizer,
             hwm_notifiers: dashmap::DashMap::new(),
+            fire_and_forget_tasks: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             #[cfg(feature = "sasl")]
             sasl_provider: crate::cluster::sasl_provider::SaslProvider::from_config(&config)
                 .await
@@ -497,6 +501,10 @@ impl SlateDBClusterHandler {
 
     /// Shutdown the handler gracefully.
     pub async fn shutdown(&self) -> SlateDBResult<()> {
+        {
+            let mut tasks = self.fire_and_forget_tasks.lock().await;
+            while tasks.join_next().await.is_some() {}
+        }
         self.partition_manager.shutdown().await?;
         self.coordinator.shutdown().await
     }
@@ -730,35 +738,8 @@ impl SlateDBClusterHandler {
             };
         }
 
-        // Use get_for_write which verifies fresh ownership with coordinator
-        // IMPORTANT: We do NOT try to acquire partitions here. Partition acquisition
-        // happens only in the background ownership loop. This prevents "partition stealing"
-        // where produce requests cause brokers to compete for partition ownership.
-        let store = match self
-            .partition_manager
-            .get_for_write(topic, partition.partition_index)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                // Map the storage error to its typed Kafka code. Collapsing
-                // every failure to NotLeaderForPartition triggers a metadata
-                // refresh storm on transient I/O — clients retry to a
-                // (correct) leader that's perfectly happy to keep failing
-                // because the underlying issue is timeout/storage, not
-                // ownership. The typed mapping returns NotLeader only on
-                // genuine NotOwned and surfaces RequestTimedOut /
-                // BrokerNotAvailable / etc. for everything else.
-                return ProducePartitionResponse {
-                    partition_index: partition.partition_index,
-                    error_code: e.to_kafka_code(),
-                    base_offset: -1,
-                    log_append_time: -1,
-                };
-            }
-        };
-
-        // Validate CRC if enabled
+        // Validate CRC before lease acquisition so corrupt batches cannot
+        // drive Raft load on the acks>=1 path.
         if self.validate_record_crc {
             match validate_batch_crc_async(&partition.records).await {
                 CrcValidationResult::Valid => {}
@@ -795,6 +776,34 @@ impl SlateDBClusterHandler {
                 }
             }
         }
+
+        // Use get_for_write which verifies fresh ownership with coordinator
+        // IMPORTANT: We do NOT try to acquire partitions here. Partition acquisition
+        // happens only in the background ownership loop. This prevents "partition stealing"
+        // where produce requests cause brokers to compete for partition ownership.
+        let store = match self
+            .partition_manager
+            .get_for_write(topic, partition.partition_index)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // Map the storage error to its typed Kafka code. Collapsing
+                // every failure to NotLeaderForPartition triggers a metadata
+                // refresh storm on transient I/O — clients retry to a
+                // (correct) leader that's perfectly happy to keep failing
+                // because the underlying issue is timeout/storage, not
+                // ownership. The typed mapping returns NotLeader only on
+                // genuine NotOwned and surfaces RequestTimedOut /
+                // BrokerNotAvailable / etc. for everything else.
+                return ProducePartitionResponse {
+                    partition_index: partition.partition_index,
+                    error_code: e.to_kafka_code(),
+                    base_offset: -1,
+                    log_append_time: -1,
+                };
+            }
+        };
 
         // For acks>=1 ("leader" / "all") Kafka clients are guaranteed durability
         // once the produce response returns success. Use the durable write path.

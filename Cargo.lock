@@ -1828,6 +1828,7 @@ dependencies = [
  "fastrand",
  "futures",
  "hmac",
+ "itoa",
  "kafka-protocol",
  "kafkaesque",
  "loom",

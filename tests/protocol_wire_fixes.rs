@@ -559,8 +559,11 @@ fn trailing_request_bytes_are_counted_not_silently_dropped() {
     buf.put_i32(-1); // all topics
     buf.put_slice(b"leftover-padding");
 
-    let request = Request::parse(Bytes::from(buf.to_vec())).unwrap();
-    assert!(matches!(request, Request::Metadata(_, _)));
+    let err = Request::parse(Bytes::from(buf.to_vec())).unwrap_err();
+    assert!(
+        matches!(err, kafkaesque::error::Error::TrailingBytes),
+        "trailing bytes must be rejected explicitly, not silently dropped: {err:?}"
+    );
 }
 
 // ============================================================================

@@ -4,6 +4,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 use kafkaesque::cluster::{ClusterConfig, SlateDBClusterHandler};
@@ -18,8 +19,8 @@ fn create_test_context() -> RequestContext {
         api_version: 8,
         client_id: Some("debug-test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),
-        principal: "User:ANONYMOUS".to_string(),
-        client_host: "127.0.0.1".to_string(),
+        principal: Arc::from("User:ANONYMOUS"),
+        client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
     }
 }

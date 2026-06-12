@@ -283,7 +283,15 @@ impl SaslProvider {
         use subtle::ConstantTimeEq;
         let eq: bool = candidate.as_bytes().ct_eq(password.as_bytes()).into();
         if stored.is_some() && eq {
-            info!(username = %username, "SASL PLAIN authentication successful");
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(username.as_bytes());
+            let hash = hasher.finalize();
+            let prefix: String = hash[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            info!(username_hash_prefix = %prefix, "SASL PLAIN authentication successful");
             (true, Some(username.to_string()))
         } else {
             // Single, uniform log line for *any* authentication failure so

@@ -64,12 +64,21 @@ pub enum ProducerCommand {
     AllocateProducerId { request_token: Option<u128> },
 
     /// Initialize a producer (possibly transactional).
+    ///
+    /// `request_token` collapses two committed entries that came from a
+    /// single `client_write` retry into one allocation. The handler mints
+    /// the token at the Kafka request boundary (so the same SDK request
+    /// retried at the openraft layer carries the same token through to
+    /// the FSM). `None` preserves the legacy non-deduped path for older
+    /// callers / replay of pre-upgrade entries.
     InitProducerId {
         transactional_id: Option<String>,
         producer_id: i64,
         epoch: i16,
         timeout_ms: i32,
         timestamp_ms: u64,
+        #[serde(default)]
+        request_token: Option<u128>,
     },
 
     /// Store producer state for idempotency.
@@ -97,6 +106,16 @@ pub enum ProducerResponse {
 
     /// Producer states were expired.
     ProducerStatesExpired { count: usize },
+
+    /// The client-supplied `(producer_id, epoch)` did not match the stored
+    /// pair for the given `transactional_id`. KIP-360 mandates this typed
+    /// signal so the client retires the producer rather than retrying with
+    /// the same identity. Emitted when a previously-fenced producer tries
+    /// to resume after the broker has bumped/replaced its epoch.
+    ProducerFenced {
+        stored_producer_id: i64,
+        stored_epoch: i16,
+    },
 
     /// Generic success.
     Ok,
@@ -161,23 +180,91 @@ impl ProducerDomainState {
 
             ProducerCommand::InitProducerId {
                 transactional_id,
-                producer_id: _,
-                epoch: _,
+                producer_id: client_pid,
+                epoch: client_epoch,
                 timeout_ms,
                 timestamp_ms,
+                request_token,
             } => {
-                if let Some(txn_id) = transactional_id {
+                // First, look for a previously-allocated id under the same
+                // request_token. A `client_write` retry that arrives after
+                // the leader has already committed the original entry must
+                // observe the SAME producer_id/epoch — minting a fresh one
+                // here would split idempotency: the client thinks one
+                // InitProducerId call returned PID X, but the broker has
+                // also burned PID X+1 with a different epoch, and any
+                // produces under PID X+1 from the leader-side first-attempt
+                // future are now orphaned.
+                if let Some(token) = request_token
+                    && let Some((_, cached_id)) =
+                        self.recent_allocations.iter().find(|(t, _)| *t == token)
+                {
+                    // The cached_id may belong to either branch; for the
+                    // transactional path we still need to surface the
+                    // current epoch on the stored entry. For the
+                    // non-transactional branch, epoch is always 0.
+                    if let Some(txn_id) = &transactional_id
+                        && let Some(entry) = self.transactional_producers.get(txn_id)
+                        && entry.producer_id == *cached_id
+                    {
+                        return ProducerResponse::ProducerIdAllocated {
+                            producer_id: entry.producer_id,
+                            epoch: entry.producer_epoch,
+                        };
+                    }
+                    return ProducerResponse::ProducerIdAllocated {
+                        producer_id: *cached_id,
+                        epoch: 0,
+                    };
+                }
+
+                let response = if let Some(txn_id) = transactional_id {
                     // Transactional producer
                     if let Some(entry) = self.transactional_producers.get_mut(&txn_id) {
-                        // Bump epoch
-                        entry.producer_epoch = entry.producer_epoch.wrapping_add(1);
+                        let claiming_recovery = client_pid >= 0 || client_epoch >= 0;
+                        if claiming_recovery
+                            && (client_pid != entry.producer_id
+                                || client_epoch != entry.producer_epoch)
+                        {
+                            tracing::warn!(
+                                transactional_id = %txn_id,
+                                client_producer_id = client_pid,
+                                client_epoch = client_epoch,
+                                stored_producer_id = entry.producer_id,
+                                stored_epoch = entry.producer_epoch,
+                                "InitProducerId fenced: client (pid, epoch) does not match stored"
+                            );
+                            return ProducerResponse::ProducerFenced {
+                                stored_producer_id: entry.producer_id,
+                                stored_epoch: entry.producer_epoch,
+                            };
+                        }
+                        if entry.producer_epoch == i16::MAX {
+                            let new_pid = self.next_producer_id;
+                            self.next_producer_id += 1;
+                            tracing::warn!(
+                                transactional_id = %txn_id,
+                                old_producer_id = entry.producer_id,
+                                new_producer_id = new_pid,
+                                "Producer epoch saturated at i16::MAX; allocating fresh producer_id and resetting epoch to 0"
+                            );
+                            entry.producer_id = new_pid;
+                            entry.producer_epoch = 0;
+                        } else {
+                            entry.producer_epoch += 1;
+                        }
                         entry.last_update_ms = timestamp_ms;
                         ProducerResponse::ProducerIdAllocated {
                             producer_id: entry.producer_id,
                             epoch: entry.producer_epoch,
                         }
                     } else {
-                        // Create new producer
+                        if client_pid >= 0 || client_epoch >= 0 {
+                            return ProducerResponse::ProducerFenced {
+                                stored_producer_id: -1,
+                                stored_epoch: -1,
+                            };
+                        }
                         let pid = self.next_producer_id;
                         self.next_producer_id += 1;
                         self.transactional_producers.insert(
@@ -197,14 +284,28 @@ impl ProducerDomainState {
                         }
                     }
                 } else {
-                    // Non-transactional producer
                     let producer_id = self.next_producer_id;
                     self.next_producer_id += 1;
                     ProducerResponse::ProducerIdAllocated {
                         producer_id,
                         epoch: 0,
                     }
+                };
+
+                // Cache the freshly-allocated id under the token so a
+                // retry that lands a duplicate entry returns the same
+                // value. Only cache the success path; a fenced response
+                // is not retry-stable (the client is supposed to abort).
+                if let (Some(token), ProducerResponse::ProducerIdAllocated { producer_id, .. }) =
+                    (request_token, &response)
+                {
+                    if self.recent_allocations.len() >= ALLOC_DEDUP_WINDOW {
+                        self.recent_allocations.pop_front();
+                    }
+                    self.recent_allocations.push_back((token, *producer_id));
                 }
+
+                response
             }
 
             ProducerCommand::StoreProducerState {
@@ -309,10 +410,11 @@ mod tests {
 
         let response = state.apply(ProducerCommand::InitProducerId {
             transactional_id: Some("txn-1".to_string()),
-            producer_id: 0,
-            epoch: 0,
+            producer_id: -1,
+            epoch: -1,
             timeout_ms: 60000,
             timestamp_ms: 1000,
+            request_token: None,
         });
 
         match response {
@@ -323,13 +425,14 @@ mod tests {
             _ => panic!("Expected ProducerIdAllocated"),
         }
 
-        // Re-init should bump epoch
+        // Re-init with the matching (pid, epoch) should bump epoch.
         let response = state.apply(ProducerCommand::InitProducerId {
             transactional_id: Some("txn-1".to_string()),
             producer_id: 0,
             epoch: 0,
             timeout_ms: 60000,
             timestamp_ms: 2000,
+            request_token: None,
         });
 
         match response {

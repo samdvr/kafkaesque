@@ -514,6 +514,15 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // Per-connection ID. Process-unique even across TCP socket-address
+    // reuse so server-side per-connection state (SASL post-auth, SCRAM
+    // session, mechanism commitment) cannot leak across connections that
+    // briefly share a `client_addr`. A monotonic atomic counter is
+    // sufficient; we don't expose it externally so wrap-around concerns
+    // are theoretical (`u64`).
+    static CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let conn_id = CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // Run on_connection_closed even on cancellation paths (forced shutdown,
     // panic, deadline aborts). Without this guard, cancellation drops the
     // outer future before the explicit call below ever runs and per-
@@ -521,21 +530,21 @@ where
     // entries that future connections may inherit.
     struct CloseGuard<G: Handler + 'static> {
         handler: Option<Arc<G>>,
-        client: SocketAddr,
+        conn_id: u64,
     }
     impl<G: Handler + 'static> Drop for CloseGuard<G> {
         fn drop(&mut self) {
             if let Some(h) = self.handler.take() {
-                let client = self.client;
+                let conn_id = self.conn_id;
                 tokio::spawn(async move {
-                    h.on_connection_closed(client).await;
+                    h.on_connection_closed(conn_id).await;
                 });
             }
         }
     }
     let _close_guard = CloseGuard {
         handler: Some(handler.clone()),
-        client,
+        conn_id,
     };
 
     // Compute the client-host string once per connection. Every request
@@ -632,6 +641,7 @@ where
                             handler.as_ref(),
                             data,
                             client,
+                            conn_id,
                             &client_host,
                             connection_label,
                             auth_gate,
@@ -937,6 +947,7 @@ async fn dispatch_request_common<H: Handler>(
     handler: &H,
     data: Bytes,
     client_addr: SocketAddr,
+    conn_id: u64,
     client_host: &Arc<str>,
     _connection_type: &str, // Used for logging to distinguish plain vs TLS
     auth_gate: &mut AuthGate,
@@ -1043,6 +1054,7 @@ async fn dispatch_request_common<H: Handler>(
 
     let ctx = RequestContext {
         client_addr,
+        conn_id,
         api_version: header.api_version,
         client_id: header.client_id.clone(),
         request_id,
@@ -1199,31 +1211,40 @@ async fn dispatch_request_common<H: Handler>(
             encode_response(correlation_id, &resp)
         }
         Request::SaslAuthenticate(_, req) => {
-            // Track SASL auth result. We must extract the principal from the
-            // wire bytes BEFORE moving `req` into the handler so the gate
-            // (and downstream authorizer) can attribute future requests to
-            // a real identity. For PLAIN that's `\0user\0pass`;
-            // for unsupported mechanisms we fall back to None and the
-            // dispatcher treats the connection as anonymous.
+            // Track SASL auth result. The handler is the sole authority on
+            // *what* identity a successful SASL exchange authenticated —
+            // never derive a principal from the inbound bytes here, even
+            // for PLAIN. A handler that returns success without populating
+            // `SaslPostAuth.principal` is buggy and we treat the
+            // connection as anonymous; we DO NOT fall back to the
+            // attacker-controlled wire bytes (that fallback would let any
+            // client self-assign `User:admin` simply by sending
+            // `\0admin\0anything`).
             //
-            // SCRAM-SHA-256 is multi-step: the first
-            // round-trip returns `error_code = None` but the handshake
-            // isn't done yet. The cluster handler signals this via
-            // `take_sasl_post_auth`, which we consult before flipping the
-            // gate.
-            let plain_principal = principal_from_sasl_plain(&req.auth_bytes);
+            // SCRAM-SHA-256 is multi-step: the first round-trip returns
+            // `error_code = None` but the handshake isn't done yet. The
+            // cluster handler signals this via `take_sasl_post_auth`,
+            // which we consult before flipping the gate.
             let response = handler.handle_sasl_authenticate(&ctx, req).await;
-            let post = handler.take_sasl_post_auth(client_addr).await;
+            let post = handler.take_sasl_post_auth(ctx.conn_id).await;
             auth_result = if response.error_code == KafkaCode::None {
                 match post {
                     Some(p) if p.complete => {
-                        auth_gate.authenticated = true;
                         if let Some(principal) = p.principal {
+                            auth_gate.authenticated = true;
                             auth_gate.principal = Some(principal);
-                        } else if let Some(p) = plain_principal {
-                            auth_gate.principal = Some(p);
+                            AuthResult::Success
+                        } else {
+                            // Handler reported success but did not return a
+                            // principal — refuse to flip the gate. Anything
+                            // else would let the client self-assign identity.
+                            tracing::warn!(
+                                client = %client_addr,
+                                conn_id,
+                                "Handler returned SASL success without a principal; treating as failure"
+                            );
+                            AuthResult::Failure
                         }
-                        AuthResult::Success
                     }
                     Some(_) => {
                         // Intermediate SCRAM step — keep the gate closed,
@@ -1232,13 +1253,11 @@ async fn dispatch_request_common<H: Handler>(
                         AuthResult::NotAuth
                     }
                     None => {
-                        // Single-step PLAIN (no override): treat success
-                        // the same as the original behavior.
-                        auth_gate.authenticated = true;
-                        if let Some(p) = plain_principal {
-                            auth_gate.principal = Some(p);
-                        }
-                        AuthResult::Success
+                        // No post-auth record at all means the handler did
+                        // not run the SASL pipeline (e.g. SASL not
+                        // configured but `error_code == None` somehow). Be
+                        // conservative and refuse to authenticate.
+                        AuthResult::Failure
                     }
                 }
             } else {
@@ -1342,24 +1361,6 @@ impl AuthGate {
             ApiKey::ApiVersions | ApiKey::SaslHandshake | ApiKey::SaslAuthenticate
         )
     }
-}
-
-/// Best-effort principal extraction from a SASL PLAIN auth payload.
-///
-/// PLAIN's wire format is `[authzid] \0 authcid \0 password`. We treat
-/// `authcid` (the actual login name) as the principal. SCRAM and other
-/// mechanisms aren't implemented yet — for those this returns `None` and
-/// the dispatcher leaves the principal slot empty, which causes authz to
-/// fall through to `User:ANONYMOUS`.
-fn principal_from_sasl_plain(auth_bytes: &[u8]) -> Option<String> {
-    let mut parts = auth_bytes.splitn(3, |b| *b == 0);
-    let _authzid = parts.next()?;
-    let authcid = parts.next()?;
-    if authcid.is_empty() {
-        return None;
-    }
-    let username = std::str::from_utf8(authcid).ok()?;
-    Some(format!("User:{}", username))
 }
 
 /// A client connection to the Kafka server.

@@ -44,7 +44,7 @@ COPY crates ./crates
 COPY examples ./examples
 
 ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static -C opt-level=z -C lto=fat -C codegen-units=1"
-RUN cargo build --release -p kafkaesque-bin --bin kafkaesque && \
+RUN cargo build --release -p kafkaesque-bin --bin kafkaesque --features tls,sasl && \
     strip --strip-all target/release/kafkaesque
 
 # =============================================================================

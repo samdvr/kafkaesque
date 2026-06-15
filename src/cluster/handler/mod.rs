@@ -150,6 +150,17 @@ pub struct SlateDBClusterHandler {
     /// Maximum concurrent partition reads per fetch request.
     pub(crate) max_concurrent_partition_reads: usize,
 
+    /// Maximum partitions per topic for explicit `CreateTopics`. Mirrors the
+    /// auto-create cap; both produce and CreateTopics share one ceiling so
+    /// an authenticated client can't bypass DoS protection by creating a
+    /// topic with millions of partitions.
+    pub(crate) max_partitions_per_topic: i32,
+
+    /// Maximum number of topics in the cluster (CreateTopics + auto-create).
+    /// Same rationale as above — without it, an authenticated client can
+    /// inflate the FSM and per-topic Prometheus cardinality without bound.
+    pub(crate) max_topics_in_cluster: u32,
+
     /// Cache for topic name Arc<str> allocations to reduce hot path allocations.
     topic_name_cache: Cache<String, Arc<str>>,
 
@@ -192,15 +203,14 @@ pub struct SlateDBClusterHandler {
     #[cfg(feature = "sasl")]
     pub(crate) sasl_provider: Option<Arc<crate::cluster::sasl_provider::SaslProvider>>,
 
-    /// Pending SASL post-authenticate state, keyed by client `SocketAddr`.
-    /// The cluster handler stashes the result of the most
-    /// recent `handle_sasl_authenticate` here so the connection
-    /// dispatcher's `take_sasl_post_auth` can read out whether the
-    /// handshake is complete and what principal was authenticated. Used
-    /// only by SCRAM today (PLAIN is single-step) but always populated for
-    /// uniformity.
+    /// Pending SASL post-authenticate state, keyed by per-connection ID.
+    /// Using a process-unique `conn_id` (NOT `SocketAddr`) ensures that
+    /// when a connection closes and a new connection from the same TCP
+    /// peer reuses that socket address, the new connection cannot
+    /// observe or inherit the old connection's authentication state —
+    /// even if the `Drop`-spawned cleanup hasn't completed yet.
     #[cfg(feature = "sasl")]
-    pub(crate) sasl_post_auth: dashmap::DashMap<std::net::SocketAddr, crate::server::SaslPostAuth>,
+    pub(crate) sasl_post_auth: dashmap::DashMap<u64, crate::server::SaslPostAuth>,
 }
 
 impl SlateDBClusterHandler {
@@ -552,6 +562,8 @@ impl SlateDBClusterHandler {
             validate_record_crc: config.validate_record_crc,
             max_concurrent_partition_writes: config.max_concurrent_partition_writes,
             max_concurrent_partition_reads: config.max_concurrent_partition_reads,
+            max_partitions_per_topic: config.max_partitions_per_topic,
+            max_topics_in_cluster: config.max_auto_created_topics,
             topic_name_cache: Cache::new(10_000),
             sasl_required: config.sasl_required,
             authorizer,
@@ -809,7 +821,7 @@ impl Handler for SlateDBClusterHandler {
             // client can handshake SCRAM and then send PLAIN bytes,
             // eliciting cleartext credentials from a flow the client
             // believed was SCRAM.
-            provider.record_negotiated_mechanism(ctx.client_addr, &mech_upper);
+            provider.record_negotiated_mechanism(ctx.conn_id, &mech_upper);
         }
         SaslHandshakeResponseData {
             error_code: if supported {
@@ -840,7 +852,7 @@ impl Handler for SlateDBClusterHandler {
         use crate::server::SaslPostAuth;
         let Some(provider) = &self.sasl_provider else {
             self.sasl_post_auth.insert(
-                ctx.client_addr,
+                ctx.conn_id,
                 SaslPostAuth {
                     principal: None,
                     complete: false,
@@ -854,7 +866,7 @@ impl Handler for SlateDBClusterHandler {
         };
 
         let mechanism = pick_sasl_mechanism(
-            provider.has_scram_session(ctx.client_addr).await,
+            provider.has_scram_session(ctx.conn_id).await,
             &request.auth_bytes,
         );
 
@@ -866,11 +878,11 @@ impl Handler for SlateDBClusterHandler {
         // the legitimate client believed was the other mechanism. Reject
         // the mismatch instead of authenticating against the wrong
         // mechanism.
-        if let Some(committed) = provider.negotiated_mechanism_for(ctx.client_addr)
+        if let Some(committed) = provider.negotiated_mechanism_for(ctx.conn_id)
             && !committed.eq_ignore_ascii_case(mechanism)
         {
             self.sasl_post_auth.insert(
-                ctx.client_addr,
+                ctx.conn_id,
                 SaslPostAuth {
                     principal: None,
                     complete: false,
@@ -889,7 +901,7 @@ impl Handler for SlateDBClusterHandler {
 
         let (ok, principal, response_bytes) = provider
             .authenticate_with_session(
-                ctx.client_addr,
+                ctx.conn_id,
                 mechanism,
                 &request.auth_bytes,
                 ctx.transport_tls,
@@ -905,7 +917,7 @@ impl Handler for SlateDBClusterHandler {
             && !response_bytes.is_empty()
             && !response_bytes.starts_with(b"e=");
         self.sasl_post_auth.insert(
-            ctx.client_addr,
+            ctx.conn_id,
             SaslPostAuth {
                 principal: principal.clone(),
                 complete: ok,
@@ -933,17 +945,17 @@ impl Handler for SlateDBClusterHandler {
     #[cfg(feature = "sasl")]
     async fn take_sasl_post_auth(
         &self,
-        client_addr: std::net::SocketAddr,
+        conn_id: u64,
     ) -> Option<crate::server::SaslPostAuth> {
-        self.sasl_post_auth.remove(&client_addr).map(|(_k, v)| v)
+        self.sasl_post_auth.remove(&conn_id).map(|(_k, v)| v)
     }
 
-    async fn on_connection_closed(&self, _client_addr: std::net::SocketAddr) {
+    async fn on_connection_closed(&self, _conn_id: u64) {
         #[cfg(feature = "sasl")]
         {
-            self.sasl_post_auth.remove(&_client_addr);
+            self.sasl_post_auth.remove(&_conn_id);
             if let Some(provider) = &self.sasl_provider {
-                provider.clear_session(_client_addr).await;
+                provider.clear_session(_conn_id).await;
             }
         }
     }

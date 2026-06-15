@@ -1616,11 +1616,23 @@ impl PartitionStore {
     /// populate the `timestamp` field of `ListOffsets` v1+ responses (required
     /// by `KafkaConsumer.offsetsForTimes()`), or `Ok(None)` when no such batch
     /// exists (Kafka reports offset -1 in that case).
+    ///
+    /// Bounded scan: an authenticated reader cannot turn this into a full-log
+    /// scan DoS by pointing the timestamp at `i64::MIN`. We cap the number of
+    /// batches inspected at `LIST_OFFSETS_TIMESTAMP_SCAN_CAP`; if the cap is
+    /// reached without a hit we report "not found" rather than continuing
+    /// indefinitely. The cap is chosen high enough to satisfy normal
+    /// `offsetsForTimes()` queries (which target recent timestamps) and low
+    /// enough that a worst-case pathological query bounds CPU and object-store
+    /// reads. Replace this with a real sparse time index when implementing the
+    /// `.timeindex` analogue.
     pub async fn offset_for_timestamp(
         &self,
         target_timestamp_ms: i64,
     ) -> SlateDBResult<Option<(i64, i64)>> {
         use super::keys::{decode_record_offset, parse_batch_max_timestamp};
+
+        const LIST_OFFSETS_TIMESTAMP_SCAN_CAP: usize = 100_000;
 
         let log_start = self.log_start_offset.load(Ordering::SeqCst);
         let high_watermark = self.high_watermark.load(Ordering::SeqCst);
@@ -1636,7 +1648,20 @@ impl PartitionStore {
             .scan(start_key.as_slice()..end_key.as_slice())
             .await?;
 
+        let mut scanned = 0usize;
         while let Some(item) = iter.next().await.map_err(SlateDBError::from)? {
+            scanned += 1;
+            if scanned > LIST_OFFSETS_TIMESTAMP_SCAN_CAP {
+                tracing::warn!(
+                    topic = %self.topic,
+                    partition = self.partition,
+                    target_timestamp_ms,
+                    scanned,
+                    "offset_for_timestamp scan cap reached; reporting not-found"
+                );
+                super::metrics::record_list_offsets_truncated(&self.topic);
+                return Ok(None);
+            }
             let Some(offset) = decode_record_offset(&item.key) else {
                 continue;
             };
@@ -1787,6 +1812,48 @@ impl PartitionStore {
             return Ok(0);
         }
 
+        // Take `write_lock` for the epoch re-verify + LSO write + delete
+        // batch. Without this, retention's epoch check (above) and its
+        // durable LSO write are not atomic — a concurrent ownership
+        // hand-off can fence us between the two, and our LSO write would
+        // either fail (good, slatedb's own fencing catches it) OR land
+        // on stale ordering versus a concurrent appender that's in the
+        // middle of `append_batch_inner`. Holding `write_lock` across the
+        // mutation block makes the "epoch verify + LSO + delete" atomic
+        // with respect to any appender, so a freshly-acked record cannot
+        // be retroactively retention-deleted.
+        let _retention_guard = self.write_lock.lock().await;
+
+        // Re-verify the epoch under the lock so we don't write LSO from a
+        // stale-epoch retention pass. (The durable write itself is also
+        // fenced by slatedb when ownership has moved, but failing fast
+        // here avoids issuing a doomed write.)
+        if self.leader_epoch != 0 {
+            let stored_epoch = match self.db.get(LEADER_EPOCH_KEY).await {
+                Ok(Some(bytes)) => decode_leader_epoch(&bytes).unwrap_or(0),
+                Ok(None) => 0,
+                Err(e) => {
+                    let err = SlateDBError::from(e);
+                    if err.is_fenced() {
+                        return Err(err);
+                    }
+                    return Err(SlateDBError::Storage(format!(
+                        "Cannot re-verify epoch for retention on {}/{}: {}",
+                        self.topic, self.partition, err
+                    )));
+                }
+            };
+            if stored_epoch != self.leader_epoch {
+                super::metrics::record_epoch_mismatch(&self.topic, self.partition);
+                return Err(SlateDBError::EpochMismatch {
+                    topic: self.topic.clone(),
+                    partition: self.partition,
+                    expected_epoch: self.leader_epoch,
+                    stored_epoch,
+                });
+            }
+        }
+
         // Persist the new LSO durably BEFORE deleting any data. See method
         // docs for the crash-ordering argument.
         self.db
@@ -1929,8 +1996,75 @@ impl PartitionStore {
             return Ok(0);
         }
 
+        // Re-verify each candidate under `write_lock` and build the delete
+        // batch while holding it. Without this, a concurrent appender for
+        // producer P can race the prune:
+        //   1. Prune scan sees P's persisted `last_used_at_ms < cutoff` and
+        //      `producer_states.contains_key(&P) == false` (cache evicted).
+        //   2. Appender for P acquires write_lock, computes a batch that
+        //      atomically writes a fresh persisted producer-state value
+        //      AND inserts P into the in-memory cache.
+        //   3. Appender's WriteBatch commits.
+        //   4. Prune (no lock) issues its delete batch including P's key.
+        //   5. P's persisted state is gone; next batch from P is treated
+        //      as a new producer, accepting duplicate sequences as new.
+        //      That's an idempotency violation.
+        // Holding `write_lock` across the re-verify + delete makes the
+        // re-verify and the delete atomic with respect to any appender:
+        // an appender either ran fully BEFORE we got the lock (its put
+        // bumped `last_used_at_ms` above the cutoff and our point-read
+        // sees that, so we skip) or runs fully AFTER (so our delete
+        // applies first, then the appender writes a fresh entry that
+        // we never had a chance to delete).
+        let _prune_guard = self.write_lock.lock().await;
+
+        let mut verified: Vec<(i64, [u8; 9])> = Vec::with_capacity(to_delete.len());
+        for (producer_id, key) in to_delete {
+            // Cache check first: an appender's `producer_states.insert`
+            // happens within the same critical section as its WriteBatch
+            // commit (see `append_batch_inner`), so if the producer is in
+            // the cache now, an appender beat us — leave it alone.
+            if self.producer_states.contains_key(&producer_id) {
+                continue;
+            }
+            // Re-read the persisted timestamp under the lock. A point-read
+            // failure here is treated as "leave it alone" — better to
+            // re-prune later than to delete an entry whose state we
+            // couldn't confirm.
+            let bytes = match self.db.get(key.as_slice()).await {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(
+                        topic = %self.topic,
+                        partition = self.partition,
+                        producer_id,
+                        error = %e,
+                        "Producer-state re-verify failed; skipping prune for this entry"
+                    );
+                    continue;
+                }
+            };
+            let Some(persisted) = decode_producer_state_value(&bytes) else {
+                continue;
+            };
+            let effective_last_used = if persisted.last_used_at_ms >= 0 {
+                persisted.last_used_at_ms
+            } else {
+                opened_at_ms
+            };
+            if effective_last_used > cutoff_ms {
+                continue;
+            }
+            verified.push((producer_id, key));
+        }
+
+        if verified.is_empty() {
+            return Ok(0);
+        }
+
         let mut delete_batch = WriteBatch::new();
-        for (_, key) in &to_delete {
+        for (_, key) in &verified {
             delete_batch.delete(key.as_slice());
         }
 
@@ -1957,8 +2091,8 @@ impl PartitionStore {
             return Err(err);
         }
 
-        let deleted = to_delete.len() as u64;
-        for (producer_id, _) in &to_delete {
+        let deleted = verified.len() as u64;
+        for (producer_id, _) in &verified {
             self.producer_states.invalidate(producer_id);
         }
 
@@ -2594,18 +2728,26 @@ impl PartitionStoreBuilder {
 
         info!(topic = %topic_for_task, partition, high_watermark = hwm, leader_epoch = validated_epoch, "Partition store opened via builder");
 
-        // Build producer state cache with configured TTL and eviction warning
-        // Clone topic for the eviction listener closure
+        // Build producer state cache with size-bounded eviction.
+        //
+        // Time-to-idle eviction is intentionally NOT configured here. With
+        // it on, an idle-but-active producer's cache entry would be evicted
+        // before the persisted-state prune horizon and the producer would
+        // be re-treated as new on reconnect — silently accepting duplicate
+        // sequences. The persisted prune is the only retention mechanism;
+        // the in-memory cache exists to avoid repeated point-reads on hot
+        // producers and is bounded by `max_capacity`. Operators worried
+        // about per-partition memory should tune that capacity.
         let topic_for_eviction = topic.clone();
         let producer_states_cache = MokaCache::builder()
             .max_capacity(DEFAULT_PRODUCER_STATE_CACHE_SIZE)
-            .time_to_idle(Duration::from_secs(self.producer_state_cache_ttl_secs))
             .eviction_listener(move |producer_id: Arc<i64>, state: ProducerState, cause| {
                 // Log warning when producers with active sequences are evicted.
-                // This is important because:
-                // 1. If the producer reconnects after eviction, its sequence tracking is lost
-                // 2. A duplicate message could be accepted as new (idempotency gap)
-                // The warning helps operators identify producers with idle periods > TTL
+                // Even with size-only eviction this can happen on hot
+                // partitions with many concurrent idempotent producers; the
+                // persisted state still gates duplicate acceptance, but a
+                // sustained warning rate is operator signal that the cache
+                // is undersized relative to the producer fleet.
                 if state.last_sequence > 0 {
                     warn!(
                         topic = %topic_for_eviction,
@@ -2614,8 +2756,7 @@ impl PartitionStoreBuilder {
                         last_sequence = state.last_sequence,
                         producer_epoch = state.producer_epoch,
                         eviction_cause = ?cause,
-                        ttl_secs = self.producer_state_cache_ttl_secs,
-                        "Producer state evicted from cache - idempotency may be lost if producer reconnects"
+                        "Producer state evicted from cache (size-bounded); persisted state still authoritative"
                     );
                     super::metrics::record_producer_state_eviction(&topic_for_eviction, partition, true);
                 } else {

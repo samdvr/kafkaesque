@@ -498,6 +498,14 @@ pub trait ConsumerGroupCoordinator: Send + Sync {
         default_session_timeout_ms: u64,
     ) -> SlateDBResult<Vec<(String, String)>>;
 
+    /// Drop committed offsets older than `ttl_ms`. Without this the
+    /// `(group_id, topic, partition) -> offset` map grows unbounded — every
+    /// long-lived group's history accumulates forever, inflating snapshot
+    /// size and FSM state.
+    ///
+    /// Returns the number of offsets that were dropped.
+    async fn expire_committed_offsets(&self, ttl_ms: u64) -> SlateDBResult<usize>;
+
     /// Get all consumer group IDs.
     async fn get_all_groups(&self) -> SlateDBResult<Vec<String>>;
 

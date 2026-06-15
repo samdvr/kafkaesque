@@ -43,7 +43,10 @@ pub(super) async fn handle_init_producer_id(
     // Transactions are not implemented (no transaction coordinator, no
     // commit/abort markers). A producer configured with `transactional.id`
     // expects exactly-once semantics this broker cannot provide — reject
-    // loudly rather than silently downgrading its guarantees to idempotence.
+    // loudly with the spec error code rather than silently downgrading its
+    // guarantees to idempotence. `TransactionalIdAuthorizationFailed` (53)
+    // is the closest typed signal: clients abort the transactional producer
+    // permanently rather than retry-storming on `InvalidRequest`.
     if let Some(ref txn_id) = request.transactional_id {
         error!(
             client = %ctx.client_addr,
@@ -52,7 +55,7 @@ pub(super) async fn handle_init_producer_id(
         );
         return InitProducerIdResponseData {
             throttle_time_ms: 0,
-            error_code: KafkaCode::InvalidRequest,
+            error_code: KafkaCode::TransactionalIdAuthorizationFailed,
             producer_id: -1,
             producer_epoch: -1,
         };

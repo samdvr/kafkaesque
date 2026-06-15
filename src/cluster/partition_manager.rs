@@ -382,12 +382,16 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         let lease_handle = self.start_lease_renewal_loop();
         let ownership_handle = self.start_ownership_loop();
         let session_handle = self.start_session_timeout_loop();
+        let offset_expiration_handle = self.start_offset_expiration_loop();
 
         let mut handles = self.task_handles.write().await;
         handles.push(heartbeat_handle);
         handles.push(lease_handle);
         handles.push(ownership_handle);
         handles.push(session_handle);
+        if let Some(h) = offset_expiration_handle {
+            handles.push(h);
+        }
 
         // Time-based log retention (only when enabled; see ClusterConfig docs)
         if self.config.log_retention_ms > 0 {
@@ -1046,6 +1050,48 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         })
     }
 
+    /// Start the leader-gated committed-offset expiration loop. Runs at a
+    /// coarser interval than session-timeout (offset retention is measured
+    /// in days, not seconds). Each broker proposes; subsequent proposals
+    /// in the same window are no-ops at the FSM (already-expired keys are
+    /// gone), so the redundancy is bounded by `replicaCount` per `interval`.
+    fn start_offset_expiration_loop(&self) -> Option<JoinHandle<()>> {
+        let retention_ms = self.config.group_offset_retention_ms;
+        if retention_ms == 0 {
+            return None;
+        }
+        let coordinator = self.coordinator.clone();
+        // Sweep every hour by default — granular enough that "7 days" is
+        // really "7 days ± 1 hour", but coarse enough that the per-call
+        // Raft proposal cost is invisible.
+        let interval = std::time::Duration::from_secs(3600);
+        let broker_id = self.broker_id;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        Some(self.control_runtime.spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(initial_jitter(interval)) => {},
+                _ = shutdown_rx.recv() => return,
+            }
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(with_jitter(interval)) => {},
+                    _ = shutdown_rx.recv() => break,
+                }
+                match coordinator.expire_committed_offsets(retention_ms).await {
+                    Ok(0) => {}
+                    Ok(count) => info!(
+                        broker_id,
+                        expired_offsets = count,
+                        retention_ms,
+                        "Expired stale committed group offsets"
+                    ),
+                    Err(e) => warn!(error = %e, "Failed to expire committed offsets"),
+                }
+            }
+        }))
+    }
+
     /// Get a partition store if we own it (internal use only).
     async fn get_store(&self, topic: &str, partition: i32) -> Option<Arc<PartitionStore>> {
         let key = self.partition_key(topic, partition);
@@ -1451,17 +1497,61 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
     }
 
     /// Delete all data for a partition from object storage.
+    ///
+    /// Ordering is load-bearing: we MUST delete the on-disk objects BEFORE
+    /// releasing the Raft lease, otherwise another broker can acquire the
+    /// partition between our release and our delete-stream and start
+    /// writing under the same `topic-X/partition-Y/` prefix — its writes
+    /// will then be silently destroyed by our in-flight delete-stream
+    /// (data loss on rapid topic churn or admin-issued partition delete
+    /// during normal ownership churn).
+    ///
+    /// The fix: close our local SlateDB instance and delete the underlying
+    /// objects while we still hold the lease (so no other broker can
+    /// acquire), then release the lease only after the delete stream
+    /// drains. If the partition isn't owned, fall through to a delete-only
+    /// pass — there's no in-broker writer to fence in that case.
     pub async fn delete_partition_data(&self, topic: &str, partition: i32) -> SlateDBResult<()> {
         use futures::{StreamExt, TryStreamExt};
         use object_store::path::Path as ObjectPath;
-        if self.owns_partition(topic, partition).await {
-            self.release_partition(topic, partition).await?;
+
+        // Step 1: if we own the partition, close the local store and remove
+        // it from `partition_states` WITHOUT releasing the lease. We keep
+        // the lease held so no peer broker can acquire and start writing
+        // before our delete-stream drains.
+        let owned = self.owns_partition(topic, partition).await;
+        if owned {
+            let key = self.partition_key(topic, partition);
+            self.lease_cache.remove(&key);
+            if let Some((_, state)) = self.partition_states.remove(&key)
+                && let Some(store) = state.store()
+            {
+                store.clear_load_metrics();
+                if let Err(e) = store.close().await {
+                    // If close fails, an acks=0 flush may still be in flight;
+                    // bail before touching object storage. The lease will
+                    // expire naturally, after which a peer broker can take
+                    // over a still-intact partition rather than the half-
+                    // deleted carcass we'd leave behind.
+                    error!(topic, partition, error = %e, "Failed to close partition store before delete");
+                    super::metrics::record_lease_operation("release", "skipped_close_failure");
+                    return Err(SlateDBError::Config(format!(
+                        "skipped delete for {}/{} after close() failure; lease will expire \
+                         naturally to avoid racing unflushed writes",
+                        topic, partition
+                    )));
+                }
+                debug!(topic, partition, "Partition store closed before delete");
+            }
         }
-        // The object_store is already configured with `base_path` as its
-        // prefix (see PartitionStore::open / ObjectStoreBuilder), so we list
-        // and delete using the same relative prefix that the store opens at.
-        // Prepending `base_path` here would double the prefix and silently
-        // delete nothing — leaving the SST/WAL objects in S3 forever.
+
+        // Step 2: delete the underlying objects while the lease is still
+        // held (when `owned`). The object_store is already configured with
+        // `base_path` as its prefix (see PartitionStore::open /
+        // ObjectStoreBuilder), so we list and delete using the same
+        // relative prefix that the store opens at. Prepending `base_path`
+        // here would double the prefix and silently delete nothing —
+        // leaving the SST/WAL objects in S3 forever.
         let path_prefix = format!("topic-{}/partition-{}", topic, partition);
         let prefix = ObjectPath::from(path_prefix.as_str());
         info!(topic, partition, path = %path_prefix, base_path = %self.base_path, "Deleting partition data from object store");
@@ -1496,6 +1586,26 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             failed = failures,
             "Deleted partition data"
         );
+
+        // Step 3: release the lease via the coordinator. Now that the
+        // backing objects are gone, any peer that acquires next will get
+        // a clean partition. Skip this step if we didn't own to begin
+        // with — there's nothing to release.
+        if owned {
+            match self.coordinator.release_partition(topic, partition).await {
+                Ok(_) => {
+                    super::metrics::record_lease_operation("release", "success");
+                    super::metrics::OWNED_PARTITIONS
+                        .with_label_values(&[topic])
+                        .dec();
+                    info!(topic, partition, "Released partition after delete");
+                }
+                Err(e) => {
+                    super::metrics::record_lease_operation("release", "error");
+                    return Err(e);
+                }
+            }
+        }
         Ok(())
     }
 

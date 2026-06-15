@@ -26,9 +26,9 @@
 use crate::constants::{
     BATCH_BASE_OFFSET, BATCH_CRC_DATA_START, BATCH_CRC_OFFSET, BATCH_FIRST_SEQUENCE_END,
     BATCH_FIRST_SEQUENCE_OFFSET, BATCH_LAST_OFFSET_DELTA_OFFSET, BATCH_LENGTH_END,
-    BATCH_LENGTH_OFFSET, BATCH_LENGTH_PREFIX, BATCH_PRODUCER_EPOCH_END,
-    BATCH_PRODUCER_EPOCH_OFFSET, BATCH_PRODUCER_ID_END, BATCH_PRODUCER_ID_OFFSET,
-    MIN_BATCH_HEADER_SIZE,
+    BATCH_LENGTH_OFFSET, BATCH_LENGTH_PREFIX, BATCH_MAGIC_OFFSET, BATCH_MAGIC_V2,
+    BATCH_PRODUCER_EPOCH_END, BATCH_PRODUCER_EPOCH_OFFSET, BATCH_PRODUCER_ID_END,
+    BATCH_PRODUCER_ID_OFFSET, MIN_BATCH_HEADER_SIZE,
 };
 
 /// Byte offset of the explicit `records_count` (INT32) field in a v2
@@ -80,6 +80,13 @@ pub enum CrcValidationResult {
     /// rather than silently falling back to inline CRC on the very runtime
     /// worker the offload was meant to spare.
     OffloadFailed,
+    /// The batch declares a non-v2 magic byte. The v2 RecordBatch layout
+    /// (records-count at offset 57-60, CRC over bytes 21+) is the only
+    /// layout the parser knows; v0/v1 MessageSets fed through this validator
+    /// would be checksummed against the wrong region and pass or fail at
+    /// random. Rejecting up front turns silent acceptance into a typed
+    /// `CorruptMessage` at the caller.
+    UnsupportedMagic { magic: u8 },
 }
 
 /// Validate CRC-32C checksum of a Kafka RecordBatch.
@@ -113,6 +120,14 @@ pub fn validate_batch_crc(batch: &[u8]) -> CrcValidationResult {
     // BATCH_CRC_DATA_START bytes for the CRC field plus first covered byte.
     if batch.len() < BATCH_CRC_DATA_START {
         return CrcValidationResult::TooSmall;
+    }
+
+    // Reject anything that isn't v2 BEFORE checksumming. The CRC region for
+    // v0/v1 starts at byte 12, not 21, so feeding a legacy MessageSet through
+    // here would produce a meaningless verdict.
+    let magic = batch[BATCH_MAGIC_OFFSET];
+    if magic != BATCH_MAGIC_V2 {
+        return CrcValidationResult::UnsupportedMagic { magic };
     }
 
     let batch_length_raw = i32::from_be_bytes([
@@ -590,9 +605,14 @@ mod tests {
     /// Stamp `batch_length` (bytes 8..12) so the buffer parses as a complete
     /// v2 RecordBatch. `batch_length` counts bytes from byte 12 to the end,
     /// so the right value for a flat fixture buffer is `batch.len() - 12`.
+    /// Also stamps the magic byte to v2 (the only layout the validator
+    /// accepts) so callers don't have to remember to set it themselves.
     fn set_batch_length_to_buffer_size(batch: &mut [u8]) {
         let len = (batch.len() as i32).saturating_sub(BATCH_LENGTH_PREFIX as i32);
         batch[BATCH_LENGTH_OFFSET..BATCH_LENGTH_END].copy_from_slice(&len.to_be_bytes());
+        if batch.len() > BATCH_MAGIC_OFFSET {
+            batch[BATCH_MAGIC_OFFSET] = BATCH_MAGIC_V2;
+        }
     }
 
     #[test]
@@ -946,6 +966,7 @@ mod tests {
         // FrameMismatch, not Invalid (a corrupt-frame report distinct from
         // a CRC report).
         let mut batch = vec![0u8; 61];
+        batch[BATCH_MAGIC_OFFSET] = BATCH_MAGIC_V2;
         // Claim 200 bytes after byte 12 (total 212), but only 61 are present.
         let oversized: i32 = 200;
         batch[8..12].copy_from_slice(&oversized.to_be_bytes());
@@ -966,6 +987,7 @@ mod tests {
     fn test_validate_batch_crc_frame_mismatch_when_non_positive() {
         // batch_length <= 0 is a malformed header; reject as FrameMismatch.
         let mut batch = vec![0u8; 61];
+        batch[BATCH_MAGIC_OFFSET] = BATCH_MAGIC_V2;
         batch[8..12].copy_from_slice(&(-5i32).to_be_bytes());
         assert!(matches!(
             validate_batch_crc(&batch),
@@ -973,6 +995,7 @@ mod tests {
         ));
 
         let mut zero = vec![0u8; 61];
+        zero[BATCH_MAGIC_OFFSET] = BATCH_MAGIC_V2;
         zero[8..12].copy_from_slice(&0i32.to_be_bytes());
         assert!(matches!(
             validate_batch_crc(&zero),

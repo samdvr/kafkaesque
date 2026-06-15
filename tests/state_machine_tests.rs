@@ -1271,6 +1271,7 @@ async fn test_init_producer_id_non_transactional() {
                 epoch: -1,
                 timeout_ms: 60000,
                 timestamp_ms: 1000,
+                request_token: None,
             },
         ))
         .await;
@@ -1293,6 +1294,7 @@ async fn test_init_producer_id_transactional() {
                 epoch: -1,
                 timeout_ms: 60000,
                 timestamp_ms: 1000,
+                request_token: None,
             },
         ))
         .await;
@@ -1315,6 +1317,7 @@ async fn test_init_producer_id_transactional() {
                 epoch,
                 timeout_ms: 60000,
                 timestamp_ms: 1000,
+                request_token: None,
             },
         ))
         .await;

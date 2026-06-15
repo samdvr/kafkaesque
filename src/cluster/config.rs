@@ -382,6 +382,14 @@ pub struct ClusterConfig {
     /// Default: 30000ms (30 seconds, matching Kafka's default)
     pub default_session_timeout_ms: u64,
 
+    /// Retention window for committed consumer-group offsets, in milliseconds.
+    /// Offsets that have not been re-committed within this window are dropped
+    /// by the leader-gated sweep. Mirrors Kafka's `offsets.retention.minutes`
+    /// (default 7 days). Set to 0 to disable expiration entirely (the FSM
+    /// will then grow without bound — only safe for short-lived clusters).
+    /// Default: 7 days
+    pub group_offset_retention_ms: u64,
+
     /// Whether to automatically create topics when they are first referenced.
     /// If false, metadata requests for unknown topics will return an error
     /// instead of auto-creating the topic.
@@ -883,6 +891,7 @@ impl Default for ClusterConfig {
                 DEFAULT_SESSION_TIMEOUT_CHECK_INTERVAL_SECS,
             ),
             default_session_timeout_ms: 30000, // 30 seconds, Kafka default
+            group_offset_retention_ms: 7 * 24 * 60 * 60 * 1000, // 7 days, Kafka default
             auto_create_topics: true,          // Match Kafka's default
             default_num_partitions: 10,
             max_partitions_per_topic: 1000, // Reasonable limit to prevent DoS

@@ -32,6 +32,7 @@ fn isolated_test_config(broker_id: i32) -> ClusterConfig {
 fn test_context(principal: &str) -> RequestContext {
     RequestContext {
         client_addr: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        conn_id: 1,
         api_version: 8,
         client_id: Some("acl-test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),

@@ -436,6 +436,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
 fn ctx() -> RequestContext {
     RequestContext {
         client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+        conn_id: 1,
         api_version: 0,
         client_id: Some("p5-3-stateful".to_string()),
         request_id: uuid::Uuid::new_v4(),

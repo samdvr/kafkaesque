@@ -51,6 +51,13 @@ pub struct SaslPostAuth {
 pub struct RequestContext {
     /// The client's address.
     pub client_addr: SocketAddr,
+    /// Process-unique identifier for the connection that produced this
+    /// request. Stable for the lifetime of the underlying socket and
+    /// reset to a fresh value on every new connection — including TCP
+    /// socket-address reuse — so server-side per-connection state
+    /// (SASL post-auth, SCRAM challenge, etc.) cannot bleed across
+    /// connections that happen to share a `client_addr`.
+    pub conn_id: u64,
     /// The API version of the request.
     pub api_version: i16,
     /// The client ID from the request header.
@@ -510,16 +517,18 @@ pub trait Handler: Send + Sync {
     /// challenges as well as final successes; the dispatcher needs to
     /// know which so it doesn't open the auth gate after just the first
     /// round-trip. The cluster handler stashes a `(principal, complete)`
-    /// record keyed by the client's `SocketAddr` while running
-    /// `handle_sasl_authenticate`, and the dispatcher takes it back out
-    /// here. Default `None` keeps PLAIN-only and test handlers unchanged.
-    async fn take_sasl_post_auth(&self, _client_addr: SocketAddr) -> Option<SaslPostAuth> {
+    /// record keyed by `conn_id` (a process-unique connection id, NOT
+    /// `SocketAddr`, so TCP socket-address reuse can't cross-pollinate
+    /// session state) while running `handle_sasl_authenticate`, and the
+    /// dispatcher takes it back out here. Default `None` keeps PLAIN-only
+    /// and test handlers unchanged.
+    async fn take_sasl_post_auth(&self, _conn_id: u64) -> Option<SaslPostAuth> {
         None
     }
 
     /// Called when a client connection closes (clean or error). Handlers can
-    /// drop per-connection auth state keyed by `client_addr`.
-    async fn on_connection_closed(&self, _client_addr: SocketAddr) {}
+    /// drop per-connection auth state keyed by `conn_id`.
+    async fn on_connection_closed(&self, _conn_id: u64) {}
 
     /// Handle a SaslAuthenticate request.
     async fn handle_sasl_authenticate(

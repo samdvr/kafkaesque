@@ -5,6 +5,13 @@
 #     --from-literal=AWS_ACCESS_KEY_ID=... \
 #     --from-literal=AWS_SECRET_ACCESS_KEY=...
 #
+#   kubectl create secret tls kafkaesque-tls -n kafkaesque \
+#     --cert=server.crt --key=server.key
+#
+#   kubectl create secret generic kafkaesque-raft-tls -n kafkaesque \
+#     --from-file=tls.crt=raft.crt --from-file=tls.key=raft.key \
+#     --from-file=ca.crt=raft-ca.crt
+#
 #   helm install kafkaesque ./kafkaesque -n kafkaesque --create-namespace \
 #     -f values-production.yaml \
 #     --set raftAuth.existingSecret=kafkaesque-raft-auth
@@ -23,6 +30,26 @@ config:
     s3:
       bucket: "your-kafkaesque-bucket"
       region: "us-east-1"
+
+# TLS for the Kafka client port. PRODUCTION REQUIRES TLS: with
+# `superUsers: ""` (above) clients authenticate over SASL, and PLAIN
+# credentials would otherwise transit the wire in cleartext. The
+# referenced secret must exist before `helm install`.
+tls:
+  enabled: true
+  certSecretName: kafkaesque-tls
+  mountPath: /etc/kafkaesque/tls
+
+# mTLS for the Raft control plane. The HMAC framing layer alone (via
+# raftAuth) authenticates message integrity; mTLS adds peer identity so a
+# compromised broker cannot impersonate another node and inject
+# `RemoveBroker` commands.
+raftTls:
+  enabled: true
+  certSecretName: kafkaesque-raft-tls
+  mountPath: /etc/kafkaesque/raft-tls
+  # Override `serverName` if your issued certs use a different SAN.
+  serverName: kafkaesque-raft
 
 extraEnvFrom:
   - secretRef:

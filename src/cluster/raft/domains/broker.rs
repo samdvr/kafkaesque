@@ -104,6 +104,18 @@ impl BrokerDomainState {
                 port,
                 timestamp_ms,
             } => {
+                // A previously Fenced broker MUST NOT come back as Active via
+                // a plain Register: its partitions have been transferred to
+                // other owners, and resuming as Active would let it write to
+                // logs the new owners are now appending to (split-brain).
+                // The same invariant Heartbeat enforces applies here. Recovery
+                // from Fenced requires an explicit out-of-band Unfence step
+                // (or Unregister + Register fresh after partitions clear).
+                if let Some(existing) = self.brokers.get(&broker_id)
+                    && matches!(existing.status, BrokerStatus::Fenced)
+                {
+                    return BrokerResponse::NotFound { broker_id };
+                }
                 self.brokers.insert(
                     broker_id,
                     BrokerInfo {

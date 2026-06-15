@@ -518,34 +518,20 @@ impl SlateDBClusterHandler {
         }
 
         // A NULLABLE_BYTES record_set of -1 (or an empty payload) is a legal
-        // per-partition slot that carries no records. CRC validation rejects
-        // it as `TooSmall`, which surfaces in librdkafka as `message corrupt`
-        // for what is just an empty batch. Return success with the current
-        // log-end offset so the producer treats the slot as a no-op.
-        //
-        // Use `get_for_write` (not `get_for_read`) so the empty path goes
-        // through the same ownership / lease check the non-empty path does:
-        // returning HWM from a partition we no longer own would mislead a
-        // producer about its log position the moment a leader transfer is
-        // in flight.
+        // per-partition slot that carries no records. We treat it as a
+        // structurally-empty produce: success with `base_offset = -1`, never
+        // the partition's HWM. Returning HWM here used to leak the next
+        // assignable offset, which then collided with whatever real append
+        // landed next (two clients sending `produce(empty)` and `produce(rec)`
+        // both saw the same `base_offset`, so a downstream consumer of those
+        // ack-strings could not distinguish them). `-1` is the established
+        // sentinel for "no record was written" on the produce response.
         if partition.records.is_empty() {
-            return match self
-                .partition_manager
-                .get_for_write(topic, partition.partition_index)
-                .await
-            {
-                Ok(store) => ProducePartitionResponse {
-                    partition_index: partition.partition_index,
-                    error_code: KafkaCode::None,
-                    base_offset: store.high_watermark(),
-                    log_append_time: -1,
-                },
-                Err(_) => ProducePartitionResponse {
-                    partition_index: partition.partition_index,
-                    error_code: KafkaCode::NotLeaderForPartition,
-                    base_offset: -1,
-                    log_append_time: -1,
-                },
+            return ProducePartitionResponse {
+                partition_index: partition.partition_index,
+                error_code: KafkaCode::None,
+                base_offset: -1,
+                log_append_time: -1,
             };
         }
 

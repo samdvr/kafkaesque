@@ -16,6 +16,7 @@ use kafkaesque::server::{Handler, RequestContext};
 fn create_test_context() -> RequestContext {
     RequestContext {
         client_addr: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        conn_id: 1,
         api_version: 8,
         client_id: Some("debug-test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),

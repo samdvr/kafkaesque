@@ -97,6 +97,13 @@ pub struct RaftCoordinator {
     transaction_counter: std::sync::atomic::AtomicU64,
     /// Runtime handle for spawning control plane tasks.
     runtime: Handle,
+    /// Soft heartbeat state for consumer groups: per-(group, member) the
+    /// last time we issued a Raft proposal. Used to coalesce frequent
+    /// client heartbeats (every 3s by default) into one durable bump every
+    /// `default_session_timeout_ms / HEARTBEAT_RAFT_DUTY_DIVISOR`. Without
+    /// this, a 10k-consumer cluster issues ~3 333 commits/s on heartbeats
+    /// alone — the dominant Raft load.
+    heartbeat_propose_state: dashmap::DashMap<(String, String), std::time::Instant>,
 }
 
 impl RaftCoordinator {
@@ -141,6 +148,7 @@ impl RaftCoordinator {
             shutdown_tx,
             transaction_counter: std::sync::atomic::AtomicU64::new(0),
             runtime,
+            heartbeat_propose_state: dashmap::DashMap::new(),
         };
 
         Ok(coordinator)

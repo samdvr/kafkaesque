@@ -236,6 +236,15 @@ pub enum GroupCommand {
         metadata: Option<String>,
         timestamp_ms: u64,
     },
+
+    /// Expire committed offsets that haven't been touched within `ttl_ms`.
+    /// Without this, `offsets` grows unbounded — every long-running consumer
+    /// group accumulates a (group, topic, partition) row that survives
+    /// forever, inflating the FSM, snapshot, and group-list cardinality.
+    /// Kafka's `offsets.retention.minutes` (default 7 days) is the
+    /// equivalent retention; clients must commit at least once per `ttl_ms`
+    /// to keep their position alive across deploys/restarts.
+    ExpireOffsets { current_time_ms: u64, ttl_ms: u64 },
 }
 
 /// Responses from group domain operations.
@@ -274,6 +283,11 @@ pub enum GroupResponse {
     /// Offset was committed.
     OffsetCommitted,
 
+    /// `count` committed offsets were dropped because they exceeded the
+    /// configured retention. Surfaced so the leader-gated sweep can log
+    /// or count these for operator visibility.
+    OffsetsExpired { count: usize },
+
     /// Group was not found.
     GroupNotFound { group_id: String },
 
@@ -285,6 +299,17 @@ pub enum GroupResponse {
         group_id: String,
         expected: i32,
         actual: i32,
+    },
+
+    /// The member's heartbeat (or other steady-state op) hit the group while
+    /// it is mid-rebalance. The client must rejoin the group with
+    /// `JoinGroup` to receive its new assignment, rather than continuing to
+    /// heartbeat against a stale assignment. Without this typed response,
+    /// rebalance latency is bounded by `session_timeout_ms × 2` (the time
+    /// for the heartbeat to time out before the client thinks to rejoin).
+    RebalanceInProgress {
+        group_id: String,
+        member_id: String,
     },
 
     /// A joining member's protocol list has no protocol in common with the
@@ -353,12 +378,24 @@ impl GroupDomainState {
                 // re-connecting after a network blip) accumulates a fresh
                 // member entry every join, bloating the group and the
                 // generation counter.
+                //
+                // Coalesce ONLY when both client_id and client_host are
+                // non-empty. Two different clients with empty `client_id`
+                // and `client_host` (legacy adapters / tests / proxies that
+                // don't surface metadata) would otherwise both match the
+                // same `("", "")` sentinel and silently overwrite each
+                // other's MemberInfo — a single-line "rejoin" that is
+                // actually identity confusion across distinct connections.
                 let final_member_id = if member_id.is_empty() {
-                    if let Some(existing) = group
-                        .members
-                        .values()
-                        .find(|m| m.client_id == client_id && m.client_host == client_host)
-                    {
+                    let coalesce_candidate = if client_id.is_empty() || client_host.is_empty() {
+                        None
+                    } else {
+                        group
+                            .members
+                            .values()
+                            .find(|m| m.client_id == client_id && m.client_host == client_host)
+                    };
+                    if let Some(existing) = coalesce_candidate {
                         existing.member_id.clone()
                     } else {
                         format!("{}-{}-{}", client_id, timestamp_ms, group.members.len())
@@ -547,6 +584,34 @@ impl GroupDomainState {
                         };
                     }
 
+                    if !group.members.contains_key(&member_id) {
+                        return GroupResponse::UnknownMember {
+                            group_id,
+                            member_id,
+                        };
+                    }
+
+                    // While the group is mid-rebalance the heartbeat must
+                    // tell the client to rejoin — its current assignment
+                    // (if any) is stale. Returning HeartbeatAck here would
+                    // let the client keep consuming under the old assignment
+                    // until session_timeout fires, doubling the visible
+                    // rebalance latency. We still update last_heartbeat_ms so
+                    // the eviction sweep doesn't expire a member that is
+                    // actively rejoining.
+                    if matches!(
+                        group.state,
+                        GroupStateEnum::PreparingRebalance | GroupStateEnum::CompletingRebalance
+                    ) {
+                        if let Some(member) = group.members.get_mut(&member_id) {
+                            member.last_heartbeat_ms = timestamp_ms;
+                        }
+                        return GroupResponse::RebalanceInProgress {
+                            group_id,
+                            member_id,
+                        };
+                    }
+
                     if let Some(member) = group.members.get_mut(&member_id) {
                         member.last_heartbeat_ms = timestamp_ms;
                         GroupResponse::HeartbeatAck
@@ -699,6 +764,26 @@ impl GroupDomainState {
                 );
                 GroupResponse::OffsetCommitted
             }
+
+            GroupCommand::ExpireOffsets {
+                current_time_ms,
+                ttl_ms,
+            } => {
+                let keys_to_remove: Vec<_> = self
+                    .offsets
+                    .iter()
+                    .filter(|(_, info)| {
+                        current_time_ms.saturating_sub(info.commit_timestamp_ms) > ttl_ms
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+
+                let count = keys_to_remove.len();
+                for key in keys_to_remove {
+                    self.offsets.remove(&key);
+                }
+                GroupResponse::OffsetsExpired { count }
+            }
         }
     }
 
@@ -806,10 +891,37 @@ mod tests {
             timestamp_ms: 1000,
         });
 
+        // After JoinGroup the group is `PreparingRebalance`; a heartbeat
+        // here must return `RebalanceInProgress` so the client rejoins
+        // rather than continue against a stale assignment. Drive the group
+        // through SyncGroup + CompleteRebalance to reach `Stable` before
+        // testing the happy-path heartbeat.
+        let group_id = "test-group".to_string();
+        let leader_id = state
+            .groups
+            .get(&group_id)
+            .and_then(|g| g.leader_id.clone())
+            .expect("leader assigned after join");
+        let generation = state
+            .groups
+            .get(&group_id)
+            .map(|g| g.generation)
+            .expect("group present");
+        state.apply(GroupCommand::SyncGroup {
+            group_id: group_id.clone(),
+            member_id: leader_id.clone(),
+            generation,
+            assignments: vec![(leader_id.clone(), Vec::new())],
+        });
+        state.apply(GroupCommand::CompleteRebalance {
+            group_id: group_id.clone(),
+            generation,
+        });
+
         let response = state.apply(GroupCommand::Heartbeat {
-            group_id: "test-group".to_string(),
-            member_id: "member-1".to_string(),
-            generation: 1,
+            group_id: group_id.clone(),
+            member_id: leader_id,
+            generation,
             timestamp_ms: 2000,
         });
 

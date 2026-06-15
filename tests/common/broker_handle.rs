@@ -110,6 +110,7 @@ impl BrokerHandle {
             client_addr: format!("127.0.0.1:{}", 50_000 + self.broker_id as u16)
                 .parse::<SocketAddr>()
                 .expect("static SocketAddr"),
+            conn_id: u64::from(self.broker_id as u32),
             api_version: 8,
             client_id: Some("test-harness".to_string()),
             request_id: uuid::Uuid::new_v4(),

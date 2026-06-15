@@ -34,7 +34,6 @@
 //! ```
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -61,19 +60,21 @@ pub struct SaslProvider {
     users: Arc<RwLock<HashMap<String, UserRecord>>>,
     /// In-flight SCRAM sessions keyed by the client's `SocketAddr`. Each
     /// SCRAM exchange is two round-trips, so we hold per-connection state
-    /// between them. Bounded by `SCRAM_MAX_SESSIONS` and a per-entry TTL so
-    /// half-open exchanges (client drops before sending client-final)
-    /// cannot accumulate; without those bounds the map grows until the OS
-    /// eventually notifies the connection layer that the socket is closed,
-    /// which can take minutes per leaked entry.
-    scram_sessions: Arc<moka::sync::Cache<SocketAddr, ScramServerState>>,
+    /// between them. Keyed by per-connection ID (NOT `SocketAddr`) so that
+    /// TCP socket-address reuse cannot cross-pollinate session state into
+    /// a fresh connection. Bounded by `SCRAM_MAX_SESSIONS` and a per-entry
+    /// TTL so half-open exchanges (client drops before sending
+    /// client-final) cannot accumulate; without those bounds the map
+    /// grows until the OS eventually notifies the connection layer that
+    /// the socket is closed, which can take minutes per leaked entry.
+    scram_sessions: Arc<moka::sync::Cache<u64, ScramServerState>>,
     /// Per-connection mechanism committed at SaslHandshake time. Looked up
     /// when authenticating to reject SaslAuthenticate payloads whose bytes
     /// disagree with the negotiated mechanism — without this lookup, a
     /// client (or downstream proxy) that handshakes SCRAM and then sends
     /// PLAIN bytes would be authenticated as PLAIN, eliciting cleartext
     /// credentials from a flow the client believed was SCRAM.
-    negotiated_mechanism: Arc<moka::sync::Cache<SocketAddr, Arc<str>>>,
+    negotiated_mechanism: Arc<moka::sync::Cache<u64, Arc<str>>>,
     /// Supported SASL mechanisms (advertised in SaslHandshake).
     mechanisms: Vec<String>,
     /// Whether authentication is required.
@@ -259,17 +260,17 @@ impl SaslProvider {
     /// sniffing logic so SCRAM `client-final` (which doesn't start with
     /// the GS2 header) is correctly routed to the SCRAM path even though
     /// the bytes themselves don't say "I am SCRAM".
-    pub async fn has_scram_session(&self, client_addr: SocketAddr) -> bool {
-        self.scram_sessions.contains_key(&client_addr)
+    pub async fn has_scram_session(&self, conn_id: u64) -> bool {
+        self.scram_sessions.contains_key(&conn_id)
     }
 
     /// Drop per-connection SCRAM state when a client disconnects.
-    pub async fn clear_session(&self, client_addr: SocketAddr) {
-        if self.scram_sessions.remove(&client_addr).is_some() {
-            debug!(client = %client_addr, "Cleared abandoned SCRAM session");
+    pub async fn clear_session(&self, conn_id: u64) {
+        if self.scram_sessions.remove(&conn_id).is_some() {
+            debug!(conn_id, "Cleared abandoned SCRAM session");
         }
-        if self.negotiated_mechanism.remove(&client_addr).is_some() {
-            debug!(client = %client_addr, "Cleared SASL mechanism commitment");
+        if self.negotiated_mechanism.remove(&conn_id).is_some() {
+            debug!(conn_id, "Cleared SASL mechanism commitment");
         }
     }
 
@@ -280,16 +281,16 @@ impl SaslProvider {
     /// re-normalizing on the hot path. Should be called only when the
     /// handshake succeeds (the mechanism is supported); a failed handshake
     /// must not record any commitment.
-    pub fn record_negotiated_mechanism(&self, client_addr: SocketAddr, mechanism: &str) {
+    pub fn record_negotiated_mechanism(&self, conn_id: u64, mechanism: &str) {
         let normalized: Arc<str> = Arc::from(mechanism.to_uppercase());
-        self.negotiated_mechanism.insert(client_addr, normalized);
+        self.negotiated_mechanism.insert(conn_id, normalized);
     }
 
     /// Return the mechanism the client committed to in `SaslHandshake`, if
     /// any. The string is upper-cased for direct comparison against the
     /// canonical mechanism names ("PLAIN", "SCRAM-SHA-256").
-    pub fn negotiated_mechanism_for(&self, client_addr: SocketAddr) -> Option<Arc<str>> {
-        self.negotiated_mechanism.get(&client_addr)
+    pub fn negotiated_mechanism_for(&self, conn_id: u64) -> Option<Arc<str>> {
+        self.negotiated_mechanism.get(&conn_id)
     }
 
     /// Authenticate using PLAIN mechanism.
@@ -325,16 +326,33 @@ impl SaslProvider {
             }
         };
 
+        // Constant-time compare AGAINST a fixed-length pad. `subtle::ct_eq`
+        // for slices short-circuits on length difference, so the previous
+        // shape (`candidate.as_bytes().ct_eq(password.as_bytes())`) leaked
+        // both whether the user existed AND the byte-length of the stored
+        // password via response-time timing. Pad both sides to a fixed
+        // `PAD_LEN` larger than any plausible password and compare exactly
+        // that many bytes, then AND in a non-short-circuiting length check
+        // so the unknown-user, wrong-password, and right-password paths
+        // all run the same amount of work. Mirrors the fixed-pad compare
+        // in `server/sasl.rs::authenticate_plain`.
+        const PAD_LEN: usize = 128;
         let users = self.users.read().await;
-        // Look up the user but always run the constant-time comparison —
-        // including against a dummy password when the user is absent — so
-        // unknown-user vs wrong-password timings can't be distinguished.
-        // Don't leak user enumeration via timing or via distinct
-        // log lines either.
         let stored = users.get(username);
-        let candidate = stored.map(|r| r.password.as_str()).unwrap_or("");
+        let candidate_bytes = stored.map(|r| r.password.as_bytes()).unwrap_or(&[]);
+        let pw_bytes = password.as_bytes();
+        let mut candidate_pad = [0u8; PAD_LEN];
+        let mut password_pad = [0u8; PAD_LEN];
+        let len_c = candidate_bytes.len().min(PAD_LEN);
+        candidate_pad[..len_c].copy_from_slice(&candidate_bytes[..len_c]);
+        let len_p = pw_bytes.len().min(PAD_LEN);
+        password_pad[..len_p].copy_from_slice(&pw_bytes[..len_p]);
         use subtle::ConstantTimeEq;
-        let eq: bool = candidate.as_bytes().ct_eq(password.as_bytes()).into();
+        let buf_eq: bool = candidate_pad.ct_eq(&password_pad).into();
+        let len_eq: bool = (candidate_bytes.len() as u64)
+            .ct_eq(&(pw_bytes.len() as u64))
+            .into();
+        let eq = buf_eq && len_eq;
         if stored.is_some() && eq {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
@@ -378,13 +396,13 @@ impl SaslProvider {
     /// purposes once it sees `success=true` here.
     pub async fn authenticate_scram_sha256(
         &self,
-        client_addr: SocketAddr,
+        conn_id: u64,
         auth_data: &[u8],
     ) -> (bool, Option<String>, Vec<u8>) {
         // Look up existing session; if none, this is the client-first step.
         let existing = {
-            let prev = self.scram_sessions.get(&client_addr);
-            self.scram_sessions.remove(&client_addr);
+            let prev = self.scram_sessions.get(&conn_id);
+            self.scram_sessions.remove(&conn_id);
             prev
         };
         match existing {
@@ -398,8 +416,8 @@ impl SaslProvider {
                 // just return the failure response.
                 match &state {
                     ScramServerState::AwaitingClientFinal { .. } => {
-                        self.scram_sessions.insert(client_addr, state);
-                        debug!(client = %client_addr, "SCRAM client-first accepted");
+                        self.scram_sessions.insert(conn_id, state);
+                        debug!(conn_id, "SCRAM client-first accepted");
                         // Not authenticated yet — handler still needs to
                         // send the response. We mark failure here so the
                         // gate doesn't flip; the dispatcher does flip it
@@ -408,7 +426,7 @@ impl SaslProvider {
                     }
                     _ => {
                         warn!(
-                            client = %client_addr,
+                            conn_id,
                             "SCRAM client-first rejected"
                         );
                         (false, None, response)
@@ -422,7 +440,7 @@ impl SaslProvider {
                 match state {
                     ScramServerState::Authenticated(principal) => {
                         info!(
-                            client = %client_addr,
+                            conn_id,
                             principal = %principal,
                             "SCRAM-SHA-256 authentication successful"
                         );
@@ -430,7 +448,7 @@ impl SaslProvider {
                     }
                     ScramServerState::Failed(reason) => {
                         warn!(
-                            client = %client_addr,
+                            conn_id,
                             reason = %reason,
                             "SCRAM-SHA-256 authentication failed"
                         );
@@ -448,7 +466,7 @@ impl SaslProvider {
 
     /// Authenticate a SASL request.
     ///
-    /// `session_id` identifies the client connection for multi-step
+    /// `conn_id` identifies the client connection for multi-step
     /// mechanisms (SCRAM). For PLAIN it's ignored.
     ///
     /// Returns `(success, principal, response_bytes)`. The third element
@@ -456,14 +474,14 @@ impl SaslProvider {
     /// challenges for SCRAM, empty for PLAIN).
     pub async fn authenticate_with_session(
         &self,
-        client_addr: SocketAddr,
+        conn_id: u64,
         mechanism: &str,
         auth_data: &[u8],
         transport_tls: bool,
     ) -> (bool, Option<String>, Vec<u8>) {
         if self.require_tls && !transport_tls {
             warn!(
-                client = %client_addr,
+                conn_id,
                 mechanism = %mechanism,
                 "Rejecting SASL on non-TLS connection (sasl_require_tls=true)"
             );
@@ -474,7 +492,7 @@ impl SaslProvider {
             "PLAIN" => {
                 if self.plain_require_tls && !transport_tls {
                     warn!(
-                        client = %client_addr,
+                        conn_id,
                         "Rejecting PLAIN SASL on non-TLS connection"
                     );
                     return (false, None, Vec::new());
@@ -482,7 +500,7 @@ impl SaslProvider {
                 let (success, principal) = self.authenticate_plain(auth_data).await;
                 (success, principal, Vec::new())
             }
-            "SCRAM-SHA-256" => self.authenticate_scram_sha256(client_addr, auth_data).await,
+            "SCRAM-SHA-256" => self.authenticate_scram_sha256(conn_id, auth_data).await,
             _ => {
                 warn!(mechanism = %mechanism, "Unsupported SASL mechanism");
                 (false, None, Vec::new())
@@ -534,16 +552,16 @@ mod tests {
     async fn test_plain_rejected_without_tls() {
         let provider = SaslProvider::new(false);
         provider.add_user("alice", "secret").await;
-        let addr: SocketAddr = "127.0.0.1:49999".parse().unwrap();
+        let conn_id: u64 = 1;
 
         let (ok, principal, _) = provider
-            .authenticate_with_session(addr, "PLAIN", b"\0alice\0secret", false)
+            .authenticate_with_session(conn_id, "PLAIN", b"\0alice\0secret", false)
             .await;
         assert!(!ok);
         assert!(principal.is_none());
 
         let (ok, principal, _) = provider
-            .authenticate_with_session(addr, "PLAIN", b"\0alice\0secret", true)
+            .authenticate_with_session(conn_id, "PLAIN", b"\0alice\0secret", true)
             .await;
         assert!(ok);
         assert_eq!(principal.as_deref(), Some("User:alice"));
@@ -553,10 +571,10 @@ mod tests {
     async fn test_plain_allowed_without_tls_when_configured() {
         let provider = SaslProvider::with_options(false, false, false);
         provider.add_user("alice", "secret").await;
-        let addr: SocketAddr = "127.0.0.1:49997".parse().unwrap();
+        let conn_id: u64 = 2;
 
         let (ok, principal, _) = provider
-            .authenticate_with_session(addr, "PLAIN", b"\0alice\0secret", false)
+            .authenticate_with_session(conn_id, "PLAIN", b"\0alice\0secret", false)
             .await;
         assert!(ok);
         assert_eq!(principal.as_deref(), Some("User:alice"));
@@ -566,14 +584,14 @@ mod tests {
     async fn test_clear_session_drops_scram_state() {
         let provider = SaslProvider::new(false);
         provider.add_user("alice", "hunter2").await;
-        let addr: SocketAddr = "127.0.0.1:49998".parse().unwrap();
+        let conn_id: u64 = 3;
         let client_first = b"n,,n=alice,r=AAAAAAAAAAAAAAAAAAAA";
         let _ = provider
-            .authenticate_with_session(addr, "SCRAM-SHA-256", client_first, false)
+            .authenticate_with_session(conn_id, "SCRAM-SHA-256", client_first, false)
             .await;
-        assert!(provider.has_scram_session(addr).await);
-        provider.clear_session(addr).await;
-        assert!(!provider.has_scram_session(addr).await);
+        assert!(provider.has_scram_session(conn_id).await);
+        provider.clear_session(conn_id).await;
+        assert!(!provider.has_scram_session(conn_id).await);
     }
 
     #[tokio::test]
@@ -651,7 +669,7 @@ mod tests {
         let provider = SaslProvider::new(false);
         provider.add_user("alice", "hunter2").await;
 
-        let addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let addr: u64 = 4;
         let user = "alice";
         let client_nonce = "fyko+d2lbbFgONRv9qkxdawL";
         let client_first_bare = format!("n={},r={}", user, client_nonce);
@@ -761,7 +779,7 @@ mod tests {
         let provider = SaslProvider::new(false);
         provider.add_user("alice", "rightpw").await;
 
-        let addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let addr: u64 = 5;
         let client_first = b"n,,n=alice,r=AAAAAAAAAAAAAAAAAAAA";
         let (ok, _, _) = provider
             .authenticate_with_session(addr, "SCRAM-SHA-256", client_first, false)

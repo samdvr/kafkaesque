@@ -133,6 +133,24 @@ pub struct RaftStore {
     /// the same vote and log prefix. When `None`, the store is
     /// in-memory only — used by unit tests that don't need durability.
     log_dir: Option<PathBuf>,
+    /// Coarse mutex serializing `apply_state_transition` calls end-to-end,
+    /// including the `last_applied` fsync that runs after the FSM mutation
+    /// guards drop. Without this, two concurrent applies could interleave
+    /// `(mutate, drop guards, fsync)` so the older entry's fsync wins and
+    /// recovery replays both — re-allocating producer ids and bumping
+    /// epochs twice. The contention added by this mutex is low: every
+    /// `apply` is gated on a small fsync, and openraft serializes
+    /// `apply_to_state_machine` callbacks through its own pipeline.
+    apply_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Single-flight mutex around the full `persist_snapshot` flow: data
+    /// write, pointer commit, mirror refresh, and best-effort delete of
+    /// the generation that fell off retention. Without this, two persisters
+    /// could overlap and one's step-4 delete could race the other's
+    /// in-flight commit, dropping a generation the new pointer still
+    /// references and leaving the next reader with a dangling pointer.
+    /// Snapshot persistence is rare (driven by openraft's snapshot
+    /// scheduler), so the serialization cost is negligible.
+    snapshot_persist_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Atomic update to one or more `RaftStore` fields.
@@ -207,6 +225,8 @@ impl RaftStore {
             object_store,
             snapshot_path: ObjectPath::from(snapshot_prefix),
             log_dir: None,
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -231,6 +251,8 @@ impl RaftStore {
             object_store,
             snapshot_path: ObjectPath::from(snapshot_prefix),
             log_dir: Some(log_dir),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -427,7 +449,17 @@ impl RaftStore {
     ///   3. last_membership
     ///   4. cached_snapshot
     ///   5. snapshot_pointer
-    async fn apply_state_transition(&self, t: StateTransition) {
+    async fn apply_state_transition(
+        &self,
+        t: StateTransition,
+    ) -> Result<(), StorageError<RaftNodeId>> {
+        // Serialize the entire (mutate + drop guards + fsync) sequence so
+        // two concurrent applies cannot interleave their fsyncs. Without
+        // this, ordering of `last_applied.bin` writes is not the same as
+        // the order in which the FSM was mutated, and a crash can resume
+        // from a stale `last_applied` while the FSM holds a newer state.
+        let _serialize = self.apply_lock.lock().await;
+
         let StateTransition {
             sm_state,
             last_applied,
@@ -488,14 +520,31 @@ impl RaftStore {
         // FSM mutation and this fsync replays at most the just-applied entry
         // on restart — without this fsync, restart replays every entry since
         // the last snapshot, which double-applies non-idempotent commands
-        // (producer_id, leader_epoch, transactional epoch). On error here
-        // we keep going: persistence is a recovery hint, not a correctness
-        // gate, and the next successful apply will re-establish it.
+        // (producer_id, leader_epoch, transactional epoch).
+        //
+        // Persistence failure here is fatal: it must propagate out as a
+        // `StorageError` so openraft refuses to mark the entry committed.
+        // Previously this was downgraded to a warn-and-continue ("the next
+        // successful apply will re-establish it"), but that comment is
+        // wrong for non-idempotent commands — if the process crashes
+        // before another apply succeeds, `last_applied.bin` is stale and
+        // recovery replays every entry above it, double-applying epoch
+        // bumps and minting duplicate producer IDs.
         if let Some(applied) = last_applied.flatten()
             && let Err(e) = self.persist_last_applied(&applied).await
         {
-            tracing::warn!(error = %e, index = applied.index, "persist_last_applied failed");
+            tracing::error!(
+                error = %e,
+                index = applied.index,
+                "persist_last_applied failed; refusing to commit entry"
+            );
+            return Err(StorageError::from_io_error(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Write,
+                std::io::Error::other(format!("persist_last_applied failed: {}", e)),
+            ));
         }
+        Ok(())
     }
 
     /// Atomically write `bytes` to `path` then fsync the file and its parent
@@ -829,7 +878,7 @@ impl RaftStore {
                     }))
                     .with_snapshot_pointer(Some(new_pointer)),
             )
-            .await;
+            .await?;
 
             // Best-effort cleanup of temp files and unreferenced
             // generations from crashed writes.
@@ -965,6 +1014,13 @@ impl RaftStore {
         meta: &SnapshotMeta<RaftNodeId, BasicNode>,
         data: &[u8],
     ) -> Result<(), StorageError<RaftNodeId>> {
+        // Single-flight: hold this guard for the WHOLE persist sequence
+        // (data write -> pointer commit -> mirror -> evict-delete) so a
+        // concurrent persister cannot race our retention delete and drop a
+        // generation that the new pointer still references. Snapshot
+        // persistence is rare so the serialization cost is fine.
+        let _persist_guard = self.snapshot_persist_lock.lock().await;
+
         // Unique per write: snapshot_id alone can repeat (it is derived from
         // the last applied index), and the referenced data object must be
         // immutable for the pointer scheme to be crash-safe.
@@ -1090,6 +1146,8 @@ impl RaftStorage<TypeConfig> for RaftStore {
             object_store: self.object_store.clone(),
             snapshot_path: self.snapshot_path.clone(),
             log_dir: self.log_dir.clone(),
+            apply_lock: self.apply_lock.clone(),
+            snapshot_persist_lock: self.snapshot_persist_lock.clone(),
         }
     }
 
@@ -1270,7 +1328,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
                     membership.clone(),
                 ));
             }
-            self.apply_state_transition(t).await;
+            self.apply_state_transition(t).await?;
 
             responses.push(response);
         }
@@ -1291,6 +1349,8 @@ impl RaftStorage<TypeConfig> for RaftStore {
             object_store: self.object_store.clone(),
             snapshot_path: self.snapshot_path.clone(),
             log_dir: self.log_dir.clone(),
+            apply_lock: self.apply_lock.clone(),
+            snapshot_persist_lock: self.snapshot_persist_lock.clone(),
         }
     }
 
@@ -1354,7 +1414,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
                     data,
                 })),
         )
-        .await;
+        .await?;
 
         crate::cluster::metrics::record_raft_snapshot("install", "success");
         Ok(())
@@ -1412,7 +1472,7 @@ impl openraft::RaftSnapshotBuilder<TypeConfig> for RaftStore {
                 data: data.clone(),
             },
         )))
-        .await;
+        .await?;
 
         crate::cluster::metrics::record_raft_snapshot("create", "success");
         Ok(Snapshot {

@@ -47,12 +47,23 @@ impl ProducerCoordinator for RaftCoordinator {
         requested_producer_id: i64,
         requested_epoch: i16,
     ) -> SlateDBResult<(i64, i16)> {
+        // Mint the token at THIS boundary (not inside the FSM). openraft's
+        // `client_write` is not idempotent: a leader-side commit followed
+        // by a crash before reply causes the proposer to retry, which
+        // commits a SECOND `InitProducerId` entry. With a stable token
+        // attached to both entries, the FSM returns the originally-minted
+        // (producer_id, epoch) pair on replay instead of burning a fresh
+        // one. The token is per-call here; client-SDK retries above the
+        // broker still mint distinct tokens, but at least the openraft-
+        // layer dup is collapsed.
+        let token = uuid::Uuid::new_v4().as_u128();
         let command = CoordinationCommand::ProducerDomain(ProducerCommand::InitProducerId {
             transactional_id: transactional_id.map(|s| s.to_string()),
             producer_id: requested_producer_id,
             epoch: requested_epoch,
             timeout_ms: 30_000,
             timestamp_ms: current_time_ms(),
+            request_token: Some(token),
         });
 
         let response = self.node.write(command).await?;
@@ -60,6 +71,21 @@ impl ProducerCoordinator for RaftCoordinator {
             CoordinationResponse::ProducerDomainResponse(
                 ProducerResponse::ProducerIdAllocated { producer_id, epoch },
             ) => Ok((producer_id, epoch)),
+            // The FSM's ProducerFenced reply maps to a typed FencedProducer
+            // error so the handler emits InvalidProducerEpoch (47) on the
+            // wire. Returning a generic Storage error would surface as the
+            // generic Unknown code and the client would retry indefinitely
+            // with the fenced identity.
+            CoordinationResponse::ProducerDomainResponse(
+                ProducerResponse::ProducerFenced {
+                    stored_producer_id,
+                    stored_epoch,
+                },
+            ) => Err(SlateDBError::FencedProducer {
+                producer_id: stored_producer_id,
+                expected_epoch: stored_epoch,
+                actual_epoch: requested_epoch,
+            }),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other

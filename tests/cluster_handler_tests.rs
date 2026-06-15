@@ -123,6 +123,7 @@ async fn create_test_handler() -> SlateDBClusterHandler {
 fn create_test_context() -> RequestContext {
     RequestContext {
         client_addr: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        conn_id: 1,
         api_version: 8,
         client_id: Some("test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),
@@ -1223,8 +1224,14 @@ async fn test_init_producer_id_with_transactional_id_rejected() {
 
     // Transactions are not implemented: a transactional InitProducerId must
     // be rejected loudly rather than silently downgrading the producer's
-    // exactly-once guarantees to mere idempotence.
-    assert_eq!(response.error_code, KafkaCode::InvalidRequest);
+    // exactly-once guarantees to mere idempotence. The typed wire signal is
+    // `TransactionalIdAuthorizationFailed` (53), so the client retires the
+    // transactional producer permanently rather than retry-storming on a
+    // generic `InvalidRequest`.
+    assert_eq!(
+        response.error_code,
+        KafkaCode::TransactionalIdAuthorizationFailed
+    );
     assert_eq!(response.producer_id, -1);
     assert_eq!(response.producer_epoch, -1);
 }

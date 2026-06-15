@@ -76,6 +76,68 @@ pub(super) async fn handle_create_topics(
             topic.num_partitions
         };
 
+        // Cap requested partition count: an authenticated client could
+        // otherwise send `num_partitions = 1_000_000` and force the broker
+        // to acquire a million leases and emit per-partition Prometheus
+        // metrics for each. The cap is the same one the auto-create path
+        // enforces in `partition_manager`.
+        let max_partitions = handler.max_partitions_per_topic;
+        if max_partitions > 0 && num_partitions > max_partitions {
+            warn!(
+                topic = %topic.name,
+                requested = num_partitions,
+                max_partitions,
+                "CreateTopics rejected: partition count exceeds limit"
+            );
+            topics.push(CreateTopicResponseData {
+                name: topic.name,
+                error_code: KafkaCode::InvalidPartitions,
+                error_message: Some(format!(
+                    "num_partitions {} exceeds max_partitions_per_topic limit of {}",
+                    num_partitions, max_partitions
+                )),
+            });
+            continue;
+        }
+
+        // Cap total topic count for the same reason. `max_auto_created_topics`
+        // is the configured ceiling; CreateTopics shares it so the authenticated
+        // path doesn't bypass the auto-create guard.
+        let max_topics = handler.max_topics_in_cluster;
+        if max_topics > 0 {
+            match handler.coordinator.get_topics().await {
+                Ok(existing) => {
+                    if (existing.len() as u32) >= max_topics {
+                        warn!(
+                            topic = %topic.name,
+                            existing_topics = existing.len(),
+                            max_topics,
+                            "CreateTopics rejected: cluster topic limit reached"
+                        );
+                        topics.push(CreateTopicResponseData {
+                            name: topic.name,
+                            error_code: KafkaCode::InvalidRequest,
+                            error_message: Some(format!(
+                                "Cluster has reached max topic limit of {} ({} existing)",
+                                max_topics,
+                                existing.len()
+                            )),
+                        });
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to enumerate existing topics for cap check");
+                    topics.push(CreateTopicResponseData {
+                        name: topic.name,
+                        error_code: KafkaCode::Unknown,
+                        error_message: Some(e.to_string()),
+                    });
+                    continue;
+                }
+            }
+        }
+
         // Kafka returns TOPIC_ALREADY_EXISTS for duplicate creates. The
         // coordinator's `register_topic` collapses "created" and "already
         // exists" into Ok(()), so detect the condition here with an

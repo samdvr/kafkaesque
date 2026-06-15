@@ -144,17 +144,24 @@ impl AclBinding {
     }
 
     fn matches_host(&self, host: &str) -> bool {
-        if self.host == "*" || self.host == host {
+        // Normalize both sides before comparing strings or parsing as IPs.
+        // Inbound `host` is sourced from `SocketAddr` / `peer_addr()` which
+        // can carry:
+        //   * IPv6 zone ids: `fe80::1%eth0`
+        //   * Bracketed IPv6 + port: `[fe80::1]:9092`
+        //   * Plain IPv4 + port: `1.2.3.4:9092`
+        // Without normalization, a literal ACL `host: "fe80::1"` matches none
+        // of these (the rule string lacks the zone/port suffix), so a
+        // "deny everyone except 1.2.3.4" intent silently fails open or closed
+        // depending on rule order. Strip the suffixes and re-parse.
+        let rule_norm = normalize_host_for_match(&self.host);
+        let host_norm = normalize_host_for_match(host);
+        if self.host == "*" || rule_norm == host_norm {
             return true;
         }
-        // Normalize IPv4-mapped IPv6 (`::ffff:1.2.3.4`) and dual-stack /
-        // zone-id literals to their canonical IPv4 / IPv6 form so
-        // `host.parse::<IpAddr>()` comparisons hit. Without this an ACL bound
-        // to `1.2.3.4` silently misses a connection presented as
-        // `::ffff:1.2.3.4` (common on dual-stack hosts).
         if let (Ok(rule_ip), Ok(host_ip)) = (
-            self.host.parse::<std::net::IpAddr>(),
-            host.parse::<std::net::IpAddr>(),
+            rule_norm.parse::<std::net::IpAddr>(),
+            host_norm.parse::<std::net::IpAddr>(),
         ) {
             let rule_canonical = match rule_ip {
                 std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -174,6 +181,47 @@ impl AclBinding {
         }
         false
     }
+}
+
+/// Strip IPv6 zone ids and trailing port suffixes from a host literal,
+/// returning a stable form suitable for ACL comparison and `IpAddr::parse`.
+///
+/// Handles the four shapes the dispatcher actually feeds us:
+/// * `fe80::1%eth0`   -> `fe80::1`        (zone id stripped)
+/// * `[fe80::1]:9092` -> `fe80::1`        (brackets and port stripped)
+/// * `[fe80::1]`      -> `fe80::1`        (brackets only)
+/// * `1.2.3.4:9092`   -> `1.2.3.4`        (port stripped)
+/// * `1.2.3.4`        -> `1.2.3.4`        (unchanged)
+/// * `host.example`   -> `host.example`   (unchanged — not an IP)
+///
+/// A bare IPv6 literal like `fe80::1` is left alone (the `::` triggers no
+/// port-strip because there is no surrounding `[]`). Wildcard `*` and other
+/// non-IP rule strings pass through untouched.
+fn normalize_host_for_match(host: &str) -> &str {
+    let host = host.trim();
+    // Bracketed IPv6: `[addr]:port` or `[addr]` — extract addr.
+    if let Some(rest) = host.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return &rest[..end];
+    }
+    // Strip IPv6 zone id (`%eth0`) BEFORE considering port, since zone ids
+    // never include `:` and a bare-IPv6 has no port.
+    let no_zone = match host.find('%') {
+        Some(idx) => &host[..idx],
+        None => host,
+    };
+    // Trailing-port strip applies to IPv4-with-port and bare hostnames.
+    // A bare IPv6 literal contains multiple `:`s; only treat the LAST `:` as a
+    // port separator when there is exactly one `:` (IPv4) — otherwise the
+    // string is either a hostname (no port) or a bare IPv6 we must not
+    // truncate. Bracketed forms were already handled above.
+    if no_zone.matches(':').count() == 1
+        && let Some((addr, _port)) = no_zone.rsplit_once(':')
+    {
+        return addr;
+    }
+    no_zone
 }
 
 /// Filter for `DeleteAcls` / `DescribeAcls`. Each field is an optional

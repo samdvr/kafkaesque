@@ -16,22 +16,40 @@ use super::object_store_metrics::MetricsObjectStore;
 
 /// Wrap a raw `ObjectStore` with the configured `cluster_id` as a top-level
 /// prefix so two Kafkaesque clusters pointed at the same bucket/path can't
-/// interleave SlateDB files. When `cluster_id` is empty we keep
-/// the legacy unprefixed layout for backwards compatibility but warn loudly.
-fn wrap_with_cluster_prefix(store: Arc<dyn ObjectStore>, cluster_id: &str) -> Arc<dyn ObjectStore> {
+/// interleave SlateDB files.
+///
+/// An empty `cluster_id` is refused unless the operator opts in via
+/// `ALLOW_UNSCOPED_CLUSTER=true`. Without scoping, two clusters that share a
+/// bucket silently corrupt each other's SST/WAL files at the bucket root —
+/// a startup-time refusal is far cheaper than the post-mortem.
+fn wrap_with_cluster_prefix(
+    store: Arc<dyn ObjectStore>,
+    cluster_id: &str,
+) -> SlateDBResult<Arc<dyn ObjectStore>> {
     if cluster_id.is_empty() {
+        let allow_unscoped = std::env::var("ALLOW_UNSCOPED_CLUSTER")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if !allow_unscoped {
+            return Err(SlateDBError::Config(
+                "cluster_id is empty; refusing to start with an unscoped object-store layout. \
+                 Two clusters sharing this bucket would silently corrupt each other. Set \
+                 CLUSTER_ID to a unique value, or set ALLOW_UNSCOPED_CLUSTER=true to opt in \
+                 (only safe when this cluster is the sole user of the bucket/prefix)."
+                    .to_string(),
+            ));
+        }
         warn!(
-            "cluster_id is empty; object-store layout is unscoped. Two clusters \
-             sharing this bucket will silently corrupt each other. Set \
-             CLUSTER_ID to a unique value."
+            "ALLOW_UNSCOPED_CLUSTER is set and cluster_id is empty; object-store layout is \
+             unscoped. Any other cluster pointed at this bucket will corrupt this one's data."
         );
-        return store;
+        return Ok(store);
     }
     info!(
         cluster_id,
         "Namespacing object store under cluster_id prefix"
     );
-    Arc::new(PrefixStore::new(store, cluster_id.to_string()))
+    Ok(Arc::new(PrefixStore::new(store, cluster_id.to_string())))
 }
 
 /// Create an object store from configuration.
@@ -173,7 +191,7 @@ pub fn create_object_store_with_faults(
     Ok(wrap_with_cluster_prefix(
         layered_store(raw, fault_injector),
         &config.cluster_id,
-    ))
+    )?)
 }
 
 fn layered_store(

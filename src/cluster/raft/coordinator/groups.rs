@@ -112,6 +112,12 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
 
     async fn get_group_protocol(&self, group_id: &str) -> SlateDBResult<Option<String>> {
         let start = Instant::now();
+        // Linearizable read: any coordinator read after a failover-induced
+        // FindCoordinator hop must serve from a state that has applied
+        // every entry committed before the new coordinator answered. A
+        // stale local read here can return a previous generation's protocol
+        // and cause SyncGroup to write assignments under the wrong key.
+        self.node.ensure_linearizable().await?;
         let state_machine = self.node.state_machine();
         let state = state_machine.read().await;
         let inner_state = state.state().await;
@@ -152,6 +158,11 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
 
     async fn get_generation(&self, group_id: &str) -> SlateDBResult<i32> {
         let start = Instant::now();
+        // Linearizable: see `get_group_protocol` for the rationale. The
+        // generation is what JoinGroup retries against; serving a stale
+        // generation lets a member rejoin with a "valid" generation that
+        // the new coordinator has already advanced past.
+        self.node.ensure_linearizable().await?;
         let state_machine = self.node.state_machine();
         let state = state_machine.read().await;
         let inner_state = state.state().await;
@@ -242,6 +253,70 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         member_id: &str,
         generation_id: i32,
     ) -> SlateDBResult<HeartbeatResult> {
+        // Coalesce frequent heartbeats: most heartbeats arrive far more
+        // often than the FSM eviction window, so we keep a soft per-member
+        // timestamp and only propose to Raft when it has aged past the
+        // duty-cycle threshold (or when the FSM-read fast path tells us
+        // we have to propose anyway because the in-memory map is stale).
+        // The FSM `last_heartbeat_ms` then advances at most once every
+        // `session_timeout_ms / HEARTBEAT_RAFT_DUTY_DIVISOR`.
+        const HEARTBEAT_RAFT_DUTY_DIVISOR: u64 = 3;
+        let session_timeout_ms = self.config.default_session_timeout_ms;
+        let propose_interval = std::time::Duration::from_millis(
+            (session_timeout_ms / HEARTBEAT_RAFT_DUTY_DIVISOR).max(1000),
+        );
+
+        let key = (group_id.to_string(), member_id.to_string());
+
+        // Fast path: read FSM to validate (group exists, member is known,
+        // generation matches, group is Stable). If any of those checks
+        // fail, fall through to the full propose so the FSM has the
+        // chance to react (RebalanceInProgress, IllegalGeneration, etc.).
+        let fast_path = {
+            use crate::cluster::raft::domains::group::GroupStateEnum;
+            let state_machine = self.node.state_machine();
+            let state = state_machine.read().await;
+            let inner_state = state.state().await;
+            let group = inner_state.group_domain.groups.get(group_id);
+            match group {
+                None => Some(HeartbeatResult::UnknownMember),
+                Some(g) if !g.members.contains_key(member_id) => {
+                    Some(HeartbeatResult::UnknownMember)
+                }
+                Some(g) if g.generation != generation_id => {
+                    Some(HeartbeatResult::IllegalGeneration)
+                }
+                Some(g) if !matches!(g.state, GroupStateEnum::Stable) => {
+                    Some(HeartbeatResult::RebalanceInProgress)
+                }
+                Some(_) => None,
+            }
+        };
+
+        // If the fast path produced a definitive answer, only propose if
+        // we haven't refreshed the FSM `last_heartbeat_ms` in a while; for
+        // non-Stable / unknown / illegal states the response is the
+        // answer regardless of whether we propose.
+        if let Some(result) = fast_path {
+            // Definitive non-success answers: skip the propose. The
+            // member-eviction sweep is only relevant for Stable groups
+            // anyway.
+            return Ok(result);
+        }
+
+        // Stable + valid: only propose if our last propose for this
+        // (group, member) is older than the duty-cycle interval. Updating
+        // the in-memory entry on the cheap path keeps us in lockstep with
+        // wall-clock without paying for Raft.
+        let now = std::time::Instant::now();
+        let should_propose = match self.heartbeat_propose_state.get(&key) {
+            Some(entry) => now.duration_since(*entry) >= propose_interval,
+            None => true,
+        };
+        if !should_propose {
+            return Ok(HeartbeatResult::Success);
+        }
+
         let command = CoordinationCommand::GroupDomain(GroupCommand::Heartbeat {
             group_id: group_id.to_string(),
             member_id: member_id.to_string(),
@@ -250,21 +325,35 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         });
 
         let response = self.node.write(command).await?;
-        match response {
+        let result = match response {
             CoordinationResponse::GroupDomainResponse(GroupResponse::HeartbeatAck) => {
-                Ok(HeartbeatResult::Success)
+                HeartbeatResult::Success
             }
+            CoordinationResponse::GroupDomainResponse(GroupResponse::RebalanceInProgress {
+                ..
+            }) => HeartbeatResult::RebalanceInProgress,
             CoordinationResponse::GroupDomainResponse(GroupResponse::UnknownMember { .. }) => {
-                Ok(HeartbeatResult::UnknownMember)
+                HeartbeatResult::UnknownMember
             }
             CoordinationResponse::GroupDomainResponse(GroupResponse::IllegalGeneration {
                 ..
-            }) => Ok(HeartbeatResult::IllegalGeneration),
-            other => Err(SlateDBError::Storage(format!(
-                "Unexpected response: {:?}",
-                other
-            ))),
+            }) => HeartbeatResult::IllegalGeneration,
+            other => {
+                return Err(SlateDBError::Storage(format!(
+                    "Unexpected response: {:?}",
+                    other
+                )));
+            }
+        };
+        if matches!(result, HeartbeatResult::Success) {
+            self.heartbeat_propose_state.insert(key, now);
+        } else {
+            // On failure (IllegalGeneration / UnknownMember / Rebalance),
+            // drop the cache entry so the next heartbeat re-validates
+            // through the slow path immediately.
+            self.heartbeat_propose_state.remove(&key);
         }
+        Ok(result)
     }
 
     async fn validate_member_for_commit(
@@ -274,6 +363,12 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         generation_id: i32,
     ) -> SlateDBResult<HeartbeatResult> {
         use crate::cluster::raft::domains::group::GroupStateEnum;
+        // Linearizable read: this validates an OffsetCommit against the
+        // current group state. A stale read after a coordinator failover
+        // could return Success against a generation the new coordinator
+        // has already advanced past, allowing a fenced consumer to commit
+        // offsets under the old generation.
+        self.node.ensure_linearizable().await?;
         // Read-only validation of member and generation for offset commit
         let state_machine = self.node.state_machine();
         let state = state_machine.read().await;
@@ -347,6 +442,24 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
             CoordinationResponse::GroupDomainResponse(GroupResponse::MembersExpired {
                 expired,
             }) => Ok(expired),
+            other => Err(SlateDBError::Storage(format!(
+                "Unexpected response: {:?}",
+                other
+            ))),
+        }
+    }
+
+    async fn expire_committed_offsets(&self, ttl_ms: u64) -> SlateDBResult<usize> {
+        let command = CoordinationCommand::GroupDomain(GroupCommand::ExpireOffsets {
+            current_time_ms: current_time_ms(),
+            ttl_ms,
+        });
+
+        let response = self.node.write(command).await?;
+        match response {
+            CoordinationResponse::GroupDomainResponse(GroupResponse::OffsetsExpired {
+                count,
+            }) => Ok(count),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other

@@ -624,7 +624,8 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkFactoryImpl {
 
         RaftNetworkConnection {
             target_addr: node.addr.clone(),
-            cached_conn: tokio::sync::Mutex::new(None),
+            control_conn: tokio::sync::Mutex::new(None),
+            bulk_conn: tokio::sync::Mutex::new(None),
             circuit_breaker: tokio::sync::Mutex::new(CircuitBreakerState::new()),
             auth_keys: self.auth_keys.clone(),
             tls: self.tls.clone(),
@@ -675,12 +676,25 @@ impl CircuitBreakerState {
 }
 
 /// A connection to a remote Raft node.
+///
+/// Maintains two independent connection lanes to the same peer so that a
+/// large `InstallSnapshot` upload (multi-second TCP write) does not
+/// serialize behind the same socket as low-latency `AppendEntries` /
+/// `Vote` traffic. Without separation, a snapshot install can starve
+/// heartbeats long enough to trigger an election (the slow snapshot held
+/// the only `cached_conn` mutex while heartbeats blocked behind it).
 pub struct RaftNetworkConnection {
     target_addr: String,
-    /// Cached socket for reuse. May be plain TCP or wrapped in TLS
-    /// depending on `tls`; reusing it preserves the TLS session so we
-    /// don't pay a handshake per RPC.
-    cached_conn: tokio::sync::Mutex<Option<MaybeTlsStreamClient>>,
+    /// Control-plane lane: AppendEntries (heartbeat + log replication) and
+    /// Vote. These RPCs are small and latency-sensitive — the leader's
+    /// liveness signal flows here, so it must never block on bulk
+    /// transfers.
+    control_conn: tokio::sync::Mutex<Option<MaybeTlsStreamClient>>,
+    /// Bulk lane: InstallSnapshot. Snapshots are large and slow; isolating
+    /// them keeps their TCP write window from monopolizing a single
+    /// cached socket. A separate connection also lets the kernel TCP
+    /// stack maintain independent congestion windows for each class.
+    bulk_conn: tokio::sync::Mutex<Option<MaybeTlsStreamClient>>,
     /// Circuit breaker state for this connection.
     circuit_breaker: tokio::sync::Mutex<CircuitBreakerState>,
     /// HMAC keys used to sign every outbound frame and verify responses.
@@ -690,9 +704,22 @@ pub struct RaftNetworkConnection {
     tls: Option<RaftTlsConfig>,
 }
 
+/// Priority class for an outbound Raft RPC. Picks which cached connection
+/// `try_send_rpc` reuses, so bulk traffic doesn't serialize behind
+/// control-plane traffic on the same socket.
+#[derive(Debug, Clone, Copy)]
+enum RpcLane {
+    Control,
+    Bulk,
+}
+
 impl RaftNetworkConnection {
     /// Send an RPC message and receive a response with timeout, retry logic, and circuit breaker.
     async fn send_rpc(&self, message: RaftRpcMessage) -> Result<RaftRpcResponse, std::io::Error> {
+        let lane = match &message {
+            RaftRpcMessage::InstallSnapshot(_) => RpcLane::Bulk,
+            _ => RpcLane::Control,
+        };
         // Check circuit breaker first
         {
             let cb = self.circuit_breaker.lock().await;
@@ -730,7 +757,7 @@ impl RaftNetworkConnection {
             .with_jitter();
 
         let target = self.target_addr.clone();
-        let result = (|| async { self.try_send_rpc(&data).await })
+        let result = (|| async { self.try_send_rpc(&data, lane).await })
             .retry(policy)
             .notify(|err: &std::io::Error, dur| {
                 tracing::debug!(
@@ -783,8 +810,19 @@ impl RaftNetworkConnection {
     /// We still hold `cached_conn.lock()` across the RPC, so concurrent
     /// callers serialize on the same target — `do_rpc` would otherwise
     /// interleave bytes on a single TCP socket.
-    async fn try_send_rpc(&self, data: &[u8]) -> Result<RaftRpcResponse, std::io::Error> {
-        let mut guard = self.cached_conn.lock().await;
+    async fn try_send_rpc(
+        &self,
+        data: &[u8],
+        lane: RpcLane,
+    ) -> Result<RaftRpcResponse, std::io::Error> {
+        // Pick the lane-appropriate cached connection. Heartbeat / log
+        // replication and snapshot install lock independent mutexes, so a
+        // multi-second snapshot upload cannot stall a heartbeat.
+        let cell = match lane {
+            RpcLane::Control => &self.control_conn,
+            RpcLane::Bulk => &self.bulk_conn,
+        };
+        let mut guard = cell.lock().await;
 
         // Acquire ownership of the stream (cached or freshly connected). The
         // cell goes to None for the duration; cancellation between any await

@@ -890,6 +890,17 @@ impl ConsumerGroupCoordinator for MockCoordinator {
         Ok(evicted)
     }
 
+    async fn expire_committed_offsets(&self, ttl_ms: u64) -> SlateDBResult<usize> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut offsets = self.offsets.write().await;
+        let before = offsets.len();
+        offsets.retain(|_, stored| {
+            let age = now_ms.saturating_sub(stored.commit_timestamp);
+            age <= ttl_ms as i64
+        });
+        Ok(before - offsets.len())
+    }
+
     async fn get_all_groups(&self) -> SlateDBResult<Vec<String>> {
         let groups = self.consumer_groups.read().await;
         Ok(groups.keys().cloned().collect())

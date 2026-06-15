@@ -365,6 +365,20 @@ pub static PARTITION_OFFSET_GAPS: Lazy<IntCounterVec> = Lazy::new(|| {
     )
 });
 
+/// A `ListOffsets(timestamp)` query exhausted the bounded scan budget
+/// without finding a matching batch. The handler answers with offset -1
+/// (Kafka's "not found" sentinel) rather than continue scanning. Tracks
+/// pathological queries (timestamp far below log_start) and operator
+/// signal that a real time index is overdue.
+pub static LIST_OFFSETS_TRUNCATED: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec_safe(
+        &REGISTRY,
+        "list_offsets_timestamp_truncated_total",
+        "ListOffsets(timestamp) scans halted at the cap; reported offset -1",
+        &["topic"],
+    )
+});
+
 /// A record batch on disk failed parse. Emitted from fetch- and
 /// retention-path scans where the loop would otherwise silently fall back
 /// to `record_count = 0`. A persistent rate signals on-disk corruption,
@@ -1836,6 +1850,16 @@ pub fn record_partition_offset_gap(topic: &str, partition: i32, record_count: i3
     PARTITION_OFFSET_GAPS
         .with_label_values(&[&t, &p])
         .inc_by(record_count.max(0) as u64);
+}
+
+/// Record that a `ListOffsets(timestamp)` query was halted at the scan cap.
+/// The cap protects against a full-log-scan DoS where an authenticated
+/// reader points the timestamp at `i64::MIN`. A persistent rate here means
+/// real workloads are scanning past the cap and a sparse time index is
+/// overdue.
+pub fn record_list_offsets_truncated(topic: &str) {
+    let t = bounded_principal_label(topic);
+    LIST_OFFSETS_TRUNCATED.with_label_values(&[&t]).inc();
 }
 
 /// Record a corrupt-batch parse failure from a partition scan. `operation`

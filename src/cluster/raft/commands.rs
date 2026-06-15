@@ -240,6 +240,7 @@ mod tests {
             epoch: 0,
             timeout_ms: 60000,
             timestamp_ms: 1000,
+            request_token: None,
         });
 
         let serialized = serde_json::to_string(&cmd).unwrap();

@@ -63,6 +63,15 @@ pub const BATCH_LENGTH_PREFIX: usize = 12;
 /// The CRC is computed over bytes from BATCH_CRC_DATA_START to end of batch.
 pub const BATCH_CRC_OFFSET: usize = 17;
 
+/// Offset of the magic byte (1 byte, u8). v2 = 2; v0/v1 (legacy MessageSet
+/// layout) use offsets 16/17. The validator and parser only support v2, so
+/// any other value is rejected up front rather than silently mis-parsed.
+pub const BATCH_MAGIC_OFFSET: usize = 16;
+
+/// Magic byte value for the v2 RecordBatch layout. v0 and v1 are the legacy
+/// MessageSet layouts and are NOT supported by this broker.
+pub const BATCH_MAGIC_V2: u8 = 2;
+
 /// Start of the CRC-covered region (attributes field).
 /// CRC is computed over bytes [21..end] of the batch.
 pub const BATCH_CRC_DATA_START: usize = 21;

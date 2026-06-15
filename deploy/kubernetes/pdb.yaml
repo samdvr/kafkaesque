@@ -1,0 +1,17 @@
+# PodDisruptionBudget to ensure availability during maintenance
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafkaesque-pdb
+  namespace: kafkaesque
+  labels:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+spec:
+  # Default manifest runs a single broker. Increase minAvailable when
+  # scaling to a multi-broker cluster with shared object storage.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafkaesque
+      app.kubernetes.io/component: broker

@@ -1,0 +1,18 @@
+apiVersion: v2
+name: kafkaesque
+description: A Kafka-compatible message broker using object storage for durability
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - kafka
+  - messaging
+  - message-broker
+  - object-storage
+  - raft
+home: https://github.com/kafkaesque/kafkaesque
+sources:
+  - https://github.com/kafkaesque/kafkaesque
+maintainers:
+  - name: Kafkaesque Team
+    email: kafkaesque@example.com

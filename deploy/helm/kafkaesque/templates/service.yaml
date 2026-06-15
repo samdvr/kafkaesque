@@ -1,0 +1,50 @@
+# Headless Service for StatefulSet pod discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kafkaesque.fullname" . }}-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kafkaesque.labels" . | nindent 4 }}
+  {{- with .Values.headlessService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "kafkaesque.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: kafka
+      port: {{ .Values.config.kafkaPort }}
+      targetPort: kafka
+    - name: raft
+      port: {{ .Values.config.raftPort }}
+      targetPort: raft
+    - name: health
+      port: {{ .Values.config.healthPort }}
+      targetPort: health
+---
+# External Service for Kafka client access
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kafkaesque.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kafkaesque.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "kafkaesque.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: kafka
+      port: {{ .Values.service.kafkaPort }}
+      targetPort: kafka
+    - name: health
+      port: {{ .Values.service.healthPort }}
+      targetPort: health

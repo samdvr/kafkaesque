@@ -1,0 +1,73 @@
+# cargo-deny configuration.
+#
+# Checked in CI on every PR. Anything new that trips a finding here
+# either gets fixed (preferred) or explicitly waived in this file with
+# a justification — no silent additions.
+
+[graph]
+# Limit to the targets we ship.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+]
+
+[advisories]
+version = 2
+# Fail closed on advisories. Yanked crates are warnings rather than
+# errors so a yanked-but-still-pinned dep doesn't break CI before we
+# get a chance to bump.
+yanked = "warn"
+ignore = [
+    # bincode 1.3.3 — unmaintained, no CVE. Pulled transitively via
+    # foyer → slatedb. Upstream considers 1.3.3 "complete and not in
+    # need of updates"; we already replaced our own direct bincode use
+    # with postcard. Removed when foyer/slatedb migrate off bincode.
+    "RUSTSEC-2025-0141",
+    # paste 1.0.15 — unmaintained, no CVE. Pulled by foyer-storage and
+    # by kafka-protocol (dev-only, used in differential roundtrip
+    # tests). No upgrade path until upstreams migrate to `pastey`.
+    "RUSTSEC-2024-0436",
+    # rustls-pemfile 2.2.0 — unmaintained, no CVE. The advisory itself
+    # states "no safe upgrade is available" — the latest release is a
+    # thin wrapper over rustls-pki-types. Used transitively by
+    # object_store/slatedb and behind our optional `tls` feature.
+    # Removed when those deps migrate to rustls-pki-types' PemObject.
+    "RUSTSEC-2025-0134",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Skip families of crates known to ship many internal versions
+# (e.g. windows-sys variants pulled by transitive deps).
+skip = []
+skip-tree = []
+
+[licenses]
+version = 2
+# Allow-list of acceptable OSS licenses for the runtime deps. Anything
+# outside this set fails CI; review the dep before broadening.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

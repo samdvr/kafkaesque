@@ -1,0 +1,6 @@
+/.idea
+/target
+/etc/redpanda/certs
+fuzz.log
+.DS_Store
+/.DS_Store

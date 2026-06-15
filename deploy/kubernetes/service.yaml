@@ -1,0 +1,46 @@
+# Headless Service for StatefulSet pod discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafkaesque-headless
+  namespace: kafkaesque
+  labels:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+    - name: raft
+      port: 9093
+      targetPort: raft
+    - name: health
+      port: 8080
+      targetPort: health
+---
+# External Service for Kafka client access
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafkaesque
+  namespace: kafkaesque
+  labels:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+    - name: health
+      port: 8080
+      targetPort: health

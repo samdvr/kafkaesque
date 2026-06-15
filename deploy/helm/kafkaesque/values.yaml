@@ -1,0 +1,284 @@
+# Default values for Kafkaesque Helm chart
+
+# Replica count for the StatefulSet.
+# Default is 3 for HA, but requires a shared object store (see
+# config.objectStore.type). Use values-dev.yaml for single-node local dev.
+replicaCount: 3
+
+image:
+  repository: kafkaesque
+  pullPolicy: IfNotPresent
+  # prefer pinning to a content digest in production deploys so
+  # the workload can't be silently shifted to a different image with the
+  # same tag (e.g. a tampered `:latest`). Set `digest` to a `sha256:...`
+  # string to override `tag`. Local dev can leave digest empty.
+  tag: "latest"
+  digest: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Service account configuration
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+# Kafkaesque broker configuration
+config:
+  # Cluster configuration
+  clusterId: "kafkaesque-cluster"
+  autoCreateTopics: false
+
+  # Production security posture (required outside CLUSTER_PROFILE=development).
+  security:
+    aclEnabled: true
+    aclDenyByDefault: true
+    # Bootstrap super-user for clients without SASL (internal clusters only).
+    # Clear this and configure SASL + ACLs before exposing outside the mesh.
+    superUsers: "User:ANONYMOUS"
+
+  # Network ports
+  kafkaPort: 9092
+  raftPort: 9093
+  healthPort: 8080
+
+  # Object storage configuration
+  objectStore:
+    # Type: local, s3, gcs, azure
+    type: local
+    # Local storage path (used when type=local)
+    dataPath: /data/kafkaesque
+
+    # S3 configuration (used when type=s3)
+    s3:
+      bucket: ""
+      region: "us-east-1"
+      endpoint: "" # For S3-compatible services like MinIO
+
+    # GCS configuration (used when type=gcs)
+    gcs:
+      bucket: ""
+
+    # Azure configuration (used when type=azure)
+    azure:
+      container: ""
+      account: ""
+
+  # Timing configuration
+  heartbeatTtlSecs: 30
+  ownershipCacheTtlSecs: 1
+
+  # Logging
+  logLevel: "info"
+  logFormat: "json"
+
+# TLS for the Kafka client port.
+#
+# When `enabled` is true the StatefulSet mounts the configured Kubernetes
+# secret at `/etc/kafkaesque/tls/` and the broker reads the cert/key from
+# that path. Build the image with `--features tls` (the published default
+# already does so). Without TLS, SASL PLAIN credentials transit the wire
+# in cleartext, so production deployments should turn this on or disable
+# PLAIN entirely.
+#
+# Generate the secret with e.g.:
+#   kubectl create secret tls kafkaesque-tls \
+#     --cert=server.crt --key=server.key
+tls:
+  enabled: false
+  # Kubernetes Secret of type `kubernetes.io/tls` containing `tls.crt`
+  # and `tls.key`. Same secret is mounted on every replica.
+  certSecretName: ""
+  # Mount path inside the container. The broker reads `tls.crt` /
+  # `tls.key` from this directory.
+  mountPath: /etc/kafkaesque/tls
+
+# mTLS for the Raft control plane. Independent of `tls` above:
+# the Kafka client port and the Raft port can run with different cert
+# bundles. The HMAC framing layer (RAFT_CLUSTER_SECRET) stays in place
+# whether or not Raft mTLS is on — TLS adds peer identity, HMAC keeps
+# message integrity guarantees that aren't undermined if a cert is leaked
+# and revoked.
+raftTls:
+  enabled: false
+  # Secret containing tls.crt, tls.key, and ca.crt for verifying peer
+  # certificates.
+  certSecretName: ""
+  mountPath: /etc/kafkaesque/raft-tls
+  # SNI presented when this broker connects out to peers. Operators set
+  # this to whatever name the issued certs carry as a SAN.
+  serverName: kafkaesque-raft
+
+# HMAC authentication for the Raft control plane. The broker REFUSES TO
+# START without RAFT_CLUSTER_SECRET outside the development profile: the
+# Raft port accepts cluster joins (auto-promoted to voter) and arbitrary
+# coordination commands, so it must never run unauthenticated.
+#
+# Exactly one of the following must be configured:
+# - existingSecret: name of a pre-created Kubernetes Secret holding the
+#   shared HMAC value under `secretKey` (recommended; keeps the secret out
+#   of Helm values/releases). Create it with e.g.:
+#     kubectl create secret generic kafkaesque-raft-auth \
+#       --from-literal=raft-cluster-secret="$(openssl rand -base64 32)"
+# - clusterSecret: an inline value; the chart renders it into a Secret.
+#   Convenient for dev/test, but the value lands in the Helm release
+#   manifest — prefer existingSecret for production.
+raftAuth:
+  existingSecret: ""
+  secretKey: raft-cluster-secret
+  joinTokenKey: raft-join-token
+  clusterSecret: ""
+  joinToken: ""
+
+# Kubernetes service configuration
+service:
+  type: ClusterIP
+  kafkaPort: 9092
+  healthPort: 8080
+  annotations: {}
+
+# Headless service for StatefulSet discovery
+headlessService:
+  annotations: {}
+
+# Pod configuration
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  capabilities:
+    drop:
+      - ALL
+
+# Resource limits
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+
+# Health probes
+livenessProbe:
+  httpGet:
+    path: /health
+    port: health
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: health
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: health
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 30
+
+# Persistence configuration
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+
+# Node scheduling
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod anti-affinity (recommended for HA)
+podAntiAffinity:
+  enabled: true
+  # "soft" or "hard"
+  type: soft
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# ServiceMonitor for Prometheus Operator
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+
+# NetworkPolicy for pod isolation
+networkPolicy:
+  enabled: true
+  # Allow external ingress (from outside the cluster)
+  allowExternal: false
+  # Namespace selector for ingress (default: allow from all namespaces)
+  ingressNamespaceSelector: {}
+  # Pod selector for Kafka clients.With no auth on the Kafka
+  # port, every pod cluster-wide should NOT be able to reach 9092 by
+  # default. Workloads must opt in by labelling themselves with the keys
+  # below — change these labels (or add allowExternal: true) once SASL
+  # is wired through.
+  ingressClientPodSelector:
+    matchLabels:
+      kafkaesque.client/allow: "true"
+  # Pod selector for /metrics + /health scrapers (Prometheus, etc.).
+  # Wide-open access leaks topic names and traffic patterns.
+  ingressHealthPodSelector:
+    matchLabels:
+      kafkaesque.health/allow: "true"
+  # Extra egress rules (e.g., for external services)
+  extraEgress: []
+
+# Extra environment variables
+extraEnv: []
+# - name: EXTRA_VAR
+#   value: "value"
+
+# Extra environment variables from secrets/configmaps
+extraEnvFrom: []
+# - secretRef:
+#     name: kafkaesque-s3-credentials
+
+# Termination grace period. Bumped from 30s so the preStop drain hook
+# below has time to run before the kubelet sends SIGKILL.
+terminationGracePeriodSeconds: 60
+
+# Pod lifecycle hooks. preStop sleeps long enough for the K8s endpoint
+# controller (~30s lag) to remove this pod from the service backing list,
+# so in-flight clients reconnect to a healthy pod instead of hitting a
+# half-shut-down broker.
+lifecycle:
+  preStop:
+    exec:
+      command:
+        - /bin/sh
+        - -c
+        - sleep 30

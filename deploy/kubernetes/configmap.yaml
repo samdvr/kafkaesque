@@ -1,0 +1,40 @@
+# ConfigMap for Kafkaesque broker configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafkaesque-config
+  namespace: kafkaesque
+  labels:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+data:
+  # Cluster configuration
+  CLUSTER_ID: "kafkaesque-cluster"
+  AUTO_CREATE_TOPICS: "false"
+
+  # Production security posture (see src/cluster/config.rs).
+  # ACL enforcement is required outside CLUSTER_PROFILE=development.
+  ACL_ENABLED: "true"
+  ACL_DENY_BY_DEFAULT: "true"
+  # Bootstrap ACLs for clients without SASL (internal clusters only).
+  # Replace with SASL + per-principal ACLs before exposing outside the mesh.
+  KAFKAESQUE_SUPER_USERS: "User:ANONYMOUS"
+
+  # Network configuration
+  HOST: "0.0.0.0"
+  PORT: "9092"
+  HEALTH_PORT: "8080"
+
+  # Object store configuration.
+  # Default: single-broker local storage. For HA (replicas > 1) you MUST
+  # switch to a shared backend (s3, gcs, azure) — see README.md.
+  OBJECT_STORE_TYPE: "local"
+  DATA_PATH: "/data/kafkaesque"
+
+  # Timing configuration
+  BROKER_HEARTBEAT_TTL_SECS: "30"
+  OWNERSHIP_CACHE_TTL_SECS: "1"
+
+  # Logging
+  RUST_LOG: "info"
+  LOG_FORMAT: "json"

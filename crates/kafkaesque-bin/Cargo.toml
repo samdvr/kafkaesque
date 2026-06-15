@@ -1,0 +1,24 @@
+[package]
+name = "kafkaesque-bin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Production binary for the Kafkaesque Kafka-compatible broker."
+license-file = "../../LICENSE"
+publish = false
+
+[[bin]]
+name = "kafkaesque"
+path = "src/main.rs"
+
+[features]
+default = []
+tls = ["kafkaesque/tls"]
+sasl = ["kafkaesque/sasl"]
+otel = ["kafkaesque/otel"]
+
+[dependencies]
+kafkaesque = { path = "../.." }
+tokio = { version = "1.48.0", features = ["full"] }
+tracing = "0.1.44"
+futures = "0.3"

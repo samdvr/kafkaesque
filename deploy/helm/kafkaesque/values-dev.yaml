@@ -1,0 +1,16 @@
+# Single-broker development values.
+# Safe to use with local object storage — data lives on one pod's PVC.
+#
+#   helm install kafkaesque ./kafkaesque -n kafkaesque --create-namespace -f values-dev.yaml \
+#     --set raftAuth.clusterSecret="$(openssl rand -base64 32)" \
+#     --set raftAuth.joinToken="$(openssl rand -base64 32)"
+
+replicaCount: 1
+
+config:
+  autoCreateTopics: true
+  objectStore:
+    type: local
+
+podDisruptionBudget:
+  minAvailable: 1

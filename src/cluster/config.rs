@@ -1,0 +1,2167 @@
+//! Configuration for SlateDB cluster.
+//!
+//! # Configuration Profiles
+//!
+//! Instead of managing 60+ configuration fields, use validated profiles:
+//!
+//! ```rust,no_run
+//! use kafkaesque::cluster::{ClusterConfig, ClusterProfile};
+//!
+//! // Development profile - optimized for fast startup and debugging
+//! let dev_config = ClusterConfig::from_profile(ClusterProfile::Development);
+//!
+//! // Production profile - balanced safety and performance
+//! let prod_config = ClusterConfig::from_profile(ClusterProfile::Production);
+//!
+//! // High-throughput profile - optimized for maximum throughput
+//! let ht_config = ClusterConfig::from_profile(ClusterProfile::HighThroughput);
+//!
+//! // Low-latency profile - optimized for fast failover and response
+//! let ll_config = ClusterConfig::from_profile(ClusterProfile::LowLatency);
+//! ```
+
+use std::time::Duration;
+
+use crate::constants::{
+    DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_LEASE_DURATION_SECS,
+    DEFAULT_LEASE_RENEWAL_INTERVAL_SECS, DEFAULT_OWNERSHIP_CHECK_INTERVAL_SECS,
+    DEFAULT_PRODUCER_STATE_CACHE_TTL_SECS, DEFAULT_SESSION_TIMEOUT_CHECK_INTERVAL_SECS,
+};
+
+/// Validated configuration profiles that reduce cognitive load and prevent misconfiguration.
+///
+/// Instead of tuning 60+ parameters, select a profile that matches your use case.
+/// Each profile is internally validated to ensure consistency.
+///
+/// # Available Profiles
+///
+/// | Profile | Use Case | Failover | Throughput | Resource Usage |
+/// |---------|----------|----------|------------|----------------|
+/// | Development | Local testing | Slow | Low | Minimal |
+/// | Production | General workloads | Fast | Balanced | Standard |
+/// | HighThroughput | Analytics, batch | Medium | Maximum | High |
+/// | LowLatency | Trading, real-time | Very Fast | Moderate | High |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterProfile {
+    /// Optimized for local development and testing.
+    ///
+    /// Features:
+    /// - Relaxed timeouts for debugging
+    /// - Fast startup (shorter initial delays)
+    /// - Lower resource usage
+    /// - Auto-create topics enabled
+    /// - Detailed metrics enabled
+    ///
+    /// **Not suitable for production use.**
+    Development,
+
+    /// Balanced configuration for production workloads.
+    ///
+    /// Features:
+    /// - Fast failover (~2.5 seconds)
+    /// - Balanced safety margins
+    /// - Auto-balancing enabled
+    /// - Circuit breaker protection
+    /// - CRC validation enabled
+    ///
+    /// This is the recommended profile for most production deployments.
+    Production,
+
+    /// Optimized for maximum throughput (analytics, batch processing).
+    ///
+    /// Features:
+    /// - Larger batch sizes
+    /// - Higher concurrent I/O limits
+    /// - Increased fetch response sizes
+    /// - Longer timeouts to avoid interrupting large operations
+    /// - More aggressive batching
+    ///
+    /// Best for:
+    /// - Data lakes and analytics pipelines
+    /// - Batch consumers
+    /// - High-volume ingestion
+    HighThroughput,
+
+    /// Optimized for minimum latency (trading, real-time).
+    ///
+    /// Features:
+    /// - Very fast failover (~1 second)
+    /// - Aggressive heartbeat intervals
+    /// - Smaller batch sizes for faster commits
+    /// - Tighter lease margins
+    ///
+    /// **Warning:** This profile has tighter safety margins.
+    /// Ensure your infrastructure (network, NTP) is reliable.
+    LowLatency,
+}
+
+impl ClusterProfile {
+    /// Get a human-readable description of the profile.
+    pub fn description(&self) -> &'static str {
+        match self {
+            ClusterProfile::Development => "Local development and testing",
+            ClusterProfile::Production => "Balanced production workloads",
+            ClusterProfile::HighThroughput => "Maximum throughput (analytics, batch)",
+            ClusterProfile::LowLatency => "Minimum latency (trading, real-time)",
+        }
+    }
+
+    /// Get all available profiles.
+    pub fn all() -> &'static [ClusterProfile] {
+        &[
+            ClusterProfile::Development,
+            ClusterProfile::Production,
+            ClusterProfile::HighThroughput,
+            ClusterProfile::LowLatency,
+        ]
+    }
+}
+
+impl std::fmt::Display for ClusterProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClusterProfile::Development => write!(f, "development"),
+            ClusterProfile::Production => write!(f, "production"),
+            ClusterProfile::HighThroughput => write!(f, "high-throughput"),
+            ClusterProfile::LowLatency => write!(f, "low-latency"),
+        }
+    }
+}
+
+impl std::str::FromStr for ClusterProfile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "development" | "dev" => Ok(ClusterProfile::Development),
+            "production" | "prod" => Ok(ClusterProfile::Production),
+            "high-throughput" | "throughput" | "ht" => Ok(ClusterProfile::HighThroughput),
+            "low-latency" | "latency" | "ll" => Ok(ClusterProfile::LowLatency),
+            _ => Err(format!(
+                "Unknown profile '{}'. Valid profiles: development, production, high-throughput, low-latency",
+                s
+            )),
+        }
+    }
+}
+
+/// Type of object store to use.
+///
+/// `Debug` is implemented manually to redact credentials. The derived impl
+/// would round-trip `secret_access_key` and `access_key` into any
+/// `format!("{:?}", config)` call — error messages, panics, structured-log
+/// expansions all fan out to whichever subscriber is loaded, making any
+/// future careless `?config` interpolation a credential-leak class.
+#[derive(Clone)]
+pub enum ObjectStoreType {
+    /// Local filesystem storage.
+    Local {
+        /// Path on local filesystem.
+        path: String,
+    },
+    /// Amazon S3 or S3-compatible storage (MinIO, etc.).
+    S3 {
+        /// S3 bucket name.
+        bucket: String,
+        /// AWS region (e.g., "us-east-1").
+        region: String,
+        /// Optional custom endpoint for S3-compatible services (e.g., MinIO).
+        endpoint: Option<String>,
+        /// Optional access key ID (if not using environment/IAM).
+        access_key_id: Option<String>,
+        /// Optional secret access key.
+        secret_access_key: Option<String>,
+    },
+    /// Google Cloud Storage.
+    Gcs {
+        /// GCS bucket name.
+        bucket: String,
+        /// Optional path to service account key file.
+        service_account_key: Option<String>,
+    },
+    /// Azure Blob Storage.
+    Azure {
+        /// Azure container name.
+        container: String,
+        /// Azure storage account name.
+        account: String,
+        /// Optional access key (if not using environment/managed identity).
+        access_key: Option<String>,
+    },
+}
+
+impl std::fmt::Debug for ObjectStoreType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(o: &Option<String>) -> &'static str {
+            match o {
+                Some(_) => "<redacted>",
+                None => "<unset>",
+            }
+        }
+        match self {
+            ObjectStoreType::Local { path } => f.debug_struct("Local").field("path", path).finish(),
+            ObjectStoreType::S3 {
+                bucket,
+                region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+            } => f
+                .debug_struct("S3")
+                .field("bucket", bucket)
+                .field("region", region)
+                .field("endpoint", endpoint)
+                .field("access_key_id", &redact(access_key_id))
+                .field("secret_access_key", &redact(secret_access_key))
+                .finish(),
+            ObjectStoreType::Gcs {
+                bucket,
+                service_account_key,
+            } => f
+                .debug_struct("Gcs")
+                .field("bucket", bucket)
+                .field("service_account_key", &redact(service_account_key))
+                .finish(),
+            ObjectStoreType::Azure {
+                container,
+                account,
+                access_key,
+            } => f
+                .debug_struct("Azure")
+                .field("container", container)
+                .field("account", account)
+                .field("access_key", &redact(access_key))
+                .finish(),
+        }
+    }
+}
+
+impl Default for ObjectStoreType {
+    fn default() -> Self {
+        ObjectStoreType::Local {
+            path: "/tmp/kafkaesque-data".to_string(),
+        }
+    }
+}
+
+/// Configuration for a SlateDB cluster node.
+///
+/// # Clock Synchronization Requirements
+///
+/// **IMPORTANT:** This distributed system relies on synchronized clocks across all brokers
+/// for correct operation of lease expiration, heartbeat TTL, and consumer session timeouts.
+///
+/// ## Requirements
+///
+/// - All brokers MUST run NTP (Network Time Protocol) or an equivalent time synchronization service
+/// - Clock drift between brokers should be kept under 1 second for optimal operation
+/// - Clock drift over 5 seconds may cause:
+///   - Premature lease expiration (partitions unexpectedly released)
+///   - False-positive broker death detection
+///   - Consumer group rebalances due to session timeout miscalculation
+///   - In extreme cases (>30s drift): potential split-brain scenarios
+///
+/// ## Recommended NTP Configuration
+///
+/// ```bash
+/// # Ubuntu/Debian
+/// sudo apt install chrony
+/// sudo systemctl enable chrony
+///
+/// # Amazon Linux / RHEL
+/// sudo yum install chrony
+/// sudo systemctl enable chronyd
+///
+/// # Verify synchronization
+/// chronyc tracking  # should show "Leap status: Normal"
+/// ```
+///
+/// ## Cloud Providers
+///
+/// - **AWS**: Use Amazon Time Sync Service (169.254.169.123)
+/// - **GCP**: VMs are automatically synchronized via Google NTP
+/// - **Azure**: VMs sync via Windows Time service or chrony
+///
+/// ## Kubernetes
+///
+/// Kubernetes nodes should have NTP configured at the host level.
+/// Pod clocks inherit from the node, so ensure node time sync is working.
+///
+/// ## Monitoring
+///
+/// Monitor the `kafkaesque_clock_skew_detected` metric (if available) and
+/// set alerts for clock drift > 1 second.
+#[derive(Debug, Clone)]
+pub struct ClusterConfig {
+    /// This broker's unique ID (must be unique across cluster).
+    ///
+    /// # CRITICAL: Broker ID Persistence Requirement
+    ///
+    /// The broker ID **MUST be persistent and stable across restarts**. This is required
+    /// because the cluster uses consistent hashing based on broker ID for partition assignment.
+    ///
+    /// If a broker restarts with a different ID:
+    /// - All its partition assignments will be recalculated
+    /// - Partitions will migrate unnecessarily to other brokers
+    /// - This causes temporary unavailability and increased load
+    ///
+    /// ## Best Practices
+    ///
+    /// 1. **Static Configuration**: Set `BROKER_ID` explicitly via environment variable
+    ///    or configuration file, not auto-assigned at runtime.
+    ///
+    /// 2. **Kubernetes**: Use the pod ordinal from StatefulSet as the broker ID.
+    ///    Example: `BROKER_ID=$(hostname | sed 's/.*-//')`
+    ///
+    /// 3. **VM/Bare Metal**: Store the broker ID in persistent storage and load it
+    ///    on startup. Generate a new ID only on first boot.
+    ///
+    /// 4. **Docker**: Pass the broker ID as an environment variable, not auto-generated.
+    pub broker_id: i32,
+
+    /// Host address to bind the server to (listen address).
+    /// Use 0.0.0.0 to listen on all interfaces.
+    pub host: String,
+
+    /// Host address advertised to Kafka clients.
+    /// This is what clients use to connect back to the broker.
+    /// Defaults to HOST if not set, but should be a routable address
+    /// (not 0.0.0.0) for clients to connect successfully.
+    pub advertised_host: String,
+
+    /// Port for Kafka clients to connect.
+    pub port: i32,
+
+    /// Port for HTTP health check server.
+    /// Exposes /health, /ready, /live, and /metrics endpoints.
+    /// Set to 0 to disable the health server.
+    /// Default: 8080
+    pub health_port: i32,
+
+    /// Optional bearer token gating the `/metrics` endpoint. When set, the
+    /// health server requires `Authorization: Bearer <token>` on `/metrics`
+    /// and returns 401 otherwise. Liveness and readiness remain open so
+    /// load balancers and kubelet can probe without credentials.
+    ///
+    /// Set via `METRICS_AUTH_TOKEN`. Default: `None` (open).
+    pub metrics_auth_token: Option<String>,
+
+    /// Cluster identifier for coordination.
+    ///
+    /// This ensures isolation between different clusters sharing
+    /// the same object store or Raft network.
+    ///
+    /// Default: "kafkaesque-cluster"
+    pub cluster_id: String,
+
+    /// Object store configuration.
+    pub object_store: ObjectStoreType,
+
+    /// Base path for SlateDB data in object store.
+    /// For S3/GCS/Azure, this is a prefix within the bucket.
+    pub object_store_path: String,
+
+    /// How long a partition ownership lease lasts.
+    pub lease_duration: Duration,
+
+    /// How often to renew partition leases.
+    pub lease_renewal_interval: Duration,
+
+    /// How often to send broker heartbeats.
+    pub heartbeat_interval: Duration,
+
+    /// How often to check for partition ownership changes.
+    pub ownership_check_interval: Duration,
+
+    /// How often to check for expired consumer group members.
+    /// Default: 10 seconds
+    pub session_timeout_check_interval: Duration,
+
+    /// Default session timeout for consumer group members (in milliseconds).
+    /// Members that don't send heartbeats within this window will be evicted.
+    /// Default: 30000ms (30 seconds, matching Kafka's default)
+    pub default_session_timeout_ms: u64,
+
+    /// Whether to automatically create topics when they are first referenced.
+    /// If false, metadata requests for unknown topics will return an error
+    /// instead of auto-creating the topic.
+    /// Default: true (Kafka's default behavior)
+    pub auto_create_topics: bool,
+
+    /// Default number of partitions for auto-created topics.
+    /// Default: 10
+    pub default_num_partitions: i32,
+
+    /// Maximum number of partitions per topic when auto-creating.
+    /// Prevents DoS attacks where clients request extremely high partition counts.
+    /// Set to 0 for no limit (not recommended).
+    /// Default: 1000
+    pub max_partitions_per_topic: i32,
+
+    /// Maximum number of topics that can be auto-created.
+    /// Prevents DoS attacks where clients create many topics.
+    /// Set to 0 for no limit (not recommended).
+    /// Default: 10000
+    pub max_auto_created_topics: u32,
+
+    // --- Network tuning ---
+    /// Maximum allowed message size for requests.
+    /// Prevents memory exhaustion from malicious or malformed messages.
+    /// Default: 100 MB
+    pub max_message_size: usize,
+
+    /// Process-wide budget for bytes of inbound Kafka frames buffered across
+    /// all connections before dispatch. Bounds coordinated slow-frame attacks
+    /// that would otherwise allocate up to `max_message_size` per connection.
+    /// Default: 1 GiB
+    pub global_inflight_byte_budget: usize,
+
+    /// Maximum size of a fetch response in bytes.
+    /// Limits memory usage per fetch request.
+    /// Default: 1 MB
+    pub max_fetch_response_size: usize,
+
+    /// Maximum concurrent partition writes per produce request.
+    /// Provides backpressure when a single request targets many partitions.
+    /// Default: 16
+    pub max_concurrent_partition_writes: usize,
+
+    /// Maximum concurrent partition reads per fetch request.
+    /// Provides backpressure when a single request targets many partitions.
+    /// Default: 16
+    pub max_concurrent_partition_reads: usize,
+
+    /// Maximum time to wait for a fetch operation to complete (seconds).
+    /// Prevents slow object store operations from blocking indefinitely.
+    /// If a fetch exceeds this timeout, it returns whatever data was collected
+    /// so far (which may be empty).
+    /// Default: 30 seconds
+    pub fetch_timeout_secs: u64,
+
+    // --- Coordinator tuning ---
+    /// TTL for broker heartbeat (seconds).
+    /// After this time without heartbeat, broker is considered dead.
+    /// Default: 30 seconds
+    pub broker_heartbeat_ttl_secs: u64,
+
+    /// TTL for group member entries (seconds).
+    /// Members are evicted if no heartbeat within this window.
+    /// Default: 300 seconds (5 minutes)
+    pub group_member_ttl_secs: i64,
+
+    /// TTL for member assignment data (seconds).
+    /// Default: 300 seconds (5 minutes)
+    pub member_assignment_ttl_secs: u64,
+
+    /// TTL for transactional producer state (seconds).
+    /// Default: 604800 (7 days)
+    pub txn_producer_ttl_secs: i64,
+
+    /// TTL for partition ownership cache (seconds).
+    ///
+    /// # Consistency Guarantees
+    ///
+    /// This cache affects **reads only**. Write operations always
+    /// verify ownership directly, ensuring strong consistency for produces.
+    ///
+    /// For fetch (read) operations, there is a window of up to `ownership_cache_ttl_secs`
+    /// where a broker may serve reads after losing ownership.
+    ///
+    /// Default: 1 second
+    pub ownership_cache_ttl_secs: u64,
+
+    /// Maximum number of entries in the ownership cache.
+    /// Default: 10,000
+    pub ownership_cache_max_capacity: u64,
+
+    // --- Recovery & resilience tuning ---
+    /// Maximum consecutive heartbeat failures before entering zombie mode.
+    /// When this threshold is reached, the broker stops accepting writes
+    /// to prevent split-brain scenarios.
+    ///
+    /// Default: 1 (minimizes split-brain window)
+    pub max_consecutive_heartbeat_failures: u32,
+
+    /// Maximum batch boundaries to cache per partition.
+    /// Keeps memory bounded while providing efficient offset lookup.
+    ///
+    /// Default: 10,000
+    pub batch_index_max_size: usize,
+
+    /// Maximum number of partitions this broker will own (hold open SlateDB
+    /// instances for) at any one time.
+    ///
+    /// Each owned partition holds a dedicated `slatedb::Db`: its own memtable,
+    /// WAL write buffer, block cache, and background flush/compaction tasks.
+    /// That per-instance overhead — not the batch index — is the dominant and
+    /// least predictable memory term, so a broker that owns thousands of
+    /// partitions can OOM well before CPU saturates.
+    ///
+    /// When the cap is reached, further `acquire_partition` attempts are
+    /// rejected (the partition stays with / falls back to another owner)
+    /// instead of opening an unbounded number of stores. This converts an
+    /// unbounded OOM failure mode into a bounded, observable capacity limit
+    /// (`partition_acquire_rejected_total{reason="max_owned"}`).
+    ///
+    /// `0` disables the cap (unbounded — the historical behavior). Operators
+    /// running at high partition density should set this based on the measured
+    /// per-partition RSS for their workload.
+    ///
+    /// Default: 0 (unbounded)
+    pub max_owned_partitions_per_broker: usize,
+
+    /// Minimum remaining lease TTL (in seconds) required to allow writes.
+    ///
+    /// If the lease has less than this remaining TTL, writes are rejected to prevent
+    /// TOCTOU (time-of-check-to-time-of-use) races where the lease could expire
+    /// during a write operation, causing split-brain scenarios.
+    ///
+    /// This value should be configured based on:
+    /// - Expected worst-case write latency to object store
+    /// - Network latency between brokers
+    /// - Any GC pauses or other system delays
+    ///
+    /// **WARNING**: Setting this too low (< 5 seconds) increases risk of split-brain.
+    /// Setting this too high reduces the effective usable lease window.
+    ///
+    /// Default: 15 seconds
+    pub min_lease_ttl_for_write_secs: u64,
+
+    /// TTL for producer state cache entries (in seconds).
+    ///
+    /// The producer state cache stores (last_sequence, producer_epoch) per producer_id
+    /// for idempotency checks. Entries expire after this duration of inactivity.
+    ///
+    /// Default: 900 seconds (15 minutes)
+    pub producer_state_cache_ttl_secs: u64,
+
+    /// Maximum groups to process per eviction scan.
+    /// Default: 100
+    pub max_groups_per_eviction_scan: usize,
+
+    // --- Circuit Breaker Configuration ---
+    /// Circuit breaker threshold for fail-closed fencing detection.
+    ///
+    /// After this many consecutive fail-closed events (unknown errors treated as
+    /// potential fencing) without any confirmed fencing, the circuit breaker trips
+    /// and stops treating unknown errors as fencing. This prevents cascading
+    /// unavailability from transient unknown errors.
+    ///
+    /// Default: 5
+    pub circuit_breaker_threshold: u64,
+
+    /// Base reset window for circuit breaker (milliseconds).
+    ///
+    /// If a confirmed fencing event is detected within this window after the
+    /// last fail-closed event, the circuit breaker counter resets. The actual
+    /// window grows exponentially based on consecutive trips.
+    ///
+    /// Default: 60000 (1 minute)
+    pub circuit_breaker_base_reset_window_ms: u64,
+
+    /// Maximum reset window for circuit breaker after exponential backoff (milliseconds).
+    ///
+    /// Default: 300000 (5 minutes)
+    pub circuit_breaker_max_reset_window_ms: u64,
+
+    // --- Raft configuration ---
+    /// Raft RPC listen address (for inter-node communication).
+    /// Default: "127.0.0.1:9093"
+    pub raft_listen_addr: String,
+
+    /// Initial Raft peers for cluster formation.
+    /// Format: "node_id=host:port,node_id=host:port,..."
+    /// Example: "0=127.0.0.1:9093,1=127.0.0.1:9094,2=127.0.0.1:9095"
+    pub raft_peers: Option<String>,
+
+    // --- Metrics tuning ---
+    /// Whether to enable per-partition metrics.
+    ///
+    /// When enabled, metrics include `partition` as a label, which provides
+    /// detailed observability but can cause high cardinality.
+    ///
+    /// Default: true (detailed metrics)
+    pub enable_partition_metrics: bool,
+
+    /// Maximum number of unique topic/partition combinations to track in metrics.
+    /// Default: 10,000
+    pub max_metric_cardinality: usize,
+
+    // --- SASL Authentication ---
+    /// Whether SASL authentication is enabled.
+    ///
+    /// Default: false
+    pub sasl_enabled: bool,
+
+    /// Whether SASL authentication is required for all clients.
+    ///
+    /// Default: false
+    pub sasl_required: bool,
+
+    /// Path to a file containing SASL users in the format `username:password`.
+    ///
+    /// Default: None
+    pub sasl_users_file: Option<String>,
+
+    /// Reject PLAIN SASL on non-TLS client connections. PLAIN sends
+    /// credentials in cleartext; this flag defaults to `true` so operators
+    /// must explicitly opt out (e.g. for local tooling over plaintext).
+    ///
+    /// Default: true
+    pub sasl_plain_require_tls: bool,
+
+    /// Require TLS for any SASL handshake (PLAIN, SCRAM-SHA-256, etc.).
+    /// SCRAM does not put the password on the wire, but the post-auth
+    /// traffic — produce/fetch payloads, ACL decisions — still flows
+    /// in cleartext when TLS is off. Defaults to `true`; operators on
+    /// trusted private networks can opt out.
+    ///
+    /// Default: true
+    pub sasl_require_tls: bool,
+
+    // --- Authorization ---
+    /// Whether ACL enforcement is enabled. When false, the cluster handler
+    /// uses an `AllowAll` authorizer (legacy / dev posture). When true, every
+    /// request goes through the ACL state machine.
+    ///
+    /// Default: false
+    pub acl_enabled: bool,
+
+    /// Whether to deny requests that don't match any ACL binding. Only
+    /// consulted when `acl_enabled` is true. `true` is the production
+    /// posture (deny-by-default — Kafka's standard behavior); `false`
+    /// allows everything that isn't explicitly denied.
+    ///
+    /// Default: true
+    pub acl_deny_by_default: bool,
+
+    /// Principals that bypass ACL checks (e.g. `User:admin`). Comma-separated
+    /// in the env var `KAFKAESQUE_SUPER_USERS`.
+    ///
+    /// Default: empty
+    pub super_users: Vec<String>,
+
+    /// Optional path to a JSON file containing ACL bindings to load at
+    /// startup. The leader writes them via Raft so they replicate
+    /// to every node. The format is a JSON array of `AclBinding` records.
+    ///
+    /// This is operator-friendly bootstrap; future iterations will accept the
+    /// Kafka `CreateAcls` admin RPC. Until then this is the primary way to
+    /// populate the ACL state machine on a fresh cluster.
+    ///
+    /// Default: None
+    pub acl_bootstrap_file: Option<String>,
+
+    /// Whether TLS is enabled on the Kafka client port.
+    /// When true, `tls_cert_path` and `tls_key_path` must be set; the
+    /// `tls` Cargo feature must be compiled in or startup refuses.
+    ///
+    /// Default: false
+    pub tls_enabled: bool,
+
+    /// Path to the PEM-encoded TLS certificate (chain) for the Kafka
+    /// listener. Loaded by `KafkaServer::new_with_tls` at startup.
+    ///
+    /// Default: None
+    pub tls_cert_path: Option<String>,
+
+    /// Path to the PEM-encoded private key for the Kafka listener.
+    ///
+    /// Default: None
+    pub tls_key_path: Option<String>,
+
+    // --- Data Integrity ---
+    /// Whether to validate CRC-32C checksums on incoming record batches.
+    ///
+    /// Default: true (enabled for production safety)
+    pub validate_record_crc: bool,
+
+    /// Whether to fail partition startup if offset gaps are detected.
+    ///
+    /// When enabled, if the HWM recovery scan detects confirmed gaps in the
+    /// offset sequence (gaps below the persisted HWM, i.e. real data loss),
+    /// the partition will refuse to open rather than serving truncated data.
+    ///
+    /// This is the right default for production: a missing record before HWM
+    /// is unrecoverable, and silently continuing makes the gap permanent.
+    /// Operators with legacy data that pre-dates this check can opt out by
+    /// setting `FAIL_ON_RECOVERY_GAP=false`.
+    ///
+    /// Default: true (refuse to open on confirmed gap).
+    pub fail_on_recovery_gap: bool,
+
+    // --- Fast Failover Configuration ---
+    /// Whether fast failover is enabled.
+    ///
+    /// When enabled, the Raft leader runs a failure detector over the
+    /// broker heartbeats applied through the state machine and proactively
+    /// transfers partitions away from failed brokers instead of waiting for
+    /// the 60-second lease expiration.
+    ///
+    /// Default: true
+    pub fast_failover_enabled: bool,
+
+    /// Expected interval between broker heartbeats for failure detection
+    /// (milliseconds).
+    ///
+    /// Heartbeats are produced by the regular broker heartbeat loop, which
+    /// runs every `heartbeat_interval`. If this value is shorter than
+    /// `heartbeat_interval` the failure detector clamps it up to the real
+    /// cadence at startup — expecting heartbeats faster than they are sent
+    /// would mark every healthy broker as failed. To detect failures
+    /// faster, lower `heartbeat_interval` (HEARTBEAT_INTERVAL_SECS).
+    ///
+    /// Default: 500ms
+    pub fast_heartbeat_interval_ms: u64,
+
+    /// Number of missed heartbeats before declaring a broker as suspected.
+    ///
+    /// Suspected state is an intermediate state that helps reduce
+    /// false positives from transient network issues.
+    ///
+    /// Default: 2
+    pub failure_suspicion_threshold: u32,
+
+    /// Number of missed heartbeats before declaring a broker as failed.
+    ///
+    /// After this many missed heartbeats, the broker is considered dead
+    /// and its partitions are redistributed.
+    ///
+    /// Default: 5
+    pub failure_threshold: u32,
+
+    // --- Auto-Balancing Configuration ---
+    /// Whether auto-balancing is enabled.
+    ///
+    /// When enabled, the cluster automatically redistributes partitions
+    /// to maintain even load distribution across brokers.
+    ///
+    /// Default: true
+    pub auto_balancer_enabled: bool,
+
+    /// How often to evaluate cluster balance (seconds).
+    ///
+    /// Default: 60 seconds
+    pub auto_balancer_evaluation_interval_secs: u64,
+
+    /// Load deviation threshold that triggers rebalancing.
+    ///
+    /// This is expressed as a fraction (0.0 to 1.0). A value of 0.3
+    /// means rebalancing is triggered when the load deviation between
+    /// the most loaded and least loaded brokers exceeds 30%.
+    ///
+    /// Default: 0.3 (30%)
+    pub auto_balancer_deviation_threshold: f64,
+
+    /// Maximum partitions to move per rebalance cycle.
+    ///
+    /// This limits the impact of a single rebalance operation
+    /// to prevent cascading failures.
+    ///
+    /// Default: 5
+    pub auto_balancer_max_partitions_per_cycle: usize,
+
+    /// Cooldown period (seconds) before a partition can be moved again.
+    ///
+    /// This prevents thrashing where the same partition is moved
+    /// back and forth repeatedly.
+    ///
+    /// Default: 300 seconds (5 minutes)
+    pub auto_balancer_cooldown_secs: u64,
+
+    /// Weight for throughput in broker score calculation.
+    ///
+    /// The broker score is calculated as:
+    /// score = partition_count * (1 - weight) + throughput * weight
+    ///
+    /// A value of 0.7 means 70% of the score is based on throughput
+    /// and 30% on partition count.
+    ///
+    /// Default: 0.7
+    pub auto_balancer_throughput_weight: f64,
+
+    // --- Raft Configuration ---
+    /// Number of Raft log entries before triggering a snapshot.
+    ///
+    /// Lower values increase snapshot frequency, which:
+    /// - Reduces data loss window on cluster-wide crash (consumer offsets, etc.)
+    /// - Increases object store write costs
+    ///
+    /// Higher values reduce snapshot overhead but increase the window
+    /// where committed Raft state could be lost on crash.
+    ///
+    /// Default: 1000 (balances durability and cost)
+    pub raft_snapshot_threshold: u64,
+
+    /// Tolerance buffer applied to lease and member-expiry checks.
+    ///
+    /// Lease/membership expiry uses the leader's wall-clock; subtracting this
+    /// tolerance from the comparison prevents a leader whose clock jumped
+    /// forward from mass-expiring valid leases.
+    ///
+    /// Default: 5000 ms.
+    pub clock_skew_tolerance_ms: u64,
+
+    // --- SlateDB Configuration ---
+    /// Maximum unflushed bytes in SlateDB memtables before backpressure.
+    ///
+    /// When unflushed data exceeds this limit, writes are paused until
+    /// data is flushed to object storage. This prevents OOM conditions
+    /// when object store latency spikes.
+    ///
+    /// Default: 256 MB (256 * 1024 * 1024)
+    pub slatedb_max_unflushed_bytes: usize,
+
+    /// Target size for SlateDB L0 SSTables in bytes.
+    ///
+    /// Memtables are flushed to L0 when they reach this size.
+    /// Smaller values mean more frequent flushes (faster recovery, higher cost).
+    ///
+    /// Default: 64 MB (64 * 1024 * 1024)
+    pub slatedb_l0_sst_size_bytes: usize,
+
+    /// SlateDB flush interval in milliseconds.
+    ///
+    /// How frequently SlateDB flushes the WAL to object storage.
+    /// Lower values reduce data loss window but increase API costs.
+    ///
+    /// Default: 100ms
+    pub slatedb_flush_interval_ms: u64,
+
+    // --- Log Retention ---
+    /// Time-based log retention in milliseconds (`retention.ms` analogue).
+    ///
+    /// Record batches whose `max_timestamp` is older than this are deleted
+    /// from owned partitions by a periodic background task, and the log
+    /// start offset advances past them. `<= 0` disables retention (data is
+    /// kept forever) — the conservative default, since enabling deletion by
+    /// default would be a destructive surprise for existing deployments.
+    ///
+    /// Env: `LOG_RETENTION_MS`. Default: -1 (disabled)
+    pub log_retention_ms: i64,
+
+    /// How often the retention task scans owned partitions, in seconds.
+    ///
+    /// Env: `LOG_RETENTION_CHECK_INTERVAL_SECS`. Default: 300 (5 minutes)
+    pub log_retention_check_interval_secs: u64,
+
+    // --- Runtime Configuration ---
+    /// Number of worker threads for the control plane runtime.
+    ///
+    /// The control plane handles Raft consensus, heartbeats, lease management,
+    /// and coordination tasks. These are low-throughput but latency-sensitive.
+    ///
+    /// Default: 2
+    pub control_plane_threads: usize,
+
+    /// Number of worker threads for the data plane runtime.
+    ///
+    /// The data plane handles client connections and produce/fetch requests.
+    /// These are high-throughput I/O-heavy tasks.
+    ///
+    /// Default: number of CPU cores
+    pub data_plane_threads: usize,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            broker_id: 0,
+            host: "127.0.0.1".to_string(),
+            advertised_host: "127.0.0.1".to_string(),
+            port: 9092,
+            health_port: 8080,
+            metrics_auth_token: None,
+            cluster_id: "kafkaesque-cluster".to_string(),
+            object_store: ObjectStoreType::default(),
+            object_store_path: "kafkaesque-data".to_string(),
+            lease_duration: Duration::from_secs(DEFAULT_LEASE_DURATION_SECS),
+            lease_renewal_interval: Duration::from_secs(DEFAULT_LEASE_RENEWAL_INTERVAL_SECS),
+            heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
+            ownership_check_interval: Duration::from_secs(DEFAULT_OWNERSHIP_CHECK_INTERVAL_SECS),
+            session_timeout_check_interval: Duration::from_secs(
+                DEFAULT_SESSION_TIMEOUT_CHECK_INTERVAL_SECS,
+            ),
+            default_session_timeout_ms: 30000, // 30 seconds, Kafka default
+            auto_create_topics: true,          // Match Kafka's default
+            default_num_partitions: 10,
+            max_partitions_per_topic: 1000, // Reasonable limit to prevent DoS
+            max_auto_created_topics: 10_000, // Reasonable limit to prevent DoS
+            // Network tuning
+            max_message_size: 100 * 1024 * 1024, // 100 MB
+            global_inflight_byte_budget: 1024 * 1024 * 1024, // 1 GiB
+            max_fetch_response_size: 1024 * 1024, // 1 MB
+            max_concurrent_partition_writes: 16,
+            max_concurrent_partition_reads: 16,
+            fetch_timeout_secs: 30, // 30 seconds
+            // Coordinator tuning
+            broker_heartbeat_ttl_secs: 30,
+            group_member_ttl_secs: 300,      // 5 minutes
+            member_assignment_ttl_secs: 300, // 5 minutes
+            txn_producer_ttl_secs: 604800,   // 7 days
+            ownership_cache_ttl_secs: 1,
+            ownership_cache_max_capacity: 10_000,
+            // Recovery & resilience tuning
+            // Default raised from 1 to 3: a single missed heartbeat sends the
+            // broker into zombie mode and rejects all writes, which on a
+            // congested network or during a routine GC pause flaps the broker
+            // out of service. With 3 we tolerate ~2× heartbeat_interval of
+            // jitter — the failure detector's accrual still catches a real
+            // dead broker on the next sweep.
+            max_consecutive_heartbeat_failures: 3,
+            batch_index_max_size: 10_000,
+            max_owned_partitions_per_broker: 0, // 0 = unbounded; see field docs
+            min_lease_ttl_for_write_secs: crate::constants::DEFAULT_MIN_LEASE_TTL_FOR_WRITE_SECS,
+            producer_state_cache_ttl_secs: DEFAULT_PRODUCER_STATE_CACHE_TTL_SECS,
+            max_groups_per_eviction_scan: 100,
+            // Circuit breaker configuration
+            circuit_breaker_threshold: 5,
+            circuit_breaker_base_reset_window_ms: 60_000, // 1 minute
+            circuit_breaker_max_reset_window_ms: 300_000, // 5 minutes
+            // Raft configuration
+            raft_listen_addr: "127.0.0.1:9093".to_string(),
+            raft_peers: None,
+            // Metrics tuning
+            enable_partition_metrics: true,
+            max_metric_cardinality: 10_000,
+            // SASL authentication
+            sasl_enabled: false,
+            sasl_required: false,
+            sasl_users_file: None,
+            sasl_plain_require_tls: true,
+            sasl_require_tls: true,
+            // Authorization
+            acl_enabled: false,
+            acl_deny_by_default: true,
+            super_users: Vec::new(),
+            acl_bootstrap_file: None,
+            tls_enabled: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            // Data integrity
+            validate_record_crc: true,
+            fail_on_recovery_gap: true,
+            // Fast failover
+            fast_failover_enabled: true,
+            fast_heartbeat_interval_ms: 500,
+            failure_suspicion_threshold: 2,
+            failure_threshold: 5,
+            // Auto-balancing
+            auto_balancer_enabled: true,
+            auto_balancer_evaluation_interval_secs: 60,
+            auto_balancer_deviation_threshold: 0.3,
+            auto_balancer_max_partitions_per_cycle: 5,
+            auto_balancer_cooldown_secs: 300,
+            auto_balancer_throughput_weight: 0.7,
+            // Raft configuration (additional)
+            raft_snapshot_threshold: 1_000,
+            clock_skew_tolerance_ms: 5_000,
+            // SlateDB configuration
+            slatedb_max_unflushed_bytes: 256 * 1024 * 1024, // 256 MB
+            slatedb_l0_sst_size_bytes: 64 * 1024 * 1024,    // 64 MB
+            slatedb_flush_interval_ms: 100,
+            // Log retention (disabled by default — see field docs)
+            log_retention_ms: -1,
+            log_retention_check_interval_secs: 300,
+            // Runtime configuration
+            control_plane_threads: 2,
+            data_plane_threads: std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4),
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// Create a configuration from a validated profile.
+    ///
+    /// Profiles provide pre-configured settings optimized for specific use cases,
+    /// reducing the cognitive load of managing 60+ configuration parameters.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use kafkaesque::cluster::{ClusterConfig, ClusterProfile};
+    ///
+    /// // Development - fast startup, relaxed timeouts
+    /// let config = ClusterConfig::from_profile(ClusterProfile::Development);
+    ///
+    /// // Production - balanced safety and performance
+    /// let config = ClusterConfig::from_profile(ClusterProfile::Production);
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// You can still customize individual fields after creating from a profile:
+    ///
+    /// ```rust,no_run
+    /// use kafkaesque::cluster::{ClusterConfig, ClusterProfile};
+    ///
+    /// let mut config = ClusterConfig::from_profile(ClusterProfile::Production);
+    /// config.broker_id = 42;
+    /// config.port = 9093;
+    /// ```
+    pub fn from_profile(profile: ClusterProfile) -> Self {
+        let base = Self::default();
+
+        match profile {
+            ClusterProfile::Development => Self {
+                // Relaxed timeouts for debugging
+                lease_duration: Duration::from_secs(120),
+                lease_renewal_interval: Duration::from_secs(40),
+                heartbeat_interval: Duration::from_secs(15),
+                broker_heartbeat_ttl_secs: 60,
+
+                // Fast startup
+                ownership_check_interval: Duration::from_secs(2),
+                session_timeout_check_interval: Duration::from_secs(5),
+
+                // Lower resource usage
+                max_concurrent_partition_writes: 4,
+                max_concurrent_partition_reads: 4,
+                batch_index_max_size: 1_000,
+                ownership_cache_max_capacity: 1_000,
+
+                // Developer-friendly defaults
+                auto_create_topics: true,
+                default_num_partitions: 3,
+                max_partitions_per_topic: 100,
+
+                // Relaxed safety for faster iteration
+                max_consecutive_heartbeat_failures: 3,
+                min_lease_ttl_for_write_secs: 10,
+
+                // Disable fast failover (not needed for dev)
+                fast_failover_enabled: false,
+
+                // Disable auto-balancing (not needed for dev)
+                auto_balancer_enabled: false,
+
+                // CRC validation for catching bugs early
+                validate_record_crc: true,
+
+                ..base
+            },
+
+            ClusterProfile::Production => Self {
+                // Balanced lease timing
+                lease_duration: Duration::from_secs(60),
+                lease_renewal_interval: Duration::from_secs(20),
+                heartbeat_interval: Duration::from_secs(5),
+                broker_heartbeat_ttl_secs: 30,
+
+                // Standard concurrency
+                max_concurrent_partition_writes: 16,
+                max_concurrent_partition_reads: 16,
+
+                // Fast failover enabled
+                fast_failover_enabled: true,
+                fast_heartbeat_interval_ms: 500,
+                failure_suspicion_threshold: 2,
+                failure_threshold: 5,
+
+                // Auto-balancing enabled
+                auto_balancer_enabled: true,
+                auto_balancer_evaluation_interval_secs: 60,
+                auto_balancer_deviation_threshold: 0.3,
+                auto_balancer_max_partitions_per_cycle: 5,
+
+                // Safety settings
+                min_lease_ttl_for_write_secs: 15,
+                validate_record_crc: true,
+                circuit_breaker_threshold: 5,
+
+                // Production: explicit topic management. Auto-creation
+                // surprises operators (typos in producer client_ids
+                // create ghost topics) and in multi-tenant clusters
+                // gives an attacker a metadata-DoS primitive.
+                auto_create_topics: false,
+                default_num_partitions: 10,
+                max_partitions_per_topic: 1000,
+
+                ..base
+            },
+
+            ClusterProfile::HighThroughput => Self {
+                // Longer leases to avoid interrupting large operations
+                lease_duration: Duration::from_secs(120),
+                lease_renewal_interval: Duration::from_secs(40),
+
+                // Higher concurrency for parallel I/O
+                max_concurrent_partition_writes: 32,
+                max_concurrent_partition_reads: 32,
+
+                // Larger batches and responses
+                max_fetch_response_size: 10 * 1024 * 1024, // 10 MB
+                batch_index_max_size: 50_000,
+
+                // Longer timeouts for large operations
+                fetch_timeout_secs: 60,
+                min_lease_ttl_for_write_secs: 20,
+
+                // More partitions for parallelism
+                default_num_partitions: 20,
+                max_partitions_per_topic: 5000,
+
+                // Fast failover still enabled but with more tolerance
+                fast_failover_enabled: true,
+                fast_heartbeat_interval_ms: 1000,
+                failure_threshold: 8,
+
+                // Auto-balancer more aggressive
+                auto_balancer_enabled: true,
+                auto_balancer_deviation_threshold: 0.2,
+                auto_balancer_max_partitions_per_cycle: 10,
+
+                // Production-class: explicit topic management.
+                auto_create_topics: false,
+
+                // Skip CRC for maximum throughput
+                validate_record_crc: false,
+
+                ..base
+            },
+
+            ClusterProfile::LowLatency => Self {
+                // Shorter leases for faster failover
+                lease_duration: Duration::from_secs(30),
+                lease_renewal_interval: Duration::from_secs(10),
+                heartbeat_interval: Duration::from_secs(2),
+                broker_heartbeat_ttl_secs: 15,
+
+                // Very aggressive fast failover
+                fast_failover_enabled: true,
+                fast_heartbeat_interval_ms: 200,
+                failure_suspicion_threshold: 2,
+                failure_threshold: 3,
+
+                // Moderate concurrency (latency over throughput)
+                max_concurrent_partition_writes: 8,
+                max_concurrent_partition_reads: 8,
+
+                // Smaller fetch responses for faster delivery
+                max_fetch_response_size: 256 * 1024, // 256 KB
+
+                // Shorter timeouts
+                fetch_timeout_secs: 10,
+                default_session_timeout_ms: 10000, // 10 seconds
+
+                // Tighter safety margins
+                min_lease_ttl_for_write_secs: 8,
+
+                // Fewer partitions per topic (reduces coordination)
+                default_num_partitions: 6,
+
+                // Keep CRC for safety
+                validate_record_crc: true,
+
+                // More responsive auto-balancer
+                auto_balancer_enabled: true,
+                auto_balancer_evaluation_interval_secs: 30,
+                auto_balancer_cooldown_secs: 120,
+
+                // Production-class: explicit topic management.
+                auto_create_topics: false,
+
+                ..base
+            },
+        }
+    }
+
+    /// Create a configuration from a profile specified by environment variable.
+    ///
+    /// Reads the `CLUSTER_PROFILE` environment variable and creates the corresponding
+    /// profile. Falls back to Production if the variable is unset; returns an error
+    /// if the variable is set to an unrecognized value (so a typo is not silently
+    /// downgraded to Production).
+    ///
+    /// # Environment Variable
+    ///
+    /// - `CLUSTER_PROFILE`: One of "development", "production", "high-throughput", "low-latency"
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// CLUSTER_PROFILE=production cargo run
+    /// ```
+    pub fn from_profile_env() -> Result<Self, String> {
+        let profile = match std::env::var("CLUSTER_PROFILE") {
+            Ok(s) => s.parse::<ClusterProfile>()?,
+            Err(_) => ClusterProfile::Production,
+        };
+
+        tracing::info!(
+            profile = %profile,
+            description = profile.description(),
+            "using cluster profile"
+        );
+        Ok(Self::from_profile(profile))
+    }
+
+    /// Count non-empty `id=host:port` entries in a `RAFT_PEERS` string.
+    pub fn count_configured_raft_peers(peers: Option<&String>) -> usize {
+        peers
+            .map(|p| {
+                p.split(',')
+                    .filter(|s| !s.trim().is_empty())
+                    .filter(|s| s.contains('='))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Validate the configuration and return any errors found.
+    ///
+    /// This should be called at startup to catch configuration issues early.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Lease timing: renewal must happen before lease expires
+        if self.lease_renewal_interval >= self.lease_duration {
+            errors.push(format!(
+                "lease_renewal_interval ({:?}) must be less than lease_duration ({:?})",
+                self.lease_renewal_interval, self.lease_duration
+            ));
+        }
+
+        // Heartbeat timing: heartbeat interval must be less than TTL
+        let heartbeat_ttl = Duration::from_secs(self.broker_heartbeat_ttl_secs);
+        if self.heartbeat_interval >= heartbeat_ttl {
+            errors.push(format!(
+                "heartbeat_interval ({:?}) must be less than broker_heartbeat_ttl ({:?})",
+                self.heartbeat_interval, heartbeat_ttl
+            ));
+        }
+
+        // Fast failover sanity: the detector counts missed heartbeats at the
+        // *actual* send cadence (`heartbeat_interval`, clamped at startup),
+        // so the thresholds must be meaningful at that cadence. A zero
+        // threshold would instantly fail every broker; suspicion must come
+        // before failure for the intermediate state to exist.
+        if self.fast_failover_enabled {
+            if self.fast_heartbeat_interval_ms == 0 {
+                errors.push("fast_heartbeat_interval_ms must be greater than 0".to_string());
+            }
+            if self.failure_threshold == 0 {
+                errors.push("failure_threshold must be at least 1".to_string());
+            }
+            if self.failure_suspicion_threshold > self.failure_threshold {
+                errors.push(format!(
+                    "failure_suspicion_threshold ({}) must not exceed failure_threshold ({})",
+                    self.failure_suspicion_threshold, self.failure_threshold
+                ));
+            }
+            // Detection time at the real heartbeat cadence. If it exceeds
+            // the lease-TTL path, fast failover silently never fires first.
+            let effective_interval = self
+                .heartbeat_interval
+                .max(Duration::from_millis(self.fast_heartbeat_interval_ms));
+            let detection_time = effective_interval * self.failure_threshold;
+            if detection_time >= self.lease_duration {
+                errors.push(format!(
+                    "fast failover detection time ({:?} = max(heartbeat_interval, \
+                     fast_heartbeat_interval_ms) * failure_threshold) must be less than \
+                     lease_duration ({:?}); otherwise lease expiry always wins and fast \
+                     failover never triggers",
+                    detection_time, self.lease_duration
+                ));
+            }
+        }
+
+        // Ownership cache TTL should be short for consistency
+        if self.ownership_cache_ttl_secs > 10 {
+            errors.push(format!(
+                "ownership_cache_ttl_secs ({}) should not exceed 10 seconds",
+                self.ownership_cache_ttl_secs
+            ));
+        }
+
+        // Port validation
+        if self.port < 1 || self.port > 65535 {
+            errors.push(format!("port ({}) must be between 1 and 65535", self.port));
+        }
+
+        // Broker ID should be non-negative
+        if self.broker_id < 0 {
+            errors.push(format!(
+                "broker_id ({}) must be non-negative",
+                self.broker_id
+            ));
+        }
+
+        // Message size bounds
+        if self.max_message_size < 1024 {
+            errors.push(format!(
+                "max_message_size ({}) should be at least 1KB",
+                self.max_message_size
+            ));
+        }
+
+        // Fetch response size should be reasonable
+        if self.max_fetch_response_size < 1024 {
+            errors.push(format!(
+                "max_fetch_response_size ({}) should be at least 1KB",
+                self.max_fetch_response_size
+            ));
+        }
+
+        // Concurrent writes should be bounded
+        if self.max_concurrent_partition_writes == 0 {
+            errors.push("max_concurrent_partition_writes must be at least 1".to_string());
+        }
+
+        // Concurrent reads should be bounded
+        if self.max_concurrent_partition_reads == 0 {
+            errors.push("max_concurrent_partition_reads must be at least 1".to_string());
+        }
+
+        // Consecutive heartbeat failures should allow some tolerance
+        if self.max_consecutive_heartbeat_failures == 0 {
+            errors.push("max_consecutive_heartbeat_failures must be at least 1".to_string());
+        }
+
+        // Session timeout should be reasonable
+        if self.default_session_timeout_ms < 1000 {
+            errors.push(format!(
+                "default_session_timeout_ms ({}) should be at least 1000ms",
+                self.default_session_timeout_ms
+            ));
+        }
+
+        // Fetch timeout must be positive
+        if self.fetch_timeout_secs == 0 {
+            errors.push("fetch_timeout_secs must be greater than 0".to_string());
+        }
+
+        // Batch index size must be positive
+        if self.batch_index_max_size == 0 {
+            errors.push("batch_index_max_size must be greater than 0".to_string());
+        }
+
+        // Retention check interval must be positive (the interval drives a
+        // tokio::time::interval, which panics on zero)
+        if self.log_retention_check_interval_secs == 0 {
+            errors.push("log_retention_check_interval_secs must be greater than 0".to_string());
+        }
+
+        // Min lease TTL for write validation
+        if self.min_lease_ttl_for_write_secs < 5 {
+            errors.push(format!(
+                "min_lease_ttl_for_write_secs ({}) should be at least 5 seconds to prevent split-brain",
+                self.min_lease_ttl_for_write_secs
+            ));
+        }
+
+        // Lease timing safety
+        const MIN_LEASE_TTL_BUFFER_SECS: u64 = 10;
+        let lease_buffer = self
+            .lease_duration
+            .as_secs()
+            .saturating_sub(self.lease_renewal_interval.as_secs());
+        if lease_buffer < MIN_LEASE_TTL_BUFFER_SECS {
+            errors.push(format!(
+                "Insufficient lease buffer: lease_duration ({:?}) - lease_renewal_interval ({:?}) = {}s, \
+                 but minimum required buffer is {}s",
+                self.lease_duration,
+                self.lease_renewal_interval,
+                lease_buffer,
+                MIN_LEASE_TTL_BUFFER_SECS
+            ));
+        }
+
+        // TOCTOU safety: min_lease_ttl_for_write_secs must be less than the lease buffer
+        // to allow writes. If min_lease_ttl_for_write_secs >= lease_buffer, writes would
+        // be rejected immediately after lease renewal, leaving no usable write window.
+        if self.min_lease_ttl_for_write_secs >= lease_buffer {
+            errors.push(format!(
+                "min_lease_ttl_for_write_secs ({}) must be less than lease buffer ({} seconds). \
+                 Writes require at least {} seconds of remaining lease. \
+                 Increase lease_duration or decrease lease_renewal_interval.",
+                self.min_lease_ttl_for_write_secs, lease_buffer, self.min_lease_ttl_for_write_secs
+            ));
+        }
+
+        if self.default_num_partitions <= 0 {
+            errors.push(format!(
+                "default_num_partitions ({}) must be positive",
+                self.default_num_partitions
+            ));
+        }
+
+        if self.cluster_id.trim().is_empty()
+            && !matches!(self.object_store, ObjectStoreType::Local { .. })
+        {
+            errors.push(
+                "cluster_id must not be empty when using a remote object-store backend; \
+                 two clusters sharing a bucket with the same (or empty) id will corrupt each other"
+                    .to_string(),
+            );
+        }
+
+        // Local object storage is per-host filesystem state unless every
+        // broker mounts the same path (dev/test only). Multi-broker
+        // production clusters require a shared backend so partition handoff
+        // reads the same durable log on every broker.
+        if matches!(self.object_store, ObjectStoreType::Local { .. })
+            && Self::count_configured_raft_peers(self.raft_peers.as_ref()) > 1
+        {
+            let profile = std::env::var("CLUSTER_PROFILE")
+                .ok()
+                .and_then(|raw| raw.parse::<ClusterProfile>().ok())
+                .unwrap_or(ClusterProfile::Production);
+            if profile != ClusterProfile::Development {
+                errors.push(
+                    "OBJECT_STORE_TYPE=local cannot be used with a multi-broker cluster \
+                     (RAFT_PEERS lists more than one member). Local storage is not shared \
+                     across brokers; partition failover would lose data. Use a shared object \
+                     store backend (s3, gcs, azure) or run a single broker."
+                        .to_string(),
+                );
+            }
+        }
+
+        // SASL consistency: requiring SASL without enabling the SASL handshake
+        // handlers would reject every client connection. Fail at startup with
+        // an actionable message instead of bricking all clients at runtime.
+        if self.sasl_required && !self.sasl_enabled {
+            errors.push(
+                "sasl_required=true requires sasl_enabled=true: with SASL required but the \
+                 SASL handshake disabled, every client connection would be rejected. \
+                 Set SASL_ENABLED=true (and configure SASL_USERS_FILE) or unset SASL_REQUIRED."
+                    .to_string(),
+            );
+        }
+
+        if self.sasl_enabled && !self.sasl_plain_require_tls && !self.tls_enabled {
+            errors.push(
+                "sasl_plain_require_tls=false requires tls_enabled=true: PLAIN sends credentials \
+                 in cleartext and must not be allowed on a plaintext Kafka port. Enable TLS or \
+                 keep SASL_PLAIN_REQUIRE_TLS=true (default)."
+                    .to_string(),
+            );
+        }
+
+        // TLS material must accompany the enable flag — otherwise the listener
+        // either crashes mid-startup or, worse, falls back to plaintext on a
+        // port operators believed was protected.
+        if self.tls_enabled {
+            if self.tls_cert_path.is_none() {
+                errors.push(
+                    "tls_enabled=true but TLS_CERT_PATH is not set: cannot serve TLS without a \
+                     server certificate. Configure TLS_CERT_PATH (and TLS_KEY_PATH) or set \
+                     TLS_ENABLED=false."
+                        .to_string(),
+                );
+            }
+            if self.tls_key_path.is_none() {
+                errors.push(
+                    "tls_enabled=true but TLS_KEY_PATH is not set: cannot serve TLS without a \
+                     private key. Configure TLS_KEY_PATH (and TLS_CERT_PATH) or set \
+                     TLS_ENABLED=false."
+                        .to_string(),
+                );
+            }
+        } else if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            errors.push(
+                "TLS_CERT_PATH and TLS_KEY_PATH must be set together: one is configured but the \
+                 other is missing. Either set both (and TLS_ENABLED=true) or unset both."
+                    .to_string(),
+            );
+        }
+
+        if self.acl_enabled && !self.acl_deny_by_default {
+            errors.push(
+                "acl_enabled is true but acl_deny_by_default is false. This combination \
+                 enforces only explicit Deny rules and leaves every undeclared resource \
+                 fully accessible — an open broker that looks closed. Either set \
+                 acl_deny_by_default=true (recommended) or disable ACLs entirely."
+                    .to_string(),
+            );
+        }
+
+        // A zero cap was historically interpreted as "unlimited", which is
+        // dangerous: roughly ten metric families carry per-(topic, partition)
+        // labels, so a misbehaving client that creates many topics blows up
+        // the Prometheus scrape (memory inside the broker plus on the
+        // scraper). Hard-refuse zero; clamp absurdly large values too so a
+        // typo can't silently convert the cap into "effectively unlimited".
+        const ABSOLUTE_CARDINALITY_CEILING: usize = 1_000_000;
+        if self.max_metric_cardinality == 0 {
+            errors.push(
+                "max_metric_cardinality must be greater than 0; a value of 0 was \
+                 historically treated as unbounded and is no longer accepted. Set a \
+                 finite cap (default 10,000)."
+                    .to_string(),
+            );
+        } else if self.max_metric_cardinality > ABSOLUTE_CARDINALITY_CEILING {
+            errors.push(format!(
+                "max_metric_cardinality ({}) exceeds absolute ceiling {}",
+                self.max_metric_cardinality, ABSOLUTE_CARDINALITY_CEILING
+            ));
+        }
+
+        // Advisory (not a hard error): a positive owned-partition cap below the
+        // default topic partition count means a broker cannot hold a full
+        // topic's partitions by itself. That is correct in a multi-broker
+        // cluster (each broker owns a subset) but will starve a single-broker
+        // deployment, which silently can't serve newly created topics. `0`
+        // means unbounded and is always fine.
+        if self.max_owned_partitions_per_broker > 0
+            && self.max_owned_partitions_per_broker < self.default_num_partitions as usize
+        {
+            tracing::warn!(
+                max_owned_partitions_per_broker = self.max_owned_partitions_per_broker,
+                default_num_partitions = self.default_num_partitions,
+                "max_owned_partitions_per_broker is below default_num_partitions: a \
+                 single broker cannot own a full topic's partitions. Ensure enough \
+                 brokers share the load, or raise the cap."
+            );
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate configuration and panic with detailed error if invalid.
+    pub fn validate_or_panic(&self) {
+        if let Err(errors) = self.validate() {
+            eprintln!("=== Configuration Validation Failed ===");
+            for (i, error) in errors.iter().enumerate() {
+                eprintln!("  {}. {}", i + 1, error);
+            }
+            eprintln!("========================================");
+            panic!("Invalid configuration - {} error(s) found", errors.len());
+        }
+    }
+
+    /// Create configuration from environment variables.
+    ///
+    /// Environment variables:
+    /// - `BROKER_ID`: Broker ID (default: 0)
+    /// - `HOST`: Host address (default: 0.0.0.0)
+    /// - `PORT`: Kafka port (default: 9092)
+    /// - `CLUSTER_ID`: Cluster identifier (default: kafkaesque-cluster)
+    /// - `RAFT_LISTEN_ADDR`: Raft RPC listen address (default: 127.0.0.1:9093)
+    /// - `RAFT_PEERS`: Initial peers for cluster formation
+    /// - `OBJECT_STORE_TYPE`: "local", "s3", "gcs", or "azure" (default: local)
+    /// - `DATA_PATH`: Local path or object store prefix (default: /tmp/kafkaesque-data)
+    /// - `AUTO_CREATE_TOPICS`: "true" or "false" (default: true)
+    ///
+    /// For S3:
+    /// - `AWS_S3_BUCKET` or `S3_BUCKET`: Bucket name
+    /// - `AWS_REGION` or `AWS_DEFAULT_REGION`: Region
+    /// - `AWS_ENDPOINT` or `S3_ENDPOINT`: Custom endpoint (for MinIO)
+    /// - `AWS_ACCESS_KEY_ID`: Access key (optional, can use IAM)
+    /// - `AWS_SECRET_ACCESS_KEY`: Secret key (optional)
+    ///
+    /// For GCS:
+    /// - `GCS_BUCKET`: Bucket name
+    /// - `GOOGLE_APPLICATION_CREDENTIALS`: Path to service account key
+    ///
+    /// For Azure:
+    /// - `AZURE_CONTAINER`: Container name
+    /// - `AZURE_STORAGE_ACCOUNT`: Storage account name
+    /// - `AZURE_STORAGE_ACCESS_KEY`: Access key (optional)
+    pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let defaults = Self::default();
+
+        let broker_id: i32 = std::env::var("BROKER_ID")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .map_err(|e| format!("Invalid BROKER_ID: {}", e))?;
+
+        if broker_id < 0 {
+            return Err("BROKER_ID must be non-negative".into());
+        }
+
+        let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+
+        // ADVERTISED_HOST is the address brokers return in Metadata responses;
+        // every Kafka client uses it to reconnect for produce/fetch. If we
+        // bind to 0.0.0.0 we MUST be told (or be able to derive) a routable
+        // address — falling back to "127.0.0.1" silently makes the K8s
+        // deployment unusable for in-cluster clients.
+        //
+        // Resolution order when ADVERTISED_HOST is unset:
+        //   1. If HOST is a concrete address (not 0.0.0.0), use it.
+        //   2. Else if $HOSTNAME is non-empty (set in every Pod), use it and
+        //      warn loudly that the operator should pin ADVERTISED_HOST to a
+        //      DNS name reachable by clients.
+        //   3. Else fall back to 127.0.0.1 with a warning — only safe for
+        //      local single-node dev.
+        let advertised_host = match std::env::var("ADVERTISED_HOST") {
+            Ok(h) if !h.is_empty() => h,
+            _ => {
+                if host != "0.0.0.0" {
+                    host.clone()
+                } else if let Ok(h) = std::env::var("HOSTNAME") {
+                    if !h.is_empty() {
+                        tracing::warn!(
+                            hostname = %h,
+                            "ADVERTISED_HOST not set; binding 0.0.0.0 and advertising $HOSTNAME. \
+                             Set ADVERTISED_HOST to a fully-qualified DNS name reachable \
+                             by all Kafka clients (e.g. <pod>.<svc>.<ns>.svc.cluster.local)."
+                        );
+                        h
+                    } else {
+                        tracing::warn!(
+                            "ADVERTISED_HOST not set and $HOSTNAME empty; falling back to \
+                             127.0.0.1. This only works for single-node local dev — set \
+                             ADVERTISED_HOST for any deployment with remote clients."
+                        );
+                        "127.0.0.1".to_string()
+                    }
+                } else {
+                    tracing::warn!(
+                        "ADVERTISED_HOST not set and $HOSTNAME unavailable; falling back to \
+                         127.0.0.1. This only works for single-node local dev — set \
+                         ADVERTISED_HOST for any deployment with remote clients."
+                    );
+                    "127.0.0.1".to_string()
+                }
+            }
+        };
+
+        let port: i32 = std::env::var("PORT")
+            .unwrap_or_else(|_| "9092".to_string())
+            .parse()
+            .map_err(|e| format!("Invalid PORT: {}", e))?;
+
+        if !(1..=65535).contains(&port) {
+            return Err(format!("PORT must be between 1 and 65535, got {}", port).into());
+        }
+
+        let health_port: i32 = std::env::var("HEALTH_PORT")
+            .unwrap_or_else(|_| "8080".to_string())
+            .parse()
+            .map_err(|e| format!("Invalid HEALTH_PORT: {}", e))?;
+
+        if health_port != 0 && !(1..=65535).contains(&health_port) {
+            return Err(format!(
+                "HEALTH_PORT must be 0 or between 1 and 65535, got {}",
+                health_port
+            )
+            .into());
+        }
+
+        // Optional bearer token for `/metrics`. Empty string is treated the
+        // same as unset so an operator clearing the value via shell doesn't
+        // accidentally configure an empty-string secret.
+        let metrics_auth_token = std::env::var("METRICS_AUTH_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+
+        let cluster_id =
+            std::env::var("CLUSTER_ID").unwrap_or_else(|_| "kafkaesque-cluster".to_string());
+
+        let raft_listen_addr =
+            std::env::var("RAFT_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:9093".to_string());
+
+        let raft_peers = std::env::var("RAFT_PEERS").ok();
+
+        let data_path =
+            std::env::var("DATA_PATH").unwrap_or_else(|_| "/tmp/kafkaesque-data".to_string());
+
+        let auto_create_topics = std::env::var("AUTO_CREATE_TOPICS")
+            .map(|v| v.to_lowercase() != "false" && v != "0")
+            .unwrap_or(true);
+
+        let default_num_partitions: i32 = std::env::var("DEFAULT_NUM_PARTITIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.default_num_partitions);
+
+        // Network tuning from env
+        let max_message_size: usize = std::env::var("MAX_MESSAGE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.max_message_size);
+
+        let global_inflight_byte_budget: usize = std::env::var("GLOBAL_INFLIGHT_BYTE_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.global_inflight_byte_budget);
+
+        let max_fetch_response_size: usize = std::env::var("MAX_FETCH_RESPONSE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.max_fetch_response_size);
+
+        let max_concurrent_partition_writes: usize =
+            std::env::var("MAX_CONCURRENT_PARTITION_WRITES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.max_concurrent_partition_writes);
+
+        let max_concurrent_partition_reads: usize = std::env::var("MAX_CONCURRENT_PARTITION_READS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.max_concurrent_partition_reads);
+
+        // Coordinator tuning
+        let broker_heartbeat_ttl_secs: u64 = std::env::var("BROKER_HEARTBEAT_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.broker_heartbeat_ttl_secs);
+
+        let group_member_ttl_secs: i64 = std::env::var("GROUP_MEMBER_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.group_member_ttl_secs);
+
+        let ownership_cache_ttl_secs: u64 = std::env::var("OWNERSHIP_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.ownership_cache_ttl_secs);
+
+        let producer_state_cache_ttl_secs: u64 = std::env::var("PRODUCER_STATE_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.producer_state_cache_ttl_secs);
+
+        let object_store_type = std::env::var("OBJECT_STORE_TYPE")
+            .unwrap_or_else(|_| "local".to_string())
+            .to_lowercase();
+
+        let object_store = match object_store_type.as_str() {
+            "s3" => {
+                let bucket = std::env::var("AWS_S3_BUCKET")
+                    .or_else(|_| std::env::var("S3_BUCKET"))
+                    .map_err(
+                        |_| "S3_BUCKET or AWS_S3_BUCKET must be set when OBJECT_STORE_TYPE=s3",
+                    )?;
+
+                let region = std::env::var("AWS_REGION")
+                    .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                    .unwrap_or_else(|_| "us-east-1".to_string());
+
+                let endpoint = std::env::var("AWS_ENDPOINT")
+                    .or_else(|_| std::env::var("S3_ENDPOINT"))
+                    .ok();
+
+                let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").ok();
+                let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+
+                ObjectStoreType::S3 {
+                    bucket,
+                    region,
+                    endpoint,
+                    access_key_id,
+                    secret_access_key,
+                }
+            }
+            "gcs" => {
+                let bucket = std::env::var("GCS_BUCKET")
+                    .map_err(|_| "GCS_BUCKET must be set when OBJECT_STORE_TYPE=gcs")?;
+
+                let service_account_key = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
+
+                ObjectStoreType::Gcs {
+                    bucket,
+                    service_account_key,
+                }
+            }
+            "azure" => {
+                let container =
+                    std::env::var("AZURE_CONTAINER").map_err(|_| "AZURE_CONTAINER must be set")?;
+
+                let account = std::env::var("AZURE_STORAGE_ACCOUNT")
+                    .map_err(|_| "AZURE_STORAGE_ACCOUNT must be set")?;
+
+                let access_key = std::env::var("AZURE_STORAGE_ACCESS_KEY").ok();
+
+                ObjectStoreType::Azure {
+                    container,
+                    account,
+                    access_key,
+                }
+            }
+            _ => ObjectStoreType::Local {
+                path: data_path.clone(),
+            },
+        };
+
+        // SASL authentication configuration
+        let sasl_enabled = std::env::var("SASL_ENABLED")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+
+        let sasl_required = std::env::var("SASL_REQUIRED")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+
+        let sasl_users_file = std::env::var("SASL_USERS_FILE").ok();
+
+        let sasl_plain_require_tls = std::env::var("SASL_PLAIN_REQUIRE_TLS")
+            .map(|v| v.to_lowercase() != "false" && v != "0")
+            .unwrap_or(true);
+
+        let sasl_require_tls = std::env::var("SASL_REQUIRE_TLS")
+            .map(|v| v.to_lowercase() != "false" && v != "0")
+            .unwrap_or(true);
+
+        // Authorization configuration. When SASL authentication is required
+        // we flip the ACL default to on: an authn-only deployment routes
+        // every authorization decision through `AllowAllAuthorizer`, which
+        // turns "we have authentication" into a false sense of security
+        // because every authenticated user can act on every resource. The
+        // operator can still set `ACL_ENABLED=false` explicitly to opt out.
+        let acl_enabled = match std::env::var("ACL_ENABLED") {
+            Ok(v) => v.to_lowercase() == "true" || v == "1",
+            Err(_) => sasl_required,
+        };
+
+        let acl_deny_by_default = std::env::var("ACL_DENY_BY_DEFAULT")
+            .map(|v| v.to_lowercase() != "false" && v != "0")
+            .unwrap_or(true);
+
+        let super_users: Vec<String> = std::env::var("KAFKAESQUE_SUPER_USERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| {
+                // Require the `User:` principal-type prefix so a stray
+                // `KAFKAESQUE_SUPER_USERS=*` cannot grant cluster-admin to
+                // every authenticated principal. The wildcard form
+                // `User:*` matches every authenticated principal *except*
+                // `User:ANONYMOUS` (see ACL host matching) and is
+                // intentionally still rejected here — a global super-user
+                // wildcard is almost always an operator mistake.
+                if s == "User:*" {
+                    tracing::error!(
+                        super_user = %s,
+                        "Refusing to install wildcard super-user; this would grant cluster-admin to every authenticated principal"
+                    );
+                    return None;
+                }
+                if !s.starts_with("User:") {
+                    tracing::error!(
+                        super_user = %s,
+                        "Refusing super-user without `User:` prefix; expected e.g. `User:alice`"
+                    );
+                    return None;
+                }
+                Some(s)
+            })
+            .collect();
+
+        let acl_bootstrap_file = std::env::var("KAFKAESQUE_ACL_BOOTSTRAP_FILE").ok();
+
+        // TLS for Kafka client port
+        let tls_enabled = std::env::var("TLS_ENABLED")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+        let tls_cert_path = std::env::var("TLS_CERT_PATH").ok();
+        let tls_key_path = std::env::var("TLS_KEY_PATH").ok();
+
+        // Data integrity configuration
+        let fail_on_recovery_gap = std::env::var("FAIL_ON_RECOVERY_GAP")
+            .map(|v| {
+                let v = v.to_lowercase();
+                !(v == "false" || v == "0")
+            })
+            .unwrap_or(true);
+
+        // Raft configuration
+        let raft_snapshot_threshold: u64 = std::env::var("RAFT_SNAPSHOT_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.raft_snapshot_threshold);
+
+        let clock_skew_tolerance_ms: u64 = std::env::var("CLOCK_SKEW_TOLERANCE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.clock_skew_tolerance_ms);
+
+        // SlateDB configuration
+        let slatedb_max_unflushed_bytes: usize = std::env::var("SLATEDB_MAX_UNFLUSHED_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.slatedb_max_unflushed_bytes);
+
+        let slatedb_l0_sst_size_bytes: usize = std::env::var("SLATEDB_L0_SST_SIZE_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.slatedb_l0_sst_size_bytes);
+
+        let slatedb_flush_interval_ms: u64 = std::env::var("SLATEDB_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.slatedb_flush_interval_ms);
+
+        // Log retention
+        let log_retention_ms: i64 = std::env::var("LOG_RETENTION_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.log_retention_ms);
+
+        let log_retention_check_interval_secs: u64 =
+            std::env::var("LOG_RETENTION_CHECK_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.log_retention_check_interval_secs);
+
+        // Runtime configuration
+        let control_plane_threads: usize = std::env::var("CONTROL_PLANE_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.control_plane_threads);
+
+        let data_plane_threads: usize = std::env::var("DATA_PLANE_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.data_plane_threads);
+
+        let max_owned_partitions_per_broker: usize =
+            std::env::var("MAX_OWNED_PARTITIONS_PER_BROKER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.max_owned_partitions_per_broker);
+
+        let config = Self {
+            broker_id,
+            host: host.clone(),
+            advertised_host: advertised_host.clone(),
+            port,
+            health_port,
+            metrics_auth_token: metrics_auth_token.clone(),
+            cluster_id: cluster_id.clone(),
+            raft_listen_addr: raft_listen_addr.clone(),
+            raft_peers: raft_peers.clone(),
+            object_store,
+            object_store_path: data_path.clone(),
+            auto_create_topics,
+            default_num_partitions,
+            max_message_size,
+            global_inflight_byte_budget,
+            max_fetch_response_size,
+            max_concurrent_partition_writes,
+            max_concurrent_partition_reads,
+            broker_heartbeat_ttl_secs,
+            group_member_ttl_secs,
+            ownership_cache_ttl_secs,
+            producer_state_cache_ttl_secs,
+            sasl_enabled,
+            sasl_required,
+            sasl_users_file,
+            sasl_plain_require_tls,
+            sasl_require_tls,
+            acl_enabled,
+            acl_deny_by_default,
+            super_users,
+            acl_bootstrap_file,
+            tls_enabled,
+            tls_cert_path,
+            tls_key_path,
+            fail_on_recovery_gap,
+            raft_snapshot_threshold,
+            clock_skew_tolerance_ms,
+            slatedb_max_unflushed_bytes,
+            slatedb_l0_sst_size_bytes,
+            slatedb_flush_interval_ms,
+            log_retention_ms,
+            log_retention_check_interval_secs,
+            control_plane_threads,
+            data_plane_threads,
+            max_owned_partitions_per_broker,
+            ..defaults
+        };
+
+        #[cfg(not(fuzzing))]
+        {
+            eprintln!("=== Kafkaesque Configuration ===");
+            eprintln!("Broker ID: {}", broker_id);
+            eprintln!("Host (bind): {}", host);
+            eprintln!("Advertised Host: {}", advertised_host);
+            eprintln!("Port: {}", port);
+            eprintln!(
+                "Health Port: {}",
+                if health_port == 0 {
+                    "disabled".to_string()
+                } else {
+                    health_port.to_string()
+                }
+            );
+            eprintln!(
+                "Metrics Auth: {}",
+                if metrics_auth_token.is_some() {
+                    "enabled (bearer token)"
+                } else {
+                    "disabled (open)"
+                }
+            );
+            eprintln!("Coordination: Raft (embedded consensus)");
+            eprintln!("Cluster ID: {}", cluster_id);
+            eprintln!("Raft Listen Addr: {}", raft_listen_addr);
+            if let Some(ref peers) = raft_peers {
+                eprintln!("Raft Peers: {}", peers);
+            }
+            eprintln!("Object Store: {:?}", object_store_type);
+            eprintln!("Data Path: {}", data_path);
+            eprintln!("Auto Create Topics: {}", auto_create_topics);
+            eprintln!("Default Num Partitions: {}", default_num_partitions);
+            eprintln!(
+                "Max Owned Partitions Per Broker: {}",
+                if max_owned_partitions_per_broker == 0 {
+                    "unbounded".to_string()
+                } else {
+                    max_owned_partitions_per_broker.to_string()
+                }
+            );
+            eprintln!("Max Message Size: {} bytes", max_message_size);
+            eprintln!(
+                "Global Inflight Byte Budget: {} bytes",
+                global_inflight_byte_budget
+            );
+            eprintln!("Max Fetch Response Size: {} bytes", max_fetch_response_size);
+            eprintln!("Broker Heartbeat TTL: {}s", broker_heartbeat_ttl_secs);
+            eprintln!("SASL Enabled: {}", sasl_enabled);
+            eprintln!("Fail on Recovery Gap: {}", fail_on_recovery_gap);
+            eprintln!(
+                "Log Retention: {}",
+                if log_retention_ms > 0 {
+                    format!(
+                        "{} ms (checked every {}s)",
+                        log_retention_ms, log_retention_check_interval_secs
+                    )
+                } else {
+                    "disabled (infinite)".to_string()
+                }
+            );
+            eprintln!(
+                "Runtime: control_plane={} threads, data_plane={} threads",
+                control_plane_threads, data_plane_threads
+            );
+            eprintln!("==========================");
+        }
+
+        // Run validation
+        if let Err(errors) = config.validate() {
+            return Err(format!("Configuration validation failed: {}", errors.join("; ")).into());
+        }
+
+        Self::validate_env_security_posture(&config)?;
+
+        Ok(config)
+    }
+
+    /// Secure-by-default startup gate for environment-driven deployments.
+    ///
+    /// The Raft RPC port accepts cluster-membership changes (`JoinCluster`
+    /// auto-promotes the caller to voter) and arbitrary coordination
+    /// commands, so running it unauthenticated is only acceptable for local
+    /// development. Outside an explicit development profile
+    /// (`CLUSTER_PROFILE=development`/`dev`) startup fails unless
+    /// `RAFT_CLUSTER_SECRET` is set to a non-empty value.
+    ///
+    /// This is checked in `from_env` (the deployed binary's entry point)
+    /// rather than `validate()` because the secret is intentionally not part
+    /// of `ClusterConfig` — it must not appear in debug output or config
+    /// dumps — and programmatic/test construction of configs should not
+    /// require process-global env state.
+    fn validate_env_security_posture(
+        config: &ClusterConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let profile = match std::env::var("CLUSTER_PROFILE") {
+            Ok(raw) => raw
+                .parse::<ClusterProfile>()
+                .map_err(|e| format!("Invalid CLUSTER_PROFILE: {}", e))?,
+            // No profile declared: assume production. Security gates must
+            // not silently relax because an env var was forgotten.
+            Err(_) => ClusterProfile::Production,
+        };
+
+        if profile == ClusterProfile::Development {
+            return Ok(());
+        }
+
+        // Reuse RaftAuthKeys' normalization so an empty/whitespace-only
+        // secret is treated as unset here exactly as it is by the RPC layer.
+        // Check the secret first: an unauthenticated control plane is the
+        // most fundamental misconfiguration and the most actionable
+        // diagnostic — the operator usually only needs one missing-env-var
+        // pointer rather than a chained list. SASL/ACL gates follow.
+        let auth_keys = crate::cluster::raft::RaftAuthKeys::from_env();
+        if !auth_keys.cluster_secret_configured() {
+            return Err(format!(
+                "RAFT_CLUSTER_SECRET is not set (profile: {}). The Raft control-plane port \
+                 accepts cluster joins and coordination commands, so it must be authenticated \
+                 outside development. Set RAFT_CLUSTER_SECRET to the same strong random value \
+                 on every node, or explicitly opt into an unauthenticated control plane for \
+                 local development with CLUSTER_PROFILE=development.",
+                profile
+            )
+            .into());
+        }
+
+        // Require BOTH authentication and authorization in production.
+        // SASL is *authentication* (proves who the client is); ACLs are
+        // *authorization* (decides what they can do). They don't substitute:
+        // a SASL-only deployment authenticates every user but the
+        // `AllowAllAuthorizer` lets every authenticated user perform every
+        // operation on every resource — typically not what the operator
+        // intends. Operators that genuinely want flat-trust authn-only
+        // access should enable ACLs and put the relevant principals in
+        // `super_users`.
+        //
+        // The "ACL on ANONYMOUS, no SASL" path is still permitted for
+        // internal-only clusters behind a network boundary where SASL is
+        // unnecessary.
+        if !config.acl_enabled {
+            return Err(format!(
+                "ACL_ENABLED is not set (profile: {}). A broker without ACL enforcement \
+                 routes every authorization decision through `AllowAllAuthorizer`, which \
+                 lets every caller (authenticated or `User:ANONYMOUS`) act on every \
+                 resource. Enable ACL_ENABLED with ACL_DENY_BY_DEFAULT=true and add the \
+                 relevant principals to SUPER_USERS, or explicitly opt into an open \
+                 broker for local development with CLUSTER_PROFILE=development.",
+                profile
+            )
+            .into());
+        }
+
+        // Require an explicit join token in production. `join_key()` falls
+        // back to `cluster_secret` when the join token is absent, so a
+        // single leak rotates *both* keys at once and an operator who set
+        // out to "rotate independently" cannot. The control plane and the
+        // join path must use distinct keys outside development.
+        if !auth_keys.join_token_configured() {
+            return Err(format!(
+                "RAFT_JOIN_TOKEN is not set (profile: {}). Without a separate join token the \
+                 cluster secret authenticates both steady-state RPCs and new-node joins; a \
+                 single leak forces both to rotate together, defeating the documented \
+                 independent-rotation goal. Set RAFT_JOIN_TOKEN (or RAFT_JOIN_TOKEN_FILE) to \
+                 a strong random value distinct from RAFT_CLUSTER_SECRET, or explicitly opt \
+                 into the legacy fall-back path with CLUSTER_PROFILE=development.",
+                profile
+            )
+            .into());
+        }
+
+        // Require TLS for any SASL handshake in production. Without
+        // `sasl_require_tls` the password (PLAIN) or post-auth payloads
+        // (SCRAM) flow over plaintext — `sasl_plain_require_tls` only
+        // covers the credential leg of PLAIN.
+        if config.sasl_enabled && !config.sasl_require_tls {
+            return Err(format!(
+                "SASL_REQUIRE_TLS is disabled while SASL is enabled (profile: {}). PLAIN puts \
+                 the password on the wire and SCRAM leaves post-auth payloads unencrypted; \
+                 SASL without TLS in production is almost always a misconfiguration. Set \
+                 SASL_REQUIRE_TLS=true (or remove the override), or opt into the legacy path \
+                 with CLUSTER_PROFILE=development.",
+                profile
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;

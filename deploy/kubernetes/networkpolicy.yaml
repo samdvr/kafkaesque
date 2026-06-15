@@ -1,0 +1,85 @@
+# NetworkPolicy for Kafkaesque - restricts network access to only required ports
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafkaesque
+  namespace: kafkaesque
+  labels:
+    app.kubernetes.io/name: kafkaesque
+    app.kubernetes.io/component: broker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kafkaesque
+      app.kubernetes.io/component: broker
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Allow Kafka client connections only from pods labeled
+    # `kafkaesque.client/allow=true` in any namespace. the previous
+    # `namespaceSelector: {}` rule allowed every pod cluster-wide to reach
+    # the broker, which makes lateral-movement trivial when paired with the
+    # unauthenticated Kafka port (S1). Operators must explicitly opt their
+    # client workloads in by adding the label to grant access.
+    - ports:
+        - protocol: TCP
+          port: 9092
+      from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              kafkaesque.client/allow: "true"
+
+    # Allow Raft communication between brokers only
+    - ports:
+        - protocol: TCP
+          port: 9093
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafkaesque
+              app.kubernetes.io/component: broker
+
+    # Allow health check access from pods that explicitly opt in
+    # (e.g. Prometheus scrapers labeled `kafkaesque.health/allow=true`).
+    # Wide-open access here leaks topic names and traffic patterns
+    # via /metrics
+    - ports:
+        - protocol: TCP
+          port: 8080
+      from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              kafkaesque.health/allow: "true"
+
+  egress:
+    # Allow DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      to:
+        - namespaceSelector: {}
+
+    # Allow Raft communication between brokers
+    - ports:
+        - protocol: TCP
+          port: 9093
+      to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafkaesque
+              app.kubernetes.io/component: broker
+
+    # Allow connections to object storage (S3/GCS/Azure)
+    # For local storage mode, this can be removed
+    - ports:
+        - protocol: TCP
+          port: 443
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0

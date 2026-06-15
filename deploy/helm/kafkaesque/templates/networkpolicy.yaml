@@ -1,0 +1,99 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kafkaesque.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kafkaesque.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kafkaesque.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Allow Kafka client connections. scope by both namespace and
+    # pod label so untrusted neighbour pods can't reach the unauthenticated
+    # Kafka port. Operators that want truly open access must set
+    # `networkPolicy.allowExternal: true` explicitly.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.config.kafkaPort }}
+      {{- if .Values.networkPolicy.allowExternal }}
+      from: []
+      {{- else }}
+      from:
+        {{- if .Values.networkPolicy.ingressNamespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.ingressNamespaceSelector | nindent 12 }}
+          {{- with .Values.networkPolicy.ingressClientPodSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- else }}
+        - namespaceSelector: {}
+          {{- with .Values.networkPolicy.ingressClientPodSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+
+    # Allow Raft communication between brokers only
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.config.raftPort }}
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "kafkaesque.selectorLabels" . | nindent 14 }}
+
+    # Allow health check access. Restricted to opt-in scrapers; without
+    # this gate /metrics leaks topic names + traffic patterns to any pod
+    # in the cluster.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.config.healthPort }}
+      from:
+        - namespaceSelector: {}
+          {{- with .Values.networkPolicy.ingressHealthPodSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+  egress:
+    # Allow DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      to:
+        - namespaceSelector: {}
+
+    # Allow Raft communication between brokers
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.config.raftPort }}
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "kafkaesque.selectorLabels" . | nindent 14 }}
+
+    # Allow connections to object storage (S3/GCS/Azure)
+    {{- if ne .Values.config.objectStore.type "local" }}
+    - ports:
+        - protocol: TCP
+          port: 443
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+    {{- end }}
+
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

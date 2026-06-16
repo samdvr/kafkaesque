@@ -18,7 +18,7 @@ use super::commands::{CoordinationCommand, CoordinationResponse};
 use super::config::RaftConfig;
 use super::network::{RaftNetworkFactoryImpl, RaftRpcServer};
 use super::state_machine::CoordinationStateMachine;
-use super::storage::RaftStore;
+use super::storage::LegacyRaftStore;
 use super::types::{RaftNodeId, TypeConfig};
 
 use crate::cluster::error::{SlateDBError, SlateDBResult};
@@ -88,7 +88,7 @@ impl RaftNode {
         let openraft_config = Arc::new(config.to_openraft_config());
         let raft_log_dir =
             std::path::PathBuf::from(format!("{}/node-{}", config.raft_log_dir, config.node_id));
-        let store = RaftStore::new_with_log_dir(
+        let store = LegacyRaftStore::new_with_log_dir(
             object_store.clone(),
             &snapshot_prefix,
             raft_log_dir.clone(),

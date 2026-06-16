@@ -74,6 +74,7 @@ fn test_config(node_id: u64, port: u16, cluster_members: Vec<(u64, String)>) -> 
         ),
         tls: None,
         clock_skew_tolerance_ms: 5_000,
+        metadata_shards: 8,
     }
 }
 

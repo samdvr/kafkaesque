@@ -7,17 +7,18 @@
 
 use super::*;
 
-use super::super::commands::CoordinationCommand;
+use super::super::commands::{CoordinationCommand, CoordinationResponse};
 use super::super::domains;
 use super::super::state_machine::CoordinationState;
+use super::super::types::TypeConfig;
 use super::*;
 use object_store::memory::InMemory;
 use openraft::{RaftLogReader, RaftStorage, Vote};
 
 /// Create a test RaftStore with in-memory object store.
-fn create_test_store() -> RaftStore {
+fn create_test_store() -> LegacyRaftStore {
     let object_store = Arc::new(InMemory::new());
-    RaftStore::new(object_store, "test/snapshots")
+    LegacyRaftStore::new(object_store, "test/snapshots")
 }
 
 /// Helper to create a log ID for testing.
@@ -401,7 +402,7 @@ async fn test_snapshot_persistence() {
 
     // Create store and build snapshot
     {
-        let mut store = RaftStore::new(object_store.clone(), "persistence-test");
+        let mut store = LegacyRaftStore::new(object_store.clone(), "persistence-test");
 
         // Apply some state
         let command = CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
@@ -419,7 +420,7 @@ async fn test_snapshot_persistence() {
     }
 
     // Create new store and load snapshot
-    let store2 = RaftStore::new(object_store.clone(), "persistence-test");
+    let store2 = LegacyRaftStore::new(object_store.clone(), "persistence-test");
     let loaded = store2.load_snapshot_from_store().await.unwrap();
     assert!(loaded);
 
@@ -503,7 +504,7 @@ async fn test_legacy_snapshot_layout_still_loads() {
         .await
         .unwrap();
 
-    let store = RaftStore::new(object_store.clone(), prefix);
+    let store = LegacyRaftStore::new(object_store.clone(), prefix);
     let loaded = store.load_snapshot_from_store().await.unwrap();
     assert!(loaded, "legacy snapshot layout should load");
 
@@ -519,7 +520,7 @@ async fn test_snapshot_falls_back_to_previous_generation() {
     let prefix = "fallback-test/snapshots";
 
     // Build two snapshot generations with distinguishable state.
-    let mut store = RaftStore::new(object_store.clone(), prefix);
+    let mut store = LegacyRaftStore::new(object_store.clone(), prefix);
     let cmd1 = CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
         broker_id: 1,
         host: "gen1-host".to_string(),
@@ -562,7 +563,7 @@ async fn test_snapshot_falls_back_to_previous_generation() {
 
     // A fresh store must fall back to the previous generation instead
     // of failing (and must not panic).
-    let store2 = RaftStore::new(object_store.clone(), prefix);
+    let store2 = LegacyRaftStore::new(object_store.clone(), prefix);
     let loaded = store2.load_snapshot_from_store().await.unwrap();
     assert!(loaded, "should fall back to the previous generation");
 
@@ -596,7 +597,7 @@ async fn test_corrupt_snapshot_meta_errors_without_panic() {
         .await
         .unwrap();
 
-    let store = RaftStore::new(object_store.clone(), prefix);
+    let store = LegacyRaftStore::new(object_store.clone(), prefix);
     let result = store.load_snapshot_from_store().await;
     assert!(result.is_err(), "corrupt metadata must error, not panic");
 }

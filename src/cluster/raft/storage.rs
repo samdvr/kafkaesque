@@ -2,6 +2,11 @@
 //!
 //! This module provides combined log and state machine storage for Raft.
 //! Snapshots are persisted to the object store for production durability.
+//!
+//! Generic over [`GroupKind`] so the same implementation backs the legacy
+//! single-group path, the control group, and every shard group. The legacy
+//! single-group flavour is exposed via the [`LegacyRaftStore`] alias and
+//! removed in step 10 of the sharding plan.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -20,9 +25,19 @@ use openraft::{
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
-use super::commands::CoordinationResponse;
-use super::state_machine::{CoordinationState, CoordinationStateMachine};
-use super::types::{RaftNodeId, TypeConfig};
+use super::group::{GroupKind, LegacyGroupKind};
+use super::types::RaftNodeId;
+
+/// Shorthand for a group's response type — the openraft `R` associated
+/// type on its `TypeConfig`. Used by trait-impl signatures so
+/// `Vec<<G::Cfg as RaftTypeConfig>::R>` doesn't drown the rest of the
+/// signature.
+type GroupResponse<G> = <<G as GroupKind>::Cfg as openraft::RaftTypeConfig>::R;
+
+/// Backwards-compat alias for the single-group store. Used by the legacy
+/// [`super::node::RaftNode`] and its tests until the sharded layout
+/// (`RaftCluster` + per-group stores) replaces them in step 10.
+pub type LegacyRaftStore = RaftStore<LegacyGroupKind>;
 
 /// Legacy snapshot metadata layout (pre-pointer scheme), stored alongside a
 /// data object at `current.snapshot`. Still understood on read for
@@ -102,15 +117,15 @@ struct CachedSnapshot {
 }
 
 /// Combined log and state machine storage for Raft.
-pub struct RaftStore {
+pub struct RaftStore<G: GroupKind> {
     /// Vote state (who we voted for in current term).
     vote: Arc<RwLock<Option<Vote<RaftNodeId>>>>,
     /// Log entries indexed by log index.
-    log: Arc<RwLock<BTreeMap<u64, Entry<TypeConfig>>>>,
+    log: Arc<RwLock<BTreeMap<u64, Entry<G::Cfg>>>>,
     /// Last purged log ID.
     last_purged_log_id: Arc<RwLock<Option<LogId<RaftNodeId>>>>,
     /// State machine.
-    sm: Arc<RwLock<CoordinationStateMachine>>,
+    sm: Arc<RwLock<G::Sm>>,
     /// Last applied log.
     last_applied_log: Arc<RwLock<Option<LogId<RaftNodeId>>>>,
     /// Current membership.
@@ -161,10 +176,9 @@ pub struct RaftStore {
 /// multi-field FSM/index/snapshot mutation goes through — see
 /// `RaftStore::apply_state_transition` for cancellation semantics and
 /// lock ordering.
-#[derive(Default)]
 #[must_use = "build with `.with_*` and call `store.apply_state_transition(t).await`"]
-struct StateTransition {
-    sm_state: Option<CoordinationState>,
+struct StateTransition<G: GroupKind> {
+    sm_state: Option<G::State>,
     /// `Some(value)` if `last_applied_log` is being set to `value`.
     /// (Inner `Option` is the field type itself — `None` means "no
     /// logs applied yet", which is a meaningful state to install.)
@@ -176,12 +190,24 @@ struct StateTransition {
     snapshot_pointer: Option<Option<SnapshotPointer>>,
 }
 
-impl StateTransition {
+impl<G: GroupKind> Default for StateTransition<G> {
+    fn default() -> Self {
+        Self {
+            sm_state: None,
+            last_applied: None,
+            last_membership: None,
+            cached_snapshot: None,
+            snapshot_pointer: None,
+        }
+    }
+}
+
+impl<G: GroupKind> StateTransition<G> {
     fn new() -> Self {
         Self::default()
     }
 
-    fn with_sm_state(mut self, state: CoordinationState) -> Self {
+    fn with_sm_state(mut self, state: G::State) -> Self {
         self.sm_state = Some(state);
         self
     }
@@ -207,17 +233,23 @@ impl StateTransition {
     }
 }
 
-impl RaftStore {
+impl<G: GroupKind> RaftStore<G> {
     /// Create a new store with object store backing for snapshots.
     ///
-    /// This is the in-memory variant — vote and log entries live only in RAM.
-    /// Used by unit tests; production code should use `new_with_log_dir`.
-    pub fn new(object_store: Arc<dyn ObjectStore>, snapshot_prefix: &str) -> Self {
+    /// In-memory variant — vote and log entries live only in RAM. Used by
+    /// unit tests; production code should use `with_init_and_log_dir`.
+    /// `init` is the `G::SmInit` (e.g. `()` for control, `ShardId` for
+    /// shard) used to construct the per-group state machine.
+    pub fn with_init(
+        object_store: Arc<dyn ObjectStore>,
+        snapshot_prefix: &str,
+        init: G::SmInit,
+    ) -> Self {
         Self {
             vote: Arc::new(RwLock::new(None)),
             log: Arc::new(RwLock::new(BTreeMap::new())),
             last_purged_log_id: Arc::new(RwLock::new(None)),
-            sm: Arc::new(RwLock::new(CoordinationStateMachine::new())),
+            sm: Arc::new(RwLock::new(G::new_sm(init))),
             last_applied_log: Arc::new(RwLock::new(None)),
             last_membership: Arc::new(RwLock::new(StoredMembership::default())),
             cached_snapshot: Arc::new(RwLock::new(None)),
@@ -234,16 +266,17 @@ impl RaftStore {
     /// The WAL is created on first write; `recover_from_disk()`
     /// must be called before `RaftNode::new` proceeds in order to repopulate
     /// in-memory state from any existing WAL files.
-    pub fn new_with_log_dir(
+    pub fn with_init_and_log_dir(
         object_store: Arc<dyn ObjectStore>,
         snapshot_prefix: &str,
         log_dir: PathBuf,
+        init: G::SmInit,
     ) -> Self {
         Self {
             vote: Arc::new(RwLock::new(None)),
             log: Arc::new(RwLock::new(BTreeMap::new())),
             last_purged_log_id: Arc::new(RwLock::new(None)),
-            sm: Arc::new(RwLock::new(CoordinationStateMachine::new())),
+            sm: Arc::new(RwLock::new(G::new_sm(init))),
             last_applied_log: Arc::new(RwLock::new(None)),
             last_membership: Arc::new(RwLock::new(StoredMembership::default())),
             cached_snapshot: Arc::new(RwLock::new(None)),
@@ -255,6 +288,28 @@ impl RaftStore {
             snapshot_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
+}
+
+/// Convenience constructors for groups whose `SmInit` is `()` (legacy and
+/// control). `RaftStore::new(...)` continues to work for these without
+/// having to thread an explicit init value through every call site.
+impl<G: GroupKind<SmInit = ()>> RaftStore<G> {
+    /// In-memory variant — see [`Self::with_init`].
+    pub fn new(object_store: Arc<dyn ObjectStore>, snapshot_prefix: &str) -> Self {
+        Self::with_init(object_store, snapshot_prefix, ())
+    }
+
+    /// Disk-backed variant — see [`Self::with_init_and_log_dir`].
+    pub fn new_with_log_dir(
+        object_store: Arc<dyn ObjectStore>,
+        snapshot_prefix: &str,
+        log_dir: PathBuf,
+    ) -> Self {
+        Self::with_init_and_log_dir(object_store, snapshot_prefix, log_dir, ())
+    }
+}
+
+impl<G: GroupKind> RaftStore<G> {
 
     /// Replay the on-disk WAL into in-memory state. Called once at startup
     /// before openraft is constructed. On a fresh node with no
@@ -417,7 +472,7 @@ impl RaftStore {
                 }
 
                 let bytes = std::fs::read(&path)?;
-                let log_entry: Entry<TypeConfig> = postcard::from_bytes(&bytes).map_err(|e| {
+                let log_entry: Entry<G::Cfg> = postcard::from_bytes(&bytes).map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("log {}: deserialize: {}", path.display(), e),
@@ -451,7 +506,7 @@ impl RaftStore {
     ///   5. snapshot_pointer
     async fn apply_state_transition(
         &self,
-        t: StateTransition,
+        t: StateTransition<G>,
     ) -> Result<(), StorageError<RaftNodeId>> {
         // Serialize the entire (mutate + drop guards + fsync) sequence so
         // two concurrent applies cannot interleave their fsyncs. Without
@@ -472,7 +527,7 @@ impl RaftStore {
         // cancellation point, but cancellation here aborts BEFORE any
         // mutation has run.
         let sm_state_guard = if sm_state.is_some() {
-            Some(self.sm.read().await.state_arc().write_owned().await)
+            Some(G::sm_state_arc(&*self.sm.read().await).write_owned().await)
         } else {
             None
         };
@@ -593,7 +648,7 @@ impl RaftStore {
     }
 
     /// Persist a log entry to disk if we have a log_dir configured.
-    async fn persist_log_entry(&self, entry: &Entry<TypeConfig>) -> std::io::Result<()> {
+    async fn persist_log_entry(&self, entry: &Entry<G::Cfg>) -> std::io::Result<()> {
         let Some(dir) = self.log_dir.as_ref() else {
             return Ok(());
         };
@@ -689,7 +744,7 @@ impl RaftStore {
     }
 
     /// Get the state machine for reading.
-    pub fn state_machine(&self) -> Arc<RwLock<CoordinationStateMachine>> {
+    pub fn state_machine(&self) -> Arc<RwLock<G::Sm>> {
         self.sm.clone()
     }
 
@@ -821,7 +876,7 @@ impl RaftStore {
             };
 
             // Validate BEFORE mutating the state machine.
-            let state = match CoordinationStateMachine::deserialize_state(&data_bytes) {
+            let state = match G::deserialize_state(&data_bytes) {
                 Ok(state) => state,
                 Err(e) => {
                     let reason = format!(
@@ -1129,7 +1184,7 @@ impl RaftStore {
     }
 }
 
-impl RaftStorage<TypeConfig> for RaftStore {
+impl<G: GroupKind> RaftStorage<G::Cfg> for RaftStore<G> {
     type LogReader = Self;
     type SnapshotBuilder = Self;
 
@@ -1170,7 +1225,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
 
     async fn get_log_state(
         &mut self,
-    ) -> Result<openraft::storage::LogState<TypeConfig>, StorageError<RaftNodeId>> {
+    ) -> Result<openraft::storage::LogState<G::Cfg>, StorageError<RaftNodeId>> {
         let log = self.log.read().await;
         let last_purged = *self.last_purged_log_id.read().await;
         let last_log_id = log.values().last().map(|e| e.log_id);
@@ -1183,12 +1238,12 @@ impl RaftStorage<TypeConfig> for RaftStore {
 
     async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<RaftNodeId>>
     where
-        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I: IntoIterator<Item = Entry<G::Cfg>> + OptionalSend,
     {
         // Collect into a Send-able Vec so the iterator is not held across
         // the spawn_blocking await inside `persist_log_entry`. Without this
         // the future would not be Send and openraft refuses to schedule it.
-        let entries: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
+        let entries: Vec<Entry<G::Cfg>> = entries.into_iter().collect();
         let mut log = self.log.write().await;
         for entry in entries {
             // Persist BEFORE updating in-memory state, otherwise a crash
@@ -1292,20 +1347,20 @@ impl RaftStorage<TypeConfig> for RaftStore {
 
     async fn apply_to_state_machine(
         &mut self,
-        entries: &[Entry<TypeConfig>],
-    ) -> Result<Vec<CoordinationResponse>, StorageError<RaftNodeId>> {
+        entries: &[Entry<G::Cfg>],
+    ) -> Result<Vec<GroupResponse<G>>, StorageError<RaftNodeId>> {
         let mut responses = Vec::with_capacity(entries.len());
 
         for entry in entries {
             let response = match &entry.payload {
-                EntryPayload::Blank => CoordinationResponse::Ok,
+                EntryPayload::Blank => G::ok_response(),
                 EntryPayload::Normal(command) => {
                     let sm = self.sm.read().await;
-                    let response = sm.apply_command(command.clone()).await;
+                    let response = G::apply(&*sm, command.clone()).await;
                     drop(sm);
                     response
                 }
-                EntryPayload::Membership(_) => CoordinationResponse::Ok,
+                EntryPayload::Membership(_) => G::ok_response(),
             };
 
             // Advance `last_applied_log` (and any membership change) ONCE
@@ -1370,7 +1425,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
         // Step 1: validate BEFORE touching anything. Corrupt bytes (e.g.
         // damaged in transit) produce a StorageError instead of a panic or
         // a half-applied install.
-        let new_state = CoordinationStateMachine::deserialize_state(&data).map_err(|e| {
+        let new_state = G::deserialize_state(&data).map_err(|e| {
             error!(
                 snapshot_id = %meta.snapshot_id,
                 error = %e,
@@ -1422,7 +1477,7 @@ impl RaftStorage<TypeConfig> for RaftStore {
 
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<RaftNodeId>> {
+    ) -> Result<Option<Snapshot<G::Cfg>>, StorageError<RaftNodeId>> {
         let snapshot_guard = self.cached_snapshot.read().await;
         match &*snapshot_guard {
             Some(cached) => Ok(Some(Snapshot {
@@ -1434,8 +1489,8 @@ impl RaftStorage<TypeConfig> for RaftStore {
     }
 }
 
-impl openraft::RaftSnapshotBuilder<TypeConfig> for RaftStore {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<RaftNodeId>> {
+impl<G: GroupKind> openraft::RaftSnapshotBuilder<G::Cfg> for RaftStore<G> {
+    async fn build_snapshot(&mut self) -> Result<Snapshot<G::Cfg>, StorageError<RaftNodeId>> {
         // Capture state and `last_applied_log` under a single read guard on
         // `last_applied_log` to fence concurrent applies — applies hold the
         // matching write guard across `apply_command` + index update, so the
@@ -1443,7 +1498,7 @@ impl openraft::RaftSnapshotBuilder<TypeConfig> for RaftStore {
         // are reflected.
         let last_applied_guard = self.last_applied_log.read().await;
         let sm = self.sm.read().await;
-        let data = sm.snapshot().await;
+        let data = G::snapshot(&*sm).await;
         let last_applied = *last_applied_guard;
         let membership = self.last_membership.read().await.clone();
         drop(sm);
@@ -1482,11 +1537,11 @@ impl openraft::RaftSnapshotBuilder<TypeConfig> for RaftStore {
     }
 }
 
-impl openraft::RaftLogReader<TypeConfig> for RaftStore {
+impl<G: GroupKind> openraft::RaftLogReader<G::Cfg> for RaftStore<G> {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<RaftNodeId>> {
+    ) -> Result<Vec<Entry<G::Cfg>>, StorageError<RaftNodeId>> {
         let log = self.log.read().await;
         let entries: Vec<_> = log.range(range).map(|(_, e)| e.clone()).collect();
         Ok(entries)

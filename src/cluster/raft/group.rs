@@ -40,17 +40,30 @@ use super::types::{ControlConfig, RaftNodeId, ShardConfig, ShardId, TypeConfig};
 /// Bundles the per-group types the storage layer needs.
 ///
 /// All three impls produce an openraft-compatible `RaftTypeConfig` whose
-/// node id is [`RaftNodeId`], node type is [`BasicNode`], and snapshot
-/// transport is `Cursor<Vec<u8>>` (in-memory). The shard kind layers a
-/// runtime `shard_id` on top of the shared static `ShardConfig`.
+/// node id is [`RaftNodeId`], node type is [`BasicNode`], snapshot
+/// transport is `Cursor<Vec<u8>>`, and entry type is `Entry<Cfg>` (the
+/// macro default). The shard kind layers a runtime `shard_id` on top of
+/// the shared static `ShardConfig`.
 pub trait GroupKind: Sized + Send + Sync + 'static {
     /// The openraft type config for this group. Pinned to
     /// `(RaftNodeId, BasicNode, Cursor<Vec<u8>>)` because the rest of the
-    /// codebase (network, storage paths) hard-codes those.
+    /// codebase (network, storage paths) hard-codes those. Pinning
+    /// `Entry = openraft::Entry<Self::Cfg>` lets the storage layer use the
+    /// concrete `Entry<Cfg>` type (with its inherent `log_id`/`payload`
+    /// fields) without dropping into trait-method-only access.
+    ///
+    /// `D: Clone` is required because the apply path clones the command
+    /// out of an immutable `EntryPayload::Normal(ref cmd)` ref to feed it
+    /// into the `async fn apply` (which takes the command by value so the
+    /// SM can match-by-move). The legacy single-group SM relied on the
+    /// concrete `CoordinationCommand: Clone` here; pinning it on the
+    /// trait keeps the same shape.
     type Cfg: openraft::RaftTypeConfig<
             NodeId = RaftNodeId,
             Node = BasicNode,
             SnapshotData = Cursor<Vec<u8>>,
+            Entry = openraft::Entry<Self::Cfg>,
+            D: Clone,
         >;
 
     /// State-machine wrapper. Holds the `Arc<RwLock<State>>` plus any hooks.
@@ -89,15 +102,21 @@ pub trait GroupKind: Sized + Send + Sync + 'static {
     fn deserialize_state(bytes: &[u8]) -> std::io::Result<Self::State>;
 
     /// Serialise the current state.
-    async fn snapshot(sm: &Self::Sm) -> Vec<u8>;
+    ///
+    /// Returns an `impl Future + Send` (rather than `async fn`) so trait
+    /// impls' returned futures are guaranteed `Send`. Without this the
+    /// storage layer cannot satisfy openraft's `RaftStorage` trait
+    /// (`apply_to_state_machine`, `build_snapshot`) which require Send
+    /// futures via openraft's `add_async_trait` annotation.
+    fn snapshot(sm: &Self::Sm) -> impl std::future::Future<Output = Vec<u8>> + Send + '_;
 
     /// Apply a single committed log entry's command to the SM and return
-    /// its response. The future is `'static` only when the SM clone is
-    /// `'static`, which all three impls satisfy.
-    async fn apply(
+    /// its response. Returns an `impl Future + Send` for the same reason
+    /// as [`Self::snapshot`].
+    fn apply(
         sm: &Self::Sm,
         cmd: <Self::Cfg as openraft::RaftTypeConfig>::D,
-    ) -> <Self::Cfg as openraft::RaftTypeConfig>::R;
+    ) -> impl std::future::Future<Output = <Self::Cfg as openraft::RaftTypeConfig>::R> + Send + '_;
 
     /// Generic Ok response for `EntryPayload::Blank` and
     /// `EntryPayload::Membership` entries. Each group's response enum

@@ -92,6 +92,6 @@ pub use node::RaftNode;
 #[doc(hidden)]
 pub use state_machine::{CoordinationStateMachine, OwnershipCacheInvalidation};
 #[doc(hidden)]
-pub use storage::RaftStore;
+pub use storage::{LegacyRaftStore as RaftStore, RaftStore as RaftStoreGeneric};
 pub use tls::RaftTlsConfig;
 pub use types::{RaftNodeId, TypeConfig};

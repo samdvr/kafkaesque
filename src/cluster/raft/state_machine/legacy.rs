@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::commands::{CoordinationCommand, CoordinationResponse};
-use super::domains::{
+use super::super::commands::{CoordinationCommand, CoordinationResponse};
+use super::super::domains;
+use super::super::domains::{
     AclDomainState, BrokerDomainState, GroupDomainState, PartitionDomainState, ProducerDomainState,
     TransferDomainState,
 };
@@ -191,7 +192,7 @@ impl CoordinationStateMachine {
 
             CoordinationCommand::BrokerDomain(cmd) => {
                 let heartbeat_broker =
-                    if let super::domains::BrokerCommand::Heartbeat { broker_id, .. } = &cmd {
+                    if let domains::BrokerCommand::Heartbeat { broker_id, .. } = &cmd {
                         Some(*broker_id)
                     } else {
                         None
@@ -214,19 +215,19 @@ impl CoordinationStateMachine {
                 // this check a fenced-but-still-running broker could win back
                 // ownership it just lost and resume writing (split-brain).
                 let requesting_broker = match &cmd {
-                    super::domains::PartitionCommand::AcquirePartition { broker_id, .. }
-                    | super::domains::PartitionCommand::RenewLease { broker_id, .. }
-                    | super::domains::PartitionCommand::RenewLeases { broker_id, .. } => {
+                    domains::PartitionCommand::AcquirePartition { broker_id, .. }
+                    | domains::PartitionCommand::RenewLease { broker_id, .. }
+                    | domains::PartitionCommand::RenewLeases { broker_id, .. } => {
                         Some(*broker_id)
                     }
                     _ => None,
                 };
                 if let Some(broker_id) = requesting_broker
                     && let Some(broker) = state.broker_domain.brokers.get(&broker_id)
-                    && broker.status != super::domains::BrokerStatus::Active
+                    && broker.status != domains::BrokerStatus::Active
                 {
                     return CoordinationResponse::PartitionDomainResponse(
-                        super::domains::PartitionResponse::BrokerNotActive { broker_id },
+                        domains::PartitionResponse::BrokerNotActive { broker_id },
                     );
                 }
                 // Disjoint borrows of `partition_domain` and `lease_clock_ms`.
@@ -356,10 +357,10 @@ impl CoordinationStateMachine {
 }
 
 fn ownership_invalidation_for_partition(
-    cmd: &super::domains::PartitionCommand,
-    response: &super::domains::PartitionResponse,
+    cmd: &domains::PartitionCommand,
+    response: &domains::PartitionResponse,
 ) -> Option<OwnershipCacheInvalidation> {
-    use super::domains::{PartitionCommand, PartitionResponse};
+    use domains::{PartitionCommand, PartitionResponse};
 
     match response {
         PartitionResponse::PartitionAcquired {
@@ -389,9 +390,9 @@ fn ownership_invalidation_for_partition(
 }
 
 fn ownership_invalidation_for_transfer(
-    response: &super::domains::TransferResponse,
+    response: &domains::TransferResponse,
 ) -> Option<OwnershipCacheInvalidation> {
-    use super::domains::TransferResponse;
+    use domains::TransferResponse;
 
     match response {
         TransferResponse::PartitionTransferred {
@@ -420,7 +421,7 @@ impl Default for CoordinationStateMachine {
 
 #[cfg(test)]
 mod tests {
-    use super::super::domains::{PartitionCommand, PartitionResponse, TransferResponse};
+    use super::domains::{PartitionCommand, PartitionResponse, TransferResponse};
     use super::*;
 
     #[test]

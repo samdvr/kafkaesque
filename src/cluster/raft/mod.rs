@@ -64,6 +64,7 @@ mod commands;
 mod config;
 mod coordinator;
 pub mod domains;
+pub(crate) mod hash;
 mod network;
 mod node;
 mod state_machine;

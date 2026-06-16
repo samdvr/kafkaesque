@@ -1,9 +1,13 @@
 //! Configuration for the Raft consensus layer.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use super::auth::RaftAuthKeys;
+use super::hash::HASH_ALGO;
 use super::tls::RaftTlsConfig;
 
 /// Configuration for a Raft node.
@@ -112,6 +116,14 @@ pub struct RaftConfig {
     /// as the effective timestamp, so a leader whose clock jumps slightly
     /// forward doesn't mass-expire valid leases.
     pub clock_skew_tolerance_ms: u64,
+
+    /// Number of metadata Raft shard groups. Topics, consumer groups and
+    /// producer-id-keyed state are partitioned across these shards by
+    /// xxh3_64. Persisted in `cluster_meta.bin` at bootstrap; a restart with
+    /// a different value refuses to start.
+    ///
+    /// Default 8. Validated to `1..=1024` at config load.
+    pub metadata_shards: u16,
 }
 
 /// Parse a Duration in milliseconds from an environment variable, falling
@@ -171,6 +183,7 @@ impl Default for RaftConfig {
             auth_keys: Arc::new(RaftAuthKeys::default()),
             tls: None,
             clock_skew_tolerance_ms: 5_000,
+            metadata_shards: 8,
         }
     }
 }
@@ -247,6 +260,13 @@ impl RaftConfig {
         let election_timeout_max =
             parse_env_duration_ms("RAFT_ELECTION_TIMEOUT_MAX_MS", Duration::from_millis(3000))?;
 
+        let metadata_shards: u16 = match std::env::var("RAFT_METADATA_SHARDS") {
+            Ok(s) if !s.is_empty() => s
+                .parse::<u16>()
+                .map_err(|e| format!("Invalid RAFT_METADATA_SHARDS: {}", e))?,
+            _ => defaults.metadata_shards,
+        };
+
         Ok(Self {
             node_id,
             broker_id,
@@ -261,6 +281,7 @@ impl RaftConfig {
             election_timeout_min,
             election_timeout_max,
             auth_keys: Arc::new(RaftAuthKeys::from_env()),
+            metadata_shards,
             ..defaults
         })
     }
@@ -291,6 +312,13 @@ impl RaftConfig {
             errors.push(format!(
                 "lease_renewal_interval ({:?}) must be less than lease_duration ({:?})",
                 self.lease_renewal_interval, self.lease_duration
+            ));
+        }
+
+        if self.metadata_shards == 0 || self.metadata_shards > 1024 {
+            errors.push(format!(
+                "metadata_shards ({}) must be in 1..=1024",
+                self.metadata_shards
             ));
         }
 
@@ -371,6 +399,108 @@ impl RaftConfig {
             tls: RaftTlsConfig::from_env().unwrap_or(None),
             clock_skew_tolerance_ms: config.clock_skew_tolerance_ms,
             ..Default::default()
+        }
+    }
+}
+
+// ============================================================================
+// cluster_meta.bin — bootstrap-time pinning of metadata_shards / hash_algo
+// ============================================================================
+//
+// At first boot a broker writes the chosen `metadata_shards` plus the hash
+// algorithm name to `{raft_log_dir}/cluster_meta.bin`. On every subsequent
+// boot the file is read back and the configured values must match exactly,
+// otherwise the broker refuses to start. This catches the most dangerous
+// silent-corruption mode of the sharded layout: an operator changes
+// `RAFT_METADATA_SHARDS` between restarts and every key reshards onto a
+// different group.
+
+/// Persisted bootstrap descriptor for the sharded metadata Raft layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterMeta {
+    /// Number of shard groups pinned at bootstrap.
+    pub metadata_shards: u16,
+    /// Cluster-stable hash algorithm name. See `super::hash::HASH_ALGO`.
+    pub hash_algo: String,
+}
+
+impl ClusterMeta {
+    /// Path to `cluster_meta.bin` for a given Raft log directory.
+    pub fn path_in(raft_log_dir: impl AsRef<Path>) -> PathBuf {
+        raft_log_dir.as_ref().join("cluster_meta.bin")
+    }
+
+    /// Load `cluster_meta.bin` from `raft_log_dir`. Returns `Ok(None)` when
+    /// the file does not exist (first boot); errors only on I/O failure or
+    /// a corrupt file (malformed magic / unknown layout).
+    pub fn load(raft_log_dir: impl AsRef<Path>) -> std::io::Result<Option<Self>> {
+        let path = Self::path_in(raft_log_dir);
+        match std::fs::read(&path) {
+            Ok(bytes) => postcard::from_bytes::<ClusterMeta>(&bytes).map(Some).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("cluster_meta.bin at {} is corrupt: {}", path.display(), e),
+                )
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Write `cluster_meta.bin` atomically (write-temp-and-rename) so a crash
+    /// mid-write cannot leave a half-written file that fails the next boot.
+    pub fn save(&self, raft_log_dir: impl AsRef<Path>) -> std::io::Result<()> {
+        let dir = raft_log_dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        let final_path = Self::path_in(dir);
+        let tmp_path = dir.join("cluster_meta.bin.tmp");
+        let bytes = postcard::to_stdvec(self).map_err(|e| {
+            std::io::Error::other(format!("encoding cluster_meta.bin: {}", e))
+        })?;
+        std::fs::write(&tmp_path, &bytes)?;
+        std::fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    }
+}
+
+impl RaftConfig {
+    /// Validate against an on-disk `cluster_meta.bin`, persisting the
+    /// configured values on first boot.
+    ///
+    /// Behaviour:
+    /// - If `cluster_meta.bin` does not exist: write the configured
+    ///   `metadata_shards` + `hash_algo` and return `Ok(())`.
+    /// - If it exists and matches: return `Ok(())`.
+    /// - If it exists and differs: return a descriptive error so the broker
+    ///   refuses to start. The mismatch is unrecoverable without a full
+    ///   re-bootstrap — every key would be on the wrong shard.
+    pub fn validate_or_init_cluster_meta(&self) -> Result<(), String> {
+        let dir = Path::new(&self.raft_log_dir);
+        match ClusterMeta::load(dir).map_err(|e| e.to_string())? {
+            Some(persisted) => {
+                if persisted.metadata_shards != self.metadata_shards {
+                    return Err(format!(
+                        "cluster bootstrapped with metadata_shards={}, config says {} — refusing",
+                        persisted.metadata_shards, self.metadata_shards
+                    ));
+                }
+                if persisted.hash_algo != HASH_ALGO {
+                    return Err(format!(
+                        "cluster bootstrapped with hash_algo={:?}, build expects {:?} — refusing",
+                        persisted.hash_algo, HASH_ALGO
+                    ));
+                }
+                Ok(())
+            }
+            None => {
+                let meta = ClusterMeta {
+                    metadata_shards: self.metadata_shards,
+                    hash_algo: HASH_ALGO.to_string(),
+                };
+                meta.save(dir).map_err(|e| {
+                    format!("failed to write cluster_meta.bin to {}: {}", dir.display(), e)
+                })
+            }
         }
     }
 }
@@ -687,5 +817,109 @@ mod tests {
         assert_eq!(config.broker_id, cloned.broker_id);
         assert_eq!(config.host, cloned.host);
         assert_eq!(config.port, cloned.port);
+    }
+
+    // ========================================================================
+    // metadata_shards / cluster_meta.bin Tests
+    // ========================================================================
+
+    fn unique_tmp_dir(label: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("kafkaesque-cm-{label}-{pid}-{nanos}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn metadata_shards_default_is_eight() {
+        assert_eq!(RaftConfig::default().metadata_shards, 8);
+    }
+
+    #[test]
+    fn validate_rejects_zero_metadata_shards() {
+        let cfg = RaftConfig {
+            metadata_shards: 0,
+            ..Default::default()
+        };
+        let errors = cfg.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("metadata_shards")));
+    }
+
+    #[test]
+    fn validate_rejects_too_many_metadata_shards() {
+        let cfg = RaftConfig {
+            metadata_shards: 1025,
+            ..Default::default()
+        };
+        let errors = cfg.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("metadata_shards")));
+    }
+
+    #[test]
+    fn cluster_meta_first_boot_writes_file() {
+        let dir = unique_tmp_dir("first-boot");
+        let cfg = RaftConfig {
+            raft_log_dir: dir.to_string_lossy().to_string(),
+            metadata_shards: 4,
+            ..Default::default()
+        };
+        cfg.validate_or_init_cluster_meta().unwrap();
+        let on_disk = ClusterMeta::load(&dir).unwrap().expect("file written");
+        assert_eq!(on_disk.metadata_shards, 4);
+        assert_eq!(on_disk.hash_algo, HASH_ALGO);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cluster_meta_match_on_restart_succeeds() {
+        let dir = unique_tmp_dir("restart-match");
+        let cfg = RaftConfig {
+            raft_log_dir: dir.to_string_lossy().to_string(),
+            metadata_shards: 16,
+            ..Default::default()
+        };
+        cfg.validate_or_init_cluster_meta().unwrap();
+        // Second boot with the same values: no error, no rewrite needed.
+        cfg.validate_or_init_cluster_meta().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cluster_meta_mismatch_refuses_with_exact_error() {
+        let dir = unique_tmp_dir("restart-mismatch");
+        let initial = RaftConfig {
+            raft_log_dir: dir.to_string_lossy().to_string(),
+            metadata_shards: 8,
+            ..Default::default()
+        };
+        initial.validate_or_init_cluster_meta().unwrap();
+        let changed = RaftConfig {
+            raft_log_dir: dir.to_string_lossy().to_string(),
+            metadata_shards: 16,
+            ..Default::default()
+        };
+        let err = changed.validate_or_init_cluster_meta().unwrap_err();
+        assert!(
+            err.contains("metadata_shards=8") && err.contains("config says 16"),
+            "unexpected error: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cluster_meta_corrupt_file_returns_error() {
+        let dir = unique_tmp_dir("corrupt");
+        std::fs::write(ClusterMeta::path_in(&dir), b"\xff\xff\xff not-postcard").unwrap();
+        let cfg = RaftConfig {
+            raft_log_dir: dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let err = cfg.validate_or_init_cluster_meta().unwrap_err();
+        assert!(err.contains("corrupt"), "unexpected error: {err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -75,6 +75,11 @@ futures = "0.3"
 fastrand = "2.3.0"  # Lightweight RNG for jitter calculations
 itoa = "1.0.15"
 
+# xxh3_64 is the cluster-stable hash used to map keys (topic / group / producer)
+# onto metadata Raft shards. Pinning the algorithm here is part of the
+# bootstrap contract — see `src/cluster/raft/hash.rs`.
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
+
 # Metrics and monitoring
 prometheus = "0.14.0"
 once_cell = "1.21.3"

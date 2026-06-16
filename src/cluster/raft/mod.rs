@@ -66,6 +66,7 @@ mod coordinator;
 pub mod domains;
 mod group;
 pub(crate) mod hash;
+mod mux;
 mod network;
 mod node;
 mod state_machine;

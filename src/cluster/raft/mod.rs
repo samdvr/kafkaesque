@@ -60,6 +60,7 @@
 //! ```
 
 mod auth;
+mod cluster;
 mod commands;
 mod config;
 mod coordinator;

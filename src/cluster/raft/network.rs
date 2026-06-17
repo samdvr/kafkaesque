@@ -68,7 +68,12 @@ const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
 const CIRCUIT_BREAKER_RESET_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of hops for forwarded requests to prevent loops.
-const MAX_FORWARD_HOPS: u8 = 3;
+///
+/// Visible to sibling modules (`mux_server`) so the multiplexed dispatcher
+/// applies the identical hop bound on the receiver side. A drift between the
+/// two cap values would let a request the legacy path refuses sail through
+/// the mux path or vice versa during the migration.
+pub(super) const MAX_FORWARD_HOPS: u8 = 3;
 
 /// Server-side Raft socket: either a plain TCP stream or a rustls
 /// `TlsStream` produced by `TlsAcceptor::accept`. Implements `AsyncRead` /

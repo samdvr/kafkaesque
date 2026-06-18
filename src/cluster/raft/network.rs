@@ -188,7 +188,11 @@ impl AsyncWrite for MaybeTlsStreamClient {
 /// Establish an outbound Raft socket and apply TLS if configured. Set
 /// `TCP_NODELAY` on the underlying TCP stream before the TLS handshake so
 /// the small Raft frames don't sit in Nagle.
-async fn connect_raft(
+///
+/// Visible to sibling modules (`mux_client`) so the multiplexed client
+/// reuses the exact same connect path — re-implementing it would risk
+/// drift in the TCP flag set or the TLS handshake error mapping.
+pub(super) async fn connect_raft(
     addr: &str,
     tls: Option<&RaftTlsConfig>,
 ) -> std::io::Result<MaybeTlsStreamClient> {

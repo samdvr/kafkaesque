@@ -68,6 +68,7 @@ pub mod domains;
 mod group;
 pub(crate) mod hash;
 mod mux;
+mod mux_client;
 mod mux_server;
 mod network;
 mod node;

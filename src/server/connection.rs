@@ -1252,6 +1252,33 @@ async fn dispatch_request_common<H: Handler>(
             }
             encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
+        Request::OffsetForLeaderEpoch(header, req) => {
+            // Per-partition error_code metric: pick the first partition's
+            // code as a representative, falling back to None for empty
+            // requests. The wire response is per-partition so a single
+            // top-level label is necessarily a coarse summary.
+            let resp = handler.handle_offset_for_leader_epoch(&ctx, req).await;
+            error_code_label = resp
+                .topics
+                .iter()
+                .flat_map(|t| t.partitions.iter())
+                .next()
+                .map(|p| p.error_code.metric_label())
+                .unwrap_or(KafkaCode::None.metric_label());
+            let mut body = Vec::new();
+            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
+                return (Err(e), auth_result);
+            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
+        }
+        Request::CreatePartitions(_, req) => encode_response(
+            correlation_id,
+            &handler.handle_create_partitions(&ctx, req).await,
+        ),
+        Request::IncrementalAlterConfigs(_, req) => encode_response(
+            correlation_id,
+            &handler.handle_incremental_alter_configs(&ctx, req).await,
+        ),
         Request::UnsupportedVersion(h) => {
             // The client sent a known API key with a version outside the
             // advertised range. Answer with UnsupportedVersion (35) under

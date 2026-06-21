@@ -810,6 +810,71 @@ impl PartitionCoordinator for RaftCoordinator {
         metrics::record_raft_query("get_partition_owners", start.elapsed().as_secs_f64());
         Ok(owners)
     }
+
+    async fn get_partition_leader_epoch(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> SlateDBResult<Option<(Option<i32>, i32)>> {
+        // Linearizable read on the topic's shard so we don't return a
+        // stale leader_epoch right after a takeover. OffsetForLeaderEpoch
+        // sits on the rebalance hot path; the read-index barrier is
+        // cheap relative to a stale answer that drives a consumer to
+        // truncate.
+        let shard = self.cluster().shard_for_topic(topic);
+        shard
+            .raft()
+            .ensure_linearizable()
+            .await
+            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+
+        let sm = shard.state_machine();
+        let state = sm.state().await;
+
+        // Return the entry as long as it exists; an expired lease still
+        // tells the consumer "I had this leader_epoch", which is the
+        // honest answer. The handler decides whether to ALSO require
+        // current ownership (it does, to fence stale fetches).
+        let entry = state
+            .partition_state
+            .partitions
+            .get(&(Arc::from(topic), partition))
+            .map(|p| (p.owner_broker_id, p.leader_epoch));
+        Ok(entry)
+    }
+
+    async fn grow_topic_partitions(
+        &self,
+        topic: &str,
+        new_count: i32,
+    ) -> SlateDBResult<bool> {
+        // Implemented as ControlCommand::TopicRegistry::GrowPartitions.
+        // The state machine validates `new_count > existing` and rejects
+        // shrinks, so racing growers converge to the largest count.
+        use super::super::commands::ControlCommand;
+        use super::super::domains::TopicRegistryCommand;
+        let command = ControlCommand::TopicRegistry(TopicRegistryCommand::GrowPartitions {
+            name: topic.to_string(),
+            new_count,
+        });
+        let response = self.cluster().write_control(command).await?;
+        match response {
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicGrown { .. }) => Ok(true),
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicNotFound { .. }) => {
+                Ok(false)
+            }
+            ControlResponse::TopicRegistry(TopicRegistryResponse::InvalidPartitionCount { .. }) => {
+                Err(SlateDBError::Storage(
+                    "new_count must be strictly greater than the current partition count"
+                        .to_string(),
+                ))
+            }
+            other => Err(SlateDBError::Storage(format!(
+                "Unexpected response: {:?}",
+                other
+            ))),
+        }
+    }
 }
 
 impl RaftCoordinator {

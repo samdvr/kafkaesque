@@ -110,6 +110,9 @@ pub enum RequestResponse {
     DeleteGroups(DeleteGroupsResponseData),
     DescribeConfigs(DescribeConfigsResponseData),
     AlterConfigs(AlterConfigsResponseData),
+    OffsetForLeaderEpoch(OffsetForLeaderEpochResponseData),
+    CreatePartitions(CreatePartitionsResponseData),
+    IncrementalAlterConfigs(IncrementalAlterConfigsResponseData),
     /// Used for both `Request::UnsupportedVersion` and `Request::Unknown`.
     Error(ErrorResponseData),
 }
@@ -195,6 +198,15 @@ pub trait Handler: Send + Sync {
             Request::AlterConfigs(_, req) => {
                 RequestResponse::AlterConfigs(self.handle_alter_configs(ctx, req).await)
             }
+            Request::OffsetForLeaderEpoch(_, req) => RequestResponse::OffsetForLeaderEpoch(
+                self.handle_offset_for_leader_epoch(ctx, req).await,
+            ),
+            Request::CreatePartitions(_, req) => {
+                RequestResponse::CreatePartitions(self.handle_create_partitions(ctx, req).await)
+            }
+            Request::IncrementalAlterConfigs(_, req) => RequestResponse::IncrementalAlterConfigs(
+                self.handle_incremental_alter_configs(ctx, req).await,
+            ),
             Request::UnsupportedVersion(_) => RequestResponse::Error(ErrorResponseData {
                 error_code: KafkaCode::UnsupportedVersion,
             }),
@@ -647,6 +659,84 @@ pub trait Handler: Send + Sync {
                 .map(|r| AlterConfigsResult {
                     error_code: KafkaCode::UnknownTopicOrPartition,
                     error_message: Some("AlterConfigs not implemented".to_string()),
+                    resource_type: r.resource_type,
+                    resource_name: r.resource_name,
+                })
+                .collect(),
+        }
+    }
+
+    /// Handle an OffsetForLeaderEpoch request.
+    ///
+    /// Default returns `UnknownTopicOrPartition` per partition — modern
+    /// consumers tolerate that and fall back to "trust the broker" mode
+    /// rather than aborting the rebalance. The cluster handler overrides
+    /// with a coordinator-backed implementation.
+    async fn handle_offset_for_leader_epoch(
+        &self,
+        _ctx: &RequestContext,
+        request: OffsetForLeaderEpochRequestData,
+    ) -> OffsetForLeaderEpochResponseData {
+        OffsetForLeaderEpochResponseData {
+            throttle_time_ms: 0,
+            topics: request
+                .topics
+                .into_iter()
+                .map(|t| OffsetForLeaderEpochTopicResponse {
+                    name: t.name,
+                    partitions: t
+                        .partitions
+                        .into_iter()
+                        .map(|p| {
+                            OffsetForLeaderEpochPartitionResponse::error(
+                                p.partition_index,
+                                KafkaCode::UnknownTopicOrPartition,
+                            )
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Handle a CreatePartitions request.
+    ///
+    /// Default returns `InvalidRequest` per topic. The cluster handler
+    /// overrides this to actually grow the topic's partition count via
+    /// the coordinator + partition manager.
+    async fn handle_create_partitions(
+        &self,
+        _ctx: &RequestContext,
+        request: CreatePartitionsRequestData,
+    ) -> CreatePartitionsResponseData {
+        CreatePartitionsResponseData {
+            throttle_time_ms: 0,
+            results: request
+                .topics
+                .into_iter()
+                .map(|t| CreatePartitionsTopicResult {
+                    name: t.name,
+                    error_code: KafkaCode::InvalidRequest,
+                    error_message: Some("CreatePartitions not implemented".to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Handle an IncrementalAlterConfigs request.
+    async fn handle_incremental_alter_configs(
+        &self,
+        _ctx: &RequestContext,
+        request: IncrementalAlterConfigsRequestData,
+    ) -> IncrementalAlterConfigsResponseData {
+        IncrementalAlterConfigsResponseData {
+            throttle_time_ms: 0,
+            responses: request
+                .resources
+                .into_iter()
+                .map(|r| IncrementalAlterConfigsResult {
+                    error_code: KafkaCode::UnknownTopicOrPartition,
+                    error_message: Some("IncrementalAlterConfigs not implemented".to_string()),
                     resource_type: r.resource_type,
                     resource_name: r.resource_name,
                 })

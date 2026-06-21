@@ -41,6 +41,15 @@ pub enum TopicRegistryCommand {
         #[serde(serialize_with = "serialize_sorted_map")]
         config: HashMap<String, String>,
     },
+
+    /// Grow a topic's partition count to `new_count`.
+    ///
+    /// Only ever adds — `new_count` must be strictly greater than the
+    /// current count. Shrinking would forfeit committed data on the
+    /// retired partitions, so the state machine refuses it. The
+    /// per-partition lease/state for the new partitions is created
+    /// lazily by the ownership loop on the topic's shard.
+    GrowPartitions { name: String, new_count: i32 },
 }
 
 /// Responses from topic registry operations.
@@ -56,6 +65,20 @@ pub enum TopicRegistryResponse {
     TopicNotFound { topic: String },
     /// Topic config was updated.
     TopicConfigUpdated { name: String },
+    /// Partition count was grown to the new value.
+    TopicGrown {
+        name: String,
+        old_count: i32,
+        new_count: i32,
+    },
+    /// `GrowPartitions` was called with `new_count <= existing`. Carries
+    /// both numbers so the handler can phrase a useful error to the
+    /// client without re-reading the registry.
+    InvalidPartitionCount {
+        topic: String,
+        existing: i32,
+        requested: i32,
+    },
 }
 
 /// State for the topic registry domain.
@@ -135,6 +158,33 @@ impl TopicRegistryState {
                     TopicRegistryResponse::TopicNotFound {
                         topic: name.to_string(),
                     }
+                }
+            }
+
+            TopicRegistryCommand::GrowPartitions { name, new_count } => {
+                let key: Arc<str> = Arc::from(name);
+                let Some(topic) = self.topics.get_mut(&key) else {
+                    return TopicRegistryResponse::TopicNotFound {
+                        topic: key.to_string(),
+                    };
+                };
+                let existing = topic.partition_count;
+                if new_count <= existing {
+                    // Strict inequality: same-count is also rejected so a
+                    // re-applied entry from a snapshot doesn't silently
+                    // succeed and confuse the client about whether the op
+                    // actually grew anything.
+                    return TopicRegistryResponse::InvalidPartitionCount {
+                        topic: key.to_string(),
+                        existing,
+                        requested: new_count,
+                    };
+                }
+                topic.partition_count = new_count;
+                TopicRegistryResponse::TopicGrown {
+                    name: key.to_string(),
+                    old_count: existing,
+                    new_count,
                 }
             }
         }

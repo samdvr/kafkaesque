@@ -9,8 +9,11 @@ mod auth;
 mod configs;
 mod fetch;
 mod groups;
+mod incremental_configs;
+mod leader_epoch;
 mod metadata;
 mod offsets;
+mod partitions;
 mod produce;
 
 use bytes::Bytes;
@@ -30,8 +33,11 @@ pub use auth::*;
 pub use configs::*;
 pub use fetch::*;
 pub use groups::*;
+pub use incremental_configs::*;
+pub use leader_epoch::*;
 pub use metadata::*;
 pub use offsets::*;
+pub use partitions::*;
 pub use produce::*;
 
 /// API keys for Kafka protocol
@@ -60,10 +66,13 @@ pub enum ApiKey {
     CreateTopics = 19,
     DeleteTopics = 20,
     InitProducerId = 22,
+    OffsetForLeaderEpoch = 23,
     DescribeConfigs = 32,
     AlterConfigs = 33,
     SaslAuthenticate = 36,
+    CreatePartitions = 37,
     DeleteGroups = 42,
+    IncrementalAlterConfigs = 44,
     Unknown(i16),
 }
 
@@ -92,10 +101,13 @@ impl From<i16> for ApiKey {
             19 => ApiKey::CreateTopics,
             20 => ApiKey::DeleteTopics,
             22 => ApiKey::InitProducerId,
+            23 => ApiKey::OffsetForLeaderEpoch,
             32 => ApiKey::DescribeConfigs,
             33 => ApiKey::AlterConfigs,
             36 => ApiKey::SaslAuthenticate,
+            37 => ApiKey::CreatePartitions,
             42 => ApiKey::DeleteGroups,
+            44 => ApiKey::IncrementalAlterConfigs,
             n => ApiKey::Unknown(n),
         }
     }
@@ -126,10 +138,13 @@ impl From<ApiKey> for i16 {
             ApiKey::CreateTopics => 19,
             ApiKey::DeleteTopics => 20,
             ApiKey::InitProducerId => 22,
+            ApiKey::OffsetForLeaderEpoch => 23,
             ApiKey::DescribeConfigs => 32,
             ApiKey::AlterConfigs => 33,
             ApiKey::SaslAuthenticate => 36,
+            ApiKey::CreatePartitions => 37,
             ApiKey::DeleteGroups => 42,
+            ApiKey::IncrementalAlterConfigs => 44,
             ApiKey::Unknown(n) => n,
         }
     }
@@ -165,10 +180,13 @@ impl ApiKey {
             ApiKey::CreateTopics => "CreateTopics",
             ApiKey::DeleteTopics => "DeleteTopics",
             ApiKey::InitProducerId => "InitProducerId",
+            ApiKey::OffsetForLeaderEpoch => "OffsetForLeaderEpoch",
             ApiKey::DescribeConfigs => "DescribeConfigs",
             ApiKey::AlterConfigs => "AlterConfigs",
             ApiKey::SaslAuthenticate => "SaslAuthenticate",
+            ApiKey::CreatePartitions => "CreatePartitions",
             ApiKey::DeleteGroups => "DeleteGroups",
+            ApiKey::IncrementalAlterConfigs => "IncrementalAlterConfigs",
             ApiKey::Unknown(_) => "Unknown",
         }
     }
@@ -254,6 +272,9 @@ pub enum Request {
     DeleteGroups(RequestHeader, DeleteGroupsRequestData),
     DescribeConfigs(RequestHeader, DescribeConfigsRequestData),
     AlterConfigs(RequestHeader, AlterConfigsRequestData),
+    OffsetForLeaderEpoch(RequestHeader, OffsetForLeaderEpochRequestData),
+    CreatePartitions(RequestHeader, CreatePartitionsRequestData),
+    IncrementalAlterConfigs(RequestHeader, IncrementalAlterConfigsRequestData),
     /// A known API key was sent with a version outside the advertised
     /// range in [`crate::server::versions::SUPPORTED_VERSIONS`]. The body
     /// is intentionally NOT parsed (its layout is unknown to us); the
@@ -289,6 +310,9 @@ impl Request {
             Request::DeleteGroups(h, _) => h,
             Request::DescribeConfigs(h, _) => h,
             Request::AlterConfigs(h, _) => h,
+            Request::OffsetForLeaderEpoch(h, _) => h,
+            Request::CreatePartitions(h, _) => h,
+            Request::IncrementalAlterConfigs(h, _) => h,
             Request::UnsupportedVersion(h) => h,
             Request::Unknown(h, _) => h,
         }
@@ -366,6 +390,9 @@ impl Request {
             DeleteGroups => groups::parse_delete_groups_request,
             DescribeConfigs => configs::parse_describe_configs_request,
             AlterConfigs => configs::parse_alter_configs_request,
+            OffsetForLeaderEpoch => leader_epoch::parse_offset_for_leader_epoch_request,
+            CreatePartitions => partitions::parse_create_partitions_request,
+            IncrementalAlterConfigs => incremental_configs::parse_incremental_alter_configs_request,
         );
 
         // Trailing bytes after a successful body parse are recorded but no

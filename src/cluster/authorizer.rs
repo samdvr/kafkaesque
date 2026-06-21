@@ -148,6 +148,9 @@ pub fn cluster_operation_for_api(api_key: crate::server::request::ApiKey) -> Opt
         | ApiKey::DeleteTopics
         | ApiKey::DescribeConfigs
         | ApiKey::AlterConfigs
+        | ApiKey::IncrementalAlterConfigs
+        | ApiKey::CreatePartitions
+        | ApiKey::OffsetForLeaderEpoch
         | ApiKey::ListOffsets
         | ApiKey::OffsetCommit
         | ApiKey::OffsetFetch

@@ -336,6 +336,47 @@ pub trait PartitionCoordinator: Send + Sync {
 
     /// Get all partitions for a topic with their current owners.
     async fn get_partition_owners(&self, topic: &str) -> SlateDBResult<Vec<(i32, Option<i32>)>>;
+
+    /// Read the replicated `(owner, leader_epoch)` for one partition.
+    ///
+    /// Returns `Ok(None)` when the partition has no entry in the
+    /// replicated state (topic doesn't exist or partition was never
+    /// acquired). Default returns `None` so test coordinators don't have
+    /// to plumb leader-epoch state.
+    ///
+    /// Used by OffsetForLeaderEpoch (KIP-320): the consumer asks for the
+    /// largest offset at the epoch it believes is current; the broker
+    /// answers with its current `leader_epoch` and `log_end_offset`.
+    /// Modern clients use this on every rebalance to validate they
+    /// haven't been truncated past their fetch offset.
+    async fn get_partition_leader_epoch(
+        &self,
+        _topic: &str,
+        _partition: i32,
+    ) -> SlateDBResult<Option<(Option<i32>, i32)>> {
+        Ok(None)
+    }
+
+    /// Grow a topic's partition count from its current value to
+    /// `new_count`. Returns `Ok(true)` when the topic existed and was
+    /// updated, `Ok(false)` when the topic does not exist.
+    ///
+    /// `new_count` must be strictly greater than the topic's current
+    /// partition count — Kafka semantics: CreatePartitions can only add,
+    /// never shrink. The caller (CreatePartitions handler) validates
+    /// this against the current count before invoking; the
+    /// implementation is also expected to enforce it (the Raft state
+    /// machine is the source of truth).
+    ///
+    /// Default returns `false` so test coordinators don't need to
+    /// implement growth.
+    async fn grow_topic_partitions(
+        &self,
+        _topic: &str,
+        _new_count: i32,
+    ) -> SlateDBResult<bool> {
+        Ok(false)
+    }
 }
 
 /// Result of a successful consumer-group join.

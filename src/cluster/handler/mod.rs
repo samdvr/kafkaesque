@@ -13,8 +13,11 @@ mod admin;
 mod configs;
 mod fetch;
 mod groups;
+mod incremental_configs;
+mod leader_epoch;
 mod metadata;
 mod offsets;
+mod partitions;
 mod produce;
 mod producer_id;
 
@@ -1176,6 +1179,33 @@ impl Handler for SlateDBClusterHandler {
         request: AlterConfigsRequestData,
     ) -> AlterConfigsResponseData {
         configs::handle_alter_configs(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_offset_for_leader_epoch(
+        &self,
+        ctx: &RequestContext,
+        request: OffsetForLeaderEpochRequestData,
+    ) -> OffsetForLeaderEpochResponseData {
+        leader_epoch::handle_offset_for_leader_epoch(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_create_partitions(
+        &self,
+        ctx: &RequestContext,
+        request: CreatePartitionsRequestData,
+    ) -> CreatePartitionsResponseData {
+        partitions::handle_create_partitions(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_incremental_alter_configs(
+        &self,
+        ctx: &RequestContext,
+        request: IncrementalAlterConfigsRequestData,
+    ) -> IncrementalAlterConfigsResponseData {
+        incremental_configs::handle_incremental_alter_configs(self, ctx, request).await
     }
 }
 

@@ -126,6 +126,18 @@ pub const SUPPORTED_VERSIONS: &[SupportedVersion] = &[
     // — both are tolerated and ignored.
     SupportedVersion::new(ApiKey::DescribeConfigs, 0, 2),
     SupportedVersion::new(ApiKey::AlterConfigs, 0, 1),
+    // OffsetForLeaderEpoch (KIP-320): consumers call this on every
+    // rebalance to validate they haven't been truncated past their fetch
+    // offset. v3 added the `replica_id` request prefix; v4 (flexible) is
+    // not yet emitted.
+    SupportedVersion::new(ApiKey::OffsetForLeaderEpoch, 0, 3),
+    // CreatePartitions: `kafka-topics.sh --alter --partitions N` and
+    // AdminClient.createPartitions() use this as the only path to grow a
+    // topic. v2+ (flexible) not yet supported.
+    SupportedVersion::new(ApiKey::CreatePartitions, 0, 1),
+    // IncrementalAlterConfigs (KIP-339): AdminClient default since
+    // Kafka 2.3. v1 (flexible) not yet supported.
+    SupportedVersion::new(ApiKey::IncrementalAlterConfigs, 0, 0),
 ];
 
 /// Get the default set of API version data for responses.
@@ -201,6 +213,9 @@ pub const PARSER_ENCODER_COVERAGE: &[(ApiKey, i16, i16)] = &[
     (ApiKey::DeleteGroups, 0, 1),
     (ApiKey::DescribeConfigs, 0, 2),
     (ApiKey::AlterConfigs, 0, 1),
+    (ApiKey::OffsetForLeaderEpoch, 0, 3),
+    (ApiKey::CreatePartitions, 0, 1),
+    (ApiKey::IncrementalAlterConfigs, 0, 0),
 ];
 
 #[cfg(test)]

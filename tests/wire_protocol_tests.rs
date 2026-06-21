@@ -150,8 +150,11 @@ fn test_api_key_roundtrip() {
         (19, ApiKey::CreateTopics),
         (20, ApiKey::DeleteTopics),
         (22, ApiKey::InitProducerId),
+        (23, ApiKey::OffsetForLeaderEpoch),
         (36, ApiKey::SaslAuthenticate),
+        (37, ApiKey::CreatePartitions),
         (42, ApiKey::DeleteGroups),
+        (44, ApiKey::IncrementalAlterConfigs),
     ];
 
     for (value, expected_key) in known_keys {
@@ -169,8 +172,10 @@ fn test_api_key_roundtrip() {
 
 #[test]
 fn test_api_key_unknown() {
-    // Unknown API keys should be preserved
-    let unknown_values = [21i16, 23, 35, 37, 100, 999, -1];
+    // Pick values that are NOT in the supported set. 23/37/44 are now
+    // claimed by OffsetForLeaderEpoch / CreatePartitions /
+    // IncrementalAlterConfigs.
+    let unknown_values = [21i16, 24, 35, 38, 43, 100, 999, -1];
 
     for value in unknown_values {
         let key: ApiKey = value.into();

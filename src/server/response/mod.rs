@@ -9,8 +9,11 @@ mod auth;
 mod configs;
 mod fetch;
 mod groups;
+mod incremental_configs;
+mod leader_epoch;
 mod metadata;
 mod offsets;
+mod partitions;
 mod produce;
 
 use bytes::BufMut;
@@ -25,8 +28,11 @@ pub use auth::*;
 pub use configs::*;
 pub use fetch::*;
 pub use groups::*;
+pub use incremental_configs::*;
+pub use leader_epoch::*;
 pub use metadata::*;
 pub use offsets::*;
+pub use partitions::*;
 pub use produce::*;
 
 /// Response header for Kafka protocol.

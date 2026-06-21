@@ -293,10 +293,13 @@ Kafkaesque implements the core Kafka protocol used by modern clients:
 
 - **Produce / Fetch** — basic messaging.
 - **Metadata** — topic and partition discovery.
+- **OffsetForLeaderEpoch** — log-truncation fencing for consumer rebalances (KIP-320).
 - **Consumer groups** — `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`,
   `OffsetCommit`, `OffsetFetch`, `DescribeGroups`, `ListGroups`,
   `DeleteGroups`, `FindCoordinator`.
-- **Admin** — `CreateTopics`, `DeleteTopics`, `InitProducerId`.
+- **Admin** — `CreateTopics`, `DeleteTopics`, `CreatePartitions`,
+  `DescribeConfigs`, `AlterConfigs`, `IncrementalAlterConfigs`,
+  `InitProducerId`.
 - **API negotiation** — `ApiVersions`.
 - **Auth** — `SaslHandshake`, `SaslAuthenticate` (PLAIN, SCRAM-SHA-256;
   requires `--features sasl`).

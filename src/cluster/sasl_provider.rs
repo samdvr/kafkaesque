@@ -54,7 +54,6 @@ struct UserRecord {
 }
 
 /// SASL authentication provider for the Kafka protocol.
-#[allow(dead_code)]
 pub struct SaslProvider {
     /// User credentials (username -> record).
     users: Arc<RwLock<HashMap<String, UserRecord>>>,
@@ -88,7 +87,6 @@ pub struct SaslProvider {
     require_tls: bool,
 }
 
-#[allow(dead_code)]
 impl SaslProvider {
     /// Create a new SASL provider with no users.
     pub fn new(required: bool) -> Self {

@@ -894,7 +894,7 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                                     return;
                                 }
                             };
-                            let mut conn = connection::TlsClientConnection::new_with_rate_limiter(
+                            let mut conn = connection::TlsClientConnection::new_tls_with_rate_limiter(
                                 tls_stream,
                                 addr,
                                 rate_limiter,
@@ -945,8 +945,11 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
 
         let handler = self.handler.clone();
         let rate_limiter = self.auth_rate_limiter.clone();
-        let mut conn =
-            connection::TlsClientConnection::new_with_rate_limiter(tls_stream, addr, rate_limiter);
+        let mut conn = connection::TlsClientConnection::new_tls_with_rate_limiter(
+            tls_stream,
+            addr,
+            rate_limiter,
+        );
         conn.set_max_message_size(self.max_message_size);
         conn.handle_requests(handler).await
     }

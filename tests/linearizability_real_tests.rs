@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use kafkaesque::cluster::{PartitionCoordinator, PartitionStore, RaftConfig, RaftCoordinator};
+use kafkaesque::cluster::{PartitionCoordinator, PartitionStore, RaftCoordinator};
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester, SequentialSpec};
@@ -45,7 +45,7 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 mod common;
-use common::next_port;
+use common::{build_single_node_raft, next_port, raft_test_config};
 
 // =============================================================================
 // Reference models for `LinearizabilityTester`
@@ -198,41 +198,6 @@ async fn open_store() -> PartitionStore {
     PartitionStore::open(store, BASE_PATH, TOPIC, PARTITION)
         .await
         .expect("open partition store")
-}
-
-fn raft_test_config(node_id: u64, port: u16) -> RaftConfig {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let root = tmp.keep();
-    RaftConfig {
-        node_id,
-        broker_id: node_id as i32,
-        host: "127.0.0.1".to_string(),
-        port: 9092 + node_id as i32,
-        raft_addr: format!("127.0.0.1:{}", port),
-        raft_log_dir: root.join("log").to_string_lossy().into_owned(),
-        snapshot_dir: root.join("snapshots").to_string_lossy().into_owned(),
-        ..RaftConfig::default()
-    }
-}
-
-async fn build_single_node_raft() -> Arc<RaftCoordinator> {
-    // SAFETY: process-global env var; every test in this file wants the
-    // single-node bootstrap path. Same pattern as `raft_chaos_starter.rs`.
-    unsafe { std::env::set_var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE", "true") };
-    let port = next_port();
-    let config = raft_test_config(1, port);
-    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-    let coord = RaftCoordinator::new(config, store, Handle::current())
-        .await
-        .expect("create coordinator");
-    coord.initialize_cluster().await.expect("init cluster");
-    let start = std::time::Instant::now();
-    while !coord.is_leader().await && start.elapsed() < Duration::from_secs(5) {
-        sleep(Duration::from_millis(50)).await;
-    }
-    assert!(coord.is_leader().await, "expected single-node leader");
-    coord.register_broker().await.expect("register broker");
-    Arc::new(coord)
 }
 
 // =============================================================================

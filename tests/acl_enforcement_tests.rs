@@ -13,10 +13,13 @@ use object_store::memory::InMemory;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+mod common;
+use common::enable_single_node_bootstrap;
+
 static RAFT_PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(22000);
 
 fn isolated_test_config(broker_id: i32) -> ClusterConfig {
-    unsafe { std::env::set_var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE", "true") };
+    enable_single_node_bootstrap();
 
     let tmp = tempfile::tempdir().expect("create test temp dir");
     let root = tmp.keep();

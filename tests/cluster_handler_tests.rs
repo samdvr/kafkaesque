@@ -13,6 +13,9 @@ use object_store::memory::InMemory;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+mod common;
+use common::enable_single_node_bootstrap;
+
 /// Helper to create a minimal valid Kafka RecordBatch for testing.
 fn create_test_batch(record_count: i32) -> Bytes {
     let mut batch = vec![0u8; 100];
@@ -93,9 +96,7 @@ static RAFT_PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::Atom
 /// against two fresh peerless brokers racing to bootstrap is irrelevant
 /// here since every test uses an isolated store.
 fn isolated_test_config(broker_id: i32) -> ClusterConfig {
-    // SAFETY: setting a process-global env var; all tests in this binary
-    // want the same value, so concurrent writers are not a hazard.
-    unsafe { std::env::set_var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE", "true") };
+    enable_single_node_bootstrap();
 
     let tmp = tempfile::tempdir().expect("create test temp dir");
     let root = tmp.keep();

@@ -1623,6 +1623,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "twox-hash",
  "uuid",
  "zeroize",
 ]
@@ -1637,6 +1638,7 @@ dependencies = [
  "libfuzzer-sys",
  "nombytes",
  "num-traits",
+ "object_store",
  "postcard",
  "serde",
  "tokio",
@@ -3016,6 +3018,7 @@ dependencies = [
  "foyer",
  "futures",
  "log",
+ "moka",
  "object_store",
  "once_cell",
  "ouroboros",

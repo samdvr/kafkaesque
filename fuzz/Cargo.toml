@@ -16,6 +16,11 @@ tokio = { version = "1.48.0", features = ["io-util", "macros", "rt"] }
 postcard = { version = "1.0", features = ["use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 num-traits = "0.2"
+# Required by the `object_store_faults` fuzz target — the main crate
+# uses object_store as an implementation detail and doesn't re-export its
+# trait, so the fuzzer pulls it in directly. Pinned to the same major as
+# the workspace dependency so the trait/impl shapes line up.
+object_store = "0.12.5"
 
 [dependencies.kafkaesque]
 path = ".."
@@ -333,6 +338,18 @@ bench = false
 [[bin]]
 name = "config_parse"
 path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+# ===========================================================================
+# Fault injector — stateful command-sequence fuzzer that drives
+# FaultingObjectStore across mutator commands and op calls.
+# ===========================================================================
+
+[[bin]]
+name = "object_store_faults"
+path = "fuzz_targets/object_store_faults.rs"
 test = false
 doc = false
 bench = false

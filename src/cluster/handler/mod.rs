@@ -90,8 +90,8 @@ impl FireAndForgetPool {
 /// low while staying well below the typical CPU-core count cap on shard
 /// fan-out for cache-line-affinity reasons.
 const FIRE_AND_FORGET_SHARDS: usize = 16;
-/// Per-shard bounded queue depth. Sized so 16 * 64 = 1024 matches the
-/// previous global `MAX_FIRE_AND_FORGET_CONCURRENT = 1000` ceiling.
+/// Per-shard bounded queue depth. 16 * 64 = 1024 is the broker-wide
+/// fire-and-forget concurrency cap.
 const FIRE_AND_FORGET_PER_SHARD: usize = 64;
 use crate::types::BrokerId;
 

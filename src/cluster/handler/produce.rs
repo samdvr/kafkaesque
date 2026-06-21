@@ -48,11 +48,6 @@
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-#[cfg(test)]
-use once_cell::sync::Lazy;
-#[cfg(test)]
-use tokio::sync::Semaphore;
-
 use crate::error::KafkaCode;
 use crate::protocol::{CrcValidationResult, parse_producer_info, validate_batch_crc_async};
 use crate::server::RequestContext;
@@ -65,28 +60,6 @@ use super::SlateDBClusterHandler;
 use crate::cluster::coordinator::validate_topic_name;
 use crate::cluster::partition_manager::PartitionManager;
 use crate::cluster::raft::RaftCoordinator;
-
-/// Maximum concurrent fire-and-forget (acks=0) writes across the broker.
-///
-/// Historical global semaphore cap; today this is enforced by the
-/// per-shard bounded mpsc channels in `FireAndForgetPool` (16 shards x
-/// 64 = 1024 ≈ this number). Kept as a doc-anchor.
-#[allow(dead_code)]
-const MAX_FIRE_AND_FORGET_CONCURRENT: usize = 1000;
-
-/// Semaphore for limiting concurrent fire-and-forget writes.
-///
-/// Replaced by `FireAndForgetPool`'s bounded per-shard channels — kept
-/// behind `#[cfg(test)]` so existing test helpers that probed permit
-/// counts still link.
-#[cfg(test)]
-static FIRE_AND_FORGET_SEMAPHORE: Lazy<Semaphore> =
-    Lazy::new(|| Semaphore::new(MAX_FIRE_AND_FORGET_CONCURRENT));
-
-#[cfg(test)]
-pub(crate) fn available_fire_and_forget_permits() -> usize {
-    FIRE_AND_FORGET_SEMAPHORE.available_permits()
-}
 
 /// True iff the batch payload carries a valid (non-default) producer-id /
 /// epoch combination, i.e. the producer is using the idempotent path.
@@ -691,27 +664,6 @@ mod tests {
     use bytes::Bytes;
 
     // ========================================================================
-    // Constants Tests
-    // ========================================================================
-
-    #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn test_max_fire_and_forget_concurrent_reasonable() {
-        // Ensure the limit is reasonable for production use
-        assert!(MAX_FIRE_AND_FORGET_CONCURRENT > 0);
-        assert!(MAX_FIRE_AND_FORGET_CONCURRENT <= 10_000);
-        assert_eq!(MAX_FIRE_AND_FORGET_CONCURRENT, 1000);
-    }
-
-    #[test]
-    fn test_semaphore_permits_available() {
-        // The semaphore should start with full permits
-        let permits = available_fire_and_forget_permits();
-        assert!(permits > 0);
-        assert!(permits <= MAX_FIRE_AND_FORGET_CONCURRENT);
-    }
-
-    // ========================================================================
     // Response Structure Tests
     // ========================================================================
 
@@ -996,23 +948,6 @@ mod tests {
         assert_eq!(response.responses[0].name, "topic-a");
         assert_eq!(response.responses[1].name, "topic-b");
     }
-
-    // ========================================================================
-    // Fire-and-Forget Backpressure Tests
-    // ========================================================================
-
-    #[test]
-    fn test_fire_and_forget_constants() {
-        // Verify the semaphore capacity constant is set appropriately
-        assert_eq!(MAX_FIRE_AND_FORGET_CONCURRENT, 1000);
-        // Verify we can check available permits (actual count varies in parallel tests)
-        let permits = available_fire_and_forget_permits();
-        assert!(permits <= MAX_FIRE_AND_FORGET_CONCURRENT);
-    }
-
-    // Note: Tests that acquire from FIRE_AND_FORGET_SEMAPHORE are intentionally
-    // omitted because it's a global static shared across all tests running in
-    // parallel, making them inherently flaky.
 
     // ========================================================================
     // CRC Validation Tests

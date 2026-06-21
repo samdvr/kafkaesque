@@ -99,7 +99,6 @@ pub struct OffsetKey {
 pub struct StoredOffset {
     pub offset: i64,
     pub metadata: Option<String>,
-    #[allow(dead_code)]
     pub commit_timestamp: i64,
 }
 

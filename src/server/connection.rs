@@ -88,7 +88,7 @@ pub fn set_global_inflight_byte_budget(bytes: usize) -> bool {
 ///
 /// Forces initialization: after calling this, the budget can no longer be
 /// changed via [`set_global_inflight_byte_budget`].
-#[allow(dead_code)] // companion introspection for the setter; used in tests
+#[cfg(test)]
 pub fn global_inflight_byte_budget() -> usize {
     // Force the semaphore so the reported value is the one actually used.
     once_cell::sync::Lazy::force(&GLOBAL_INFLIGHT);
@@ -184,44 +184,6 @@ fn encode_versioned_raw_response(
         ResponseStyle::Flexible => Response::new_raw_flexible(correlation_id, body)?,
     };
     response.encode_with_size()
-}
-
-/// Encode a versioned response body directly into a single framed buffer,
-/// without an intermediate body `Vec` that would later be copied into the
-/// framed output. The body is written behind a pre-zeroed header, then the
-/// header is patched in place.
-///
-/// The previous shape — encode body into a `Vec<u8>`, then wrap it in
-/// `Response::new_raw{,_flexible}` which `extend_from_slice`'d the body
-/// into a fresh framed `Vec` — paid one full memcpy per response on the
-/// fetch hot path. For a 10 MB fetch that's 10 MB of avoided memory
-/// bandwidth and a halving of resident memory at peak.
-#[allow(dead_code)]
-fn encode_versioned_response_into_frame<F>(
-    correlation_id: i32,
-    api_key: crate::server::request::ApiKey,
-    api_version: i16,
-    encode_body: F,
-) -> Result<Vec<u8>>
-where
-    F: FnOnce(&mut Vec<u8>) -> Result<()>,
-{
-    let flexible = matches!(api_key.response_style(api_version), ResponseStyle::Flexible);
-    let header_len: usize = if flexible { 9 } else { 8 };
-
-    let mut framed = Vec::with_capacity(header_len + 1024);
-    framed.resize(header_len, 0);
-    encode_body(&mut framed)?;
-
-    let body_len = framed.len() - 4;
-    let size: i32 = body_len as i32;
-    framed[0..4].copy_from_slice(&size.to_be_bytes());
-    framed[4..8].copy_from_slice(&correlation_id.to_be_bytes());
-    if flexible {
-        framed[8] = 0;
-    }
-
-    Ok(framed)
 }
 
 /// What the dispatch path produces. Most arms produce a contiguous
@@ -466,7 +428,6 @@ async fn write_kafka_frame<S: AsyncWrite + Unpin>(
 /// single buffer. The fetch path can pour records straight from SlateDB
 /// into the chain (refcount-bump, no copy), and the bytes ride through
 /// to TCP unchanged.
-#[allow(dead_code)]
 async fn write_kafka_frame_chain<S: AsyncWrite + Unpin>(
     stream: &mut S,
     chain: &kafkaesque_protocol::bytes_chain::BytesChain,
@@ -1372,9 +1333,24 @@ impl AuthGate {
 }
 
 /// A client connection to the Kafka server.
-pub struct ClientConnection {
-    reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: tokio::net::tcp::OwnedWriteHalf,
+///
+/// Generic over the reader / writer halves so plain TCP and TLS share one
+/// implementation. The two type aliases below pin the concrete halves:
+///
+/// - [`ClientConnection`] (default `R, W`) — plain `TcpStream`, split via
+///   `into_split()` into the specialized `OwnedReadHalf`/`OwnedWriteHalf`.
+/// - [`TlsClientConnection`] — TLS, split via `tokio::io::split` into
+///   generic `ReadHalf`/`WriteHalf` over the TLS stream.
+///
+/// Methods that don't care about the underlying transport
+/// (`set_max_message_size`, `require_sasl`, `record_auth_*`,
+/// `handle_requests`) live in a generic impl block and are shared by both.
+pub struct ClientConnection<
+    R = tokio::net::tcp::OwnedReadHalf,
+    W = tokio::net::tcp::OwnedWriteHalf,
+> {
+    reader: tokio::io::BufReader<R>,
+    writer: W,
     addr: SocketAddr,
     /// Rate limiter for auth failures (optional for backwards compat)
     rate_limiter: Option<Arc<AuthRateLimiter>>,
@@ -1384,42 +1360,48 @@ pub struct ClientConnection {
     auth_gate: AuthGate,
     /// Maximum allowed inbound frame size for this connection.
     max_message_size: usize,
+    /// Transport label for metrics ("plain" or "tls").
+    transport_label: &'static str,
+    /// Whether this connection is TLS-protected. Threaded into
+    /// `RequestContext::transport_tls` so handlers can vary policy.
+    transport_tls: bool,
 }
 
-impl ClientConnection {
-    /// Create a new client connection (without rate limiter).
-    pub fn new(stream: TcpStream, addr: SocketAddr) -> Self {
-        let (read_half, write_half) = stream.into_split();
-        Self {
-            reader: tokio::io::BufReader::with_capacity(CONNECTION_READ_BUF_CAPACITY, read_half),
-            writer: write_half,
-            addr,
-            rate_limiter: None,
-            auth_gate: AuthGate::default(),
-            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-        }
-    }
-
-    /// Create a new client connection with auth rate limiter.
-    ///
-    /// This constructor enables auth failure rate limiting
-    /// to protect against brute-force attacks.
-    pub fn new_with_rate_limiter(
-        stream: TcpStream,
+/// Construct a `ClientConnection` from already-split halves. Used by the
+/// transport-specific constructors below; not exposed publicly.
+impl<R, W> ClientConnection<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    fn from_halves(
+        reader: R,
+        writer: W,
         addr: SocketAddr,
-        rate_limiter: Arc<AuthRateLimiter>,
+        rate_limiter: Option<Arc<AuthRateLimiter>>,
+        transport_label: &'static str,
+        transport_tls: bool,
     ) -> Self {
-        let (read_half, write_half) = stream.into_split();
         Self {
-            reader: tokio::io::BufReader::with_capacity(CONNECTION_READ_BUF_CAPACITY, read_half),
-            writer: write_half,
+            reader: tokio::io::BufReader::with_capacity(CONNECTION_READ_BUF_CAPACITY, reader),
+            writer,
             addr,
-            rate_limiter: Some(rate_limiter),
+            rate_limiter,
             auth_gate: AuthGate::default(),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            transport_label,
+            transport_tls,
         }
     }
+}
 
+/// Methods that don't depend on the transport. Both plain and TLS
+/// connections inherit these.
+impl<R, W> ClientConnection<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     /// Override the per-connection inbound frame cap. Used by the server
     /// to propagate `ClusterConfig::max_message_size` down to the wire.
     pub fn set_max_message_size(&mut self, max: usize) {
@@ -1455,15 +1437,7 @@ impl ClientConnection {
     pub async fn handle_requests<H: Handler + 'static>(&mut self, handler: Arc<H>) -> Result<()> {
         track_connection_open();
 
-        let result = self.handle_requests_inner(handler).await;
-
-        track_connection_close();
-
-        result
-    }
-
-    async fn handle_requests_inner<H: Handler + 'static>(&mut self, handler: Arc<H>) -> Result<()> {
-        serve_connection_requests(
+        let result = serve_connection_requests(
             &mut self.reader,
             &mut self.writer,
             self.addr,
@@ -1471,14 +1445,18 @@ impl ClientConnection {
             handler,
             &mut self.auth_gate,
             self.rate_limiter.as_ref(),
-            "plain",
-            false,
+            self.transport_label,
+            self.transport_tls,
         )
-        .await
+        .await;
+
+        track_connection_close();
+
+        result
     }
 }
 
-impl AuthRateLimited for ClientConnection {
+impl<R, W> AuthRateLimited for ClientConnection<R, W> {
     fn rate_limiter(&self) -> Option<&Arc<AuthRateLimiter>> {
         self.rate_limiter.as_ref()
     }
@@ -1488,105 +1466,70 @@ impl AuthRateLimited for ClientConnection {
     }
 }
 
-/// A TLS client connection to the Kafka server.
-#[cfg(feature = "tls")]
-pub struct TlsClientConnection {
-    reader: tokio::io::BufReader<tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>>,
-    writer: tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>,
-    addr: SocketAddr,
-    /// Rate limiter for auth failures (optional for backwards compat)
-    rate_limiter: Option<Arc<AuthRateLimiter>>,
-    /// Connection-level SASL gate (mirrors `ClientConnection`). The TLS
-    /// listener uses the same authz/authn machinery.
-    auth_gate: AuthGate,
-    /// Maximum allowed inbound frame size for this connection.
-    max_message_size: usize,
-}
-
-#[cfg(feature = "tls")]
-impl TlsClientConnection {
-    /// Create a new TLS client connection (without rate limiter).
-    #[allow(dead_code)]
-    pub fn new(stream: TlsStream<TcpStream>, addr: SocketAddr) -> Self {
-        let (read_half, write_half) = tokio::io::split(stream);
-        Self {
-            reader: tokio::io::BufReader::with_capacity(CONNECTION_READ_BUF_CAPACITY, read_half),
-            writer: write_half,
-            addr,
-            rate_limiter: None,
-            auth_gate: AuthGate::default(),
-            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-        }
+/// Plain-TCP constructors.
+impl ClientConnection<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf> {
+    /// Create a new client connection (without rate limiter).
+    pub fn new(stream: TcpStream, addr: SocketAddr) -> Self {
+        let (read_half, write_half) = stream.into_split();
+        Self::from_halves(read_half, write_half, addr, None, "plain", false)
     }
 
-    /// Create a new TLS client connection with auth rate limiter.
+    /// Create a new client connection with auth rate limiter.
     ///
     /// This constructor enables auth failure rate limiting
     /// to protect against brute-force attacks.
     pub fn new_with_rate_limiter(
+        stream: TcpStream,
+        addr: SocketAddr,
+        rate_limiter: Arc<AuthRateLimiter>,
+    ) -> Self {
+        let (read_half, write_half) = stream.into_split();
+        Self::from_halves(
+            read_half,
+            write_half,
+            addr,
+            Some(rate_limiter),
+            "plain",
+            false,
+        )
+    }
+}
+
+/// A TLS client connection — `ClientConnection` parameterized over the
+/// TLS stream's split halves.
+#[cfg(feature = "tls")]
+pub type TlsClientConnection = ClientConnection<
+    tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
+    tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>,
+>;
+
+/// TLS-only constructor. Distinct name from the plain-TCP
+/// `ClientConnection::new_with_rate_limiter` so a call expressed as
+/// `ClientConnection::method(...)` (without the type alias) resolves
+/// unambiguously to the plain-TCP impl. Always pair with the
+/// [`TlsClientConnection`] alias at the call site.
+#[cfg(feature = "tls")]
+impl
+    ClientConnection<
+        tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
+        tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>,
+    >
+{
+    /// Create a new TLS client connection with auth rate limiter.
+    pub fn new_tls_with_rate_limiter(
         stream: TlsStream<TcpStream>,
         addr: SocketAddr,
         rate_limiter: Arc<AuthRateLimiter>,
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
-        Self {
-            reader: tokio::io::BufReader::with_capacity(CONNECTION_READ_BUF_CAPACITY, read_half),
-            writer: write_half,
+        Self::from_halves(
+            read_half,
+            write_half,
             addr,
-            rate_limiter: Some(rate_limiter),
-            auth_gate: AuthGate::default(),
-            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-        }
-    }
-
-    /// Mark this connection as requiring SASL before any non-handshake API
-    /// is served. Mirrors `ClientConnection::require_sasl`.
-    pub fn require_sasl(&mut self) {
-        self.auth_gate.required = true;
-    }
-
-    /// Override the per-connection inbound frame cap.
-    pub fn set_max_message_size(&mut self, max: usize) {
-        self.max_message_size = max;
-    }
-
-    /// Handle requests from this connection until closed.
-    ///
-    ///Uses unified metric tracking functions.
-    pub async fn handle_requests<H: Handler + 'static>(&mut self, handler: Arc<H>) -> Result<()> {
-        track_connection_open();
-
-        let result = self.handle_requests_inner(handler).await;
-
-        track_connection_close();
-
-        result
-    }
-
-    async fn handle_requests_inner<H: Handler + 'static>(&mut self, handler: Arc<H>) -> Result<()> {
-        serve_connection_requests(
-            &mut self.reader,
-            &mut self.writer,
-            self.addr,
-            self.max_message_size,
-            handler,
-            &mut self.auth_gate,
-            self.rate_limiter.as_ref(),
+            Some(rate_limiter),
             "tls",
             true,
         )
-        .await
-    }
-}
-
-#[cfg(feature = "tls")]
-impl AuthRateLimited for TlsClientConnection {
-    fn rate_limiter(&self) -> Option<&Arc<AuthRateLimiter>> {
-        self.rate_limiter.as_ref()
-    }
-
-    fn client_ip(&self) -> std::net::IpAddr {
-        self.addr.ip()
     }
 }
 

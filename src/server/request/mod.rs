@@ -4,6 +4,7 @@
 //! of what the client-side protocol module does (encoding requests).
 
 mod admin;
+mod api_versions;
 mod auth;
 mod configs;
 mod fetch;
@@ -11,7 +12,6 @@ mod groups;
 mod metadata;
 mod offsets;
 mod produce;
-mod versions;
 
 use bytes::Bytes;
 use nom::{
@@ -25,6 +25,7 @@ use crate::parser::{parse_kafka_string_opt, skip_tagged_fields};
 
 // Re-export all request data types
 pub use admin::*;
+pub use api_versions::*;
 pub use auth::*;
 pub use configs::*;
 pub use fetch::*;
@@ -32,7 +33,6 @@ pub use groups::*;
 pub use metadata::*;
 pub use offsets::*;
 pub use produce::*;
-pub use versions::*;
 
 /// API keys for Kafka protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,119 +320,53 @@ impl Request {
         let version = header.api_version;
         let api_key = header.api_key;
 
-        let (rest, request) = match api_key {
-            ApiKey::Produce => {
-                let (rest, body) = produce::parse_produce_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::Produce(header, body))
-            }
-            ApiKey::Fetch => {
-                let (rest, body) = fetch::parse_fetch_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::Fetch(header, body))
-            }
-            ApiKey::ListOffsets => {
-                let (rest, body) = offsets::parse_list_offsets_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::ListOffsets(header, body))
-            }
-            ApiKey::Metadata => {
-                let (rest, body) = metadata::parse_metadata_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::Metadata(header, body))
-            }
-            ApiKey::OffsetCommit => {
-                let (rest, body) = offsets::parse_offset_commit_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::OffsetCommit(header, body))
-            }
-            ApiKey::OffsetFetch => {
-                let (rest, body) = offsets::parse_offset_fetch_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::OffsetFetch(header, body))
-            }
-            ApiKey::FindCoordinator => {
-                let (rest, body) = groups::parse_find_coordinator_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::FindCoordinator(header, body))
-            }
-            ApiKey::JoinGroup => {
-                let (rest, body) = groups::parse_join_group_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::JoinGroup(header, body))
-            }
-            ApiKey::Heartbeat => {
-                let (rest, body) = groups::parse_heartbeat_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::Heartbeat(header, body))
-            }
-            ApiKey::LeaveGroup => {
-                let (rest, body) = groups::parse_leave_group_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::LeaveGroup(header, body))
-            }
-            ApiKey::SyncGroup => {
-                let (rest, body) = groups::parse_sync_group_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::SyncGroup(header, body))
-            }
-            ApiKey::SaslHandshake => {
-                let (rest, body) = auth::parse_sasl_handshake_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::SaslHandshake(header, body))
-            }
-            ApiKey::SaslAuthenticate => {
-                let (rest, body) = auth::parse_sasl_authenticate_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::SaslAuthenticate(header, body))
-            }
-            ApiKey::ApiVersions => {
-                let (rest, body) = versions::parse_api_versions_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::ApiVersions(header, body))
-            }
-            ApiKey::CreateTopics => {
-                let (rest, body) = admin::parse_create_topics_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::CreateTopics(header, body))
-            }
-            ApiKey::DeleteTopics => {
-                let (rest, body) = admin::parse_delete_topics_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::DeleteTopics(header, body))
-            }
-            ApiKey::InitProducerId => {
-                let (rest, body) = admin::parse_init_producer_id_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::InitProducerId(header, body))
-            }
-            ApiKey::DescribeGroups => {
-                let (rest, body) = groups::parse_describe_groups_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::DescribeGroups(header, body))
-            }
-            ApiKey::ListGroups => {
-                let (rest, body) = groups::parse_list_groups_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::ListGroups(header, body))
-            }
-            ApiKey::DeleteGroups => {
-                let (rest, body) = groups::parse_delete_groups_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::DeleteGroups(header, body))
-            }
-            ApiKey::DescribeConfigs => {
-                let (rest, body) = configs::parse_describe_configs_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::DescribeConfigs(header, body))
-            }
-            ApiKey::AlterConfigs => {
-                let (rest, body) = configs::parse_alter_configs_request(remaining, version)
-                    .map_err(|_| parsing_error(&data))?;
-                (rest, Request::AlterConfigs(header, body))
-            }
-            _ => return Ok(Request::Unknown(header, remaining.into_bytes())),
-        };
+        // Each match arm is structurally identical: invoke the per-API
+        // parser, wrap the result in the matching `Request` variant.
+        // Hand-written, that's 22 nearly-identical 4-line blocks (~90 lines
+        // of boilerplate); keeping that shape in sync across "added a new
+        // API" PRs is exactly the kind of bookkeeping that drifts. The
+        // macro below collapses it to a one-liner per API.
+        macro_rules! dispatch_request {
+            (
+                $($variant:ident => $parser:path),* $(,)?
+            ) => {
+                match api_key {
+                    $(
+                        ApiKey::$variant => {
+                            let (rest, body) = $parser(remaining, version)
+                                .map_err(|_| parsing_error(&data))?;
+                            (rest, Request::$variant(header, body))
+                        }
+                    )*
+                    _ => return Ok(Request::Unknown(header, remaining.into_bytes())),
+                }
+            };
+        }
+
+        let (rest, request) = dispatch_request!(
+            Produce => produce::parse_produce_request,
+            Fetch => fetch::parse_fetch_request,
+            ListOffsets => offsets::parse_list_offsets_request,
+            Metadata => metadata::parse_metadata_request,
+            OffsetCommit => offsets::parse_offset_commit_request,
+            OffsetFetch => offsets::parse_offset_fetch_request,
+            FindCoordinator => groups::parse_find_coordinator_request,
+            JoinGroup => groups::parse_join_group_request,
+            Heartbeat => groups::parse_heartbeat_request,
+            LeaveGroup => groups::parse_leave_group_request,
+            SyncGroup => groups::parse_sync_group_request,
+            SaslHandshake => auth::parse_sasl_handshake_request,
+            SaslAuthenticate => auth::parse_sasl_authenticate_request,
+            ApiVersions => api_versions::parse_api_versions_request,
+            CreateTopics => admin::parse_create_topics_request,
+            DeleteTopics => admin::parse_delete_topics_request,
+            InitProducerId => admin::parse_init_producer_id_request,
+            DescribeGroups => groups::parse_describe_groups_request,
+            ListGroups => groups::parse_list_groups_request,
+            DeleteGroups => groups::parse_delete_groups_request,
+            DescribeConfigs => configs::parse_describe_configs_request,
+            AlterConfigs => configs::parse_alter_configs_request,
+        );
 
         // Trailing bytes after a successful body parse are recorded but no
         // longer block dispatch. The previous behavior — rejecting with

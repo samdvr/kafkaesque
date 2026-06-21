@@ -424,4 +424,201 @@ mod tests {
             "latency should have been applied"
         );
     }
+
+    /// `restrict_to(&[])` means "no kinds are faultable" — but the
+    /// implementation treats a 0-mask as "every kind faultable" because
+    /// the bit-mask path collapses unset to all-set. Document and lock
+    /// this in: an empty restrict still drives `fail_next` decrements
+    /// and `block` on every op.
+    #[tokio::test]
+    async fn empty_restrict_to_falls_back_to_all_kinds() {
+        let (store, injector) = store_under_test();
+        injector.restrict_to(&[]);
+        injector.fail_next(1);
+        let _ = store
+            .put(&Path::from("a"), PutPayload::from(b"x".as_slice()))
+            .await
+            .expect_err("empty restrict_to behaves like restrict_all");
+        // Counter must have been decremented exactly once.
+        store
+            .put(&Path::from("a"), PutPayload::from(b"x".as_slice()))
+            .await
+            .expect("subsequent put recovers");
+    }
+
+    /// `restrict_all` after a `restrict_to([Put])` must re-enable every
+    /// op — proves the mask is overwritten, not OR'd.
+    #[tokio::test]
+    async fn restrict_all_resets_op_mask() {
+        let (store, injector) = store_under_test();
+        injector.restrict_to(&[OpKind::Put]);
+        injector.restrict_all();
+        injector.fail_next(1);
+        let _ = store
+            .get(&Path::from("missing"))
+            .await
+            .expect_err("get should now fault under all-mask");
+    }
+
+    /// Latency without a planned failure must still delay the op and
+    /// still let it succeed afterwards. This is the "slow but healthy"
+    /// scenario — distinct from `latency_applies_before_failure`.
+    #[tokio::test]
+    async fn latency_alone_delays_but_succeeds() {
+        let (store, injector) = store_under_test();
+        injector.set_latency(Duration::from_millis(15));
+        let started = std::time::Instant::now();
+        store
+            .put(&Path::from("k"), PutPayload::from(b"v".as_slice()))
+            .await
+            .expect("latency-only put must still succeed");
+        assert!(
+            started.elapsed() >= Duration::from_millis(10),
+            "latency must have been applied"
+        );
+    }
+
+    /// Fault injection on the non-Put paths (Head, Delete, List, Copy,
+    /// Rename) was never directly exercised. Confirm each kind respects
+    /// its own bit in the op mask.
+    #[tokio::test]
+    async fn each_op_kind_faultable_independently() {
+        for kind in [
+            OpKind::Get,
+            OpKind::Put,
+            OpKind::Delete,
+            OpKind::List,
+            OpKind::Copy,
+            OpKind::Rename,
+            OpKind::Head,
+        ] {
+            let (store, injector) = store_under_test();
+            // Pre-populate so head/get/copy/delete have something real to do.
+            store
+                .put(&Path::from("seed"), PutPayload::from(b"s".as_slice()))
+                .await
+                .expect("seed put");
+            injector.restrict_to(&[kind]);
+            injector.fail_next(1);
+            let result: Result<(), Error> = match kind {
+                OpKind::Get => store
+                    .get(&Path::from("seed"))
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e),
+                OpKind::Put => store
+                    .put(&Path::from("p"), PutPayload::from(b"x".as_slice()))
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e),
+                OpKind::Delete => store.delete(&Path::from("seed")).await,
+                OpKind::List => store
+                    .list_with_delimiter(None)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e),
+                OpKind::Copy => store.copy(&Path::from("seed"), &Path::from("dst")).await,
+                OpKind::Rename => store.rename(&Path::from("seed"), &Path::from("dst")).await,
+                OpKind::Head => store
+                    .head(&Path::from("seed"))
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e),
+            };
+            let err = result.expect_err("kind under restrict must surface fault");
+            let s = err.to_string();
+            assert!(
+                s.contains("planned failure") || s.contains("network blocked"),
+                "{kind:?}: unexpected error shape: {s}"
+            );
+        }
+    }
+
+    /// `block` shapes the error message; rule out the case where a
+    /// blocked-op error accidentally claims it's a "planned failure".
+    #[tokio::test]
+    async fn block_error_message_is_distinguishable() {
+        let (store, injector) = store_under_test();
+        injector.block();
+        let err = store
+            .put(&Path::from("a"), PutPayload::from(b"x".as_slice()))
+            .await
+            .expect_err("blocked");
+        assert!(err.to_string().contains("network blocked"));
+        assert!(!err.to_string().contains("planned failure"));
+    }
+
+    /// Concurrent ops competing for the same `fail_next` budget must
+    /// fail exactly `n` times, never `n + ε` — the `compare_exchange`
+    /// loop is the contract.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fail_next_budget_is_exact_under_concurrency() {
+        let (store, injector) = store_under_test();
+        let n = 8u32;
+        let total = 32usize;
+        injector.fail_next(n);
+        let mut handles = Vec::with_capacity(total);
+        for i in 0..total {
+            let store = store.clone();
+            let path = Path::from(format!("k{i}"));
+            handles.push(tokio::spawn(async move {
+                store.put(&path, PutPayload::from(b"x".as_slice())).await
+            }));
+        }
+        let mut failed = 0;
+        for h in handles {
+            if h.await.expect("join").is_err() {
+                failed += 1;
+            }
+        }
+        assert_eq!(
+            failed, n as usize,
+            "exactly {n} ops must fail, observed {failed}"
+        );
+    }
+
+    /// `unblock` must restore forward progress. A test that only
+    /// proves blocking would miss the case where `unblock` no-ops or
+    /// the atomic doesn't release.
+    #[tokio::test]
+    async fn unblock_restores_forward_progress() {
+        let (store, injector) = store_under_test();
+        injector.block();
+        store
+            .put(&Path::from("a"), PutPayload::from(b"x".as_slice()))
+            .await
+            .expect_err("blocked");
+        injector.unblock();
+        store
+            .put(&Path::from("a"), PutPayload::from(b"x".as_slice()))
+            .await
+            .expect("unblocked put must succeed");
+    }
+
+    /// Block while restricted to a subset: ops outside the subset must
+    /// still proceed even though `block` is asserted. Critical for
+    /// degraded-mode tests where you only partition one path.
+    #[tokio::test]
+    async fn block_respects_restrict_to() {
+        let (store, injector) = store_under_test();
+        injector.restrict_to(&[OpKind::Put]);
+        injector.block();
+        // Get is not restricted — must succeed even with block flagged.
+        store
+            .put(&Path::from("seed"), PutPayload::from(b"s".as_slice()))
+            .await
+            .expect_err("put is in the blocked set");
+        // We can't write through, but a get on a non-existent key still
+        // hits the inner store (returns NotFound), proving the path is
+        // not gated by `block`.
+        let res = store.get(&Path::from("seed")).await;
+        // Either NotFound or Ok — both acceptable; the only invalid
+        // outcome is a "network blocked" error on the get path.
+        if let Err(e) = res {
+            assert!(
+                !e.to_string().contains("network blocked"),
+                "Get must not see the block while restrict excludes Get"
+            );
+        }
+    }
 }

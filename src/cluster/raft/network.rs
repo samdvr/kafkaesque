@@ -248,36 +248,6 @@ pub enum RpcErrorKind {
     Network,
 }
 
-impl RpcErrorKind {
-    /// Returns true if the client should retry on this error.
-    ///
-    /// Exposed (and therefore not dead even though no first-party caller
-    /// uses it yet) for downstream operators / extensions that want to
-    /// branch on retry semantics without re-implementing the kind matrix.
-    #[allow(dead_code)]
-    pub fn is_retryable(&self) -> bool {
-        match self {
-            RpcErrorKind::LeadershipChanged => true,
-            RpcErrorKind::NotLeader { .. } => true,
-            RpcErrorKind::ForwardLoopDetected => false,
-            RpcErrorKind::InvalidRequest => false,
-            RpcErrorKind::Internal => true,
-            RpcErrorKind::Timeout => true,
-            RpcErrorKind::Network => true,
-        }
-    }
-
-    /// Returns true if the client should refresh leader information
-    /// before retrying.
-    #[allow(dead_code)]
-    pub fn should_refresh_leader(&self) -> bool {
-        matches!(
-            self,
-            RpcErrorKind::LeadershipChanged | RpcErrorKind::NotLeader { .. }
-        )
-    }
-}
-
 /// Structured RPC error with kind and message.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RpcErrorInfo {

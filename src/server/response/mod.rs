@@ -4,6 +4,7 @@
 //! of what the client-side protocol module does (parsing responses).
 
 mod admin;
+mod api_versions;
 mod auth;
 mod configs;
 mod fetch;
@@ -11,7 +12,6 @@ mod groups;
 mod metadata;
 mod offsets;
 mod produce;
-mod versions;
 
 use bytes::BufMut;
 
@@ -20,6 +20,7 @@ use crate::error::Result;
 
 // Re-export all response data types
 pub use admin::*;
+pub use api_versions::*;
 pub use auth::*;
 pub use configs::*;
 pub use fetch::*;
@@ -27,7 +28,6 @@ pub use groups::*;
 pub use metadata::*;
 pub use offsets::*;
 pub use produce::*;
-pub use versions::*;
 
 /// Response header for Kafka protocol.
 #[derive(Debug, Clone)]

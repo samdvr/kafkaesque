@@ -34,14 +34,15 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use tempfile::TempDir;
 
+mod common;
+use common::enable_single_node_bootstrap;
+
 /// Spin up an in-memory single-broker server bound to a random port.
 /// Returns `(addr, server, _tempdir)`. The tempdir is held for the test's
 /// lifetime; dropping it cleans up the SlateDB tree.
 async fn start_in_memory_broker()
 -> Option<(String, Arc<KafkaServer<SlateDBClusterHandler>>, TempDir)> {
-    // SAFETY: process-global env var. Every test in this binary runs against
-    // its own isolated single-node cluster.
-    unsafe { std::env::set_var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE", "true") };
+    enable_single_node_bootstrap();
 
     let tempdir = TempDir::new().expect("tempdir");
     let data_path = tempdir.path().to_string_lossy().to_string();

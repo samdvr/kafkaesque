@@ -34,3 +34,19 @@ pub fn next_port() -> u16 {
 pub fn create_object_store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
 }
+
+/// Set the `RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE` env var so a fresh
+/// peerless broker will bootstrap as a single-node cluster.
+///
+/// Tests that build a `SlateDBClusterHandler` or `RaftCoordinator`
+/// directly (i.e. without going through `BrokerHandle::spawn` /
+/// `build_single_node_raft`, which already set this) call this helper
+/// at the top of their setup. Centralizes the `unsafe` block so every
+/// test file isn't reinventing the same incantation.
+///
+/// SAFETY: env var mutation is process-global. Every test in every test
+/// binary wants the same value, and re-setting an already-true var is a
+/// no-op, so this is safe to call repeatedly.
+pub fn enable_single_node_bootstrap() {
+    unsafe { std::env::set_var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE", "true") };
+}

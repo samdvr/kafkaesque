@@ -12,6 +12,9 @@ use kafkaesque::error::KafkaCode;
 use kafkaesque::server::request::*;
 use kafkaesque::server::{Handler, RequestContext};
 
+mod common;
+use common::enable_single_node_bootstrap;
+
 /// Create a minimal request context for testing.
 fn create_test_context() -> RequestContext {
     RequestContext {
@@ -31,9 +34,7 @@ async fn create_handler(data_path: &str) -> SlateDBClusterHandler {
     // Permit single-node Raft bootstrap: this test runs one isolated broker
     // against its own temp dir, so the two-fresh-brokers bootstrap race the
     // production gate protects against cannot occur.
-    // SAFETY: process-global env var; every test in this binary wants the
-    // same value.
-    unsafe { std::env::set_var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE", "true") };
+    enable_single_node_bootstrap();
 
     let mut config = ClusterConfig::default();
     config.broker_id = 0;

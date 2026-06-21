@@ -16,6 +16,9 @@ use object_store::memory::InMemory;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+mod common;
+use common::enable_single_node_bootstrap;
+
 /// Atomic port counter so each test's Raft RPC listener binds a unique port.
 /// Base differs from tests/cluster_handler_tests.rs (21000) since both test
 /// binaries can run concurrently in separate processes on one machine.
@@ -30,9 +33,7 @@ static RAFT_PORT_COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::Atom
 /// - `RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE` so a fresh peerless broker is
 ///   allowed to bootstrap.
 fn isolated_test_config(broker_id: i32) -> ClusterConfig {
-    // SAFETY: setting a process-global env var; all tests in this binary
-    // want the same value, so concurrent writers are not a hazard.
-    unsafe { std::env::set_var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE", "true") };
+    enable_single_node_bootstrap();
 
     let tmp = tempfile::tempdir().expect("create test temp dir");
     let root = tmp.keep();

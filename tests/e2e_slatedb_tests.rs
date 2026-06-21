@@ -11,6 +11,9 @@ use kafkaesque::cluster::{ClusterConfig, SlateDBClusterHandler};
 use kafkaesque::error::KafkaCode;
 use kafkaesque::server::request::*;
 use kafkaesque::server::{Handler, RequestContext};
+
+mod common;
+use common::enable_single_node_bootstrap as allow_single_node_bootstrap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -123,16 +126,6 @@ fn compute_crc32c(data: &[u8]) -> u32 {
         crc = (crc >> 8) ^ CRC32C_TABLE[index];
     }
     !crc
-}
-
-/// Permit single-node Raft bootstrap for the in-process test handlers.
-/// Each test runs one isolated broker against its own temp dir, so the
-/// two-fresh-brokers bootstrap race the production gate protects against
-/// cannot occur.
-fn allow_single_node_bootstrap() {
-    // SAFETY: process-global env var; every test in this binary wants the
-    // same value.
-    unsafe { std::env::set_var("RAFT_BOOTSTRAP_EXPECT_SINGLE_NODE", "true") };
 }
 
 /// Create a test handler with local file storage.

@@ -19,17 +19,18 @@
 
 ## Tier 2 — version bumps on APIs we already have
 
-- [ ] **Fetch** — currently v4 only; bump to at least **v7** (target `4..=11`)
+- [x] **Fetch** — bumped from v4 only to **v4..=v11**
   - Why: v7 introduces incremental fetch sessions (KIP-227) — re-shipping full partition state on every fetch is a real throughput tax for consumers with many partitions. v11 adds rack-aware replica selection.
   - Skippable intermediates: v5 (log_start_offset), v6 (no wire change).
+  - Notes: parser handles `session_id` / `session_epoch` / `forgotten_topics_data` (v7+), per-partition `current_leader_epoch` (v9+), `log_start_offset` (v5+), and top-level `rack_id` (v11+). Response encoder gates `last_stable_offset` + `aborted_transactions` (v4+), `log_start_offset` (v5+), top-level `error_code` + `session_id` (v7+), and per-partition `preferred_read_replica` (v11+). v12+ (flexible) is out of scope.
 
-- [ ] **Metadata** — currently v0-1; bump to at least **v9** (target `0..=12`)
+- [x] **Metadata** — bumped from v0..=v1 to **v0..=v9**
   - Why: v9 adds `cluster_id` (clients use this for client-id allocation and idempotency) and topic IDs (KIP-516). Some newer admin tools degrade gracefully, others do not.
-  - Notes: v9+ uses flexible encoding.
+  - Notes: v9+ uses flexible encoding (compact arrays / strings, trailing tagged fields). Response carries `cluster_id` (v2+), `throttle_time_ms` (v3+), per-partition `offline_replicas` (v5+), `leader_epoch` (v7+), and `cluster_authorized_operations` + per-topic `topic_authorized_operations` (v8..=v10). v10+ adds topic `topic_id` UUIDs and is intentionally deferred.
 
-- [ ] **Produce** — currently v3 only; bump to **v9** (target `3..=9`)
+- [x] **Produce** — bumped from v3 only to **v3..=v9**
   - Why: v9 is the modern flexible version; carries `current_leader` (leader-epoch) on the response so clients can refresh metadata without a separate round-trip after a leader change.
-  - Notes: not load-bearing for correctness today, but completes the set with Fetch/Metadata bumps.
+  - Notes: v9+ flexible request body (`COMPACT_NULLABLE_STRING` transactional_id, compact arrays, `COMPACT_NULLABLE_BYTES` records, trailing tagged fields). Response gains per-partition `log_start_offset` (v5+) and `record_errors` + `error_message` (v8+). v10+ (`current_leader`) is deferred.
 
 ## Out of scope (intentional)
 

@@ -144,8 +144,11 @@ impl Handler for TestHandler {
                                 leader_id: self.broker_id,
                                 replica_nodes: vec![self.broker_id],
                                 isr_nodes: vec![self.broker_id],
+                                leader_epoch: -1,
+                                offline_replicas: vec![],
                             })
                             .collect(),
+                        topic_authorized_operations: 0,
                     })
                     .collect()
             }
@@ -164,8 +167,11 @@ impl Handler for TestHandler {
                                 leader_id: self.broker_id,
                                 replica_nodes: vec![self.broker_id],
                                 isr_nodes: vec![self.broker_id],
+                                leader_epoch: -1,
+                                offline_replicas: vec![],
                             })
                             .collect(),
+                        topic_authorized_operations: 0,
                     })
                     .collect()
             }
@@ -184,8 +190,11 @@ impl Handler for TestHandler {
                                     leader_id: self.broker_id,
                                     replica_nodes: vec![self.broker_id],
                                     isr_nodes: vec![self.broker_id],
+                                    leader_epoch: -1,
+                                    offline_replicas: vec![],
                                 })
                                 .collect(),
+                            topic_authorized_operations: 0,
                         }
                     } else {
                         TopicMetadata {
@@ -193,6 +202,7 @@ impl Handler for TestHandler {
                             name: name.clone(),
                             is_internal: false,
                             partitions: vec![],
+                            topic_authorized_operations: 0,
                         }
                     }
                 })
@@ -208,6 +218,9 @@ impl Handler for TestHandler {
             }],
             controller_id: self.broker_id,
             topics: topic_metadata,
+            throttle_time_ms: 0,
+            cluster_id: None,
+            cluster_authorized_operations: 0,
         }
     }
 
@@ -242,6 +255,9 @@ impl Handler for TestHandler {
                             error_code: KafkaCode::None,
                             base_offset,
                             log_append_time: -1,
+                            log_start_offset: -1,
+                            record_errors: vec![],
+                            error_message: None,
                         }
                     })
                     .collect();
@@ -291,7 +307,9 @@ impl Handler for TestHandler {
                                     error_code: KafkaCode::None,
                                     high_watermark: partition_data.len() as i64,
                                     last_stable_offset: partition_data.len() as i64,
+                                    log_start_offset: -1,
                                     aborted_transactions: vec![],
+                                    preferred_read_replica: -1,
                                     records,
                                 }
                             } else {
@@ -318,6 +336,8 @@ impl Handler for TestHandler {
 
         FetchResponseData {
             throttle_time_ms: 0,
+            error_code: KafkaCode::None,
+            session_id: 0,
             responses,
         }
     }

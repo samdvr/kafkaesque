@@ -16,6 +16,8 @@ use kafkaesque::server::response::{
 fn test_fetch_response_with_topics() {
     let response = FetchResponseData {
         throttle_time_ms: 100,
+        error_code: KafkaCode::None,
+        session_id: 0,
         responses: vec![FetchTopicResponse {
             name: "my-topic".to_string(),
             partitions: vec![FetchPartitionResponse {
@@ -24,6 +26,8 @@ fn test_fetch_response_with_topics() {
                 high_watermark: 1000,
                 last_stable_offset: 1000,
                 aborted_transactions: vec![],
+                log_start_offset: -1,
+                preferred_read_replica: -1,
                 records: Some(Bytes::from(vec![1, 2, 3, 4])),
             }],
         }],
@@ -39,6 +43,8 @@ fn test_fetch_response_with_topics() {
 fn test_fetch_response_debug() {
     let response = FetchResponseData {
         throttle_time_ms: 0,
+        error_code: KafkaCode::None,
+        session_id: 0,
         responses: vec![],
     };
     let debug_str = format!("{:?}", response);
@@ -49,6 +55,8 @@ fn test_fetch_response_debug() {
 fn test_fetch_response_clone() {
     let response = FetchResponseData {
         throttle_time_ms: 50,
+        error_code: KafkaCode::None,
+        session_id: 0,
         responses: vec![],
     };
     let cloned = response.clone();
@@ -136,6 +144,7 @@ fn test_fetch_partition_response_with_aborted() {
         error_code: KafkaCode::None,
         high_watermark: 100,
         last_stable_offset: 100,
+        log_start_offset: -1,
         aborted_transactions: vec![
             AbortedTransaction {
                 producer_id: 123,
@@ -146,6 +155,7 @@ fn test_fetch_partition_response_with_aborted() {
                 first_offset: 75,
             },
         ],
+        preferred_read_replica: -1,
         records: None,
     };
 
@@ -169,6 +179,8 @@ fn test_fetch_partition_response_clone() {
         high_watermark: 500,
         last_stable_offset: 500,
         aborted_transactions: vec![],
+        log_start_offset: -1,
+        preferred_read_replica: -1,
         records: Some(Bytes::from(vec![1, 2, 3])),
     };
     let cloned = response.clone();
@@ -235,6 +247,9 @@ fn test_produce_response_with_topics() {
                 error_code: KafkaCode::None,
                 base_offset: 100,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             }],
         }],
     };
@@ -287,12 +302,18 @@ fn test_produce_topic_response_with_partitions() {
                 error_code: KafkaCode::None,
                 base_offset: 0,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             },
             ProducePartitionResponse {
                 partition_index: 1,
                 error_code: KafkaCode::None,
                 base_offset: 100,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             },
         ],
     };
@@ -366,6 +387,9 @@ fn test_produce_partition_response_clone() {
         error_code: KafkaCode::None,
         base_offset: 999,
         log_append_time: -1,
+        log_start_offset: -1,
+        record_errors: vec![],
+        error_message: None,
     };
     let cloned = response.clone();
     assert_eq!(response.partition_index, cloned.partition_index);

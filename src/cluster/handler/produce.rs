@@ -112,6 +112,9 @@ pub(super) async fn handle_produce(
                         error_code: KafkaCode::InvalidRequest,
                         base_offset: -1,
                         log_append_time: -1,
+                        log_start_offset: -1,
+                        record_errors: vec![],
+                        error_message: None,
                     })
                     .collect(),
                 name: topic.name,
@@ -275,6 +278,9 @@ pub(super) async fn handle_produce(
                     error_code: KafkaCode::InvalidTopic,
                     base_offset: -1,
                     log_append_time: -1,
+                    log_start_offset: -1,
+                    record_errors: vec![],
+                    error_message: None,
                 })
                 .collect();
             responses.push(ProduceTopicResponse {
@@ -315,6 +321,9 @@ pub(super) async fn handle_produce(
                     error_code: KafkaCode::TopicAuthorizationFailed,
                     base_offset: -1,
                     log_append_time: -1,
+                    log_start_offset: -1,
+                    record_errors: vec![],
+                    error_message: None,
                 })
                 .collect();
             responses.push(ProduceTopicResponse {
@@ -363,6 +372,9 @@ pub(super) async fn handle_produce(
                             error_code: KafkaCode::ClusterAuthorizationFailed,
                             base_offset: -1,
                             log_append_time: -1,
+                            log_start_offset: -1,
+                            record_errors: vec![],
+                            error_message: None,
                         };
                     }
                     handler
@@ -487,6 +499,9 @@ impl SlateDBClusterHandler {
                 error_code: KafkaCode::NotLeaderForPartition,
                 base_offset: -1,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             };
         }
 
@@ -505,6 +520,9 @@ impl SlateDBClusterHandler {
                 error_code: KafkaCode::None,
                 base_offset: -1,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             };
         }
 
@@ -525,6 +543,9 @@ impl SlateDBClusterHandler {
                         error_code: KafkaCode::CorruptMessage,
                         base_offset: -1,
                         log_append_time: -1,
+                        log_start_offset: -1,
+                        record_errors: vec![],
+                        error_message: None,
                     };
                 }
                 CrcValidationResult::TooSmall => {
@@ -540,6 +561,9 @@ impl SlateDBClusterHandler {
                         error_code: KafkaCode::CorruptMessage,
                         base_offset: -1,
                         log_append_time: -1,
+                        log_start_offset: -1,
+                        record_errors: vec![],
+                        error_message: None,
                     };
                 }
                 CrcValidationResult::FrameMismatch {
@@ -559,6 +583,9 @@ impl SlateDBClusterHandler {
                         error_code: KafkaCode::CorruptMessage,
                         base_offset: -1,
                         log_append_time: -1,
+                        log_start_offset: -1,
+                        record_errors: vec![],
+                        error_message: None,
                     };
                 }
                 CrcValidationResult::OffloadFailed => {
@@ -573,6 +600,9 @@ impl SlateDBClusterHandler {
                         error_code: KafkaCode::CorruptMessage,
                         base_offset: -1,
                         log_append_time: -1,
+                        log_start_offset: -1,
+                        record_errors: vec![],
+                        error_message: None,
                     };
                 }
                 // The CRC enum is non_exhaustive across crate boundaries.
@@ -584,6 +614,9 @@ impl SlateDBClusterHandler {
                         error_code: KafkaCode::CorruptMessage,
                         base_offset: -1,
                         log_append_time: -1,
+                        log_start_offset: -1,
+                        record_errors: vec![],
+                        error_message: None,
                     };
                 }
             }
@@ -601,6 +634,9 @@ impl SlateDBClusterHandler {
                     error_code: e.to_kafka_code(),
                     base_offset: -1,
                     log_append_time: -1,
+                    log_start_offset: -1,
+                    record_errors: vec![],
+                    error_message: None,
                 };
             }
         };
@@ -633,6 +669,9 @@ impl SlateDBClusterHandler {
                     error_code: KafkaCode::None,
                     base_offset,
                     log_append_time: -1,
+                    log_start_offset: -1,
+                    record_errors: vec![],
+                    error_message: None,
                 }
             }
             Err(e) => {
@@ -652,6 +691,9 @@ impl SlateDBClusterHandler {
                     error_code,
                     base_offset: -1,
                     log_append_time: -1,
+                    log_start_offset: -1,
+                    record_errors: vec![],
+                    error_message: None,
                 }
             }
         }
@@ -674,6 +716,9 @@ mod tests {
             error_code: KafkaCode::None,
             base_offset: 42,
             log_append_time: -1,
+            log_start_offset: -1,
+            record_errors: vec![],
+            error_message: None,
         };
 
         assert_eq!(response.partition_index, 0);
@@ -689,6 +734,9 @@ mod tests {
             error_code: KafkaCode::NotLeaderForPartition,
             base_offset: -1,
             log_append_time: -1,
+            log_start_offset: -1,
+            record_errors: vec![],
+            error_message: None,
         };
 
         assert_eq!(response.partition_index, 5);
@@ -703,6 +751,9 @@ mod tests {
             error_code: KafkaCode::CorruptMessage,
             base_offset: -1,
             log_append_time: -1,
+            log_start_offset: -1,
+            record_errors: vec![],
+            error_message: None,
         };
 
         assert_eq!(response.error_code, KafkaCode::CorruptMessage);
@@ -715,6 +766,9 @@ mod tests {
             error_code: KafkaCode::InvalidTopic,
             base_offset: -1,
             log_append_time: -1,
+            log_start_offset: -1,
+            record_errors: vec![],
+            error_message: None,
         };
 
         assert_eq!(response.error_code, KafkaCode::InvalidTopic);
@@ -728,12 +782,18 @@ mod tests {
                 error_code: KafkaCode::None,
                 base_offset: 0,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             },
             ProducePartitionResponse {
                 partition_index: 1,
                 error_code: KafkaCode::None,
                 base_offset: 10,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             },
         ];
 
@@ -855,6 +915,9 @@ mod tests {
             error_code: KafkaCode::Unknown,
             base_offset: -1,
             log_append_time: -1,
+            log_start_offset: -1,
+            record_errors: vec![],
+            error_message: None,
         };
 
         assert_eq!(response.base_offset, -1);
@@ -869,6 +932,9 @@ mod tests {
                 error_code: KafkaCode::None,
                 base_offset: offset,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             };
             assert_eq!(response.base_offset, offset);
         }
@@ -886,18 +952,27 @@ mod tests {
                 error_code: KafkaCode::None,
                 base_offset: 0,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             },
             ProducePartitionResponse {
                 partition_index: 1,
                 error_code: KafkaCode::NotLeaderForPartition,
                 base_offset: -1,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             },
             ProducePartitionResponse {
                 partition_index: 2,
                 error_code: KafkaCode::None,
                 base_offset: 50,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             },
         ];
 
@@ -926,6 +1001,9 @@ mod tests {
                     error_code: KafkaCode::None,
                     base_offset: 100,
                     log_append_time: -1,
+                    log_start_offset: -1,
+                    record_errors: vec![],
+                    error_message: None,
                 }],
             },
             ProduceTopicResponse {
@@ -935,6 +1013,9 @@ mod tests {
                     error_code: KafkaCode::None,
                     base_offset: 200,
                     log_append_time: -1,
+                    log_start_offset: -1,
+                    record_errors: vec![],
+                    error_message: None,
                 }],
             },
         ];
@@ -1043,6 +1124,9 @@ mod tests {
                     error_code: KafkaCode::None,
                     base_offset: 0,
                     log_append_time: -1,
+                    log_start_offset: -1,
+                    record_errors: vec![],
+                    error_message: None,
                 }],
             }],
             throttle_time_ms: 0,
@@ -1074,6 +1158,9 @@ mod tests {
                 error_code: code,
                 base_offset: if code == KafkaCode::None { 0 } else { -1 },
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             };
 
             assert_eq!(response.error_code, code);
@@ -1105,6 +1192,9 @@ mod tests {
                 error_code: KafkaCode::None,
                 base_offset: i as i64 * 100,
                 log_append_time: -1,
+                log_start_offset: -1,
+                record_errors: vec![],
+                error_message: None,
             })
             .collect();
 

@@ -824,14 +824,14 @@ mod tests {
 
     #[test]
     fn test_parse_unsupported_version_above_max() {
-        // Fetch max is v4; v5 must be refused even though v5's layout is a
-        // superset (we'd silently ignore session fields otherwise).
-        let data = build_header(1, 5, 31337, None);
+        // Fetch max is v11; v12 must be refused (v12+ is flexible and
+        // intentionally out of scope).
+        let data = build_header(1, 12, 31337, None);
         let request = Request::parse(Bytes::from(data)).unwrap();
         match request {
             Request::UnsupportedVersion(header) => {
                 assert_eq!(header.api_key, ApiKey::Fetch);
-                assert_eq!(header.api_version, 5);
+                assert_eq!(header.api_version, 12);
                 assert_eq!(header.correlation_id, 31337);
             }
             other => panic!("Expected UnsupportedVersion, got {:?}", other),

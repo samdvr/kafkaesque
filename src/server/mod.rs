@@ -30,6 +30,9 @@
 //!             }],
 //!             controller_id: 0,
 //!             topics: vec![],
+//!             throttle_time_ms: 0,
+//!             cluster_id: None,
+//!             cluster_authorized_operations: 0,
 //!         }
 //!     }
 //!     // ... implement other handlers

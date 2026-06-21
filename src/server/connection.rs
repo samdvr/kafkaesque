@@ -1080,11 +1080,21 @@ async fn dispatch_request_common<H: Handler>(
                 encode_api_versions_standard(correlation_id, header.api_version, &response)
             }
         }
-        Request::Metadata(_, req) => {
-            encode_response(correlation_id, &handler.handle_metadata(&ctx, req).await)
+        Request::Metadata(header, req) => {
+            let resp = handler.handle_metadata(&ctx, req).await;
+            let mut body = Vec::new();
+            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
+                return (Err(e), auth_result);
+            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
-        Request::Produce(_, req) => {
-            encode_response(correlation_id, &handler.handle_produce(&ctx, req).await)
+        Request::Produce(header, req) => {
+            let resp = handler.handle_produce(&ctx, req).await;
+            let mut body = Vec::new();
+            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
+                return (Err(e), auth_result);
+            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::Fetch(_, _) => {
             // Handled by the early-exit zero-copy chain path above; the

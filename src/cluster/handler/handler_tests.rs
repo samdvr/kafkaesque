@@ -164,6 +164,9 @@ fn test_produce_partition_response_zombie_mode() {
         error_code: KafkaCode::NotLeaderForPartition,
         base_offset: -1,
         log_append_time: -1,
+        log_start_offset: -1,
+        record_errors: vec![],
+        error_message: None,
     };
 
     assert_eq!(response.partition_index, 5);
@@ -179,6 +182,9 @@ fn test_produce_partition_response_success() {
         error_code: KafkaCode::None,
         base_offset: 42,
         log_append_time: -1,
+        log_start_offset: -1,
+        record_errors: vec![],
+        error_message: None,
     };
 
     assert_eq!(response.partition_index, 0);
@@ -193,6 +199,9 @@ fn test_produce_partition_response_corrupt_message() {
         error_code: KafkaCode::CorruptMessage,
         base_offset: -1,
         log_append_time: -1,
+        log_start_offset: -1,
+        record_errors: vec![],
+        error_message: None,
     };
 
     assert_eq!(response.error_code, KafkaCode::CorruptMessage);
@@ -210,6 +219,8 @@ fn test_partition_metadata_structure() {
         leader_id: 1,
         replica_nodes: vec![1],
         isr_nodes: vec![1],
+        leader_epoch: -1,
+        offline_replicas: vec![],
     };
 
     assert_eq!(meta.error_code, KafkaCode::None);
@@ -228,6 +239,8 @@ fn test_topic_metadata_structure() {
             leader_id: 1,
             replica_nodes: vec![1],
             isr_nodes: vec![1],
+            leader_epoch: -1,
+            offline_replicas: vec![],
         },
         PartitionMetadata {
             error_code: KafkaCode::None,
@@ -235,6 +248,8 @@ fn test_topic_metadata_structure() {
             leader_id: 2,
             replica_nodes: vec![2],
             isr_nodes: vec![2],
+            leader_epoch: -1,
+            offline_replicas: vec![],
         },
     ];
 
@@ -243,6 +258,7 @@ fn test_topic_metadata_structure() {
         name: "my-topic".to_string(),
         is_internal: false,
         partitions,
+        topic_authorized_operations: 0,
     };
 
     assert_eq!(topic.name, "my-topic");
@@ -291,6 +307,7 @@ fn test_topic_metadata_internal_topic() {
         name: "__consumer_offsets".to_string(),
         is_internal: true,
         partitions: vec![],
+        topic_authorized_operations: 0,
     };
 
     assert!(topic.is_internal);
@@ -304,6 +321,7 @@ fn test_topic_metadata_error() {
         name: "nonexistent".to_string(),
         is_internal: false,
         partitions: vec![],
+        topic_authorized_operations: 0,
     };
 
     assert_eq!(topic.error_code, KafkaCode::UnknownTopicOrPartition);
@@ -318,6 +336,8 @@ fn test_partition_metadata_with_replicas() {
         leader_id: 1,
         replica_nodes: vec![1, 2, 3],
         isr_nodes: vec![1, 2],
+        leader_epoch: -1,
+        offline_replicas: vec![],
     };
 
     assert_eq!(meta.partition_index, 5);
@@ -334,6 +354,8 @@ fn test_partition_metadata_leader_election() {
         leader_id: -1,
         replica_nodes: vec![1, 2, 3],
         isr_nodes: vec![],
+        leader_epoch: -1,
+        offline_replicas: vec![],
     };
 
     assert_eq!(meta.error_code, KafkaCode::LeaderNotAvailable);
@@ -361,6 +383,9 @@ fn test_produce_error_codes() {
             error_code: code,
             base_offset: if code == KafkaCode::None { 0 } else { -1 },
             log_append_time: -1,
+            log_start_offset: -1,
+            record_errors: vec![],
+            error_message: None,
         };
         assert_eq!(response.error_code, code);
     }
@@ -379,6 +404,8 @@ fn test_topic_metadata_many_partitions() {
             leader_id: (i % 3) + 1, // Distribute across brokers 1, 2, 3
             replica_nodes: vec![(i % 3) + 1],
             isr_nodes: vec![(i % 3) + 1],
+            leader_epoch: -1,
+            offline_replicas: vec![],
         })
         .collect();
 
@@ -387,6 +414,7 @@ fn test_topic_metadata_many_partitions() {
         name: "high-partition-topic".to_string(),
         is_internal: false,
         partitions,
+        topic_authorized_operations: 0,
     };
 
     assert_eq!(topic.partitions.len(), 100);
@@ -452,12 +480,18 @@ fn test_produce_topic_response_structure() {
             error_code: KafkaCode::None,
             base_offset: 100,
             log_append_time: -1,
+            log_start_offset: -1,
+            record_errors: vec![],
+            error_message: None,
         },
         ProducePartitionResponse {
             partition_index: 1,
             error_code: KafkaCode::NotLeaderForPartition,
             base_offset: -1,
             log_append_time: -1,
+            log_start_offset: -1,
+            record_errors: vec![],
+            error_message: None,
         },
     ];
 

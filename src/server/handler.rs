@@ -242,6 +242,9 @@ pub trait Handler: Send + Sync {
             brokers: vec![],
             controller_id: -1,
             topics: vec![],
+            throttle_time_ms: 0,
+            cluster_id: None,
+            cluster_authorized_operations: 0,
         }
     }
 
@@ -266,6 +269,9 @@ pub trait Handler: Send + Sync {
                             error_code: KafkaCode::UnknownTopicOrPartition,
                             base_offset: -1,
                             log_append_time: -1,
+                            log_start_offset: -1,
+                            record_errors: vec![],
+                            error_message: None,
                         })
                         .collect(),
                 })
@@ -283,6 +289,8 @@ pub trait Handler: Send + Sync {
         // Default: return error for all partitions
         FetchResponseData {
             throttle_time_ms: 0,
+            error_code: KafkaCode::None,
+            session_id: 0,
             responses: request
                 .topics
                 .into_iter()
@@ -297,6 +305,8 @@ pub trait Handler: Send + Sync {
                             high_watermark: -1,
                             last_stable_offset: -1,
                             aborted_transactions: vec![],
+                            log_start_offset: -1,
+                            preferred_read_replica: -1,
                             records: None,
                         })
                         .collect(),

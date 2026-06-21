@@ -189,6 +189,8 @@ pub(super) async fn handle_fetch(
 
     let response = FetchResponseData {
         throttle_time_ms: 0,
+        error_code: KafkaCode::None,
+        session_id: 0,
         responses,
     };
     let total_bytes = total_record_bytes(&response.responses);
@@ -275,6 +277,8 @@ async fn collect_fetch(
                         high_watermark: -1,
                         last_stable_offset: -1,
                         aborted_transactions: vec![],
+                        log_start_offset: -1,
+                        preferred_read_replica: -1,
                         records: None,
                     });
                 }
@@ -323,6 +327,8 @@ async fn collect_fetch(
                                         high_watermark: -1,
                                         last_stable_offset: -1,
                                         aborted_transactions: vec![],
+                                        log_start_offset: -1,
+                                        preferred_read_replica: -1,
                                         records: None,
                                     };
                                 }
@@ -336,6 +342,8 @@ async fn collect_fetch(
                                         high_watermark: current_hwm,
                                         last_stable_offset: -1,
                                         aborted_transactions: vec![],
+                                        log_start_offset: -1,
+                                        preferred_read_replica: -1,
                                         records: None,
                                     };
                                 }
@@ -349,6 +357,8 @@ async fn collect_fetch(
                                     high_watermark: current_hwm,
                                     last_stable_offset: -1,
                                     aborted_transactions: vec![],
+                                    log_start_offset: -1,
+                                    preferred_read_replica: -1,
                                     records: None,
                                 };
                             }
@@ -390,6 +400,8 @@ async fn collect_fetch(
                                     high_watermark: current_hwm,
                                     last_stable_offset: current_hwm,
                                     aborted_transactions: vec![],
+                                    log_start_offset: -1,
+                                    preferred_read_replica: -1,
                                     records: None,
                                 };
                             }
@@ -424,7 +436,9 @@ async fn collect_fetch(
                                         error_code: KafkaCode::None,
                                         high_watermark,
                                         last_stable_offset: high_watermark,
+                                        log_start_offset: -1,
                                         aborted_transactions: vec![],
+                                        preferred_read_replica: -1,
                                         records,
                                     }
                                 }
@@ -446,6 +460,8 @@ async fn collect_fetch(
                                         high_watermark: -1,
                                         last_stable_offset: -1,
                                         aborted_transactions: vec![],
+                                        log_start_offset: -1,
+                                        preferred_read_replica: -1,
                                         records: None,
                                     }
                                 }
@@ -457,6 +473,8 @@ async fn collect_fetch(
                             high_watermark: -1,
                             last_stable_offset: -1,
                             aborted_transactions: vec![],
+                            log_start_offset: -1,
+                            preferred_read_replica: -1,
                             records: None,
                         },
                     }
@@ -514,6 +532,8 @@ mod tests {
                 high_watermark: 0,
                 last_stable_offset: 0,
                 aborted_transactions: vec![],
+                log_start_offset: -1,
+                preferred_read_replica: -1,
                 records: None,
             }],
         }];
@@ -532,6 +552,8 @@ mod tests {
                         high_watermark: 1,
                         last_stable_offset: 1,
                         aborted_transactions: vec![],
+                        log_start_offset: -1,
+                        preferred_read_replica: -1,
                         records: Some(Bytes::from_static(b"hello")),
                     },
                     FetchPartitionResponse {
@@ -540,6 +562,8 @@ mod tests {
                         high_watermark: 1,
                         last_stable_offset: 1,
                         aborted_transactions: vec![],
+                        log_start_offset: -1,
+                        preferred_read_replica: -1,
                         records: Some(Bytes::from_static(b"world!")),
                     },
                 ],
@@ -552,6 +576,8 @@ mod tests {
                     high_watermark: 1,
                     last_stable_offset: 1,
                     aborted_transactions: vec![],
+                    log_start_offset: -1,
+                    preferred_read_replica: -1,
                     records: Some(Bytes::from_static(b"!!!")),
                 }],
             },
@@ -572,6 +598,8 @@ mod tests {
             high_watermark: 100,
             last_stable_offset: 100,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: Some(Bytes::from_static(b"test records")),
         };
 
@@ -590,6 +618,8 @@ mod tests {
             high_watermark: -1,
             last_stable_offset: -1,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -606,6 +636,8 @@ mod tests {
             high_watermark: 50,
             last_stable_offset: 50,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -622,6 +654,8 @@ mod tests {
             high_watermark: -1,
             last_stable_offset: -1,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -637,6 +671,8 @@ mod tests {
                 high_watermark: 10,
                 last_stable_offset: 10,
                 aborted_transactions: vec![],
+                log_start_offset: -1,
+                preferred_read_replica: -1,
                 records: Some(Bytes::from_static(b"data")),
             },
             FetchPartitionResponse {
@@ -645,6 +681,8 @@ mod tests {
                 high_watermark: 20,
                 last_stable_offset: 20,
                 aborted_transactions: vec![],
+                log_start_offset: -1,
+                preferred_read_replica: -1,
                 records: Some(Bytes::from_static(b"more data")),
             },
         ];
@@ -667,6 +705,8 @@ mod tests {
 
         let response = FetchResponseData {
             throttle_time_ms: 0,
+            error_code: KafkaCode::None,
+            session_id: 0,
             responses,
         };
 
@@ -734,6 +774,8 @@ mod tests {
             high_watermark: 50,
             last_stable_offset: 50,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -752,6 +794,8 @@ mod tests {
             high_watermark: 0,
             last_stable_offset: 0,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -768,6 +812,8 @@ mod tests {
             high_watermark: 100,
             last_stable_offset: 100,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -788,6 +834,8 @@ mod tests {
                 high_watermark: 100,
                 last_stable_offset: 100,
                 aborted_transactions: vec![],
+                log_start_offset: -1,
+                preferred_read_replica: -1,
                 records: Some(Bytes::from_static(b"data")),
             },
             FetchPartitionResponse {
@@ -796,6 +844,8 @@ mod tests {
                 high_watermark: -1,
                 last_stable_offset: -1,
                 aborted_transactions: vec![],
+                log_start_offset: -1,
+                preferred_read_replica: -1,
                 records: None,
             },
             FetchPartitionResponse {
@@ -804,6 +854,8 @@ mod tests {
                 high_watermark: 50,
                 last_stable_offset: 50,
                 aborted_transactions: vec![],
+                log_start_offset: -1,
+                preferred_read_replica: -1,
                 records: None,
             },
         ];
@@ -848,6 +900,8 @@ mod tests {
             high_watermark: 100,
             last_stable_offset: 100,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -869,6 +923,8 @@ mod tests {
                     high_watermark: 100,
                     last_stable_offset: 100,
                     aborted_transactions: vec![],
+                    log_start_offset: -1,
+                    preferred_read_replica: -1,
                     records: Some(Bytes::from_static(b"a")),
                 }],
             },
@@ -880,6 +936,8 @@ mod tests {
                     high_watermark: 200,
                     last_stable_offset: 200,
                     aborted_transactions: vec![],
+                    log_start_offset: -1,
+                    preferred_read_replica: -1,
                     records: Some(Bytes::from_static(b"b")),
                 }],
             },
@@ -887,6 +945,8 @@ mod tests {
 
         let response = FetchResponseData {
             throttle_time_ms: 0,
+            error_code: KafkaCode::None,
+            session_id: 0,
             responses,
         };
 
@@ -903,6 +963,8 @@ mod tests {
     fn test_throttle_time_default_zero() {
         let response = FetchResponseData {
             throttle_time_ms: 0,
+            error_code: KafkaCode::None,
+            session_id: 0,
             responses: vec![],
         };
 
@@ -923,6 +985,8 @@ mod tests {
             high_watermark: 1000, // HWM is high
             last_stable_offset: 1000,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -949,6 +1013,8 @@ mod tests {
             high_watermark: 1000,
             last_stable_offset: 1000,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -970,6 +1036,8 @@ mod tests {
             high_watermark: 1000,
             last_stable_offset: 1000,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: Some(Bytes::from_static(b"data at log start")),
         };
 
@@ -993,6 +1061,8 @@ mod tests {
             high_watermark,
             last_stable_offset: high_watermark,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: Some(Bytes::from_static(b"valid data")),
         };
 
@@ -1019,6 +1089,8 @@ mod tests {
             high_watermark,
             last_stable_offset,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -1047,6 +1119,8 @@ mod tests {
             high_watermark: 1000,
             last_stable_offset: 1000, // Always equals HWM in Kafkaesque
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -1082,6 +1156,8 @@ mod tests {
             high_watermark: hwm,
             last_stable_offset: hwm,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -1130,6 +1206,8 @@ mod tests {
             high_watermark: 100,
             last_stable_offset: 100,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: Some(Bytes::from(records)),
         };
 
@@ -1152,6 +1230,8 @@ mod tests {
                     high_watermark: 100,
                     last_stable_offset: 100,
                     aborted_transactions: vec![],
+                    log_start_offset: -1,
+                    preferred_read_replica: -1,
                     records: Some(Bytes::from(records)),
                 }
             })
@@ -1179,6 +1259,8 @@ mod tests {
             high_watermark: 100,
             last_stable_offset: 100,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: Some(Bytes::from_static(b"first")),
         };
 
@@ -1188,6 +1270,8 @@ mod tests {
             high_watermark: 150, // HWM increased
             last_stable_offset: 150,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: Some(Bytes::from_static(b"second")),
         };
 
@@ -1207,6 +1291,8 @@ mod tests {
             high_watermark: 0,
             last_stable_offset: 0,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 
@@ -1224,6 +1310,8 @@ mod tests {
             high_watermark: 0,
             last_stable_offset: 0,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
 

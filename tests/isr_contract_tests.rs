@@ -192,8 +192,14 @@ async fn isr_in_metadata_response_is_static_compat_field() {
                 leader_id: 1,
                 replica_nodes: vec![1],
                 isr_nodes: vec![1],
+                leader_epoch: -1,
+                offline_replicas: vec![],
             }],
+            topic_authorized_operations: 0,
         }],
+        throttle_time_ms: 0,
+        cluster_id: None,
+        cluster_authorized_operations: 0,
     };
 
     let p = &response.topics[0].partitions[0];

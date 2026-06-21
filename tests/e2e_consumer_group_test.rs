@@ -333,6 +333,9 @@ async fn test_consumer_group_protocol_debug() {
     println!("\n=== STEP 3: Metadata ===");
     let metadata_req = MetadataRequestData {
         topics: Some(vec![topic.to_string()]),
+        allow_auto_topic_creation: true,
+        include_cluster_authorized_operations: false,
+        include_topic_authorized_operations: false,
     };
     let metadata_resp = handler.handle_metadata(&ctx, metadata_req).await;
     println!("Brokers:");
@@ -514,8 +517,14 @@ async fn test_consumer_group_protocol_debug() {
                 partition_index: 0,
                 fetch_offset: 0,
                 partition_max_bytes: 1024 * 1024,
+                current_leader_epoch: -1,
+                log_start_offset: -1,
             }],
         }],
+        session_id: 0,
+        session_epoch: -1,
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let fetch_resp = handler.handle_fetch(&ctx, fetch_req).await;

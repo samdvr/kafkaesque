@@ -333,8 +333,14 @@ async fn test_e2e_produce_and_consume_with_verification() {
                 partition_index: 0,
                 fetch_offset: base_offset,
                 partition_max_bytes: 1024 * 1024,
+                current_leader_epoch: -1,
+                log_start_offset: -1,
             }],
         }],
+        session_id: 0,
+        session_epoch: -1,
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let fetch_response = handler.handle_fetch(&ctx, fetch_req).await;
@@ -450,8 +456,14 @@ async fn test_e2e_slatedb_persistence_across_restart() {
                         partition_index: 0,
                         fetch_offset: 0,
                         partition_max_bytes: 1024 * 1024,
+                        current_leader_epoch: -1,
+                        log_start_offset: -1,
                     }],
                 }],
+                session_id: 0,
+                session_epoch: -1,
+                forgotten_topics: vec![],
+                rack_id: String::new(),
             };
 
             let response = handler.handle_fetch(&ctx, fetch_req).await;
@@ -564,8 +576,14 @@ async fn test_e2e_message_ordering_preserved() {
                 partition_index: 0,
                 fetch_offset: 0,
                 partition_max_bytes: 10 * 1024 * 1024,
+                current_leader_epoch: -1,
+                log_start_offset: -1,
             }],
         }],
+        session_id: 0,
+        session_epoch: -1,
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let fetch_response = handler.handle_fetch(&ctx, fetch_req).await;
@@ -661,8 +679,14 @@ async fn test_e2e_large_messages() {
                 partition_index: 0,
                 fetch_offset: 0,
                 partition_max_bytes: 10 * 1024 * 1024,
+                current_leader_epoch: -1,
+                log_start_offset: -1,
             }],
         }],
+        session_id: 0,
+        session_epoch: -1,
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let fetch_response = handler.handle_fetch(&ctx, fetch_req).await;
@@ -756,8 +780,14 @@ async fn test_e2e_multiple_produce_cycles_with_persistence() {
                     partition_index: 0,
                     fetch_offset: 0,
                     partition_max_bytes: 10 * 1024 * 1024,
+                    current_leader_epoch: -1,
+                    log_start_offset: -1,
                 }],
             }],
+            session_id: 0,
+            session_epoch: -1,
+            forgotten_topics: vec![],
+            rack_id: String::new(),
         };
 
         let fetch_response = handler.handle_fetch(&ctx, fetch_req).await;
@@ -841,8 +871,14 @@ async fn test_e2e_slatedb_data_persistence() {
                 partition_index: 0,
                 fetch_offset: 0,
                 partition_max_bytes: 1024 * 1024,
+                current_leader_epoch: -1,
+                log_start_offset: -1,
             }],
         }],
+        session_id: 0,
+        session_epoch: -1,
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let fetch_response = handler.handle_fetch(&ctx, fetch_req).await;
@@ -910,7 +946,12 @@ async fn test_e2e_produce_consume_with_advertised_host() {
     let ctx = create_test_context();
 
     // Step 1: Verify metadata returns advertised_host, not bind host
-    let metadata_req = MetadataRequestData { topics: None };
+    let metadata_req = MetadataRequestData {
+    topics: None,
+    allow_auto_topic_creation: true,
+    include_cluster_authorized_operations: false,
+    include_topic_authorized_operations: false,
+};
     let metadata_resp = handler.handle_metadata(&ctx, metadata_req).await;
 
     assert!(
@@ -997,8 +1038,14 @@ async fn test_e2e_produce_consume_with_advertised_host() {
                 partition_index: 0,
                 fetch_offset: base_offset,
                 partition_max_bytes: 1024 * 1024,
+                current_leader_epoch: -1,
+                log_start_offset: -1,
             }],
         }],
+        session_id: 0,
+        session_epoch: -1,
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let fetch_resp = handler.handle_fetch(&ctx, fetch_req).await;

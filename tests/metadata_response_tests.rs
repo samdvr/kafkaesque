@@ -37,8 +37,14 @@ fn test_metadata_response_with_data() {
                 leader_id: 0,
                 replica_nodes: vec![0, 1],
                 isr_nodes: vec![0, 1],
+                leader_epoch: -1,
+                offline_replicas: vec![],
             }],
+            topic_authorized_operations: 0,
         }],
+        throttle_time_ms: 0,
+        cluster_id: None,
+        cluster_authorized_operations: 0,
     };
 
     assert_eq!(response.brokers.len(), 2);
@@ -52,6 +58,9 @@ fn test_metadata_response_debug() {
         brokers: vec![],
         controller_id: -1,
         topics: vec![],
+        throttle_time_ms: 0,
+        cluster_id: None,
+        cluster_authorized_operations: 0,
     };
     let debug_str = format!("{:?}", response);
     assert!(debug_str.contains("MetadataResponseData"));
@@ -63,6 +72,9 @@ fn test_metadata_response_clone() {
         brokers: vec![],
         controller_id: 0,
         topics: vec![],
+        throttle_time_ms: 0,
+        cluster_id: None,
+        cluster_authorized_operations: 0,
     };
     let cloned = response.clone();
     assert_eq!(response.controller_id, cloned.controller_id);
@@ -136,6 +148,7 @@ fn test_topic_metadata_with_error() {
         name: "missing-topic".to_string(),
         is_internal: false,
         partitions: vec![],
+        topic_authorized_operations: 0,
     };
 
     assert_eq!(topic.error_code, KafkaCode::UnknownTopicOrPartition);
@@ -149,6 +162,7 @@ fn test_topic_metadata_internal() {
         name: "__consumer_offsets".to_string(),
         is_internal: true,
         partitions: vec![],
+        topic_authorized_operations: 0,
     };
 
     assert!(topic.is_internal);
@@ -168,6 +182,8 @@ fn test_topic_metadata_with_partitions() {
                 leader_id: 0,
                 replica_nodes: vec![0, 1, 2],
                 isr_nodes: vec![0, 1, 2],
+                leader_epoch: -1,
+                offline_replicas: vec![],
             },
             PartitionMetadata {
                 error_code: KafkaCode::None,
@@ -175,6 +191,8 @@ fn test_topic_metadata_with_partitions() {
                 leader_id: 1,
                 replica_nodes: vec![0, 1, 2],
                 isr_nodes: vec![0, 1],
+                leader_epoch: -1,
+                offline_replicas: vec![],
             },
             PartitionMetadata {
                 error_code: KafkaCode::None,
@@ -182,8 +200,11 @@ fn test_topic_metadata_with_partitions() {
                 leader_id: 2,
                 replica_nodes: vec![0, 1, 2],
                 isr_nodes: vec![2],
+                leader_epoch: -1,
+                offline_replicas: vec![],
             },
         ],
+        topic_authorized_operations: 0,
     };
 
     assert_eq!(topic.partitions.len(), 3);
@@ -199,6 +220,7 @@ fn test_topic_metadata_debug() {
         name: "".to_string(),
         is_internal: false,
         partitions: vec![],
+        topic_authorized_operations: 0,
     };
     let debug_str = format!("{:?}", topic);
     assert!(debug_str.contains("TopicMetadata"));
@@ -211,6 +233,7 @@ fn test_topic_metadata_clone() {
         name: "t".to_string(),
         is_internal: false,
         partitions: vec![],
+        topic_authorized_operations: 0,
     };
     let cloned = topic.clone();
     assert_eq!(topic.name, cloned.name);
@@ -228,6 +251,8 @@ fn test_partition_metadata_with_values() {
         leader_id: 2,
         replica_nodes: vec![0, 1, 2],
         isr_nodes: vec![0, 2],
+        leader_epoch: -1,
+        offline_replicas: vec![],
     };
 
     assert_eq!(partition.partition_index, 5);
@@ -244,6 +269,8 @@ fn test_partition_metadata_with_error() {
         leader_id: -1,
         replica_nodes: vec![0, 1, 2],
         isr_nodes: vec![],
+        leader_epoch: -1,
+        offline_replicas: vec![],
     };
 
     assert_eq!(partition.error_code, KafkaCode::LeaderNotAvailable);
@@ -259,6 +286,8 @@ fn test_partition_metadata_debug() {
         leader_id: 0,
         replica_nodes: vec![],
         isr_nodes: vec![],
+        leader_epoch: -1,
+        offline_replicas: vec![],
     };
     let debug_str = format!("{:?}", partition);
     assert!(debug_str.contains("PartitionMetadata"));
@@ -272,6 +301,8 @@ fn test_partition_metadata_clone() {
         leader_id: 0,
         replica_nodes: vec![0, 1],
         isr_nodes: vec![0, 1],
+        leader_epoch: -1,
+        offline_replicas: vec![],
     };
     let cloned = partition.clone();
     assert_eq!(partition.partition_index, cloned.partition_index);

@@ -324,6 +324,9 @@ mod tests {
             error_code: KafkaCode::None,
             base_offset: 100,
             log_append_time: -1,
+            log_start_offset: -1,
+            record_errors: vec![],
+            error_message: None,
         };
         let mut buf = Vec::new();
         response.encode(&mut buf).unwrap();
@@ -492,6 +495,8 @@ mod tests {
             high_watermark: 100,
             last_stable_offset: 100,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: Some(Bytes::from(vec![1, 2, 3, 4])),
         };
         let mut buf = Vec::new();
@@ -509,6 +514,8 @@ mod tests {
             high_watermark: 0,
             last_stable_offset: 0,
             aborted_transactions: vec![],
+            log_start_offset: -1,
+            preferred_read_replica: -1,
             records: None,
         };
         let mut buf = Vec::new();
@@ -526,6 +533,8 @@ mod tests {
             leader_id: 1,
             replica_nodes: vec![1, 2, 3],
             isr_nodes: vec![1, 2],
+            leader_epoch: -1,
+            offline_replicas: vec![],
         };
         let mut buf = Vec::new();
         metadata.encode(&mut buf).unwrap();
@@ -541,6 +550,7 @@ mod tests {
             name: "test".to_string(),
             is_internal: false,
             partitions: vec![],
+            topic_authorized_operations: 0,
         };
         let mut buf = Vec::new();
         topic.encode(&mut buf).unwrap();

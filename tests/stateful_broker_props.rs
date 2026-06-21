@@ -105,10 +105,16 @@ impl Handler for StatefulHandler {
                             leader_id: 0,
                             replica_nodes: vec![0],
                             isr_nodes: vec![0],
+                            leader_epoch: -1,
+                            offline_replicas: vec![],
                         })
                         .collect(),
+                    topic_authorized_operations: 0,
                 })
                 .collect(),
+            throttle_time_ms: 0,
+            cluster_id: None,
+            cluster_authorized_operations: 0,
         }
     }
 
@@ -145,6 +151,9 @@ impl Handler for StatefulHandler {
                                 error_code: KafkaCode::UnknownTopicOrPartition,
                                 base_offset: -1,
                                 log_append_time: -1,
+                                log_start_offset: -1,
+                                record_errors: vec![],
+                                error_message: None,
                             };
                         }
                         let log = topic_data.entry(p.partition_index).or_default();
@@ -157,6 +166,9 @@ impl Handler for StatefulHandler {
                             error_code: KafkaCode::None,
                             base_offset,
                             log_append_time: -1,
+                            log_start_offset: -1,
+                            record_errors: vec![],
+                            error_message: None,
                         }
                     })
                     .collect();
@@ -198,6 +210,8 @@ impl Handler for StatefulHandler {
                                         high_watermark: log.len() as i64,
                                         last_stable_offset: log.len() as i64,
                                         aborted_transactions: vec![],
+                                        log_start_offset: -1,
+                                        preferred_read_replica: -1,
                                         records: None,
                                     }
                                 } else {
@@ -207,6 +221,8 @@ impl Handler for StatefulHandler {
                                         high_watermark: log.len() as i64,
                                         last_stable_offset: log.len() as i64,
                                         aborted_transactions: vec![],
+                                        log_start_offset: -1,
+                                        preferred_read_replica: -1,
                                         records: Some(log[offset as usize].clone()),
                                     }
                                 }
@@ -226,6 +242,8 @@ impl Handler for StatefulHandler {
             .collect();
         FetchResponseData {
             throttle_time_ms: 0,
+            error_code: KafkaCode::None,
+            session_id: 0,
             responses,
         }
     }
@@ -598,14 +616,20 @@ async fn run_ops(ops: Vec<Op>) -> Result<(), String> {
                     min_bytes: 0,
                     max_bytes: 1024,
                     isolation_level: 0,
+                    session_id: 0,
+                    session_epoch: -1,
                     topics: vec![FetchTopicData {
                         name: topic.clone(),
                         partitions: vec![FetchPartitionData {
                             partition_index: partition,
+                            current_leader_epoch: -1,
                             fetch_offset: offset,
+                            log_start_offset: -1,
                             partition_max_bytes: 1024,
                         }],
                     }],
+                    forgotten_topics: vec![],
+                    rack_id: String::new(),
                 };
                 let resp = handler.handle_fetch(&ctx, req).await;
                 if resp.responses.len() != 1 || resp.responses[0].partitions.len() != 1 {
@@ -710,7 +734,12 @@ async fn run_ops(ops: Vec<Op>) -> Result<(), String> {
                 }
             }
             Op::Metadata => {
-                let req = MetadataRequestData { topics: None };
+                let req = MetadataRequestData {
+                    topics: None,
+                    allow_auto_topic_creation: true,
+                    include_cluster_authorized_operations: false,
+                    include_topic_authorized_operations: false,
+                };
                 let resp = handler.handle_metadata(&ctx, req).await;
                 // Brokers list is non-empty, every declared topic shows up.
                 if resp.brokers.is_empty() {

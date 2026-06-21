@@ -30,7 +30,7 @@
 //! | API              | Min | Max | Why min isn't 0                                |
 //! |------------------|-----|-----|------------------------------------------------|
 //! | Produce          | 3   | 3   | parser reads `transactional_id` (v3+)          |
-//! | Fetch            | 4   | 4   | parser reads `max_bytes` (v3+) and `isolation` (v4+) |
+//! | Fetch            | 4   | 11  | parser reads `max_bytes` (v3+) and `isolation` (v4+); v7 sessions, v9 leader_epoch, v11 rack |
 //! | ListOffsets      | 0   | 2   | parser is version-agnostic                     |
 //! | Metadata         | 0   | 1   | parser is version-agnostic                     |
 //! | OffsetCommit     | 0   | 2   |                                                |
@@ -96,14 +96,24 @@ impl SupportedVersion {
 /// parsers actually decode. Handlers may override this in their
 /// ApiVersions response if needed.
 pub const SUPPORTED_VERSIONS: &[SupportedVersion] = &[
-    // Produce v3 added the leading nullable `transactional_id` field that the
-    // parser reads unconditionally; refusing v0–v2 prevents silent misreads.
-    SupportedVersion::new(ApiKey::Produce, 3, 3),
-    // Fetch v3 added `max_bytes`, v4 added `isolation_level` — both are
-    // unconditionally parsed today.
-    SupportedVersion::new(ApiKey::Fetch, 4, 4),
+    // Produce: v3..=v9. v9 (KIP-482) is flexible. v3 carries
+    // `transactional_id`, v5 adds per-partition `log_start_offset`, v8
+    // adds `record_errors` + `error_message`. v0..=v2 omit
+    // `transactional_id` and aren't accepted because the parser reads
+    // the v3+ field unconditionally.
+    SupportedVersion::new(ApiKey::Produce, 3, 9),
+    // Fetch v3 added `max_bytes`, v4 added `isolation_level`. v5 added
+    // per-partition `log_start_offset`, v7 added incremental fetch session
+    // state (KIP-227), v9 added `current_leader_epoch`, v11 added
+    // rack-aware replica selection (KIP-392). v12+ is flexible and out of
+    // scope.
+    SupportedVersion::new(ApiKey::Fetch, 4, 11),
     SupportedVersion::new(ApiKey::ListOffsets, 0, 2),
-    SupportedVersion::new(ApiKey::Metadata, 0, 1),
+    // Metadata: v0..=v9. v9 (KIP-482) is flexible. v2 added cluster_id,
+    // v3 added throttle_time_ms, v5 offline_replicas, v7 leader_epoch,
+    // v8 cluster/topic authorized_operations. v10+ adds topic_id (UUID)
+    // and is intentionally deferred.
+    SupportedVersion::new(ApiKey::Metadata, 0, 9),
     SupportedVersion::new(ApiKey::OffsetCommit, 0, 2),
     SupportedVersion::new(ApiKey::OffsetFetch, 0, 1),
     SupportedVersion::new(ApiKey::FindCoordinator, 0, 1),
@@ -172,6 +182,10 @@ pub fn uses_flexible_encoding(api_key: ApiKey, version: i16) -> bool {
         // This was previously (incorrectly) gated at v3, which mis-framed
         // every v2 request and response.
         ApiKey::InitProducerId => version >= 2,
+        // Metadata: flexible from v9 (KIP-482).
+        ApiKey::Metadata => version >= 9,
+        // Produce: flexible from v9 (KIP-482).
+        ApiKey::Produce => version >= 9,
         // Add other APIs as needed when flexible versions are implemented
         _ => false,
     }
@@ -191,10 +205,10 @@ pub fn uses_flexible_encoding(api_key: ApiKey, version: i16) -> bool {
 /// 3. Bump the matching entry in `SUPPORTED_VERSIONS`.
 /// 4. The unit test ensures all three stay in lockstep.
 pub const PARSER_ENCODER_COVERAGE: &[(ApiKey, i16, i16)] = &[
-    (ApiKey::Produce, 3, 3),
-    (ApiKey::Fetch, 4, 4),
+    (ApiKey::Produce, 3, 9),
+    (ApiKey::Fetch, 4, 11),
     (ApiKey::ListOffsets, 0, 2),
-    (ApiKey::Metadata, 0, 1),
+    (ApiKey::Metadata, 0, 9),
     (ApiKey::OffsetCommit, 0, 2),
     (ApiKey::OffsetFetch, 0, 1),
     (ApiKey::FindCoordinator, 0, 1),
@@ -269,7 +283,7 @@ mod tests {
         assert_eq!(produce.api_key, ApiKey::Produce);
         // Produce min is clamped to what the parser actually supports.
         assert_eq!(produce.min_version, 3);
-        assert_eq!(produce.max_version, 3);
+        assert_eq!(produce.max_version, 9);
     }
 
     #[test]
@@ -284,9 +298,10 @@ mod tests {
     #[test]
     fn test_is_version_supported() {
         assert!(is_version_supported(ApiKey::Produce, 3));
+        assert!(is_version_supported(ApiKey::Produce, 9));
         assert!(!is_version_supported(ApiKey::Produce, 0));
         assert!(!is_version_supported(ApiKey::Produce, 2));
-        assert!(!is_version_supported(ApiKey::Produce, 4));
+        assert!(!is_version_supported(ApiKey::Produce, 10));
         assert!(!is_version_supported(ApiKey::Produce, -1));
     }
 

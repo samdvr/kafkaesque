@@ -682,7 +682,15 @@ async fn test_metadata_reports_raft_leader_as_controller() {
     assert_eq!(create.topics[0].error_code, KafkaCode::None);
 
     let metadata = handler
-        .handle_metadata(&ctx, MetadataRequestData { topics: None })
+        .handle_metadata(
+            &ctx,
+            MetadataRequestData {
+                topics: None,
+                allow_auto_topic_creation: true,
+                include_cluster_authorized_operations: false,
+                include_topic_authorized_operations: false,
+            },
+        )
         .await;
 
     // Single-node cluster: this broker IS the Raft leader, so the

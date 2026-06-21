@@ -159,6 +159,9 @@ async fn test_metadata_request_specific_topics() {
     // Request metadata for specific topics
     let request = MetadataRequestData {
         topics: Some(vec!["test-topic".to_string()]),
+        allow_auto_topic_creation: true,
+        include_cluster_authorized_operations: false,
+        include_topic_authorized_operations: false,
     };
 
     let response = handler.handle_metadata(&ctx, request).await;
@@ -197,7 +200,12 @@ async fn test_metadata_request_all_topics() {
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
     // Request metadata for all topics
-    let request = MetadataRequestData { topics: None };
+    let request = MetadataRequestData {
+    topics: None,
+    allow_auto_topic_creation: true,
+    include_cluster_authorized_operations: false,
+    include_topic_authorized_operations: false,
+};
 
     let response = handler.handle_metadata(&ctx, request).await;
 
@@ -212,6 +220,9 @@ async fn test_metadata_request_invalid_topic_name() {
     // Request metadata for topic with invalid characters
     let request = MetadataRequestData {
         topics: Some(vec!["invalid/topic".to_string()]),
+        allow_auto_topic_creation: true,
+        include_cluster_authorized_operations: false,
+        include_topic_authorized_operations: false,
     };
 
     let response = handler.handle_metadata(&ctx, request).await;
@@ -234,6 +245,9 @@ async fn test_metadata_auto_create_disabled() {
     // Request metadata for non-existent topic
     let request = MetadataRequestData {
         topics: Some(vec!["nonexistent".to_string()]),
+        allow_auto_topic_creation: true,
+        include_cluster_authorized_operations: false,
+        include_topic_authorized_operations: false,
     };
 
     let response = handler.handle_metadata(&ctx, request).await;
@@ -260,7 +274,12 @@ async fn test_metadata_returns_advertised_host_not_bind_host() {
         .expect("Failed to create handler");
     let ctx = create_test_context();
 
-    let request = MetadataRequestData { topics: None };
+    let request = MetadataRequestData {
+    topics: None,
+    allow_auto_topic_creation: true,
+    include_cluster_authorized_operations: false,
+    include_topic_authorized_operations: false,
+};
     let response = handler.handle_metadata(&ctx, request).await;
 
     // Verify broker list uses advertised_host, NOT bind host
@@ -322,6 +341,9 @@ async fn test_metadata_isr_nodes_contains_leader_to_prevent_not_leader_error() {
     // Request metadata - this is what Kafka clients do before producing
     let request = MetadataRequestData {
         topics: Some(vec!["isr-test-topic".to_string()]),
+        allow_auto_topic_creation: true,
+        include_cluster_authorized_operations: false,
+        include_topic_authorized_operations: false,
     };
     let response = handler.handle_metadata(&ctx, request).await;
 
@@ -473,7 +495,15 @@ async fn test_create_topics_validate_only_dry_run() {
     // Dry-run must not register the topic. List-all metadata avoids
     // auto-create-on-named-request (enabled in the default test handler).
     let metadata = handler
-        .handle_metadata(&ctx, MetadataRequestData { topics: None })
+        .handle_metadata(
+            &ctx,
+            MetadataRequestData {
+                topics: None,
+                allow_auto_topic_creation: true,
+                include_cluster_authorized_operations: false,
+                include_topic_authorized_operations: false,
+            },
+        )
         .await;
     assert!(
         !metadata.topics.iter().any(|t| t.name == "dry-run-topic"),
@@ -782,8 +812,14 @@ async fn test_fetch_request_success() {
                 partition_index: 0,
                 fetch_offset: 0,
                 partition_max_bytes: 1024 * 1024,
+                current_leader_epoch: -1,
+                log_start_offset: -1,
             }],
         }],
+        session_id: 0,
+        session_epoch: -1,
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let response = handler.handle_fetch(&ctx, fetch_req).await;
@@ -827,8 +863,14 @@ async fn test_fetch_offset_out_of_range() {
                 partition_index: 0,
                 fetch_offset: 1000,
                 partition_max_bytes: 1024 * 1024,
+                current_leader_epoch: -1,
+                log_start_offset: -1,
             }],
         }],
+        session_id: 0,
+        session_epoch: -1,
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let response = handler.handle_fetch(&ctx, fetch_req).await;
@@ -856,8 +898,14 @@ async fn test_fetch_invalid_topic_name() {
                 partition_index: 0,
                 fetch_offset: 0,
                 partition_max_bytes: 1024 * 1024,
+                current_leader_epoch: -1,
+                log_start_offset: -1,
             }],
         }],
+        session_id: 0,
+        session_epoch: -1,
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let response = handler.handle_fetch(&ctx, fetch_req).await;
@@ -899,8 +947,14 @@ async fn test_fetch_nonexistent_partition() {
                 partition_index: 99,
                 fetch_offset: 0,
                 partition_max_bytes: 1024 * 1024,
+                current_leader_epoch: -1,
+                log_start_offset: -1,
             }],
         }],
+        session_id: 0,
+        session_epoch: -1,
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let response = handler.handle_fetch(&ctx, fetch_req).await;

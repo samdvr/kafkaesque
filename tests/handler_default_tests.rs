@@ -53,6 +53,9 @@ async fn test_default_metadata() {
 
     let request = MetadataRequestData {
         topics: Some(vec!["test-topic".to_string()]),
+        allow_auto_topic_creation: true,
+        include_cluster_authorized_operations: false,
+        include_topic_authorized_operations: false,
     };
 
     let response = handler.handle_metadata(&ctx, request).await;
@@ -101,14 +104,20 @@ async fn test_default_fetch() {
         min_bytes: 1,
         max_bytes: 1024,
         isolation_level: 0,
+        session_id: 0,
+        session_epoch: -1,
         topics: vec![FetchTopicData {
             name: "test-topic".to_string(),
             partitions: vec![FetchPartitionData {
                 partition_index: 0,
+                current_leader_epoch: -1,
                 fetch_offset: 0,
+                log_start_offset: -1,
                 partition_max_bytes: 1024,
             }],
         }],
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let response = handler.handle_fetch(&ctx, request).await;
@@ -501,18 +510,24 @@ async fn test_default_implementations_with_multiple_items() {
         min_bytes: 1,
         max_bytes: 10240,
         isolation_level: 0,
+        session_id: 0,
+        session_epoch: -1,
         topics: vec![
             FetchTopicData {
                 name: "topic1".to_string(),
                 partitions: vec![
                     FetchPartitionData {
                         partition_index: 0,
+                        current_leader_epoch: -1,
                         fetch_offset: 0,
+                        log_start_offset: -1,
                         partition_max_bytes: 1024,
                     },
                     FetchPartitionData {
                         partition_index: 1,
+                        current_leader_epoch: -1,
                         fetch_offset: 10,
+                        log_start_offset: -1,
                         partition_max_bytes: 1024,
                     },
                 ],
@@ -521,11 +536,15 @@ async fn test_default_implementations_with_multiple_items() {
                 name: "topic2".to_string(),
                 partitions: vec![FetchPartitionData {
                     partition_index: 0,
+                    current_leader_epoch: -1,
                     fetch_offset: 0,
+                    log_start_offset: -1,
                     partition_max_bytes: 1024,
                 }],
             },
         ],
+        forgotten_topics: vec![],
+        rack_id: String::new(),
     };
 
     let fetch_resp = handler.handle_fetch(&ctx, fetch_req).await;

@@ -125,6 +125,9 @@ async fn test_metadata_filters_unauthorized_topics() {
             &ctx,
             MetadataRequestData {
                 topics: Some(vec!["restricted".to_string()]),
+                allow_auto_topic_creation: true,
+                include_cluster_authorized_operations: false,
+                include_topic_authorized_operations: false,
             },
         )
         .await;

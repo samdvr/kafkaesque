@@ -115,11 +115,16 @@ impl Handler for DiffHandler {
                         leader_id: 0,
                         replica_nodes: vec![0],
                         isr_nodes: vec![0],
+                        leader_epoch: -1,
+                        offline_replicas: vec![],
                     }],
+                    topic_authorized_operations: 0,
                 })
                 .collect(),
-        }
-    }
+            throttle_time_ms: 0,
+            cluster_id: None,
+            cluster_authorized_operations: 0,
+        }    }
 }
 
 // ---------------------------------------------------------------------------

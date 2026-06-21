@@ -49,6 +49,7 @@ pub(super) async fn handle_metadata(
                         name,
                         is_internal: false,
                         partitions: vec![],
+                        topic_authorized_operations: 0,
                     });
                     continue;
                 }
@@ -73,6 +74,7 @@ pub(super) async fn handle_metadata(
                         name,
                         is_internal: false,
                         partitions: vec![],
+                        topic_authorized_operations: 0,
                     });
                     continue;
                 }
@@ -110,6 +112,7 @@ pub(super) async fn handle_metadata(
                             name,
                             is_internal: false,
                             partitions: vec![],
+                            topic_authorized_operations: 0,
                         });
                         continue;
                     }
@@ -145,6 +148,7 @@ pub(super) async fn handle_metadata(
                                     name,
                                     is_internal: false,
                                     partitions: vec![],
+                                    topic_authorized_operations: 0,
                                 });
                             }
                         }
@@ -155,6 +159,7 @@ pub(super) async fn handle_metadata(
                                 name,
                                 is_internal: false,
                                 partitions: vec![],
+                                topic_authorized_operations: 0,
                             });
                         }
                     }
@@ -166,6 +171,7 @@ pub(super) async fn handle_metadata(
                         name,
                         is_internal: false,
                         partitions: vec![],
+                        topic_authorized_operations: 0,
                     });
                 }
             }
@@ -260,6 +266,9 @@ pub(super) async fn handle_metadata(
         brokers,
         controller_id,
         topics,
+        throttle_time_ms: 0,
+        cluster_id: None,
+        cluster_authorized_operations: 0,
     }
 }
 
@@ -279,6 +288,7 @@ mod tests {
             name: "test-topic".to_string(),
             is_internal: false,
             partitions: vec![],
+            topic_authorized_operations: 0,
         };
 
         assert_eq!(metadata.error_code, KafkaCode::None);
@@ -293,6 +303,7 @@ mod tests {
             name: "".to_string(),
             is_internal: false,
             partitions: vec![],
+            topic_authorized_operations: 0,
         };
 
         assert_eq!(metadata.error_code, KafkaCode::InvalidTopic);
@@ -306,6 +317,7 @@ mod tests {
             name: "non-existent".to_string(),
             is_internal: false,
             partitions: vec![],
+            topic_authorized_operations: 0,
         };
 
         assert_eq!(metadata.error_code, KafkaCode::UnknownTopicOrPartition);
@@ -318,6 +330,7 @@ mod tests {
             name: "new-topic".to_string(),
             is_internal: false,
             partitions: vec![],
+            topic_authorized_operations: 0,
         };
 
         assert_eq!(metadata.error_code, KafkaCode::LeaderNotAvailable);
@@ -395,6 +408,8 @@ mod tests {
             leader_id: 1,
             replica_nodes: vec![1],
             isr_nodes: vec![1],
+            leader_epoch: -1,
+            offline_replicas: vec![],
         };
 
         assert_eq!(partition.error_code, KafkaCode::None);
@@ -410,6 +425,8 @@ mod tests {
             leader_id: -1,
             replica_nodes: vec![],
             isr_nodes: vec![],
+            leader_epoch: -1,
+            offline_replicas: vec![],
         };
 
         assert_eq!(partition.error_code, KafkaCode::LeaderNotAvailable);
@@ -424,6 +441,8 @@ mod tests {
             leader_id: 1,
             replica_nodes: vec![1, 2, 3],
             isr_nodes: vec![1, 2, 3],
+            leader_epoch: -1,
+            offline_replicas: vec![],
         };
 
         assert_eq!(partition.replica_nodes.len(), 3);
@@ -445,6 +464,9 @@ mod tests {
             }],
             controller_id: 1,
             topics: vec![],
+            throttle_time_ms: 0,
+            cluster_id: None,
+            cluster_authorized_operations: 0,
         };
 
         assert_eq!(response.controller_id, 1);
@@ -463,14 +485,19 @@ mod tests {
                     name: "topic-a".to_string(),
                     is_internal: false,
                     partitions: vec![],
+                    topic_authorized_operations: 0,
                 },
                 TopicMetadata {
                     error_code: KafkaCode::None,
                     name: "topic-b".to_string(),
                     is_internal: false,
                     partitions: vec![],
+                    topic_authorized_operations: 0,
                 },
             ],
+            throttle_time_ms: 0,
+            cluster_id: None,
+            cluster_authorized_operations: 0,
         };
 
         assert_eq!(response.topics.len(), 2);
@@ -506,6 +533,7 @@ mod tests {
             name: "__consumer_offsets".to_string(),
             is_internal: true,
             partitions: vec![],
+            topic_authorized_operations: 0,
         };
 
         assert!(metadata.is_internal);

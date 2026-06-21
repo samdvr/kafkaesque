@@ -418,6 +418,8 @@ fn test_fetch_partition_response_success() {
 fn test_fetch_response_construction() {
     let response = FetchResponseData {
         throttle_time_ms: 0,
+        error_code: KafkaCode::None,
+        session_id: 0,
         responses: vec![FetchTopicResponse {
             name: "test".to_string(),
             partitions: vec![FetchPartitionResponse::success(0, 100, None)],

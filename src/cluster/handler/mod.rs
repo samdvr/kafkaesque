@@ -823,6 +823,8 @@ impl SlateDBClusterHandler {
                 } else {
                     vec![]
                 },
+                leader_epoch: -1,
+                offline_replicas: vec![],
             });
         }
 
@@ -835,6 +837,7 @@ impl SlateDBClusterHandler {
             // metadata. Admin tools and clients filter on this flag.
             is_internal: topic.starts_with("__"),
             partitions,
+            topic_authorized_operations: 0,
         }
     }
 }

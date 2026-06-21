@@ -1,4 +1,8 @@
 //! Produce request parsing.
+//!
+//! Supports v3..=v9. v9+ uses the KIP-482 flexible wire format. For our
+//! target range the body fields are stable across versions; only the
+//! length-prefix encoding changes.
 
 use bytes::Bytes;
 use nom::{
@@ -7,7 +11,10 @@ use nom::{
 };
 use nombytes::NomBytes;
 
-use crate::parser::{parse_array, parse_kafka_string, parse_kafka_string_opt};
+use crate::parser::{
+    parse_array, parse_compact_nullable_string, parse_kafka_string, parse_kafka_string_opt,
+    parse_unsigned_varint, skip_tagged_fields,
+};
 
 /// Produce request data.
 #[derive(Debug, Clone)]
@@ -30,11 +37,19 @@ pub struct ProducePartitionData {
     pub records: Bytes,
 }
 
-pub fn parse_produce_request(s: NomBytes, _version: i16) -> IResult<NomBytes, ProduceRequestData> {
+pub fn parse_produce_request(s: NomBytes, version: i16) -> IResult<NomBytes, ProduceRequestData> {
+    if version >= 9 {
+        parse_produce_request_flexible(s)
+    } else {
+        parse_produce_request_classic(s)
+    }
+}
+
+fn parse_produce_request_classic(s: NomBytes) -> IResult<NomBytes, ProduceRequestData> {
     let (s, transactional_id) = parse_kafka_string_opt(s)?;
     let (s, acks) = be_i16(s)?;
     let (s, timeout_ms) = be_i32(s)?;
-    let (s, topics) = parse_array(parse_produce_topic)(s)?;
+    let (s, topics) = parse_array(parse_produce_topic_classic)(s)?;
 
     Ok((
         s,
@@ -47,14 +62,14 @@ pub fn parse_produce_request(s: NomBytes, _version: i16) -> IResult<NomBytes, Pr
     ))
 }
 
-fn parse_produce_topic(s: NomBytes) -> IResult<NomBytes, ProduceTopicData> {
+fn parse_produce_topic_classic(s: NomBytes) -> IResult<NomBytes, ProduceTopicData> {
     let (s, name) = parse_kafka_string(s)?;
-    let (s, partitions) = parse_array(parse_produce_partition)(s)?;
+    let (s, partitions) = parse_array(parse_produce_partition_classic)(s)?;
 
     Ok((s, ProduceTopicData { name, partitions }))
 }
 
-fn parse_produce_partition(s: NomBytes) -> IResult<NomBytes, ProducePartitionData> {
+fn parse_produce_partition_classic(s: NomBytes) -> IResult<NomBytes, ProducePartitionData> {
     let (s, partition_index) = be_i32(s)?;
     let (s, record_set_size) = be_i32(s)?;
     // The Kafka protocol types this field as NULLABLE_BYTES: -1 is a legal
@@ -87,6 +102,110 @@ fn parse_produce_partition(s: NomBytes) -> IResult<NomBytes, ProducePartitionDat
             records: records.into_bytes(),
         },
     ))
+}
+
+/// v9+ flexible body: transactional_id is `COMPACT_NULLABLE_STRING`, the
+/// arrays are compact, records are `COMPACT_NULLABLE_BYTES`, and every
+/// record carries a trailing tagged-fields section.
+fn parse_produce_request_flexible(s: NomBytes) -> IResult<NomBytes, ProduceRequestData> {
+    let (s, txn_bytes) = parse_compact_nullable_string(s)?;
+    let transactional_id = match txn_bytes {
+        Some(b) => match std::str::from_utf8(&b) {
+            Ok(t) => Some(t.to_string()),
+            Err(_) => {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    s,
+                    nom::error::ErrorKind::Verify,
+                )));
+            }
+        },
+        None => None,
+    };
+    let (s, acks) = be_i16(s)?;
+    let (s, timeout_ms) = be_i32(s)?;
+    let (s, topics) = parse_compact_array(s, parse_produce_topic_flexible)?;
+    let (s, _) = skip_tagged_fields(s)?;
+
+    Ok((
+        s,
+        ProduceRequestData {
+            transactional_id,
+            acks,
+            timeout_ms,
+            topics,
+        },
+    ))
+}
+
+fn parse_produce_topic_flexible(s: NomBytes) -> IResult<NomBytes, ProduceTopicData> {
+    let (s, name_bytes) = crate::parser::parse_compact_nullable_string(s)?;
+    let name = match name_bytes {
+        Some(b) => match std::str::from_utf8(&b) {
+            Ok(t) => t.to_string(),
+            Err(_) => {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    s,
+                    nom::error::ErrorKind::Verify,
+                )));
+            }
+        },
+        // Topic name is COMPACT_STRING (non-nullable) in v9; if a client
+        // sends 0 (null) we treat it as empty.
+        None => String::new(),
+    };
+    let (s, partitions) = parse_compact_array(s, parse_produce_partition_flexible)?;
+    let (s, _) = skip_tagged_fields(s)?;
+    Ok((s, ProduceTopicData { name, partitions }))
+}
+
+fn parse_produce_partition_flexible(s: NomBytes) -> IResult<NomBytes, ProducePartitionData> {
+    let (s, partition_index) = be_i32(s)?;
+    // records: COMPACT_NULLABLE_BYTES — varint length, where 0 = null.
+    let (s, raw_len) = parse_unsigned_varint(s)?;
+    let (s, records) = if raw_len == 0 {
+        (s, Bytes::new())
+    } else {
+        let n = (raw_len - 1) as usize;
+        let (s, payload) = nom::bytes::complete::take(n)(s)?;
+        (s, payload.into_bytes())
+    };
+    let (s, _) = skip_tagged_fields(s)?;
+    Ok((
+        s,
+        ProducePartitionData {
+            partition_index,
+            records,
+        },
+    ))
+}
+
+/// Parse a flexible compact array.
+fn parse_compact_array<O, F>(
+    s: NomBytes,
+    mut item: F,
+) -> IResult<NomBytes, Vec<O>>
+where
+    F: FnMut(NomBytes) -> IResult<NomBytes, O>,
+{
+    let (s, raw_len) = parse_unsigned_varint(s)?;
+    if raw_len == 0 {
+        return Ok((s, Vec::new()));
+    }
+    let n = (raw_len - 1) as usize;
+    if n > crate::constants::MAX_PROTOCOL_ARRAY_SIZE as usize {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            s,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut remaining = s;
+    for _ in 0..n {
+        let (next, x) = item(remaining)?;
+        out.push(x);
+        remaining = next;
+    }
+    Ok((remaining, out))
 }
 
 #[cfg(test)]
@@ -223,5 +342,67 @@ mod tests {
         assert_eq!(req.transactional_id.as_deref(), Some("txn-1"));
         assert_eq!(req.acks, -1);
         assert_eq!(req.topics.len(), 0);
+    }
+
+    /// v9 flexible: transactional_id compact-nullable, compact arrays,
+    /// trailing tagged-fields after every record.
+    #[test]
+    fn v9_flexible_round_trip() {
+        let mut buf = BytesMut::new();
+        // transactional_id = null (varint 0)
+        buf.put_u8(0);
+        buf.put_i16(1); // acks
+        buf.put_i32(30_000); // timeout_ms
+        // topics: compact_array len 1 -> varint 2
+        buf.put_u8(0x02);
+        // topic.name = "t" -> compact_string (varint 2 + 1 byte)
+        buf.put_u8(0x02);
+        buf.put_slice(b"t");
+        // partitions: compact_array len 1 -> varint 2
+        buf.put_u8(0x02);
+        // partition_index
+        buf.put_i32(0);
+        // records: compact_nullable_bytes — len 4 -> varint 5 + 4 payload bytes
+        buf.put_u8(0x05);
+        buf.put_slice(b"abcd");
+        // partition tagged fields
+        buf.put_u8(0);
+        // topic tagged fields
+        buf.put_u8(0);
+        // body tagged fields
+        buf.put_u8(0);
+
+        let (rest, req) =
+            parse_produce_request(NomBytes::new(buf.freeze()), 9).expect("v9 valid");
+        assert!(rest.to_bytes().is_empty());
+        assert_eq!(req.transactional_id, None);
+        assert_eq!(req.acks, 1);
+        assert_eq!(req.timeout_ms, 30_000);
+        assert_eq!(req.topics.len(), 1);
+        assert_eq!(req.topics[0].name, "t");
+        assert_eq!(req.topics[0].partitions.len(), 1);
+        assert_eq!(req.topics[0].partitions[0].records.as_ref(), b"abcd");
+    }
+
+    /// v9 with null records compact (varint 0): produces an empty
+    /// payload, not a parse error.
+    #[test]
+    fn v9_flexible_null_records_decodes_as_empty() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0); // transactional_id = null
+        buf.put_i16(1);
+        buf.put_i32(30_000);
+        buf.put_u8(0x02); // 1 topic
+        buf.put_u8(0x02); // name "t"
+        buf.put_slice(b"t");
+        buf.put_u8(0x02); // 1 partition
+        buf.put_i32(0);
+        buf.put_u8(0); // records: compact null
+        buf.put_u8(0); // partition tagged
+        buf.put_u8(0); // topic tagged
+        buf.put_u8(0); // body tagged
+
+        let (_, req) = parse_produce_request(NomBytes::new(buf.freeze()), 9).expect("null OK");
+        assert!(req.topics[0].partitions[0].records.is_empty());
     }
 }

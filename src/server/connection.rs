@@ -1274,6 +1274,14 @@ async fn dispatch_request_common<H: Handler>(
             correlation_id,
             &handler.handle_delete_topics(&ctx, req).await,
         ),
+        Request::DescribeConfigs(_, req) => encode_response(
+            correlation_id,
+            &handler.handle_describe_configs(&ctx, req).await,
+        ),
+        Request::AlterConfigs(_, req) => encode_response(
+            correlation_id,
+            &handler.handle_alter_configs(&ctx, req).await,
+        ),
         Request::InitProducerId(header, req) => {
             let resp = handler.handle_init_producer_id(&ctx, req).await;
             error_code_label = resp.error_code.metric_label();

@@ -479,38 +479,88 @@ proptest! {
 }
 
 // ===========================================================================
-// postcard codec for CoordinationCommand (Raft log entries + snapshots)
+// postcard codec for ControlCommand / ShardCommand (Raft log entries + snapshots)
 // ===========================================================================
 
 mod postcard_props {
     use super::*;
-    use kafkaesque::cluster::raft::CoordinationCommand;
+    use kafkaesque::cluster::raft::domains::PartitionStateCommand;
+    use kafkaesque::cluster::raft::{BrokerCommand, ControlCommand, ShardCommand};
 
     proptest! {
         #[test]
-        fn coordination_command_postcard_decode_never_panics(
+        fn control_command_postcard_decode_never_panics(
             data in proptest::collection::vec(any::<u8>(), 0..1024),
         ) {
             // Property: arbitrary bytes feeding postcard::from_bytes must
             // never panic. A panic here takes down the broker on restart
             // (decoding a corrupt log entry / snapshot pointer).
-            let _ = postcard::from_bytes::<CoordinationCommand>(&data);
+            let _ = postcard::from_bytes::<ControlCommand>(&data);
         }
 
         #[test]
-        fn coordination_command_postcard_canonical_roundtrip(
+        fn shard_command_postcard_decode_never_panics(
+            data in proptest::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let _ = postcard::from_bytes::<ShardCommand>(&data);
+        }
+
+        #[test]
+        fn control_command_postcard_canonical_roundtrip(
             data in proptest::collection::vec(any::<u8>(), 0..1024),
         ) {
             // If a byte string decodes, re-encoding it must produce a
             // string that re-decodes to the same value (canonicalisation).
-            if let Ok(decoded) = postcard::from_bytes::<CoordinationCommand>(&data) {
+            if let Ok(decoded) = postcard::from_bytes::<ControlCommand>(&data) {
                 let reencoded = postcard::to_stdvec(&decoded)
                     .expect("decoded value must always re-encode");
-                let again: CoordinationCommand =
+                let again: ControlCommand =
                     postcard::from_bytes(&reencoded)
                         .expect("canonical form must decode");
                 prop_assert_eq!(decoded, again);
             }
         }
+
+        #[test]
+        fn shard_command_postcard_canonical_roundtrip(
+            data in proptest::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            if let Ok(decoded) = postcard::from_bytes::<ShardCommand>(&data) {
+                let reencoded = postcard::to_stdvec(&decoded)
+                    .expect("decoded value must always re-encode");
+                let again: ShardCommand =
+                    postcard::from_bytes(&reencoded)
+                        .expect("canonical form must decode");
+                prop_assert_eq!(decoded, again);
+            }
+        }
+    }
+
+    // Smoke roundtrips on hand-built representative variants — the
+    // proptests above hammer the decode path with random bytes; these
+    // pin the canonical-encode shape of each variant we actually emit.
+    #[test]
+    fn control_command_register_broker_roundtrip() {
+        let cmd = ControlCommand::Broker(BrokerCommand::Register {
+            broker_id: 1,
+            host: "localhost".to_string(),
+            port: 9092,
+            timestamp_ms: 1000,
+        });
+        let bytes = postcard::to_stdvec(&cmd).unwrap();
+        let back: ControlCommand = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn shard_command_init_partition_roundtrip() {
+        let cmd = ShardCommand::Partition(PartitionStateCommand::InitPartition {
+            topic: "t".to_string(),
+            partition: 3,
+            created_at_ms: 1000,
+        });
+        let bytes = postcard::to_stdvec(&cmd).unwrap();
+        let back: ShardCommand = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(cmd, back);
     }
 }

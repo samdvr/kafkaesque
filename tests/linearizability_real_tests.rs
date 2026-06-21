@@ -624,8 +624,8 @@ async fn build_multi_node_raft(n: u64) -> Vec<Arc<RaftCoordinator>> {
     for (idx, addr) in raft_addrs.iter().enumerate().skip(1) {
         let node_id = (idx + 1) as u64;
         coords[0]
-            .node()
-            .add_learner(node_id, addr.clone())
+            .cluster()
+            .add_learner_all_groups(node_id, addr.clone())
             .await
             .expect("add_learner");
     }
@@ -636,8 +636,8 @@ async fn build_multi_node_raft(n: u64) -> Vec<Arc<RaftCoordinator>> {
     let mut promoted = false;
     while start.elapsed() < promote_deadline {
         if coords[0]
-            .node()
-            .change_membership(voters.clone())
+            .cluster()
+            .change_membership_all_groups(voters.clone())
             .await
             .is_ok()
         {

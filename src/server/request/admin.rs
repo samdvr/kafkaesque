@@ -7,8 +7,8 @@ use nom::{
 use nombytes::NomBytes;
 
 use crate::parser::{
-    bytes_to_string_opt, parse_array, parse_compact_nullable_string, parse_kafka_string,
-    parse_nullable_string, parse_string, skip_tagged_fields,
+    bytes_to_string, bytes_to_string_opt, parse_array, parse_compact_nullable_string,
+    parse_kafka_string, parse_nullable_string, skip_tagged_fields,
 };
 
 // ============================================================================
@@ -30,6 +30,11 @@ pub struct CreateTopicData {
     pub name: String,
     pub num_partitions: i32,
     pub replication_factor: i16,
+    /// Per-topic config entries from `CreateTopicsRequest` v0+. The wire
+    /// format carries `Option<String>` values: `None` is the protocol-level
+    /// NULL (no value), distinct from `Some("")` (the literal empty string).
+    /// We forward both verbatim — validation lives at the handler boundary.
+    pub configs: Vec<(String, Option<String>)>,
 }
 
 pub fn parse_create_topics_request(
@@ -62,16 +67,22 @@ fn parse_create_topic(s: NomBytes) -> IResult<NomBytes, CreateTopicData> {
     let (s, name) = parse_kafka_string(s)?;
     let (s, num_partitions) = be_i32(s)?;
     let (s, replication_factor) = be_i16(s)?;
-    // Skip replica assignments and configs for now
+    // Skip replica assignments (we don't honor explicit assignments yet).
     let (s, _replica_assignments) = parse_array(|s| {
         let (s, _) = be_i32(s)?;
         let (s, _) = parse_array(be_i32)(s)?;
         Ok((s, ()))
     })(s)?;
-    let (s, _configs) = parse_array(|s| {
-        let (s, _) = parse_string(s)?;
-        let (s, _) = parse_nullable_string(s)?;
-        Ok((s, ()))
+    // Configs: name STRING + value NULLABLE_STRING. Carry both through to
+    // the handler so it can validate `cleanup.policy` etc. before persist.
+    let (s, configs) = parse_array(|s| {
+        let (s, name) = parse_kafka_string(s)?;
+        let (s, value_bytes) = parse_nullable_string(s)?;
+        let value = match value_bytes {
+            None => None,
+            Some(b) => Some(bytes_to_string(&b)?),
+        };
+        Ok((s, (name, value)))
     })(s)?;
 
     Ok((
@@ -80,6 +91,7 @@ fn parse_create_topic(s: NomBytes) -> IResult<NomBytes, CreateTopicData> {
             name,
             num_partitions,
             replication_factor,
+            configs,
         },
     ))
 }
@@ -335,12 +347,56 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_create_topics_request_captures_configs() {
+        // CreateTopics carries per-topic config entries (name + nullable
+        // value). Until the plumbing for `cleanup.policy=compact` etc.
+        // landed, the parser silently dropped them; this test pins that
+        // they make it back to the handler intact, including the
+        // null-vs-empty distinction Kafka uses for "delete" vs "set to ''".
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i32.to_be_bytes()); // 1 topic
+        data.extend_from_slice(&5i16.to_be_bytes());
+        data.extend_from_slice(b"t-cfg");
+        data.extend_from_slice(&1i32.to_be_bytes()); // partitions
+        data.extend_from_slice(&1i16.to_be_bytes()); // replication
+        data.extend_from_slice(&0i32.to_be_bytes()); // empty replica assignments
+        // configs: 3 entries
+        data.extend_from_slice(&3i32.to_be_bytes());
+        // 1: cleanup.policy = "compact"
+        data.extend_from_slice(&14i16.to_be_bytes());
+        data.extend_from_slice(b"cleanup.policy");
+        data.extend_from_slice(&7i16.to_be_bytes());
+        data.extend_from_slice(b"compact");
+        // 2: retention.ms = null
+        data.extend_from_slice(&12i16.to_be_bytes());
+        data.extend_from_slice(b"retention.ms");
+        data.extend_from_slice(&(-1i16).to_be_bytes());
+        // 3: empty.value = ""
+        data.extend_from_slice(&11i16.to_be_bytes());
+        data.extend_from_slice(b"empty.value");
+        data.extend_from_slice(&0i16.to_be_bytes());
+        data.extend_from_slice(&30000i32.to_be_bytes()); // timeout_ms
+
+        let (rest, request) = parse_create_topics_request(create_nom_bytes(&data), 0).unwrap();
+        assert!(rest.into_bytes().is_empty(), "must consume entire body");
+        let cfgs = &request.topics[0].configs;
+        assert_eq!(cfgs.len(), 3);
+        assert_eq!(cfgs[0].0, "cleanup.policy");
+        assert_eq!(cfgs[0].1.as_deref(), Some("compact"));
+        assert_eq!(cfgs[1].0, "retention.ms");
+        assert_eq!(cfgs[1].1, None, "null value distinct from empty");
+        assert_eq!(cfgs[2].0, "empty.value");
+        assert_eq!(cfgs[2].1.as_deref(), Some(""));
+    }
+
+    #[test]
     fn test_create_topics_request_data_debug() {
         let data = CreateTopicsRequestData {
             topics: vec![CreateTopicData {
                 name: "test".to_string(),
                 num_partitions: 1,
                 replication_factor: 1,
+                configs: vec![],
             }],
             timeout_ms: 5000,
             validate_only: false,
@@ -357,6 +413,7 @@ mod tests {
                 name: "test".to_string(),
                 num_partitions: 3,
                 replication_factor: 1,
+                configs: vec![],
             }],
             timeout_ms: 10000,
             validate_only: false,
@@ -373,6 +430,7 @@ mod tests {
             name: "my-topic".to_string(),
             num_partitions: 10,
             replication_factor: 3,
+            configs: vec![],
         };
         let cloned = original.clone();
         assert_eq!(cloned.name, "my-topic");
@@ -695,6 +753,7 @@ mod tests {
             name: "test".to_string(),
             num_partitions: 3,
             replication_factor: 1,
+            configs: vec![],
         };
         let debug = format!("{:?}", data);
         assert!(debug.contains("CreateTopicData"));

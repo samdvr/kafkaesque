@@ -1,24 +1,14 @@
 //! Per-Raft-group polymorphism.
 //!
-//! The metadata layout is migrating from a single Raft group to a control
-//! group plus N shard groups. To avoid duplicating 1500 lines of storage
-//! code per group, [`RaftStore`] is generic over a [`GroupKind`] trait
-//! that bundles the openraft `TypeConfig`, the SM wrapper, the SM state
-//! type, and a few thin operations (apply, snapshot, deserialize, new).
+//! `RaftStore<G>` is generic over a [`GroupKind`] trait that bundles the
+//! openraft `TypeConfig`, the SM wrapper, the SM state type, and a few
+//! thin operations (apply, snapshot, deserialize, new). Two impls:
 //!
-//! Three impls are provided:
-//!
-//! - [`LegacyGroupKind`] — wraps the existing
-//!   [`legacy::CoordinationStateMachine`]. Exists ONLY so the legacy
-//!   `RaftNode` and its tests keep compiling while the migration lands.
-//!   Deleted in step 10 of the sharding plan.
 //! - [`ControlGroupKind`] — wraps [`control::ControlStateMachine`].
 //! - [`ShardGroupKind`] — wraps [`shard::ShardStateMachine`]. Each shard's
 //!   storage instance is parameterised by its `shard_id` at construction;
 //!   the kind itself is shared across all shard groups since openraft
 //!   needs a single `'static` type per `Raft<Cfg>`.
-
-#![allow(dead_code)] // wired in subsequent migration steps
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -26,20 +16,16 @@ use std::sync::Arc;
 use openraft::BasicNode;
 use tokio::sync::RwLock;
 
-use super::commands::{
-    ControlCommand, ControlResponse, CoordinationCommand, CoordinationResponse, ShardCommand,
-    ShardResponse,
-};
+use super::commands::{ControlCommand, ControlResponse, ShardCommand, ShardResponse};
 use super::state_machine::{
-    CoordinationState, CoordinationStateMachine,
     control::{ControlState, ControlStateMachine},
     shard::{ShardState, ShardStateMachine},
 };
-use super::types::{ControlConfig, RaftNodeId, ShardConfig, ShardId, TypeConfig};
+use super::types::{ControlConfig, RaftNodeId, ShardConfig, ShardId};
 
 /// Bundles the per-group types the storage layer needs.
 ///
-/// All three impls produce an openraft-compatible `RaftTypeConfig` whose
+/// Both impls produce an openraft-compatible `RaftTypeConfig` whose
 /// node id is [`RaftNodeId`], node type is [`BasicNode`], snapshot
 /// transport is `Cursor<Vec<u8>>`, and entry type is `Entry<Cfg>` (the
 /// macro default). The shard kind layers a runtime `shard_id` on top of
@@ -55,9 +41,7 @@ pub trait GroupKind: Sized + Send + Sync + 'static {
     /// `D: Clone` is required because the apply path clones the command
     /// out of an immutable `EntryPayload::Normal(ref cmd)` ref to feed it
     /// into the `async fn apply` (which takes the command by value so the
-    /// SM can match-by-move). The legacy single-group SM relied on the
-    /// concrete `CoordinationCommand: Clone` here; pinning it on the
-    /// trait keeps the same shape.
+    /// SM can match-by-move).
     type Cfg: openraft::RaftTypeConfig<
             NodeId = RaftNodeId,
             Node = BasicNode,
@@ -82,9 +66,9 @@ pub trait GroupKind: Sized + Send + Sync + 'static {
         + serde::Serialize
         + serde::de::DeserializeOwned;
 
-    /// Construction parameter for [`Self::new_sm`]. For the legacy and
-    /// control kinds this is `()`; for the shard kind it carries the
-    /// shard id so each shard's SM is wired with its own identity.
+    /// Construction parameter for [`Self::new_sm`]. For the control kind
+    /// this is `()`; for the shard kind it carries the shard id so each
+    /// shard's SM is wired with its own identity.
     type SmInit: Clone + Send + Sync + 'static;
 
     /// Build a fresh state machine.
@@ -111,73 +95,20 @@ pub trait GroupKind: Sized + Send + Sync + 'static {
     fn snapshot(sm: &Self::Sm) -> impl std::future::Future<Output = Vec<u8>> + Send + '_;
 
     /// Apply a single committed log entry's command to the SM and return
-    /// its response. Returns an `impl Future + Send` for the same reason
-    /// as [`Self::snapshot`].
+    /// its response.
     fn apply(
         sm: &Self::Sm,
         cmd: <Self::Cfg as openraft::RaftTypeConfig>::D,
     ) -> impl std::future::Future<Output = <Self::Cfg as openraft::RaftTypeConfig>::R> + Send + '_;
 
     /// Generic Ok response for `EntryPayload::Blank` and
-    /// `EntryPayload::Membership` entries. Each group's response enum
-    /// has its own `Ok` variant.
+    /// `EntryPayload::Membership` entries.
     fn ok_response() -> <Self::Cfg as openraft::RaftTypeConfig>::R;
 
     /// Per-group on-disk subdirectory under `{raft_log_dir}/node-{id}/`.
     /// Used by storage to avoid log/snapshot collisions across groups.
-    /// Examples: `"control"`, `"shard-3"`, `"legacy"`.
+    /// Examples: `"control"`, `"shard-3"`.
     fn dir_segment(init: &Self::SmInit) -> String;
-}
-
-// ============================================================================
-// LegacyGroupKind — adapter for the existing single-group state machine.
-// ============================================================================
-
-/// Single-group kind backing the existing [`RaftNode`].
-///
-/// This impl exists so the legacy `RaftStore` keeps working while the
-/// multi-group layout is wired in. Deleted alongside `RaftNode` in step
-/// 10 of the sharding plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LegacyGroupKind;
-
-impl GroupKind for LegacyGroupKind {
-    type Cfg = TypeConfig;
-    type Sm = CoordinationStateMachine;
-    type State = CoordinationState;
-    type SmInit = ();
-
-    fn new_sm(_init: ()) -> Self::Sm {
-        CoordinationStateMachine::new()
-    }
-
-    fn sm_state_arc(sm: &Self::Sm) -> Arc<RwLock<Self::State>> {
-        sm.state_arc()
-    }
-
-    fn deserialize_state(bytes: &[u8]) -> std::io::Result<Self::State> {
-        CoordinationStateMachine::deserialize_state(bytes)
-    }
-
-    async fn snapshot(sm: &Self::Sm) -> Vec<u8> {
-        sm.snapshot().await
-    }
-
-    async fn apply(sm: &Self::Sm, cmd: CoordinationCommand) -> CoordinationResponse {
-        sm.apply_command(cmd).await
-    }
-
-    fn ok_response() -> CoordinationResponse {
-        CoordinationResponse::Ok
-    }
-
-    fn dir_segment(_init: &Self::SmInit) -> String {
-        // The legacy single-group store predates per-group directories;
-        // call sites pick the directory directly. This segment is only
-        // used by the new generic helpers, so a stable placeholder is
-        // fine.
-        "legacy".to_string()
-    }
 }
 
 // ============================================================================
@@ -273,16 +204,8 @@ impl GroupKind for ShardGroupKind {
 #[cfg(test)]
 mod tests {
     //! Smoke tests confirming every `GroupKind` impl round-trips.
-    //!
-    //! These aren't trying to re-test the SM logic — that's covered in
-    //! each SM's own tests. They confirm that the trait wires up the
-    //! right SM constructors / decoders / appliers.
 
     use super::*;
-
-    fn legacy_sm() -> CoordinationStateMachine {
-        LegacyGroupKind::new_sm(())
-    }
 
     fn control_sm() -> ControlStateMachine {
         ControlGroupKind::new_sm(())
@@ -290,17 +213,6 @@ mod tests {
 
     fn shard_sm(id: ShardId) -> ShardStateMachine {
         ShardGroupKind::new_sm(id)
-    }
-
-    #[tokio::test]
-    async fn legacy_kind_apply_and_snapshot_roundtrip() {
-        let sm = legacy_sm();
-        let resp = LegacyGroupKind::apply(&sm, CoordinationCommand::Noop).await;
-        assert!(matches!(resp, CoordinationResponse::Ok));
-        let bytes = LegacyGroupKind::snapshot(&sm).await;
-        let state = LegacyGroupKind::deserialize_state(&bytes).unwrap();
-        // version is bumped on every apply, including Noop.
-        assert_eq!(state.version, 1);
     }
 
     #[tokio::test]
@@ -326,7 +238,6 @@ mod tests {
 
     #[test]
     fn dir_segments_are_distinct_per_group() {
-        assert_eq!(LegacyGroupKind::dir_segment(&()), "legacy");
         assert_eq!(ControlGroupKind::dir_segment(&()), "control");
         assert_eq!(ShardGroupKind::dir_segment(&3), "shard-3");
         assert_eq!(ShardGroupKind::dir_segment(&0), "shard-0");
@@ -334,10 +245,6 @@ mod tests {
 
     #[test]
     fn ok_response_per_kind_is_ok_variant() {
-        match LegacyGroupKind::ok_response() {
-            CoordinationResponse::Ok => {}
-            _ => panic!("expected Ok"),
-        }
         match ControlGroupKind::ok_response() {
             ControlResponse::Ok => {}
             _ => panic!("expected Ok"),
@@ -350,9 +257,8 @@ mod tests {
 
     #[tokio::test]
     async fn deserialize_state_rejects_corrupt_bytes() {
-        for label in ["legacy", "control", "shard"] {
+        for label in ["control", "shard"] {
             let result: std::io::Result<()> = match label {
-                "legacy" => LegacyGroupKind::deserialize_state(&[0xff; 16]).map(|_| ()),
                 "control" => ControlGroupKind::deserialize_state(&[0xff; 16]).map(|_| ()),
                 "shard" => ShardGroupKind::deserialize_state(&[0xff; 16]).map(|_| ()),
                 _ => unreachable!(),

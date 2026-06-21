@@ -836,6 +836,53 @@ pub struct ClusterConfig {
     /// Default: 100ms
     pub slatedb_flush_interval_ms: u64,
 
+    /// Total budget (in bytes) of the **shared** SlateDB block cache.
+    ///
+    /// One `MokaCache` instance is built at broker startup and injected into
+    /// every per-partition `Db::builder` via `with_memory_cache`, replacing
+    /// SlateDB's per-DB default cache. At N partitions on one broker the
+    /// memory floor drops from N × per-DB cache to one shared budget.
+    ///
+    /// Sized for ~100 partitions on a 16 GiB broker host (≈20 MiB amortized
+    /// per partition; far above the per-partition cache miss rate observed
+    /// in practice). Note this bounds the **read-side** cache only —
+    /// `slatedb_max_unflushed_bytes` (write-side memtable budget) is still
+    /// per-partition.
+    ///
+    /// Set to `0` to disable the shared cache; each `Db` then falls back to
+    /// SlateDB's default per-DB cache (today's behaviour, useful for A/B).
+    ///
+    /// Env: `SLATEDB_BLOCK_CACHE_BYTES`. Default: 2 GiB.
+    pub slatedb_block_cache_bytes: usize,
+
+    /// Worker thread count of the **dedicated** compaction runtime.
+    ///
+    /// Every per-`Db` compactor task spawns onto one shared multi-thread
+    /// runtime owned by `PartitionManager`, replacing N independent
+    /// compactor pools running on the ambient runtime. The worker count
+    /// caps total compaction parallelism across all partitions.
+    ///
+    /// Why a dedicated runtime (not the request runtime): compaction CPU
+    /// bursts on the request runtime would head-of-line block raft
+    /// heartbeats and trigger spurious failovers given the failure
+    /// detector's tuning.
+    ///
+    /// Set to `0` to fall back to the ambient runtime — escape hatch
+    /// only; not recommended.
+    ///
+    /// Env: `SLATEDB_COMPACTION_WORKERS`. Default: 4.
+    pub slatedb_compaction_workers: usize,
+
+    /// Thread-name prefix for the dedicated compaction runtime's workers.
+    ///
+    /// Quality-of-life only — surfaces compaction threads under
+    /// `top -H` and in flamegraphs so an operator can tell compaction
+    /// activity apart from request-handling activity.
+    ///
+    /// Env: `SLATEDB_COMPACTION_THREAD_NAME_PREFIX`. Default:
+    /// `"slatedb-compact"`.
+    pub slatedb_compaction_thread_name_prefix: String,
+
     // --- Log Retention ---
     /// Time-based log retention in milliseconds (`retention.ms` analogue).
     ///
@@ -852,6 +899,54 @@ pub struct ClusterConfig {
     ///
     /// Env: `LOG_RETENTION_CHECK_INTERVAL_SECS`. Default: 300 (5 minutes)
     pub log_retention_check_interval_secs: u64,
+
+    // --- Log Compaction (cleanup.policy=compact) ---
+    /// Default for `min.cleanable.dirty.bytes`. A compaction pass on a
+    /// partition runs only once at least this many bytes of "dirty" log
+    /// (records below the cleanable boundary that haven't been compacted
+    /// yet) have accumulated. Tuning this trades object-store cost for
+    /// compaction freshness; the floor is high enough that a small idle
+    /// topic isn't compacted every interval.
+    ///
+    /// Env: `COMPACTION_MIN_CLEANABLE_DIRTY_BYTES`. Default: 64 MiB.
+    pub compaction_default_min_cleanable_dirty_bytes: u64,
+
+    /// Default for `min.compaction.lag.ms`. Records younger than this
+    /// (measured against `max_timestamp` on their batch) are NOT eligible
+    /// for compaction even if they've been superseded; this gives lagging
+    /// consumers a window to read recent values before they vanish.
+    ///
+    /// Env: `COMPACTION_MIN_LAG_MS`. Default: 0 (Kafka default).
+    pub compaction_default_min_lag_ms: i64,
+
+    /// Default for `max.compaction.lag.ms`. Records older than this become
+    /// eligible regardless of the dirty-byte budget. `i64::MAX` disables.
+    ///
+    /// Env: `COMPACTION_MAX_LAG_MS`. Default: `i64::MAX` (disabled).
+    pub compaction_default_max_lag_ms: i64,
+
+    /// Default for `delete.retention.ms`. How long a tombstone (null-value
+    /// record) is retained after the last non-tombstone for the same key
+    /// has been compacted away — Kafka's contract for letting consumers
+    /// observe a delete before it disappears.
+    ///
+    /// Env: `COMPACTION_DELETE_RETENTION_MS`. Default: 24 hours
+    /// (Kafka default).
+    pub compaction_default_delete_retention_ms: i64,
+
+    /// How often the compaction task scans owned partitions, in seconds.
+    /// Mirrors `log_retention_check_interval_secs` for compaction.
+    ///
+    /// Env: `COMPACTION_CHECK_INTERVAL_SECS`. Default: 300 (5 minutes).
+    pub compaction_check_interval_secs: u64,
+
+    /// Maximum number of partition compactions running concurrently on
+    /// this broker. Compaction reads and rewrites against the object
+    /// store; without a cap a fan-out across thousands of owned partitions
+    /// would saturate the egress budget.
+    ///
+    /// Env: `COMPACTION_MAX_IN_FLIGHT_PARTITIONS`. Default: 4.
+    pub compaction_max_in_flight_partitions: usize,
 
     // --- Runtime Configuration ---
     /// Number of worker threads for the control plane runtime.
@@ -969,9 +1064,19 @@ impl Default for ClusterConfig {
             slatedb_max_unflushed_bytes: 256 * 1024 * 1024, // 256 MB
             slatedb_l0_sst_size_bytes: 64 * 1024 * 1024,    // 64 MB
             slatedb_flush_interval_ms: 100,
+            slatedb_block_cache_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB shared
+            slatedb_compaction_workers: 4,
+            slatedb_compaction_thread_name_prefix: "slatedb-compact".to_string(),
             // Log retention (disabled by default — see field docs)
             log_retention_ms: -1,
             log_retention_check_interval_secs: 300,
+            // Log compaction defaults
+            compaction_default_min_cleanable_dirty_bytes: 64 * 1024 * 1024, // 64 MiB
+            compaction_default_min_lag_ms: 0,
+            compaction_default_max_lag_ms: i64::MAX,
+            compaction_default_delete_retention_ms: 24 * 60 * 60 * 1000, // 24h
+            compaction_check_interval_secs: 300,
+            compaction_max_in_flight_partitions: 4,
             // Runtime configuration
             control_plane_threads: 2,
             data_plane_threads: std::thread::available_parallelism()
@@ -1351,6 +1456,11 @@ impl ClusterConfig {
         // tokio::time::interval, which panics on zero)
         if self.log_retention_check_interval_secs == 0 {
             errors.push("log_retention_check_interval_secs must be greater than 0".to_string());
+        }
+
+        // Compaction check interval drives the same kind of tokio interval.
+        if self.compaction_check_interval_secs == 0 {
+            errors.push("compaction_check_interval_secs must be greater than 0".to_string());
         }
 
         // Min lease TTL for write validation
@@ -1902,6 +2012,22 @@ impl ClusterConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(defaults.slatedb_flush_interval_ms);
 
+        let slatedb_block_cache_bytes: usize = std::env::var("SLATEDB_BLOCK_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.slatedb_block_cache_bytes);
+
+        let slatedb_compaction_workers: usize = std::env::var("SLATEDB_COMPACTION_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.slatedb_compaction_workers);
+
+        let slatedb_compaction_thread_name_prefix: String =
+            std::env::var("SLATEDB_COMPACTION_THREAD_NAME_PREFIX")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| defaults.slatedb_compaction_thread_name_prefix.clone());
+
         // Log retention
         let log_retention_ms: i64 = std::env::var("LOG_RETENTION_MS")
             .ok()
@@ -1913,6 +2039,40 @@ impl ClusterConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(defaults.log_retention_check_interval_secs);
+
+        // Log compaction
+        let compaction_default_min_cleanable_dirty_bytes: u64 =
+            std::env::var("COMPACTION_MIN_CLEANABLE_DIRTY_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.compaction_default_min_cleanable_dirty_bytes);
+
+        let compaction_default_min_lag_ms: i64 = std::env::var("COMPACTION_MIN_LAG_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.compaction_default_min_lag_ms);
+
+        let compaction_default_max_lag_ms: i64 = std::env::var("COMPACTION_MAX_LAG_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.compaction_default_max_lag_ms);
+
+        let compaction_default_delete_retention_ms: i64 =
+            std::env::var("COMPACTION_DELETE_RETENTION_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.compaction_default_delete_retention_ms);
+
+        let compaction_check_interval_secs: u64 = std::env::var("COMPACTION_CHECK_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.compaction_check_interval_secs);
+
+        let compaction_max_in_flight_partitions: usize =
+            std::env::var("COMPACTION_MAX_IN_FLIGHT_PARTITIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.compaction_max_in_flight_partitions);
 
         // Runtime configuration
         let control_plane_threads: usize = std::env::var("CONTROL_PLANE_THREADS")
@@ -1972,8 +2132,17 @@ impl ClusterConfig {
             slatedb_max_unflushed_bytes,
             slatedb_l0_sst_size_bytes,
             slatedb_flush_interval_ms,
+            slatedb_block_cache_bytes,
+            slatedb_compaction_workers,
+            slatedb_compaction_thread_name_prefix,
             log_retention_ms,
             log_retention_check_interval_secs,
+            compaction_default_min_cleanable_dirty_bytes,
+            compaction_default_min_lag_ms,
+            compaction_default_max_lag_ms,
+            compaction_default_delete_retention_ms,
+            compaction_check_interval_secs,
+            compaction_max_in_flight_partitions,
             control_plane_threads,
             data_plane_threads,
             max_owned_partitions_per_broker,

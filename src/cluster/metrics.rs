@@ -772,6 +772,80 @@ pub static PENDING_REBALANCES: Lazy<IntGauge> = Lazy::new(|| {
     )
 });
 
+// ============================================================================
+// Shared SlateDB resources (block cache + dedicated compaction runtime)
+// ============================================================================
+//
+// One block cache + one dedicated compaction runtime are built at broker
+// startup (see `cluster::slatedb_resources::SharedSlateDbResources`) and
+// shared across every per-partition `Db`. These gauges surface the
+// runtime state of those pools so an operator can see them filling /
+// emptying without opening a debugger.
+//
+// Note: SlateDB's `MokaCache` wraps a per-DB scope token around every
+// entry (`DbCacheWrapper`). When a partition is released its `Db` drops
+// but the entries it inserted under its scope remain in the cache and
+// only become eligible for normal LRU eviction. A high-churn broker
+// will see `entry_count` grow with stale-scope entries until the cache
+// fills — that's why having visibility on this gauge matters.
+
+/// Configured shared block-cache budget in bytes.
+///
+/// Mirrors `ClusterConfig::slatedb_block_cache_bytes`. Set once at
+/// startup; doesn't move at runtime. `0` indicates the operator has
+/// disabled the shared cache (each `Db` falls back to its own
+/// per-DB default).
+pub static SLATEDB_BLOCK_CACHE_BYTES_CONFIGURED: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge_safe(
+        &REGISTRY,
+        "slatedb_block_cache_bytes_configured",
+        "Configured shared SlateDB block-cache byte budget (0 = disabled)",
+    )
+});
+
+/// Live entry count of the shared block cache.
+///
+/// Sum across every (`scope`, `key`) the cache currently holds. Grows as
+/// reads land cache entries; plateaus or shrinks once size-based LRU
+/// eviction kicks in. Worth alerting on if it sits at the configured
+/// byte budget for sustained periods — that's a "cache is too small"
+/// signal for the partition footprint.
+pub static SLATEDB_BLOCK_CACHE_ENTRY_COUNT: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge_safe(
+        &REGISTRY,
+        "slatedb_block_cache_entry_count",
+        "Number of entries currently held in the shared SlateDB block cache",
+    )
+});
+
+/// Configured worker count of the dedicated compaction runtime.
+///
+/// Mirrors `ClusterConfig::slatedb_compaction_workers`. `0` indicates
+/// the escape hatch — compaction is running on the ambient request
+/// runtime instead of a dedicated pool.
+pub static SLATEDB_COMPACTION_WORKERS_CONFIGURED: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge_safe(
+        &REGISTRY,
+        "slatedb_compaction_workers_configured",
+        "Worker count of the dedicated compaction runtime (0 = ambient)",
+    )
+});
+
+/// Set the shared SlateDB resource gauges. Called once after
+/// `PartitionManager` constructs its `SharedSlateDbResources` so the
+/// configured-budget gauges are non-zero from the first scrape.
+pub fn set_slatedb_resources_configured(block_cache_bytes: usize, compaction_workers: usize) {
+    SLATEDB_BLOCK_CACHE_BYTES_CONFIGURED.set(block_cache_bytes as i64);
+    SLATEDB_COMPACTION_WORKERS_CONFIGURED.set(compaction_workers as i64);
+}
+
+/// Update the live block-cache entry count gauge. Called from the
+/// `PartitionManager` background metrics task; cheap but takes a
+/// `DbCache::entry_count()` per call so it's not a hot-path call.
+pub fn set_slatedb_block_cache_entry_count(count: u64) {
+    SLATEDB_BLOCK_CACHE_ENTRY_COUNT.set(count as i64);
+}
+
 /// SlateDB storage operation latency
 pub static STORAGE_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec_safe(

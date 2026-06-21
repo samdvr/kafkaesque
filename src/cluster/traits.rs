@@ -268,6 +268,53 @@ pub trait PartitionCoordinator: Send + Sync {
     /// Register a topic with its partition count.
     async fn register_topic(&self, topic: &str, partitions: i32) -> SlateDBResult<()>;
 
+    /// Register a topic with its partition count and a per-topic config map.
+    ///
+    /// The default implementation calls [`register_topic`] (dropping the
+    /// config). Implementations that persist topic configs should override
+    /// this so CreateTopics-supplied keys (e.g. `cleanup.policy=compact`)
+    /// reach the registry.
+    ///
+    /// [`register_topic`]: Self::register_topic
+    async fn register_topic_with_config(
+        &self,
+        topic: &str,
+        partitions: i32,
+        _config: std::collections::HashMap<String, String>,
+    ) -> SlateDBResult<()> {
+        self.register_topic(topic, partitions).await
+    }
+
+    /// Read a topic's current config map.
+    ///
+    /// Returns `Ok(None)` for unknown topics. The map is the verbatim
+    /// content of the topic registry — callers that want a typed view
+    /// should run it through [`crate::cluster::TopicCompactionConfig::resolve`].
+    ///
+    /// Default returns `None` for every topic so non-Raft test
+    /// implementations don't need to track configs.
+    async fn get_topic_config(
+        &self,
+        _topic: &str,
+    ) -> SlateDBResult<Option<std::collections::HashMap<String, String>>> {
+        Ok(None)
+    }
+
+    /// Replace a topic's config map.
+    ///
+    /// Returns `Ok(true)` if the topic existed and its config was updated,
+    /// `Ok(false)` if the topic does not exist. The map fully replaces
+    /// the previous map — there is no per-key merge here. Validation of
+    /// the proposed final map is the caller's responsibility (see
+    /// [`crate::cluster::TopicCompactionConfig::validate_raw`]).
+    async fn update_topic_config(
+        &self,
+        _topic: &str,
+        _config: std::collections::HashMap<String, String>,
+    ) -> SlateDBResult<bool> {
+        Ok(false)
+    }
+
     /// Get all topics.
     async fn get_topics(&self) -> SlateDBResult<Vec<String>>;
 

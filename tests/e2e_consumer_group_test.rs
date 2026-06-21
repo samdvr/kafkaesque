@@ -281,6 +281,7 @@ async fn test_consumer_group_protocol_debug() {
             name: topic.to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,

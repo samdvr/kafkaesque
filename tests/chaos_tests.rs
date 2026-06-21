@@ -255,6 +255,7 @@ impl TestCluster {
 
         // Get shared state from first broker
         let shared_topics = broker1.topics.clone();
+        let shared_topic_configs = broker1.topic_configs.clone();
         let shared_owners = broker1.partition_owners.clone();
         let shared_brokers_state = broker1.brokers.clone();
         let shared_epochs = broker1.partition_epochs.clone();
@@ -269,6 +270,7 @@ impl TestCluster {
                 port: next_port() as i32,
                 brokers: shared_brokers_state.clone(),
                 topics: shared_topics.clone(),
+                topic_configs: shared_topic_configs.clone(),
                 partition_owners: shared_owners.clone(),
                 partition_epochs: shared_epochs.clone(),
                 consumer_groups: Arc::new(RwLock::new(HashMap::new())),

@@ -46,6 +46,7 @@ impl MultiBrokerCluster {
 
         // Get shared state from first broker
         let shared_topics = broker1.topics.clone();
+        let shared_topic_configs = broker1.topic_configs.clone();
         let shared_owners = broker1.partition_owners.clone();
         let shared_brokers_state = broker1.brokers.clone();
         let shared_producer_id = broker1.next_producer_id.clone();
@@ -61,6 +62,7 @@ impl MultiBrokerCluster {
                 port: next_port() as i32,
                 brokers: shared_brokers_state.clone(),
                 topics: shared_topics.clone(),
+                topic_configs: shared_topic_configs.clone(),
                 partition_owners: shared_owners.clone(),
                 partition_epochs: shared_epochs.clone(),
                 consumer_groups: Arc::new(RwLock::new(HashMap::new())),
@@ -277,6 +279,7 @@ mod multi_broker_assignment {
         // Start with 2 brokers
         let broker1 = MockCoordinator::new(1, "localhost", next_port() as i32);
         let shared_topics = broker1.topics.clone();
+        let shared_topic_configs = broker1.topic_configs.clone();
         let shared_owners = broker1.partition_owners.clone();
         let shared_brokers_state = broker1.brokers.clone();
 
@@ -286,6 +289,7 @@ mod multi_broker_assignment {
             port: next_port() as i32,
             brokers: shared_brokers_state.clone(),
             topics: shared_topics.clone(),
+            topic_configs: shared_topic_configs.clone(),
             partition_owners: shared_owners.clone(),
             partition_epochs: broker1.partition_epochs.clone(),
             consumer_groups: Arc::new(RwLock::new(HashMap::new())),
@@ -322,6 +326,7 @@ mod multi_broker_assignment {
             port: next_port() as i32,
             brokers: shared_brokers_state.clone(),
             topics: shared_topics.clone(),
+            topic_configs: shared_topic_configs.clone(),
             partition_owners: shared_owners.clone(),
             partition_epochs: broker1.partition_epochs.clone(),
             consumer_groups: Arc::new(RwLock::new(HashMap::new())),
@@ -953,6 +958,7 @@ mod leader_election {
         let broker1 = MockCoordinator::new(1, "localhost", next_port() as i32);
         let shared_brokers = broker1.brokers.clone();
         let shared_topics = broker1.topics.clone();
+        let shared_topic_configs = broker1.topic_configs.clone();
         let shared_owners = broker1.partition_owners.clone();
         let shared_epochs = broker1.partition_epochs.clone();
 
@@ -967,6 +973,7 @@ mod leader_election {
                 port: next_port() as i32,
                 brokers: shared_brokers.clone(),
                 topics: shared_topics.clone(),
+                topic_configs: shared_topic_configs.clone(),
                 partition_owners: shared_owners.clone(),
                 partition_epochs: shared_epochs.clone(),
                 consumer_groups: Arc::new(RwLock::new(HashMap::new())),

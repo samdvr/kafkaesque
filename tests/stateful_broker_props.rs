@@ -476,6 +476,7 @@ async fn run_ops(ops: Vec<Op>) -> Result<(), String> {
                         name: name.clone(),
                         num_partitions,
                         replication_factor: 1,
+                        configs: vec![],
                     }],
                     timeout_ms: 1000,
                     validate_only: false,

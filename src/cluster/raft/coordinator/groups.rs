@@ -1,15 +1,15 @@
 //! ConsumerGroupCoordinator implementation for RaftCoordinator.
 //!
-//! This module handles:
-//! - Consumer group membership (join/leave)
-//! - Group rebalancing
-//! - Offset commit/fetch
+//! Every consumer-group operation routes to the shard owning
+//! `hash(group_id) % metadata_shards`. The shard owns the group's members,
+//! generation, assignments, and committed offsets — there's no per-group
+//! state on control, so a group operation never crosses shards.
 
 use std::time::Instant;
 
 use async_trait::async_trait;
 
-use super::super::commands::{CoordinationCommand, CoordinationResponse};
+use super::super::commands::{ShardCommand, ShardResponse};
 use super::super::domains::{GroupCommand, GroupResponse};
 use super::{RaftCoordinator, current_time_ms};
 
@@ -66,7 +66,7 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         session_timeout_ms: i32,
         rebalance_timeout_ms: i32,
     ) -> SlateDBResult<GroupJoinOutcome> {
-        let command = CoordinationCommand::GroupDomain(GroupCommand::JoinGroup {
+        let command = ShardCommand::Group(GroupCommand::JoinGroup {
             group_id: group_id.to_string(),
             member_id: member_id.to_string(),
             client_id: "".to_string(),
@@ -78,9 +78,12 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
             timestamp_ms: current_time_ms(),
         });
 
-        let response = self.node.write(command).await?;
+        let response = self
+            .cluster()
+            .write_shard_for_group(group_id, command)
+            .await?;
         match response {
-            CoordinationResponse::GroupDomainResponse(GroupResponse::JoinGroupResponse {
+            ShardResponse::Group(GroupResponse::JoinGroupResponse {
                 generation,
                 leader_id,
                 member_id,
@@ -100,9 +103,9 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
                         .collect(),
                 }))
             }
-            CoordinationResponse::GroupDomainResponse(GroupResponse::InconsistentProtocol {
-                ..
-            }) => Ok(GroupJoinOutcome::InconsistentProtocol),
+            ShardResponse::Group(GroupResponse::InconsistentProtocol { .. }) => {
+                Ok(GroupJoinOutcome::InconsistentProtocol)
+            }
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -117,12 +120,16 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         // every entry committed before the new coordinator answered. A
         // stale local read here can return a previous generation's protocol
         // and cause SyncGroup to write assignments under the wrong key.
-        self.node.ensure_linearizable().await?;
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let shard = self.cluster().shard_for_group(group_id);
+        shard
+            .raft()
+            .ensure_linearizable()
+            .await
+            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+        let sm = shard.state_machine();
+        let state = sm.state().await;
 
-        let protocol = inner_state
+        let protocol = state
             .group_domain
             .groups
             .get(group_id)
@@ -136,19 +143,18 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         group_id: &str,
         expected_generation: i32,
     ) -> SlateDBResult<bool> {
-        let command = CoordinationCommand::GroupDomain(GroupCommand::CompleteRebalance {
+        let command = ShardCommand::Group(GroupCommand::CompleteRebalance {
             group_id: group_id.to_string(),
             generation: expected_generation,
         });
 
-        let response = self.node.write(command).await?;
+        let response = self
+            .cluster()
+            .write_shard_for_group(group_id, command)
+            .await?;
         match response {
-            CoordinationResponse::GroupDomainResponse(GroupResponse::RebalanceCompleted {
-                ..
-            }) => Ok(true),
-            CoordinationResponse::GroupDomainResponse(GroupResponse::IllegalGeneration {
-                ..
-            }) => Ok(false),
+            ShardResponse::Group(GroupResponse::RebalanceCompleted { .. }) => Ok(true),
+            ShardResponse::Group(GroupResponse::IllegalGeneration { .. }) => Ok(false),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -162,12 +168,16 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         // generation is what JoinGroup retries against; serving a stale
         // generation lets a member rejoin with a "valid" generation that
         // the new coordinator has already advanced past.
-        self.node.ensure_linearizable().await?;
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let shard = self.cluster().shard_for_group(group_id);
+        shard
+            .raft()
+            .ensure_linearizable()
+            .await
+            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+        let sm = shard.state_machine();
+        let state = sm.state().await;
 
-        let generation = inner_state
+        let generation = state
             .group_domain
             .groups
             .get(group_id)
@@ -189,11 +199,10 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
 
     async fn get_group_members(&self, group_id: &str) -> SlateDBResult<Vec<String>> {
         let start = Instant::now();
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let sm = self.cluster().shard_for_group(group_id).state_machine();
+        let state = sm.state().await;
 
-        let members = inner_state
+        let members = state
             .group_domain
             .groups
             .get(group_id)
@@ -205,11 +214,10 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
 
     async fn get_group_leader(&self, group_id: &str) -> SlateDBResult<Option<String>> {
         let start = Instant::now();
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let sm = self.cluster().shard_for_group(group_id).state_machine();
+        let state = sm.state().await;
 
-        let leader = inner_state
+        let leader = state
             .group_domain
             .groups
             .get(group_id)
@@ -219,25 +227,30 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
     }
 
     async fn remove_group_member(&self, group_id: &str, member_id: &str) -> SlateDBResult<()> {
-        let command = CoordinationCommand::GroupDomain(GroupCommand::LeaveGroup {
+        let command = ShardCommand::Group(GroupCommand::LeaveGroup {
             group_id: group_id.to_string(),
             member_id: member_id.to_string(),
         });
 
-        self.node.write(command).await?;
+        self.cluster()
+            .write_shard_for_group(group_id, command)
+            .await?;
         Ok(())
     }
 
     async fn leave_group(&self, group_id: &str, member_id: &str) -> SlateDBResult<bool> {
-        let command = CoordinationCommand::GroupDomain(GroupCommand::LeaveGroup {
+        let command = ShardCommand::Group(GroupCommand::LeaveGroup {
             group_id: group_id.to_string(),
             member_id: member_id.to_string(),
         });
 
-        let response = self.node.write(command).await?;
+        let response = self
+            .cluster()
+            .write_shard_for_group(group_id, command)
+            .await?;
         match response {
-            CoordinationResponse::GroupDomainResponse(GroupResponse::LeftGroup) => Ok(true),
-            CoordinationResponse::GroupDomainResponse(
+            ShardResponse::Group(GroupResponse::LeftGroup) => Ok(true),
+            ShardResponse::Group(
                 GroupResponse::UnknownMember { .. } | GroupResponse::GroupNotFound { .. },
             ) => Ok(false),
             other => Err(SlateDBError::Storage(format!(
@@ -274,10 +287,9 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         // chance to react (RebalanceInProgress, IllegalGeneration, etc.).
         let fast_path = {
             use crate::cluster::raft::domains::group::GroupStateEnum;
-            let state_machine = self.node.state_machine();
-            let state = state_machine.read().await;
-            let inner_state = state.state().await;
-            let group = inner_state.group_domain.groups.get(group_id);
+            let sm = self.cluster().shard_for_group(group_id).state_machine();
+            let state = sm.state().await;
+            let group = state.group_domain.groups.get(group_id);
             match group {
                 None => Some(HeartbeatResult::UnknownMember),
                 Some(g) if !g.members.contains_key(member_id) => {
@@ -317,27 +329,28 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
             return Ok(HeartbeatResult::Success);
         }
 
-        let command = CoordinationCommand::GroupDomain(GroupCommand::Heartbeat {
+        let command = ShardCommand::Group(GroupCommand::Heartbeat {
             group_id: group_id.to_string(),
             member_id: member_id.to_string(),
             generation: generation_id,
             timestamp_ms: current_time_ms(),
         });
 
-        let response = self.node.write(command).await?;
+        let response = self
+            .cluster()
+            .write_shard_for_group(group_id, command)
+            .await?;
         let result = match response {
-            CoordinationResponse::GroupDomainResponse(GroupResponse::HeartbeatAck) => {
-                HeartbeatResult::Success
+            ShardResponse::Group(GroupResponse::HeartbeatAck) => HeartbeatResult::Success,
+            ShardResponse::Group(GroupResponse::RebalanceInProgress { .. }) => {
+                HeartbeatResult::RebalanceInProgress
             }
-            CoordinationResponse::GroupDomainResponse(GroupResponse::RebalanceInProgress {
-                ..
-            }) => HeartbeatResult::RebalanceInProgress,
-            CoordinationResponse::GroupDomainResponse(GroupResponse::UnknownMember { .. }) => {
+            ShardResponse::Group(GroupResponse::UnknownMember { .. }) => {
                 HeartbeatResult::UnknownMember
             }
-            CoordinationResponse::GroupDomainResponse(GroupResponse::IllegalGeneration {
-                ..
-            }) => HeartbeatResult::IllegalGeneration,
+            ShardResponse::Group(GroupResponse::IllegalGeneration { .. }) => {
+                HeartbeatResult::IllegalGeneration
+            }
             other => {
                 return Err(SlateDBError::Storage(format!(
                     "Unexpected response: {:?}",
@@ -368,13 +381,16 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         // could return Success against a generation the new coordinator
         // has already advanced past, allowing a fenced consumer to commit
         // offsets under the old generation.
-        self.node.ensure_linearizable().await?;
-        // Read-only validation of member and generation for offset commit
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let shard = self.cluster().shard_for_group(group_id);
+        shard
+            .raft()
+            .ensure_linearizable()
+            .await
+            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+        let sm = shard.state_machine();
+        let state = sm.state().await;
 
-        let group = match inner_state.group_domain.groups.get(group_id) {
+        let group = match state.group_domain.groups.get(group_id) {
             Some(g) => g,
             None => return Ok(HeartbeatResult::UnknownMember),
         };
@@ -401,24 +417,21 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         expected_generation: i32,
         assignments: &[(String, Vec<u8>)],
     ) -> SlateDBResult<bool> {
-        let command = CoordinationCommand::GroupDomain(GroupCommand::SyncGroup {
+        let command = ShardCommand::Group(GroupCommand::SyncGroup {
             group_id: group_id.to_string(),
             member_id: leader_id.to_string(),
             generation: expected_generation,
             assignments: assignments.to_vec(),
         });
 
-        let response = self.node.write(command).await?;
+        let response = self
+            .cluster()
+            .write_shard_for_group(group_id, command)
+            .await?;
         match response {
-            CoordinationResponse::GroupDomainResponse(GroupResponse::SyncGroupResponse {
-                ..
-            }) => Ok(true),
-            CoordinationResponse::GroupDomainResponse(GroupResponse::IllegalGeneration {
-                ..
-            }) => Ok(false),
-            CoordinationResponse::GroupDomainResponse(GroupResponse::UnknownMember { .. }) => {
-                Ok(false)
-            }
+            ShardResponse::Group(GroupResponse::SyncGroupResponse { .. }) => Ok(true),
+            ShardResponse::Group(GroupResponse::IllegalGeneration { .. }) => Ok(false),
+            ShardResponse::Group(GroupResponse::UnknownMember { .. }) => Ok(false),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -433,56 +446,74 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         // Apply skew tolerance: a leader with a fast clock would otherwise
         // mass-evict members that were still inside their session window.
         let now = current_time_ms().saturating_sub(self.config.clock_skew_tolerance_ms);
-        let command = CoordinationCommand::GroupDomain(GroupCommand::ExpireMembers {
-            current_time_ms: now,
-        });
 
-        let response = self.node.write(command).await?;
-        match response {
-            CoordinationResponse::GroupDomainResponse(GroupResponse::MembersExpired {
-                expired,
-            }) => Ok(expired),
-            other => Err(SlateDBError::Storage(format!(
-                "Unexpected response: {:?}",
-                other
-            ))),
+        // Fan out across every shard. Each shard owns its own slice of
+        // groups; we need to issue ExpireMembers to all of them so no
+        // shard is skipped. The merged list is the union of expired
+        // (group_id, member_id) pairs.
+        let mut expired_all: Vec<(String, String)> = Vec::new();
+        for shard_idx in 0..self.cluster().metadata_shards() {
+            let command = ShardCommand::Group(GroupCommand::ExpireMembers {
+                current_time_ms: now,
+            });
+            let response = self.cluster().write_shard(shard_idx, command).await?;
+            match response {
+                ShardResponse::Group(GroupResponse::MembersExpired { expired }) => {
+                    expired_all.extend(expired);
+                }
+                other => {
+                    return Err(SlateDBError::Storage(format!(
+                        "Unexpected response on shard {}: {:?}",
+                        shard_idx, other
+                    )));
+                }
+            }
         }
+        Ok(expired_all)
     }
 
     async fn expire_committed_offsets(&self, ttl_ms: u64) -> SlateDBResult<usize> {
-        let command = CoordinationCommand::GroupDomain(GroupCommand::ExpireOffsets {
-            current_time_ms: current_time_ms(),
-            ttl_ms,
-        });
-
-        let response = self.node.write(command).await?;
-        match response {
-            CoordinationResponse::GroupDomainResponse(GroupResponse::OffsetsExpired {
-                count,
-            }) => Ok(count),
-            other => Err(SlateDBError::Storage(format!(
-                "Unexpected response: {:?}",
-                other
-            ))),
+        // Same fan-out: offsets are sharded by group, so one shard's
+        // ExpireOffsets only sweeps the groups *it* owns.
+        let mut total = 0usize;
+        for shard_idx in 0..self.cluster().metadata_shards() {
+            let command = ShardCommand::Group(GroupCommand::ExpireOffsets {
+                current_time_ms: current_time_ms(),
+                ttl_ms,
+            });
+            let response = self.cluster().write_shard(shard_idx, command).await?;
+            match response {
+                ShardResponse::Group(GroupResponse::OffsetsExpired { count }) => total += count,
+                other => {
+                    return Err(SlateDBError::Storage(format!(
+                        "Unexpected response on shard {}: {:?}",
+                        shard_idx, other
+                    )));
+                }
+            }
         }
+        Ok(total)
     }
 
     async fn get_all_groups(&self) -> SlateDBResult<Vec<String>> {
         let start = Instant::now();
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
-
-        let groups = inner_state.group_domain.groups.keys().cloned().collect();
+        let mut groups: Vec<String> = Vec::new();
+        for shard in self.cluster().shards() {
+            let sm = shard.state_machine();
+            let state = sm.state().await;
+            groups.extend(state.group_domain.groups.keys().cloned());
+        }
         metrics::record_raft_query("get_group_state", start.elapsed().as_secs_f64());
         Ok(groups)
     }
 
     async fn delete_consumer_group(&self, group_id: &str) -> SlateDBResult<()> {
-        let command = CoordinationCommand::GroupDomain(GroupCommand::DeleteGroup {
+        let command = ShardCommand::Group(GroupCommand::DeleteGroup {
             group_id: group_id.to_string(),
         });
-        self.node.write(command).await?;
+        self.cluster()
+            .write_shard_for_group(group_id, command)
+            .await?;
         Ok(())
     }
 
@@ -502,11 +533,10 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         member_id: &str,
     ) -> SlateDBResult<Vec<u8>> {
         let start = Instant::now();
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let sm = self.cluster().shard_for_group(group_id).state_machine();
+        let state = sm.state().await;
 
-        let assignment = inner_state
+        let assignment = state
             .group_domain
             .groups
             .get(group_id)
@@ -524,7 +554,7 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         offset: i64,
         metadata: Option<&str>,
     ) -> SlateDBResult<()> {
-        let command = CoordinationCommand::GroupDomain(GroupCommand::CommitOffset {
+        let command = ShardCommand::Group(GroupCommand::CommitOffset {
             group_id: group_id.to_string(),
             topic: topic.to_string(),
             partition,
@@ -533,7 +563,9 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
             timestamp_ms: current_time_ms(),
         });
 
-        self.node.write(command).await?;
+        self.cluster()
+            .write_shard_for_group(group_id, command)
+            .await?;
         Ok(())
     }
 
@@ -546,12 +578,11 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         use std::sync::Arc;
 
         let start = Instant::now();
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let sm = self.cluster().shard_for_group(group_id).state_machine();
+        let state = sm.state().await;
 
         let key = (group_id.to_string(), Arc::from(topic), partition);
-        let result = inner_state
+        let result = state
             .group_domain
             .offsets
             .get(&key)

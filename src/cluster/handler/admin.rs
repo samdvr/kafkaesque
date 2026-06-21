@@ -1,8 +1,10 @@
 //! Admin request handling (create/delete topics).
 
 use futures::stream::{self, StreamExt};
+use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 
+use crate::cluster::TopicCompactionConfig;
 use crate::constants::DEFAULT_NUM_PARTITIONS;
 use crate::error::KafkaCode;
 use crate::server::RequestContext;
@@ -167,6 +169,33 @@ pub(super) async fn handle_create_topics(
             }
         }
 
+        // Build the persistent config map from the wire-level entries:
+        // null values are the "delete this key" wire signal — for a
+        // freshly-created topic that just means "don't include it" (there's
+        // nothing to delete yet).
+        let topic_config_map: HashMap<String, String> = topic
+            .configs
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone())))
+            .collect();
+
+        // Validate the proposed config BEFORE registering the topic. A
+        // bad `cleanup.policy` or out-of-range `min.compaction.lag.ms` is
+        // an INVALID_CONFIG, not a silent drop.
+        if let Err(e) = TopicCompactionConfig::validate_raw(&topic_config_map) {
+            debug!(
+                topic = %topic.name,
+                error = %e,
+                "CreateTopics: rejecting invalid config"
+            );
+            topics.push(CreateTopicResponseData {
+                name: topic.name,
+                error_code: KafkaCode::InvalidConfig,
+                error_message: Some(e.to_string()),
+            });
+            continue;
+        }
+
         // validate_only (CreateTopics v1+): dry-run — report success without
         // mutating cluster state. Previously the flag was parsed off the wire
         // and dropped, so clients got a real create when they asked for a
@@ -180,10 +209,12 @@ pub(super) async fn handle_create_topics(
             continue;
         }
 
-        // Register topic in coordinator
+        // Register topic in coordinator, plumbing the validated config
+        // through so `cleanup.policy=compact` (and friends) actually reach
+        // the registry instead of being dropped on the floor.
         if let Err(e) = handler
             .coordinator
-            .register_topic(&topic.name, num_partitions)
+            .register_topic_with_config(&topic.name, num_partitions, topic_config_map)
             .await
         {
             error!(error = %e, "Failed to register topic");

@@ -108,6 +108,8 @@ pub enum RequestResponse {
     DeleteTopics(DeleteTopicsResponseData),
     InitProducerId(InitProducerIdResponseData),
     DeleteGroups(DeleteGroupsResponseData),
+    DescribeConfigs(DescribeConfigsResponseData),
+    AlterConfigs(AlterConfigsResponseData),
     /// Used for both `Request::UnsupportedVersion` and `Request::Unknown`.
     Error(ErrorResponseData),
 }
@@ -186,6 +188,12 @@ pub trait Handler: Send + Sync {
             }
             Request::InitProducerId(_, req) => {
                 RequestResponse::InitProducerId(self.handle_init_producer_id(ctx, req).await)
+            }
+            Request::DescribeConfigs(_, req) => {
+                RequestResponse::DescribeConfigs(self.handle_describe_configs(ctx, req).await)
+            }
+            Request::AlterConfigs(_, req) => {
+                RequestResponse::AlterConfigs(self.handle_alter_configs(ctx, req).await)
             }
             Request::UnsupportedVersion(_) => RequestResponse::Error(ErrorResponseData {
                 error_code: KafkaCode::UnsupportedVersion,
@@ -595,6 +603,54 @@ pub trait Handler: Send + Sync {
             error_code: KafkaCode::None,
             producer_id: 1,
             producer_epoch: 0,
+        }
+    }
+
+    /// Handle a DescribeConfigs request.
+    ///
+    /// Default implementation returns `UnknownTopicOrPartition` for every
+    /// resource, the conservative answer when no real config registry is
+    /// wired up. The cluster handler overrides this with a registry-backed
+    /// implementation.
+    async fn handle_describe_configs(
+        &self,
+        _ctx: &RequestContext,
+        request: DescribeConfigsRequestData,
+    ) -> DescribeConfigsResponseData {
+        DescribeConfigsResponseData {
+            throttle_time_ms: 0,
+            results: request
+                .resources
+                .into_iter()
+                .map(|r| DescribeConfigsResult {
+                    error_code: KafkaCode::UnknownTopicOrPartition,
+                    error_message: Some("DescribeConfigs not implemented".to_string()),
+                    resource_type: r.resource_type,
+                    resource_name: r.resource_name,
+                    configs: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    /// Handle an AlterConfigs request.
+    async fn handle_alter_configs(
+        &self,
+        _ctx: &RequestContext,
+        request: AlterConfigsRequestData,
+    ) -> AlterConfigsResponseData {
+        AlterConfigsResponseData {
+            throttle_time_ms: 0,
+            responses: request
+                .resources
+                .into_iter()
+                .map(|r| AlterConfigsResult {
+                    error_code: KafkaCode::UnknownTopicOrPartition,
+                    error_message: Some("AlterConfigs not implemented".to_string()),
+                    resource_type: r.resource_type,
+                    resource_name: r.resource_name,
+                })
+                .collect(),
         }
     }
 

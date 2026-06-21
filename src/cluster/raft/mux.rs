@@ -89,13 +89,17 @@ pub enum MuxRaftRpcMessage {
     #[serde(rename = "mux_shard_v1")]
     Shard(ShardId, ShardRpcMessage),
 
-    /// Bootstrap join — same shape as the legacy frame but routed through
-    /// the multiplexed port. The server responds without involving any
-    /// `Raft<_>` instance directly (see `RaftCluster::handle_join`).
-    #[serde(rename = "mux_join_v1")]
+    /// Bootstrap join — adds the new broker as a **learner** on `group`.
+    /// Sent once per group during the join sequence (sharding plan
+    /// "Bootstrap & membership"). Each group's leader handles its own
+    /// JoinCluster; cross-group fan-out is the *joining* broker's
+    /// responsibility, not a control-group coordinator job, to keep the
+    /// control leader off the critical path of every join.
+    #[serde(rename = "mux_join_v2")]
     JoinCluster {
         node_id: RaftNodeId,
         raft_addr: String,
+        group: GroupId,
     },
 
     /// Promote an existing learner on `group` to a voting member.
@@ -166,7 +170,15 @@ pub fn dispatch_target(msg: &MuxRaftRpcMessage) -> DispatchTarget {
     match msg {
         MuxRaftRpcMessage::Control(_) => DispatchTarget::Control,
         MuxRaftRpcMessage::Shard(id, _) => DispatchTarget::Shard(*id),
-        MuxRaftRpcMessage::JoinCluster { .. } => DispatchTarget::ClusterControl,
+        // Per-group join (mux_join_v2): the dispatch target is the group
+        // the learner is being added to, not a "cluster-control" plane.
+        // This is what lets the joining broker target each group's leader
+        // independently — without it the control leader would have to
+        // coordinate every shard's add_learner.
+        MuxRaftRpcMessage::JoinCluster { group, .. } => match group {
+            GroupId::Control => DispatchTarget::ClusterControl,
+            GroupId::Shard(id) => DispatchTarget::Shard(*id),
+        },
         MuxRaftRpcMessage::PromoteMember { group, .. } => match group {
             GroupId::Control => DispatchTarget::Control,
             GroupId::Shard(id) => DispatchTarget::Shard(*id),
@@ -219,6 +231,15 @@ mod tests {
         MuxRaftRpcMessage::JoinCluster {
             node_id: 7,
             raft_addr: "127.0.0.1:9191".into(),
+            group: GroupId::Control,
+        }
+    }
+
+    fn sample_join_shard(id: ShardId) -> MuxRaftRpcMessage {
+        MuxRaftRpcMessage::JoinCluster {
+            node_id: 7,
+            raft_addr: "127.0.0.1:9191".into(),
+            group: GroupId::Shard(id),
         }
     }
 
@@ -234,9 +255,15 @@ mod tests {
             dispatch_target(&sample_shard(7)),
             DispatchTarget::Shard(7)
         );
+        // Control join: still routed to control-plane handler.
         assert_eq!(
             dispatch_target(&sample_join()),
             DispatchTarget::ClusterControl
+        );
+        // Shard join: routed to the targeted shard's Raft handle.
+        assert_eq!(
+            dispatch_target(&sample_join_shard(3)),
+            DispatchTarget::Shard(3)
         );
         assert_eq!(
             dispatch_target(&sample_promote(GroupId::Control)),
@@ -336,9 +363,19 @@ mod tests {
                             assert_eq!(*id, t)
                         }
                         (
-                            MuxRaftRpcMessage::JoinCluster { .. },
+                            MuxRaftRpcMessage::JoinCluster {
+                                group: GroupId::Control,
+                                ..
+                            },
                             DispatchTarget::ClusterControl,
                         ) => {}
+                        (
+                            MuxRaftRpcMessage::JoinCluster {
+                                group: GroupId::Shard(id),
+                                ..
+                            },
+                            DispatchTarget::Shard(t),
+                        ) => assert_eq!(*id, t),
                         (
                             MuxRaftRpcMessage::PromoteMember {
                                 group: GroupId::Control,

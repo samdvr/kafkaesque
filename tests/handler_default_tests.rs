@@ -371,11 +371,13 @@ async fn test_default_create_topics() {
                 name: "topic1".to_string(),
                 num_partitions: 3,
                 replication_factor: 1,
+                configs: vec![],
             },
             CreateTopicData {
                 name: "topic2".to_string(),
                 num_partitions: 5,
                 replication_factor: 1,
+                configs: vec![],
             },
         ],
         timeout_ms: 5000,

@@ -408,12 +408,19 @@ impl RaftConfig {
 // ============================================================================
 //
 // At first boot a broker writes the chosen `metadata_shards` plus the hash
-// algorithm name to `{raft_log_dir}/cluster_meta.bin`. On every subsequent
-// boot the file is read back and the configured values must match exactly,
-// otherwise the broker refuses to start. This catches the most dangerous
-// silent-corruption mode of the sharded layout: an operator changes
-// `RAFT_METADATA_SHARDS` between restarts and every key reshards onto a
-// different group.
+// algorithm name to `{raft_log_dir}/node-{id}/cluster_meta.bin`. On every
+// subsequent boot the file is read back and the configured values must
+// match exactly, otherwise the broker refuses to start. This catches the
+// most dangerous silent-corruption mode of the sharded layout: an operator
+// changes `RAFT_METADATA_SHARDS` between restarts and every key reshards
+// onto a different group.
+//
+// **Per-node directory** (`node-{id}` segment): brokers in a shared
+// development setup may point multiple `node_id`s at the same
+// `raft_log_dir` parent. Per-node scoping ensures each broker validates
+// its OWN bootstrap independently; without it, the first broker to boot
+// would write the file and every subsequent broker would inherit its
+// settings without revisiting them.
 
 /// Persisted bootstrap descriptor for the sharded metadata Raft layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,16 +432,18 @@ pub struct ClusterMeta {
 }
 
 impl ClusterMeta {
-    /// Path to `cluster_meta.bin` for a given Raft log directory.
-    pub fn path_in(raft_log_dir: impl AsRef<Path>) -> PathBuf {
-        raft_log_dir.as_ref().join("cluster_meta.bin")
+    /// Path to `cluster_meta.bin` for a given Raft log directory. The file
+    /// lives directly under the directory passed in — callers that want
+    /// per-node scoping pass `{raft_log_dir}/node-{id}` here.
+    pub fn path_in(dir: impl AsRef<Path>) -> PathBuf {
+        dir.as_ref().join("cluster_meta.bin")
     }
 
-    /// Load `cluster_meta.bin` from `raft_log_dir`. Returns `Ok(None)` when
+    /// Load `cluster_meta.bin` from `dir`. Returns `Ok(None)` when
     /// the file does not exist (first boot); errors only on I/O failure or
     /// a corrupt file (malformed magic / unknown layout).
-    pub fn load(raft_log_dir: impl AsRef<Path>) -> std::io::Result<Option<Self>> {
-        let path = Self::path_in(raft_log_dir);
+    pub fn load(dir: impl AsRef<Path>) -> std::io::Result<Option<Self>> {
+        let path = Self::path_in(dir);
         match std::fs::read(&path) {
             Ok(bytes) => postcard::from_bytes::<ClusterMeta>(&bytes).map(Some).map_err(|e| {
                 std::io::Error::new(
@@ -449,8 +458,8 @@ impl ClusterMeta {
 
     /// Write `cluster_meta.bin` atomically (write-temp-and-rename) so a crash
     /// mid-write cannot leave a half-written file that fails the next boot.
-    pub fn save(&self, raft_log_dir: impl AsRef<Path>) -> std::io::Result<()> {
-        let dir = raft_log_dir.as_ref();
+    pub fn save(&self, dir: impl AsRef<Path>) -> std::io::Result<()> {
+        let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let final_path = Self::path_in(dir);
         let tmp_path = dir.join("cluster_meta.bin.tmp");
@@ -464,6 +473,17 @@ impl ClusterMeta {
 }
 
 impl RaftConfig {
+    /// Per-node directory holding `cluster_meta.bin` and the per-group log
+    /// + snapshot subtrees: `{raft_log_dir}/node-{node_id}`.
+    ///
+    /// Public so the cluster bootstrap can use the same path it does for
+    /// log directories — drift between this helper and the bootstrap
+    /// would surface as a broker that validates a meta file under a
+    /// different directory than the one it actually persists logs into.
+    pub fn node_dir(&self) -> PathBuf {
+        Path::new(&self.raft_log_dir).join(format!("node-{}", self.node_id))
+    }
+
     /// Validate against an on-disk `cluster_meta.bin`, persisting the
     /// configured values on first boot.
     ///
@@ -474,9 +494,13 @@ impl RaftConfig {
     /// - If it exists and differs: return a descriptive error so the broker
     ///   refuses to start. The mismatch is unrecoverable without a full
     ///   re-bootstrap — every key would be on the wrong shard.
+    ///
+    /// Reads from / writes to [`Self::node_dir`] (i.e.
+    /// `{raft_log_dir}/node-{node_id}/cluster_meta.bin`) per the
+    /// sharding plan's per-node layout.
     pub fn validate_or_init_cluster_meta(&self) -> Result<(), String> {
-        let dir = Path::new(&self.raft_log_dir);
-        match ClusterMeta::load(dir).map_err(|e| e.to_string())? {
+        let dir = self.node_dir();
+        match ClusterMeta::load(&dir).map_err(|e| e.to_string())? {
             Some(persisted) => {
                 if persisted.metadata_shards != self.metadata_shards {
                     return Err(format!(
@@ -497,7 +521,7 @@ impl RaftConfig {
                     metadata_shards: self.metadata_shards,
                     hash_algo: HASH_ALGO.to_string(),
                 };
-                meta.save(dir).map_err(|e| {
+                meta.save(&dir).map_err(|e| {
                     format!("failed to write cluster_meta.bin to {}: {}", dir.display(), e)
                 })
             }
@@ -864,13 +888,23 @@ mod tests {
         let dir = unique_tmp_dir("first-boot");
         let cfg = RaftConfig {
             raft_log_dir: dir.to_string_lossy().to_string(),
+            node_id: 7,
             metadata_shards: 4,
             ..Default::default()
         };
         cfg.validate_or_init_cluster_meta().unwrap();
-        let on_disk = ClusterMeta::load(&dir).unwrap().expect("file written");
+        // Per-node scoping: file lands under node-{id}, NOT the parent.
+        let on_disk = ClusterMeta::load(cfg.node_dir())
+            .unwrap()
+            .expect("file written");
         assert_eq!(on_disk.metadata_shards, 4);
         assert_eq!(on_disk.hash_algo, HASH_ALGO);
+        // No file at the parent — this used to be the layout pre-step-9
+        // and would shadow per-node validation.
+        assert!(
+            !ClusterMeta::path_in(&dir).exists(),
+            "no file expected at the parent dir, only under node-{{id}}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -879,6 +913,7 @@ mod tests {
         let dir = unique_tmp_dir("restart-match");
         let cfg = RaftConfig {
             raft_log_dir: dir.to_string_lossy().to_string(),
+            node_id: 1,
             metadata_shards: 16,
             ..Default::default()
         };
@@ -893,12 +928,14 @@ mod tests {
         let dir = unique_tmp_dir("restart-mismatch");
         let initial = RaftConfig {
             raft_log_dir: dir.to_string_lossy().to_string(),
+            node_id: 1,
             metadata_shards: 8,
             ..Default::default()
         };
         initial.validate_or_init_cluster_meta().unwrap();
         let changed = RaftConfig {
             raft_log_dir: dir.to_string_lossy().to_string(),
+            node_id: 1,
             metadata_shards: 16,
             ..Default::default()
         };
@@ -907,19 +944,88 @@ mod tests {
             err.contains("metadata_shards=8") && err.contains("config says 16"),
             "unexpected error: {err}"
         );
+        // Pin the exact wording the plan calls out, so a refactor that
+        // reorders the `format!` arguments doesn't silently break alerts /
+        // operator runbooks keyed on this string.
+        assert_eq!(
+            err,
+            "cluster bootstrapped with metadata_shards=8, config says 16 — refusing"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn cluster_meta_corrupt_file_returns_error() {
         let dir = unique_tmp_dir("corrupt");
-        std::fs::write(ClusterMeta::path_in(&dir), b"\xff\xff\xff not-postcard").unwrap();
         let cfg = RaftConfig {
             raft_log_dir: dir.to_string_lossy().to_string(),
+            node_id: 1,
             ..Default::default()
         };
+        std::fs::create_dir_all(cfg.node_dir()).unwrap();
+        std::fs::write(
+            ClusterMeta::path_in(cfg.node_dir()),
+            b"\xff\xff\xff not-postcard",
+        )
+        .unwrap();
         let err = cfg.validate_or_init_cluster_meta().unwrap_err();
         assert!(err.contains("corrupt"), "unexpected error: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cluster_meta_per_node_paths_dont_collide() {
+        // Two brokers sharing one `raft_log_dir` parent must each
+        // validate against their OWN node-{id}/cluster_meta.bin. Without
+        // per-node scoping, the first boot's file would shadow every
+        // subsequent broker's check.
+        let dir = unique_tmp_dir("per-node");
+        let cfg_a = RaftConfig {
+            raft_log_dir: dir.to_string_lossy().to_string(),
+            node_id: 1,
+            metadata_shards: 4,
+            ..Default::default()
+        };
+        let cfg_b = RaftConfig {
+            raft_log_dir: dir.to_string_lossy().to_string(),
+            node_id: 2,
+            metadata_shards: 8,
+            ..Default::default()
+        };
+        cfg_a.validate_or_init_cluster_meta().unwrap();
+        // B is not corrupted by A's file — it writes its own.
+        cfg_b.validate_or_init_cluster_meta().unwrap();
+        let a_meta = ClusterMeta::load(cfg_a.node_dir()).unwrap().unwrap();
+        let b_meta = ClusterMeta::load(cfg_b.node_dir()).unwrap().unwrap();
+        assert_eq!(a_meta.metadata_shards, 4);
+        assert_eq!(b_meta.metadata_shards, 8);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cluster_meta_hash_algo_mismatch_refuses() {
+        // Defensive: if a future build ever ships a different hash algorithm
+        // and a broker boots against a `cluster_meta.bin` written by an old
+        // build, refuse rather than silently re-shard every key. The error
+        // must mention `hash_algo` so the operator can see the cause.
+        let dir = unique_tmp_dir("hash-mismatch");
+        let cfg = RaftConfig {
+            raft_log_dir: dir.to_string_lossy().to_string(),
+            node_id: 1,
+            metadata_shards: 8,
+            ..Default::default()
+        };
+        std::fs::create_dir_all(cfg.node_dir()).unwrap();
+        let foreign = ClusterMeta {
+            metadata_shards: 8,
+            hash_algo: "sha256-alien".to_string(),
+        };
+        foreign.save(cfg.node_dir()).unwrap();
+        let err = cfg.validate_or_init_cluster_meta().unwrap_err();
+        assert!(
+            err.contains("hash_algo") && err.contains("sha256-alien"),
+            "unexpected error: {err}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

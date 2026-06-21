@@ -2296,6 +2296,17 @@ pub struct PartitionStoreBuilder {
     slatedb_l0_sst_size_bytes: usize,
     /// SlateDB flush interval in milliseconds.
     slatedb_flush_interval_ms: u64,
+    /// Optional shared block cache. When `Some`, every `Db::builder` is
+    /// chained with `.with_memory_cache(cache.clone())`, replacing
+    /// SlateDB's per-DB default. When `None`, the per-DB default is
+    /// used (today's behaviour).
+    slatedb_block_cache: Option<Arc<dyn slatedb::db_cache::DbCache>>,
+    /// Optional dedicated compaction runtime handle. When `Some`,
+    /// every `Db::builder` is chained with
+    /// `.with_compaction_runtime(handle.clone())` so the per-DB
+    /// compactor task spawns onto the broker-wide bounded runtime
+    /// rather than the ambient runtime.
+    slatedb_compaction_handle: Option<tokio::runtime::Handle>,
 }
 
 impl Default for PartitionStoreBuilder {
@@ -2322,6 +2333,8 @@ impl PartitionStoreBuilder {
             slatedb_max_unflushed_bytes: 256 * 1024 * 1024, // 256 MB default
             slatedb_l0_sst_size_bytes: 64 * 1024 * 1024, // 64 MB default
             slatedb_flush_interval_ms: 100, // 100ms default
+            slatedb_block_cache: None,
+            slatedb_compaction_handle: None,
         }
     }
 
@@ -2447,6 +2460,34 @@ impl PartitionStoreBuilder {
         self
     }
 
+    /// Inject a broker-wide shared block cache.
+    ///
+    /// One `Arc<dyn DbCache>` is built once at broker startup (see
+    /// `super::slatedb_resources::SharedSlateDbResources`) and threaded
+    /// into every per-partition open via this setter. SlateDB wraps it
+    /// in a per-DB scope wrapper internally so all DBs share one
+    /// underlying cache while their entries remain distinguishable.
+    ///
+    /// Pass `Arc::clone(&cache)` for each partition — the inner trait
+    /// object is unchanged across opens, so cache hits accumulate
+    /// across the broker's lifetime rather than per-partition.
+    pub fn slatedb_block_cache(mut self, cache: Arc<dyn slatedb::db_cache::DbCache>) -> Self {
+        self.slatedb_block_cache = Some(cache);
+        self
+    }
+
+    /// Inject a broker-wide dedicated compaction runtime handle.
+    ///
+    /// All per-`Db` compactor tasks spawn onto this runtime, capping
+    /// total compaction parallelism via the runtime's worker count.
+    /// Without this setter SlateDB spawns its compactor on the ambient
+    /// runtime, which puts compaction CPU bursts on the same threads
+    /// as raft heartbeats — a recipe for spurious failovers.
+    pub fn slatedb_compaction_handle(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.slatedb_compaction_handle = Some(handle);
+        self
+    }
+
     /// Build the PartitionStore.
     pub async fn build(self) -> SlateDBResult<PartitionStore> {
         use super::keys::{
@@ -2481,6 +2522,13 @@ impl PartitionStoreBuilder {
         let object_store_for_task = object_store;
         let fail_on_gap = self.fail_on_recovery_gap;
         let expected_epoch = self.leader_epoch;
+        // Move shared resources into the open future. `Option<Arc<...>>`
+        // is `None` when the broker is configured without the shared
+        // pool (escape hatch for A/B testing); the `Db::builder` chain
+        // below skips the corresponding setter so SlateDB falls back
+        // to its per-DB defaults.
+        let block_cache = self.slatedb_block_cache.clone();
+        let compaction_handle = self.slatedb_compaction_handle.clone();
 
         // Prepare SlateDB settings with explicit memory limits for backpressure
         let slatedb_settings = SlateDbSettings {
@@ -2493,6 +2541,8 @@ impl PartitionStoreBuilder {
             max_unflushed_bytes = self.slatedb_max_unflushed_bytes,
             l0_sst_size_bytes = self.slatedb_l0_sst_size_bytes,
             flush_interval_ms = self.slatedb_flush_interval_ms,
+            block_cache_shared = block_cache.is_some(),
+            compaction_runtime_shared = compaction_handle.is_some(),
             "SlateDB settings configured for backpressure"
         );
 
@@ -2502,8 +2552,19 @@ impl PartitionStoreBuilder {
         // back to the runtime.
         let open_future = async move {
             let object_path = ObjectPath::from(path_for_task.as_str());
-            let db = Db::builder(object_path, object_store_for_task)
-                .with_settings(slatedb_settings)
+            let mut db_builder = Db::builder(object_path, object_store_for_task)
+                .with_settings(slatedb_settings);
+            // Conditional chaining: only set the cache / compaction
+            // runtime when broker-wide pools were configured.
+            // `None` paths fall through to SlateDB's per-DB defaults
+            // (today's behaviour).
+            if let Some(cache) = block_cache {
+                db_builder = db_builder.with_memory_cache(cache);
+            }
+            if let Some(handle) = compaction_handle {
+                db_builder = db_builder.with_compaction_runtime(handle);
+            }
+            let db = db_builder
                 .build()
                 .await
                 .map_err(SlateDBError::from)?;

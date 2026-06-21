@@ -521,6 +521,189 @@ fn unexpected_variant_install(
 // caller doesn't have to re-add the import.
 const _: Option<FramePurpose> = None;
 
+// ============================================================================
+// One-shot client helpers — used by the coordinator's forward path and join
+// fan-out. Each opens a fresh connection, sends one frame, reads one
+// response, and drops the socket.
+// ============================================================================
+
+use std::time::Duration as StdDuration;
+use tokio::time::timeout;
+
+use super::commands::{ControlCommand, ControlResponse, ShardCommand, ShardResponse};
+use super::network::MAX_FORWARD_HOPS;
+use super::types::{GroupId, ShardId as RpcShardId};
+
+/// Timeout for one-shot mux client operations (forward, join, promote).
+const MUX_RPC_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+
+/// Forward a control-group client write to `addr`.
+///
+/// Mirrors [`super::network::forward_client_write_with_term`] but on the
+/// multiplexed port: the frame carries `MuxRaftRpcMessage::Control(
+/// ControlRpcMessage::ClientWriteWithTerm { command, expected_term,
+/// forward_hops })`. The receiver's mux dispatcher applies the same
+/// hop-cap, term, and is-leader checks as the legacy server.
+pub async fn forward_control_write_with_term(
+    addr: &str,
+    command: ControlCommand,
+    expected_term: u64,
+    forward_hops: u8,
+    auth_keys: &Arc<RaftAuthKeys>,
+    tls: Option<&RaftTlsConfig>,
+) -> Result<ControlResponse, std::io::Error> {
+    if forward_hops >= MAX_FORWARD_HOPS {
+        return Err(std::io::Error::other(format!(
+            "Forward loop detected: request exceeded {} hops, likely leadership instability",
+            MAX_FORWARD_HOPS
+        )));
+    }
+    let frame = MuxRaftRpcMessage::Control(ControlRpcMessage::ClientWriteWithTerm {
+        command,
+        expected_term,
+        forward_hops: forward_hops + 1,
+    });
+    match send_one_shot(addr, &frame, false, auth_keys, tls).await? {
+        MuxRaftRpcResponse::ControlClientWriteOk(resp) => Ok(resp),
+        MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
+        other => Err(unexpected_io("ControlClientWriteOk", &other)),
+    }
+}
+
+/// Forward a shard-group client write to `addr` for shard `shard_id`.
+///
+/// Same hop / term semantics as [`forward_control_write_with_term`].
+pub async fn forward_shard_write_with_term(
+    addr: &str,
+    shard_id: RpcShardId,
+    command: ShardCommand,
+    expected_term: u64,
+    forward_hops: u8,
+    auth_keys: &Arc<RaftAuthKeys>,
+    tls: Option<&RaftTlsConfig>,
+) -> Result<ShardResponse, std::io::Error> {
+    if forward_hops >= MAX_FORWARD_HOPS {
+        return Err(std::io::Error::other(format!(
+            "Forward loop detected: request exceeded {} hops, likely leadership instability",
+            MAX_FORWARD_HOPS
+        )));
+    }
+    let frame = MuxRaftRpcMessage::Shard(
+        shard_id,
+        ShardRpcMessage::ClientWriteWithTerm {
+            command,
+            expected_term,
+            forward_hops: forward_hops + 1,
+        },
+    );
+    match send_one_shot(addr, &frame, false, auth_keys, tls).await? {
+        MuxRaftRpcResponse::ShardClientWriteOk(resp) => Ok(resp),
+        MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
+        other => Err(unexpected_io("ShardClientWriteOk", &other)),
+    }
+}
+
+/// Send a `JoinCluster { group, ... }` to a leader and add the joining
+/// broker as a learner of `group`.
+///
+/// `auth_keys` is consumed under the **join** purpose tag — phase 1 of the
+/// two-phase join. [`request_mux_promote`] runs phase 2 under the cluster
+/// purpose. Same key-tier split as the legacy single-port path: a
+/// holder-of-join-token-only cannot promote themselves to a voter on any
+/// group.
+pub async fn request_mux_join(
+    peer_addr: &str,
+    node_id: RaftNodeId,
+    raft_addr: &str,
+    group: GroupId,
+    auth_keys: &Arc<RaftAuthKeys>,
+    tls: Option<&RaftTlsConfig>,
+) -> Result<(), std::io::Error> {
+    let frame = MuxRaftRpcMessage::JoinCluster {
+        node_id,
+        raft_addr: raft_addr.to_string(),
+        group,
+    };
+    match send_one_shot(peer_addr, &frame, true, auth_keys, tls).await? {
+        MuxRaftRpcResponse::JoinClusterOk => Ok(()),
+        MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
+        other => Err(unexpected_io("JoinClusterOk", &other)),
+    }
+}
+
+/// Promote `node_id` from learner to voter on `group`. Phase 2 of the
+/// two-phase join. Cluster purpose tag.
+pub async fn request_mux_promote(
+    peer_addr: &str,
+    node_id: RaftNodeId,
+    group: GroupId,
+    auth_keys: &Arc<RaftAuthKeys>,
+    tls: Option<&RaftTlsConfig>,
+) -> Result<(), std::io::Error> {
+    let frame = MuxRaftRpcMessage::PromoteMember { node_id, group };
+    match send_one_shot(peer_addr, &frame, false, auth_keys, tls).await? {
+        MuxRaftRpcResponse::PromoteMemberOk => Ok(()),
+        MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
+        other => Err(unexpected_io("PromoteMemberOk", &other)),
+    }
+}
+
+/// One-shot send-and-receive helper. Opens a fresh connection (no caching
+/// — these helpers are called rarely: forward only on leader-mismatch,
+/// join only at bootstrap), writes one frame, reads one response, drops
+/// the socket.
+async fn send_one_shot(
+    peer_addr: &str,
+    frame: &MuxRaftRpcMessage,
+    is_join: bool,
+    auth_keys: &Arc<RaftAuthKeys>,
+    tls: Option<&RaftTlsConfig>,
+) -> std::io::Result<MuxRaftRpcResponse> {
+    let data = postcard::to_stdvec(frame)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut stream = super::network::connect_raft(peer_addr, tls).await?;
+
+    timeout(MUX_RPC_OPERATION_TIMEOUT, async {
+        write_rpc_frame(&mut stream, auth_keys, is_join, &data).await?;
+        let (_purpose, response_buf) = read_rpc_frame(
+            &mut stream,
+            auth_keys,
+            &PeerScope::from_addr_str(peer_addr),
+            MAX_RPC_MESSAGE_BYTES,
+        )
+        .await?;
+        postcard::from_bytes::<MuxRaftRpcResponse>(&response_buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "mux RPC operation timeout"))?
+}
+
+fn rpc_error_to_io(info: RpcErrorInfo) -> std::io::Error {
+    let kind = match info.kind {
+        RpcErrorKind::LeadershipChanged | RpcErrorKind::NotLeader { .. } => {
+            std::io::ErrorKind::NotConnected
+        }
+        RpcErrorKind::ForwardLoopDetected => std::io::ErrorKind::ConnectionRefused,
+        RpcErrorKind::InvalidRequest => std::io::ErrorKind::InvalidInput,
+        RpcErrorKind::Internal => std::io::ErrorKind::Other,
+        RpcErrorKind::Timeout => std::io::ErrorKind::TimedOut,
+        RpcErrorKind::Network => std::io::ErrorKind::ConnectionAborted,
+    };
+    std::io::Error::new(kind, info.message)
+}
+
+fn unexpected_io(expected: &str, actual: &MuxRaftRpcResponse) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "unexpected mux response: expected {}, got {:?}",
+            expected,
+            std::mem::discriminant(actual)
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     //! These tests cover the address-book sharing contract — the part of

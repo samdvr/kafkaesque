@@ -112,6 +112,10 @@ pub struct MockCoordinator {
     pub brokers: Arc<RwLock<HashMap<i32, (BrokerInfo, Instant)>>>,
     /// Shared topic registry: topic -> partition_count
     pub topics: Arc<RwLock<HashMap<String, i32>>>,
+    /// Shared topic config registry: topic -> config map.
+    /// Kept in lockstep with `topics` — every entry in `topics` has a
+    /// corresponding entry here (possibly empty).
+    pub topic_configs: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
     /// Shared partition ownership: (topic, partition) -> (broker_id, lease_expiry)
     pub partition_owners: Arc<RwLock<PartitionOwnersMap>>,
     /// Per-partition leader epoch. Bumped on every acquire/transfer/mark-
@@ -143,6 +147,7 @@ impl MockCoordinator {
             port,
             brokers: Arc::new(RwLock::new(HashMap::new())),
             topics: Arc::new(RwLock::new(HashMap::new())),
+            topic_configs: Arc::new(RwLock::new(HashMap::new())),
             partition_owners: Arc::new(RwLock::new(HashMap::new())),
             partition_epochs: Arc::new(RwLock::new(HashMap::new())),
             consumer_groups: Arc::new(RwLock::new(HashMap::new())),
@@ -417,9 +422,47 @@ impl PartitionCoordinator for MockCoordinator {
     }
 
     async fn register_topic(&self, topic: &str, partitions: i32) -> SlateDBResult<()> {
+        self.register_topic_with_config(topic, partitions, HashMap::new())
+            .await
+    }
+
+    async fn register_topic_with_config(
+        &self,
+        topic: &str,
+        partitions: i32,
+        config: HashMap<String, String>,
+    ) -> SlateDBResult<()> {
         let mut topics = self.topics.write().await;
+        let mut configs = self.topic_configs.write().await;
         topics.insert(topic.to_string(), partitions);
+        // Seed/replace the config entry. Keeping the maps lockstep is the
+        // mock's analogue of `topic_configs` being a field on the registry's
+        // `TopicInfo` in the real Raft coordinator.
+        configs.insert(topic.to_string(), config);
         Ok(())
+    }
+
+    async fn get_topic_config(
+        &self,
+        topic: &str,
+    ) -> SlateDBResult<Option<HashMap<String, String>>> {
+        let configs = self.topic_configs.read().await;
+        Ok(configs.get(topic).cloned())
+    }
+
+    async fn update_topic_config(
+        &self,
+        topic: &str,
+        config: HashMap<String, String>,
+    ) -> SlateDBResult<bool> {
+        let topics = self.topics.read().await;
+        if !topics.contains_key(topic) {
+            return Ok(false);
+        }
+        drop(topics);
+        let mut configs = self.topic_configs.write().await;
+        configs.insert(topic.to_string(), config);
+        Ok(true)
     }
 
     async fn get_topics(&self) -> SlateDBResult<Vec<String>> {
@@ -439,7 +482,15 @@ impl PartitionCoordinator for MockCoordinator {
 
     async fn delete_topic(&self, topic: &str) -> SlateDBResult<bool> {
         let mut topics = self.topics.write().await;
-        Ok(topics.remove(topic).is_some())
+        let removed = topics.remove(topic).is_some();
+        drop(topics);
+        // Drop the matching config entry; otherwise a recreate-with-same-name
+        // would silently inherit the stale config and a Describe immediately
+        // after Delete would report a topic the broker says doesn't exist.
+        if removed {
+            self.topic_configs.write().await.remove(topic);
+        }
+        Ok(removed)
     }
 
     async fn get_assigned_partitions(&self) -> SlateDBResult<Vec<(String, i32)>> {

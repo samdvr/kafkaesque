@@ -71,14 +71,14 @@ mod mux;
 mod mux_client;
 mod mux_server;
 mod network;
-mod node;
+mod reconciler;
 mod state_machine;
 mod storage;
 mod tls;
 mod types;
 
 pub use auth::RaftAuthKeys;
-pub use commands::{CoordinationCommand, CoordinationResponse};
+pub use commands::{ControlCommand, ControlResponse, ShardCommand, ShardResponse};
 pub use config::RaftConfig;
 pub use coordinator::RaftCoordinator;
 pub use domains::{
@@ -89,13 +89,9 @@ pub use domains::{
     ProducerDomainState, ProducerResponse, TransferCommand, TransferDomainState, TransferReason,
     TransferResponse,
 };
-pub use network::{RaftNetworkFactoryImpl, request_cluster_join};
 #[doc(hidden)]
-pub use network::{RaftRpcMessage, RaftRpcResponse};
-pub use node::RaftNode;
+pub use state_machine::OwnershipCacheInvalidation;
 #[doc(hidden)]
-pub use state_machine::{CoordinationStateMachine, OwnershipCacheInvalidation};
-#[doc(hidden)]
-pub use storage::{LegacyRaftStore as RaftStore, RaftStore as RaftStoreGeneric};
+pub use storage::RaftStore;
 pub use tls::RaftTlsConfig;
-pub use types::{RaftNodeId, TypeConfig};
+pub use types::{RaftNodeId, ShardId};

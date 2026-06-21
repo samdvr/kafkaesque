@@ -1,24 +1,30 @@
 //! Inline tests previously embedded in `storage.rs`. Moved to a sibling
 //! file so the implementation isn't gated on scrolling past the test
 //! block. `super::*` re-exports private helpers the tests rely on.
+//!
+//! Exercise the control-group flavour of `RaftStore<G>` — the storage
+//! invariants (WAL recovery, snapshot pointer scheme, conflict-truncate
+//! safety) are generic over `GroupKind`, so testing them through the
+//! control kind covers the shard kind too.
 
 #![allow(clippy::module_inception)]
 #![allow(unused_imports)]
 
 use super::*;
 
-use super::super::commands::{CoordinationCommand, CoordinationResponse};
+use super::super::commands::{ControlCommand, ControlResponse};
 use super::super::domains;
-use super::super::state_machine::CoordinationState;
-use super::super::types::TypeConfig;
+use super::super::group::ControlGroupKind;
+use super::super::state_machine::control::ControlState;
+use super::super::types::ControlConfig;
 use super::*;
 use object_store::memory::InMemory;
 use openraft::{RaftLogReader, RaftStorage, Vote};
 
-/// Create a test RaftStore with in-memory object store.
-fn create_test_store() -> LegacyRaftStore {
+/// Create a test RaftStore<ControlGroupKind> with in-memory object store.
+fn create_test_store() -> RaftStore<ControlGroupKind> {
     let object_store = Arc::new(InMemory::new());
-    LegacyRaftStore::new(object_store, "test/snapshots")
+    RaftStore::<ControlGroupKind>::new(object_store, "test/snapshots")
 }
 
 /// Helper to create a log ID for testing.
@@ -31,8 +37,8 @@ fn make_entry(
     term: u64,
     node: u64,
     index: u64,
-    payload: EntryPayload<TypeConfig>,
-) -> Entry<TypeConfig> {
+    payload: EntryPayload<ControlConfig>,
+) -> Entry<ControlConfig> {
     Entry {
         log_id: make_log_id(term, node, index),
         payload,
@@ -196,7 +202,7 @@ async fn test_apply_blank_entries() {
     // Verify responses
     assert_eq!(responses.len(), 2);
     for response in responses {
-        assert_eq!(response, CoordinationResponse::Ok);
+        assert_eq!(response, ControlResponse::Ok);
     }
 
     // Verify last_applied_log is updated
@@ -210,7 +216,7 @@ async fn test_apply_normal_entries() {
     let mut store = create_test_store();
 
     // Create entries with a command
-    let command = CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
+    let command = ControlCommand::Broker(domains::BrokerCommand::Register {
         broker_id: 1,
         host: "localhost".to_string(),
         port: 9092,
@@ -225,7 +231,7 @@ async fn test_apply_normal_entries() {
     // Verify response
     assert_eq!(responses.len(), 1);
     match &responses[0] {
-        CoordinationResponse::BrokerDomainResponse(domains::BrokerResponse::Registered {
+        ControlResponse::Broker(domains::BrokerResponse::Registered {
             broker_id,
         }) => {
             assert_eq!(*broker_id, 1);
@@ -336,7 +342,7 @@ async fn test_install_snapshot() {
     let mut store = create_test_store();
 
     // Create a test state
-    let state = CoordinationState {
+    let state = ControlState {
         version: 5,
         ..Default::default()
     };
@@ -374,7 +380,7 @@ async fn test_build_snapshot() {
     let mut store = create_test_store();
 
     // Apply some commands to build state
-    let command = CoordinationCommand::PartitionDomain(domains::PartitionCommand::CreateTopic {
+    let command = ControlCommand::TopicRegistry(domains::TopicRegistryCommand::CreateTopic {
         name: "test-topic".to_string(),
         partitions: 3,
         config: std::collections::HashMap::new(),
@@ -402,10 +408,10 @@ async fn test_snapshot_persistence() {
 
     // Create store and build snapshot
     {
-        let mut store = LegacyRaftStore::new(object_store.clone(), "persistence-test");
+        let mut store =     RaftStore::<ControlGroupKind>::new(object_store.clone(), "persistence-test");
 
         // Apply some state
-        let command = CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
+        let command = ControlCommand::Broker(domains::BrokerCommand::Register {
             broker_id: 42,
             host: "test-host".to_string(),
             port: 9092,
@@ -420,7 +426,7 @@ async fn test_snapshot_persistence() {
     }
 
     // Create new store and load snapshot
-    let store2 = LegacyRaftStore::new(object_store.clone(), "persistence-test");
+    let store2 =     RaftStore::<ControlGroupKind>::new(object_store.clone(), "persistence-test");
     let loaded = store2.load_snapshot_from_store().await.unwrap();
     assert!(loaded);
 
@@ -437,13 +443,13 @@ async fn test_snapshot_roundtrip() {
 
     // Build some state
     let commands = vec![
-        CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
+        ControlCommand::Broker(domains::BrokerCommand::Register {
             broker_id: 1,
             host: "broker1".to_string(),
             port: 9092,
             timestamp_ms: 1000,
         }),
-        CoordinationCommand::PartitionDomain(domains::PartitionCommand::CreateTopic {
+        ControlCommand::TopicRegistry(domains::TopicRegistryCommand::CreateTopic {
             name: "topic1".to_string(),
             partitions: 2,
             config: std::collections::HashMap::new(),
@@ -477,7 +483,7 @@ async fn test_legacy_snapshot_layout_still_loads() {
     let object_store = Arc::new(InMemory::new());
     let prefix = "legacy-test/snapshots";
 
-    let state = CoordinationState {
+    let state = ControlState {
         version: 7,
         ..Default::default()
     };
@@ -504,7 +510,7 @@ async fn test_legacy_snapshot_layout_still_loads() {
         .await
         .unwrap();
 
-    let store = LegacyRaftStore::new(object_store.clone(), prefix);
+    let store = RaftStore::<ControlGroupKind>::new(object_store.clone(), prefix);
     let loaded = store.load_snapshot_from_store().await.unwrap();
     assert!(loaded, "legacy snapshot layout should load");
 
@@ -520,8 +526,8 @@ async fn test_snapshot_falls_back_to_previous_generation() {
     let prefix = "fallback-test/snapshots";
 
     // Build two snapshot generations with distinguishable state.
-    let mut store = LegacyRaftStore::new(object_store.clone(), prefix);
-    let cmd1 = CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
+    let mut store = RaftStore::<ControlGroupKind>::new(object_store.clone(), prefix);
+    let cmd1 = ControlCommand::Broker(domains::BrokerCommand::Register {
         broker_id: 1,
         host: "gen1-host".to_string(),
         port: 9092,
@@ -534,7 +540,7 @@ async fn test_snapshot_falls_back_to_previous_generation() {
     use openraft::RaftSnapshotBuilder;
     store.build_snapshot().await.unwrap();
 
-    let cmd2 = CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
+    let cmd2 = ControlCommand::Broker(domains::BrokerCommand::Register {
         broker_id: 2,
         host: "gen2-host".to_string(),
         port: 9093,
@@ -563,7 +569,7 @@ async fn test_snapshot_falls_back_to_previous_generation() {
 
     // A fresh store must fall back to the previous generation instead
     // of failing (and must not panic).
-    let store2 = LegacyRaftStore::new(object_store.clone(), prefix);
+    let store2 = RaftStore::<ControlGroupKind>::new(object_store.clone(), prefix);
     let loaded = store2.load_snapshot_from_store().await.unwrap();
     assert!(loaded, "should fall back to the previous generation");
 
@@ -597,7 +603,7 @@ async fn test_corrupt_snapshot_meta_errors_without_panic() {
         .await
         .unwrap();
 
-    let store = LegacyRaftStore::new(object_store.clone(), prefix);
+    let store = RaftStore::<ControlGroupKind>::new(object_store.clone(), prefix);
     let result = store.load_snapshot_from_store().await;
     assert!(result.is_err(), "corrupt metadata must error, not panic");
 }
@@ -607,7 +613,7 @@ async fn test_install_snapshot_rejects_corrupt_bytes_without_mutating() {
     let mut store = create_test_store();
 
     // Seed some state.
-    let cmd = CoordinationCommand::BrokerDomain(domains::BrokerCommand::Register {
+    let cmd = ControlCommand::Broker(domains::BrokerCommand::Register {
         broker_id: 1,
         host: "host1".to_string(),
         port: 9092,
@@ -675,7 +681,7 @@ async fn test_membership_entry_application() {
 
     // Verify response
     assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0], CoordinationResponse::Ok);
+    assert_eq!(responses[0], ControlResponse::Ok);
 
     // Verify membership is updated
     let (_, stored_membership) = store.last_applied_state().await.unwrap();
@@ -694,7 +700,7 @@ async fn test_apply_multiple_commands() {
             1,
             0,
             1,
-            EntryPayload::Normal(CoordinationCommand::BrokerDomain(
+            EntryPayload::Normal(ControlCommand::Broker(
                 domains::BrokerCommand::Register {
                     broker_id: 1,
                     host: "host1".to_string(),
@@ -707,7 +713,7 @@ async fn test_apply_multiple_commands() {
             1,
             0,
             2,
-            EntryPayload::Normal(CoordinationCommand::BrokerDomain(
+            EntryPayload::Normal(ControlCommand::Broker(
                 domains::BrokerCommand::Register {
                     broker_id: 2,
                     host: "host2".to_string(),
@@ -720,8 +726,8 @@ async fn test_apply_multiple_commands() {
             1,
             0,
             3,
-            EntryPayload::Normal(CoordinationCommand::PartitionDomain(
-                domains::PartitionCommand::CreateTopic {
+            EntryPayload::Normal(ControlCommand::TopicRegistry(
+                domains::TopicRegistryCommand::CreateTopic {
                     name: "topic1".to_string(),
                     partitions: 3,
                     config: std::collections::HashMap::new(),
@@ -741,7 +747,7 @@ async fn test_apply_multiple_commands() {
     let sm = store.sm.read().await;
     let state = sm.state().await;
     assert_eq!(state.broker_domain.brokers.len(), 2);
-    assert_eq!(state.partition_domain.topics.len(), 1);
+    assert_eq!(state.topic_registry.topics.len(), 1);
 }
 
 #[tokio::test]
@@ -753,13 +759,13 @@ async fn test_noop_command() {
         1,
         0,
         1,
-        EntryPayload::Normal(CoordinationCommand::Noop),
+        EntryPayload::Normal(ControlCommand::Noop),
     )];
 
     let responses = store.apply_to_state_machine(&entries).await.unwrap();
 
     assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0], CoordinationResponse::Ok);
+    assert_eq!(responses[0], ControlResponse::Ok);
 }
 
 #[tokio::test]

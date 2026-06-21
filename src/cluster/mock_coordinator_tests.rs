@@ -714,6 +714,7 @@ async fn test_partition_failover_on_lease_expiry() {
 
     // Setup: Share the same state between brokers
     let shared_topics = broker1.topics.clone();
+    let shared_topic_configs = broker1.topic_configs.clone();
     let shared_owners = broker1.partition_owners.clone();
     let shared_epochs = broker1.partition_epochs.clone();
     let shared_brokers = broker1.brokers.clone();
@@ -725,6 +726,7 @@ async fn test_partition_failover_on_lease_expiry() {
         port: 9093,
         brokers: shared_brokers,
         topics: shared_topics,
+        topic_configs: shared_topic_configs,
         partition_owners: shared_owners,
         partition_epochs: shared_epochs,
         consumer_groups: broker2.consumer_groups.clone(),
@@ -796,6 +798,7 @@ async fn test_partition_ownership_fencing() {
 
     // Share state
     let shared_topics = broker1.topics.clone();
+    let shared_topic_configs = broker1.topic_configs.clone();
     let shared_owners = broker1.partition_owners.clone();
     let shared_epochs = broker1.partition_epochs.clone();
     let shared_brokers = broker1.brokers.clone();
@@ -806,6 +809,7 @@ async fn test_partition_ownership_fencing() {
         port: 9093,
         brokers: shared_brokers,
         topics: shared_topics,
+        topic_configs: shared_topic_configs,
         partition_owners: shared_owners,
         partition_epochs: shared_epochs,
         consumer_groups: broker2.consumer_groups.clone(),
@@ -854,6 +858,7 @@ async fn test_concurrent_partition_acquisition_race() {
 
     // Share state
     let shared_topics = broker1.topics.clone();
+    let shared_topic_configs = broker1.topic_configs.clone();
     let shared_owners = broker1.partition_owners.clone();
     let shared_epochs = broker1.partition_epochs.clone();
     let shared_brokers = broker1.brokers.clone();
@@ -864,6 +869,7 @@ async fn test_concurrent_partition_acquisition_race() {
         port: 9093,
         brokers: shared_brokers,
         topics: shared_topics,
+        topic_configs: shared_topic_configs,
         partition_owners: shared_owners,
         partition_epochs: shared_epochs,
         consumer_groups: broker2.consumer_groups.clone(),
@@ -913,6 +919,7 @@ async fn test_partition_release_and_reacquisition() {
 
     // Share state
     let shared_topics = broker1.topics.clone();
+    let shared_topic_configs = broker1.topic_configs.clone();
     let shared_owners = broker1.partition_owners.clone();
     let shared_epochs = broker1.partition_epochs.clone();
     let shared_brokers = broker1.brokers.clone();
@@ -923,6 +930,7 @@ async fn test_partition_release_and_reacquisition() {
         port: 9093,
         brokers: shared_brokers,
         topics: shared_topics,
+        topic_configs: shared_topic_configs,
         partition_owners: shared_owners,
         partition_epochs: shared_epochs,
         consumer_groups: broker2.consumer_groups.clone(),
@@ -1058,6 +1066,7 @@ async fn test_multi_partition_failover() {
 
     // Share state among all brokers
     let shared_topics = broker1.topics.clone();
+    let shared_topic_configs = broker1.topic_configs.clone();
     let shared_owners = broker1.partition_owners.clone();
     let shared_epochs = broker1.partition_epochs.clone();
     let shared_brokers = broker1.brokers.clone();
@@ -1068,6 +1077,7 @@ async fn test_multi_partition_failover() {
         port: 9093,
         brokers: shared_brokers.clone(),
         topics: shared_topics.clone(),
+        topic_configs: shared_topic_configs.clone(),
         partition_owners: shared_owners.clone(),
         partition_epochs: shared_epochs.clone(),
         consumer_groups: broker2.consumer_groups.clone(),
@@ -1084,6 +1094,7 @@ async fn test_multi_partition_failover() {
         port: 9094,
         brokers: shared_brokers,
         topics: shared_topics,
+        topic_configs: shared_topic_configs,
         partition_owners: shared_owners,
         partition_epochs: shared_epochs,
         consumer_groups: broker3.consumer_groups.clone(),
@@ -1209,6 +1220,7 @@ async fn test_lease_renewal_keeps_ownership() {
 
     // Share state
     let shared_topics = broker1.topics.clone();
+    let shared_topic_configs = broker1.topic_configs.clone();
     let shared_owners = broker1.partition_owners.clone();
     let shared_epochs = broker1.partition_epochs.clone();
     let shared_brokers = broker1.brokers.clone();
@@ -1219,6 +1231,7 @@ async fn test_lease_renewal_keeps_ownership() {
         port: 9093,
         brokers: shared_brokers,
         topics: shared_topics,
+        topic_configs: shared_topic_configs,
         partition_owners: shared_owners,
         partition_epochs: shared_epochs,
         consumer_groups: broker2.consumer_groups.clone(),

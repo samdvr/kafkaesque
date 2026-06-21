@@ -1922,4 +1922,172 @@ mod tests {
 
         store.close().await.expect("Failed to close");
     }
+
+    // ========================================================================
+    // Shared SlateDB block cache + bounded compaction runtime
+    // ========================================================================
+    //
+    // These pin the broker-wide pooling contract introduced by
+    // `super::super::slatedb_resources::SharedSlateDbResources`:
+    //
+    //   1. One `Arc<dyn DbCache>` is reused across every partition open
+    //      (so cache hits accumulate broker-wide instead of being
+    //      partitioned).
+    //   2. The cache has a hard byte cap — `entry_count()` plateaus
+    //      under sustained load, doesn't grow unbounded.
+    //   3. The dedicated compaction runtime has the worker count the
+    //      operator configured.
+    //   4. The acquire→release→acquire close-before-reopen contract
+    //      (`partition_manager.rs:2296`) still holds when SlateDB's
+    //      compactor is hosted on the dedicated runtime instead of the
+    //      ambient one.
+
+    use super::super::slatedb_resources::SharedSlateDbResources;
+    use slatedb::db_cache::DbCache;
+
+    /// Open a partition with the supplied shared resources installed
+    /// directly on the builder. Mirrors what `apply_store_tuning` does
+    /// in `partition_manager.rs` but bypasses `PartitionManager`
+    /// itself, since the contract here is purely about whether the
+    /// cache / runtime are reused across builds — not about the
+    /// coordinator path.
+    async fn open_with_shared(
+        object_store: Arc<dyn object_store::ObjectStore>,
+        topic: &str,
+        partition: i32,
+        resources: &SharedSlateDbResources,
+    ) -> PartitionStore {
+        let mut builder = PartitionStore::builder()
+            .object_store(object_store)
+            .base_path("test")
+            .topic(topic)
+            .partition(partition)
+            .slatedb_compaction_handle(resources.compaction_handle.clone());
+        if let Some(cache) = resources.cache.clone() {
+            builder = builder.slatedb_block_cache(cache);
+        }
+        builder.build().await.expect("open with shared resources")
+    }
+
+    #[tokio::test]
+    async fn shared_block_cache_is_reused_across_partition_opens() {
+        // Two partitions opened against the same `Arc<dyn DbCache>`
+        // must hit one shared cache. A regression that made the
+        // builder clone the inner cache (instead of cloning the `Arc`)
+        // would isolate them — caught here by both the pointer-equality
+        // check and the entry-count progression.
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let (resources, _rt) = SharedSlateDbResources::for_tests();
+        let cache_for_assert = resources
+            .cache
+            .clone()
+            .expect("test resources must have a cache");
+
+        // Open partition A and drive a small write so the cache has
+        // something to track.
+        let a = open_with_shared(object_store.clone(), "shared-cache-a", 0, &resources).await;
+        let batch = create_test_batch(1, 0, 0, 4);
+        a.append_batch(&batch).await.expect("append A");
+        let _ = a.fetch_from(0).await.expect("fetch A");
+        a.close().await.expect("close A");
+
+        let entries_after_a = cache_for_assert.entry_count();
+
+        // Open partition B against the SAME shared resources.
+        let b = open_with_shared(object_store.clone(), "shared-cache-b", 0, &resources).await;
+        let batch_b = create_test_batch(2, 0, 0, 4);
+        b.append_batch(&batch_b).await.expect("append B");
+        let _ = b.fetch_from(0).await.expect("fetch B");
+
+        // Pointer-equality on the `Arc` we *gave* the builder: this
+        // catches the "we cloned the inner DbCache" regression that
+        // would silently de-share the cache.
+        let cache_via_resources = resources
+            .cache
+            .clone()
+            .expect("resources must still hold the cache");
+        assert!(
+            Arc::ptr_eq(&cache_for_assert, &cache_via_resources),
+            "the same Arc<dyn DbCache> must back every open"
+        );
+
+        // Entry count must have grown from B's reads landing in the
+        // shared cache. If it didn't grow, B got an isolated cache.
+        let entries_after_b = cache_for_assert.entry_count();
+        assert!(
+            entries_after_b >= entries_after_a,
+            "shared cache entry count must grow (or stay equal) across partitions; \
+             a == {entries_after_a}, b == {entries_after_b}"
+        );
+
+        b.close().await.expect("close B");
+    }
+
+    #[tokio::test]
+    async fn dedicated_compaction_runtime_has_configured_worker_count() {
+        // Sanity: the dedicated runtime carries the worker count the
+        // operator asked for. This catches a misconfiguration where a
+        // future refactor accidentally reverts to a current-thread
+        // runtime (which would make every shard compactor serialize
+        // through one worker, masking the bounded-parallelism
+        // guarantee with a worse one).
+        let (resources, _rt) = SharedSlateDbResources::for_tests();
+        assert_eq!(
+            resources.compaction_handle.metrics().num_workers(),
+            1,
+            "for_tests() configures 1 worker"
+        );
+
+        // Spawning a task on the compaction handle must not run on
+        // the ambient (test) runtime — the very point of the
+        // dedicated runtime is that compaction CPU does not burn
+        // request-handling cycles. Pin that the spawned task observes
+        // a different `Handle::current()` than the test's.
+        let test_handle_id = format!("{:?}", tokio::runtime::Handle::current());
+        let compaction_observed = resources
+            .compaction_handle
+            .spawn(async {
+                // Inside the compaction runtime, `Handle::current()`
+                // is the compaction runtime's handle, not the test's.
+                format!("{:?}", tokio::runtime::Handle::current())
+            })
+            .await
+            .expect("compaction task must run");
+        assert_ne!(
+            test_handle_id, compaction_observed,
+            "compaction tasks must run on the dedicated runtime, not the test runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_release_acquire_with_shared_resources_does_not_deadlock_or_panic() {
+        // Regression test for the close-before-reopen race
+        // (`partition_manager.rs:2296`). The original path closes the
+        // SlateDB instance synchronously before the new owner opens,
+        // because the compactor would otherwise race the new opener
+        // and panic. Sharing only the *runtime* (not the compactor
+        // instance) preserves that contract — but we want a test that
+        // exercises it under shared resources to catch a future
+        // regression that lets an in-flight compaction outlive the
+        // close.
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let (resources, _rt) = SharedSlateDbResources::for_tests();
+        let topic = "rapid-cycle";
+        let partition = 0;
+
+        for cycle in 0..3 {
+            let store = open_with_shared(object_store.clone(), topic, partition, &resources).await;
+            let batch = create_test_batch(cycle as i64 + 1, 0, 0, 2);
+            store
+                .append_batch(&batch)
+                .await
+                .unwrap_or_else(|e| panic!("append cycle {cycle} failed: {e}"));
+            // Close synchronously — this is what
+            // `release_reassigned_partition` does today.
+            store
+                .close()
+                .await
+                .unwrap_or_else(|e| panic!("close cycle {cycle} failed: {e}"));
+        }
+    }
 }

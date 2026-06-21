@@ -5,6 +5,7 @@
 
 mod admin;
 mod auth;
+mod configs;
 mod fetch;
 mod groups;
 mod metadata;
@@ -25,6 +26,7 @@ use crate::parser::{parse_kafka_string_opt, skip_tagged_fields};
 // Re-export all request data types
 pub use admin::*;
 pub use auth::*;
+pub use configs::*;
 pub use fetch::*;
 pub use groups::*;
 pub use metadata::*;
@@ -58,6 +60,8 @@ pub enum ApiKey {
     CreateTopics = 19,
     DeleteTopics = 20,
     InitProducerId = 22,
+    DescribeConfigs = 32,
+    AlterConfigs = 33,
     SaslAuthenticate = 36,
     DeleteGroups = 42,
     Unknown(i16),
@@ -88,6 +92,8 @@ impl From<i16> for ApiKey {
             19 => ApiKey::CreateTopics,
             20 => ApiKey::DeleteTopics,
             22 => ApiKey::InitProducerId,
+            32 => ApiKey::DescribeConfigs,
+            33 => ApiKey::AlterConfigs,
             36 => ApiKey::SaslAuthenticate,
             42 => ApiKey::DeleteGroups,
             n => ApiKey::Unknown(n),
@@ -120,6 +126,8 @@ impl From<ApiKey> for i16 {
             ApiKey::CreateTopics => 19,
             ApiKey::DeleteTopics => 20,
             ApiKey::InitProducerId => 22,
+            ApiKey::DescribeConfigs => 32,
+            ApiKey::AlterConfigs => 33,
             ApiKey::SaslAuthenticate => 36,
             ApiKey::DeleteGroups => 42,
             ApiKey::Unknown(n) => n,
@@ -157,6 +165,8 @@ impl ApiKey {
             ApiKey::CreateTopics => "CreateTopics",
             ApiKey::DeleteTopics => "DeleteTopics",
             ApiKey::InitProducerId => "InitProducerId",
+            ApiKey::DescribeConfigs => "DescribeConfigs",
+            ApiKey::AlterConfigs => "AlterConfigs",
             ApiKey::SaslAuthenticate => "SaslAuthenticate",
             ApiKey::DeleteGroups => "DeleteGroups",
             ApiKey::Unknown(_) => "Unknown",
@@ -242,6 +252,8 @@ pub enum Request {
     DeleteTopics(RequestHeader, DeleteTopicsRequestData),
     InitProducerId(RequestHeader, InitProducerIdRequestData),
     DeleteGroups(RequestHeader, DeleteGroupsRequestData),
+    DescribeConfigs(RequestHeader, DescribeConfigsRequestData),
+    AlterConfigs(RequestHeader, AlterConfigsRequestData),
     /// A known API key was sent with a version outside the advertised
     /// range in [`crate::server::versions::SUPPORTED_VERSIONS`]. The body
     /// is intentionally NOT parsed (its layout is unknown to us); the
@@ -275,6 +287,8 @@ impl Request {
             Request::DeleteTopics(h, _) => h,
             Request::InitProducerId(h, _) => h,
             Request::DeleteGroups(h, _) => h,
+            Request::DescribeConfigs(h, _) => h,
+            Request::AlterConfigs(h, _) => h,
             Request::UnsupportedVersion(h) => h,
             Request::Unknown(h, _) => h,
         }
@@ -406,6 +420,16 @@ impl Request {
                 let (rest, body) = groups::parse_delete_groups_request(remaining, version)
                     .map_err(|_| parsing_error(&data))?;
                 (rest, Request::DeleteGroups(header, body))
+            }
+            ApiKey::DescribeConfigs => {
+                let (rest, body) = configs::parse_describe_configs_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::DescribeConfigs(header, body))
+            }
+            ApiKey::AlterConfigs => {
+                let (rest, body) = configs::parse_alter_configs_request(remaining, version)
+                    .map_err(|_| parsing_error(&data))?;
+                (rest, Request::AlterConfigs(header, body))
             }
             _ => return Ok(Request::Unknown(header, remaining.into_bytes())),
         };

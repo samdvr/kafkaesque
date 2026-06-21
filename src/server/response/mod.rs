@@ -5,6 +5,7 @@
 
 mod admin;
 mod auth;
+mod configs;
 mod fetch;
 mod groups;
 mod metadata;
@@ -20,6 +21,7 @@ use crate::error::Result;
 // Re-export all response data types
 pub use admin::*;
 pub use auth::*;
+pub use configs::*;
 pub use fetch::*;
 pub use groups::*;
 pub use metadata::*;

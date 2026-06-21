@@ -10,6 +10,7 @@
 //! - `producer_id` - Producer ID initialization
 
 mod admin;
+mod configs;
 mod fetch;
 mod groups;
 mod metadata;
@@ -98,7 +99,7 @@ use super::config::ClusterConfig;
 use super::error::{SlateDBError, SlateDBResult};
 use super::object_store::create_object_store;
 use super::partition_manager::PartitionManager;
-use super::raft::{RaftConfig, RaftCoordinator, request_cluster_join};
+use super::raft::{RaftConfig, RaftCoordinator};
 use super::traits::PartitionCoordinator;
 
 /// Health status of the cluster handler.
@@ -174,6 +175,15 @@ pub struct SlateDBClusterHandler {
     /// `Some` — set to `AllowAllAuthorizer` when ACL enforcement is off so
     /// the call sites don't need to special-case the disabled path.
     pub(crate) authorizer: Arc<dyn crate::cluster::authorizer::Authorizer>,
+
+    /// Cluster-level config snapshot.
+    ///
+    /// The handler caches this at startup so per-request code (e.g.
+    /// DescribeConfigs resolving topic configs against cluster defaults)
+    /// can read knobs that aren't already broken out into individual
+    /// fields above. `Arc` keeps the clones in `tracing::instrument`-style
+    /// captures cheap.
+    pub(crate) config: Arc<ClusterConfig>,
 
     /// Per-partition notifies that fire after every successful append.
     /// Fetch handlers waiting under `max_wait_ms` / `min_bytes` listen on
@@ -359,9 +369,9 @@ impl SlateDBClusterHandler {
                 "Joining existing Raft cluster as new member"
             );
 
-            // Try to join the cluster via any known peer
-            let node_id = config.broker_id as u64;
-            let raft_addr = config.raft_listen_addr.clone();
+            // Try to join the cluster via any known peer. Identity
+            // (`node_id`, `raft_addr`) flows through the coordinator's
+            // join path; no need to re-extract it here.
 
             // Try each peer until we successfully join
             if let Some(peers) = &config.raft_peers {
@@ -376,16 +386,12 @@ impl SlateDBClusterHandler {
                             "Requesting to join cluster via peer"
                         );
 
-                        // Send join request to the peer (who will forward to leader if needed)
-                        match request_cluster_join(
-                            peer_addr,
-                            node_id,
-                            &raft_addr,
-                            &raft_config.auth_keys,
-                            raft_config.tls.as_ref(),
-                        )
-                        .await
-                        {
+                        // Multi-group fan-out via the coordinator: phase 1
+                        // adds this broker as learner on control + every
+                        // shard, phase 2 promotes to voter on each. Each
+                        // RPC is idempotent server-side so retries against
+                        // a partially-joined cluster recover cleanly.
+                        match coordinator.join_cluster(peer_addr).await {
                             Ok(()) => {
                                 info!(
                                     broker_id = config.broker_id,
@@ -437,16 +443,18 @@ impl SlateDBClusterHandler {
             runtime_handles.control.clone(),
         ));
 
-        // Install a heartbeat hook on the Raft state machine so
-        // every applied broker heartbeat refreshes the local failure
-        // detector. Without this, fast-failover would rely on lease-TTL expiry
-        // (~60s) instead of the configured ~2.5s heartbeat budget.
+        // Install a heartbeat hook on the **control** group state machine
+        // so every applied broker heartbeat refreshes the local failure
+        // detector. Without this, fast-failover would rely on lease-TTL
+        // expiry (~60s) instead of the configured ~2.5s heartbeat budget.
+        // Heartbeats are cluster-wide state and live on control only —
+        // shard SMs don't apply broker heartbeats.
         if let Some(rebalance_coord) = partition_manager.rebalance_coordinator() {
             let rc = rebalance_coord.clone();
-            let sm_arc = coordinator.node().state_machine();
-            sm_arc
-                .read()
-                .await
+            coordinator
+                .cluster()
+                .control()
+                .state_machine()
                 .set_heartbeat_hook(Arc::new(move |broker_id| {
                     rc.record_heartbeat(broker_id);
                 }));
@@ -456,31 +464,69 @@ impl SlateDBClusterHandler {
         // machine applies an ownership change. Without this, followers (and
         // the broker that lost a partition) can serve fetch/metadata from a
         // stale 1s-TTL cache after failover.
+        //
+        // The hook installs on **control** (broker fence → All
+        // invalidation) AND every **shard** (per-partition acquire/release
+        // → Partition invalidation). All of them dispatch into the same
+        // global `RaftCoordinator` invalidator — the cache is process-wide,
+        // not per-group.
         {
-            let coordinator_for_hook = coordinator.clone();
             let runtime = runtime_handles.control.clone();
-            let sm_arc = coordinator.node().state_machine();
-            sm_arc
-                .read()
-                .await
-                .set_ownership_change_hook(Arc::new(move |invalidation| {
-                    let coordinator = coordinator_for_hook.clone();
-                    runtime.spawn(async move {
-                        match invalidation {
-                            super::raft::OwnershipCacheInvalidation::Partition {
-                                topic,
-                                partition,
-                            } => {
-                                coordinator
-                                    .invalidate_ownership_cache(&topic, partition)
-                                    .await;
+            // Control hook: bulk invalidation on broker-status changes.
+            {
+                let coordinator_for_hook = coordinator.clone();
+                let runtime = runtime.clone();
+                coordinator
+                    .cluster()
+                    .control()
+                    .state_machine()
+                    .set_ownership_change_hook(Arc::new(move |invalidation| {
+                        let coordinator = coordinator_for_hook.clone();
+                        runtime.spawn(async move {
+                            match invalidation {
+                                super::raft::OwnershipCacheInvalidation::Partition {
+                                    topic,
+                                    partition,
+                                } => {
+                                    coordinator
+                                        .invalidate_ownership_cache(&topic, partition)
+                                        .await;
+                                }
+                                super::raft::OwnershipCacheInvalidation::All => {
+                                    coordinator.invalidate_all_ownership_cache().await;
+                                }
                             }
-                            super::raft::OwnershipCacheInvalidation::All => {
-                                coordinator.invalidate_all_ownership_cache().await;
+                        });
+                    }));
+            }
+            // Per-shard hooks: per-partition invalidation on
+            // acquire/release/transfer. Without these, a follower's owner
+            // cache would lag by up to its 1s TTL after a transfer commits
+            // on its shard.
+            for shard in coordinator.cluster().shards() {
+                let coordinator_for_hook = coordinator.clone();
+                let runtime = runtime.clone();
+                shard
+                    .state_machine()
+                    .set_ownership_change_hook(Arc::new(move |invalidation| {
+                        let coordinator = coordinator_for_hook.clone();
+                        runtime.spawn(async move {
+                            match invalidation {
+                                super::raft::OwnershipCacheInvalidation::Partition {
+                                    topic,
+                                    partition,
+                                } => {
+                                    coordinator
+                                        .invalidate_ownership_cache(&topic, partition)
+                                        .await;
+                                }
+                                super::raft::OwnershipCacheInvalidation::All => {
+                                    coordinator.invalidate_all_ownership_cache().await;
+                                }
                             }
-                        }
-                    });
-                }));
+                        });
+                    }));
+            }
         }
 
         // Start background tasks
@@ -578,6 +624,7 @@ impl SlateDBClusterHandler {
                 .map(Arc::new),
             #[cfg(feature = "sasl")]
             sasl_post_auth: dashmap::DashMap::new(),
+            config: Arc::new(config),
         })
     }
 
@@ -1111,6 +1158,24 @@ impl Handler for SlateDBClusterHandler {
         request: InitProducerIdRequestData,
     ) -> InitProducerIdResponseData {
         producer_id::handle_init_producer_id(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_describe_configs(
+        &self,
+        ctx: &RequestContext,
+        request: DescribeConfigsRequestData,
+    ) -> DescribeConfigsResponseData {
+        configs::handle_describe_configs(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_alter_configs(
+        &self,
+        ctx: &RequestContext,
+        request: AlterConfigsRequestData,
+    ) -> AlterConfigsResponseData {
+        configs::handle_alter_configs(self, ctx, request).await
     }
 }
 

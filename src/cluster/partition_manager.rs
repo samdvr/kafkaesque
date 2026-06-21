@@ -155,6 +155,27 @@ pub struct PartitionManager<C: ClusterCoordinator> {
 
     /// Runtime handle for spawning control plane tasks.
     control_runtime: Handle,
+
+    /// Broker-wide SlateDB resources (shared block cache + dedicated
+    /// compaction runtime handle), built once and threaded into every
+    /// per-partition `Db::builder` via `apply_store_tuning`.
+    slatedb_resources: super::slatedb_resources::SharedSlateDbResources,
+
+    /// Owning handle for the dedicated compaction runtime.
+    ///
+    /// MUST outlive every `Db` opened on this broker — dropping it
+    /// while in-flight compactions are running aborts those tasks
+    /// mid-flush. `PartitionManager::stop` closes every store *before*
+    /// dropping `self`, which drops this `Arc` last in field
+    /// declaration order. `None` when `slatedb_compaction_workers ==
+    /// 0` (compaction runs on the ambient runtime — escape hatch).
+    ///
+    /// Wrapped in `OwnedCompactionRuntime` (a Drop guard that calls
+    /// `Runtime::shutdown_background` on drop) so dropping
+    /// `PartitionManager` from inside an async context (every
+    /// `#[tokio::test]`) doesn't trip tokio's
+    /// "cannot drop a runtime in async context" panic.
+    _compaction_runtime: Option<Arc<super::slatedb_resources::OwnedCompactionRuntime>>,
 }
 
 impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
@@ -165,6 +186,22 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         config: ClusterConfig,
         control_runtime: Handle,
     ) -> Self {
+        // Build broker-wide SlateDB resources from config. The dedicated
+        // compaction runtime is built here (not at the broker handler)
+        // because its lifetime is exactly `PartitionManager`'s — drops
+        // last in field order so it outlives every `Db` we open.
+        let (slatedb_resources, compaction_runtime) =
+            super::slatedb_resources::SharedSlateDbResources::from_config(&config)
+                .expect("SharedSlateDbResources::from_config must build the dedicated compaction runtime; see SLATEDB_COMPACTION_WORKERS");
+
+        // Surface the configured budgets as gauges so an operator can
+        // see them in the first metrics scrape rather than waiting for
+        // the live-update tick.
+        super::metrics::set_slatedb_resources_configured(
+            config.slatedb_block_cache_bytes,
+            config.slatedb_compaction_workers,
+        );
+
         // Create shutdown channel with capacity for all background tasks
         let (shutdown_tx, _) = broadcast::channel(4);
 
@@ -253,6 +290,8 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             rebalance_coordinator,
             rebalance_task_handles: RwLock::new(None),
             control_runtime,
+            slatedb_resources,
+            _compaction_runtime: compaction_runtime,
         }
     }
 
@@ -353,6 +392,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             slatedb_max_unflushed_bytes: self.config.slatedb_max_unflushed_bytes,
             slatedb_l0_sst_size_bytes: self.config.slatedb_l0_sst_size_bytes,
             slatedb_flush_interval_ms: self.config.slatedb_flush_interval_ms,
+            slatedb_resources: self.slatedb_resources.clone(),
             max_owned_partitions_per_broker: self.config.max_owned_partitions_per_broker,
             acquire_locks: self.acquire_locks.clone(),
             topic_name_cache: self.topic_name_cache.clone(),
@@ -383,6 +423,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         let ownership_handle = self.start_ownership_loop();
         let session_handle = self.start_session_timeout_loop();
         let offset_expiration_handle = self.start_offset_expiration_loop();
+        let cache_metrics_handle = self.start_slatedb_cache_metrics_loop();
 
         let mut handles = self.task_handles.write().await;
         handles.push(heartbeat_handle);
@@ -390,6 +431,9 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         handles.push(ownership_handle);
         handles.push(session_handle);
         if let Some(h) = offset_expiration_handle {
+            handles.push(h);
+        }
+        if let Some(h) = cache_metrics_handle {
             handles.push(h);
         }
 
@@ -412,6 +456,32 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         }
 
         info!(broker_id = self.broker_id, "Partition manager started");
+    }
+
+    /// Periodically publish the live entry count of the shared
+    /// SlateDB block cache. Returns `None` when the operator has
+    /// disabled the shared cache (the gauge stays at 0 — no point
+    /// burning a task on it).
+    ///
+    /// 5s tick: `entry_count()` is a simple atomic read on `MokaCache`,
+    /// so cost is negligible. The gauge is informational — operators
+    /// alert on it sustained at the configured byte budget (signal:
+    /// "cache too small for partition footprint, oldest scopes may
+    /// be churning").
+    fn start_slatedb_cache_metrics_loop(&self) -> Option<JoinHandle<()>> {
+        let cache = self.slatedb_resources.cache.clone()?;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        Some(self.control_runtime.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        super::metrics::set_slatedb_block_cache_entry_count(cache.entry_count());
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+        }))
     }
 
     /// Start the broker heartbeat loop.
@@ -1758,6 +1828,11 @@ struct OwnershipContext<C: ClusterCoordinator> {
     slatedb_max_unflushed_bytes: usize,
     slatedb_l0_sst_size_bytes: usize,
     slatedb_flush_interval_ms: u64,
+    /// Broker-wide shared block cache + dedicated compaction runtime
+    /// handle. Threaded into every `Db::builder` via `apply_store_tuning`
+    /// so all per-partition `Db` instances share one cache and one
+    /// bounded compaction runtime.
+    slatedb_resources: super::slatedb_resources::SharedSlateDbResources,
     /// Maximum partitions this broker may own at once. `0` means unbounded.
     /// Enforced in `acquire_partition_core` before opening a SlateDB instance.
     max_owned_partitions_per_broker: usize,
@@ -1788,7 +1863,7 @@ fn apply_store_tuning<C: ClusterCoordinator>(
     builder: crate::cluster::partition_store::PartitionStoreBuilder,
     ctx: &OwnershipContext<C>,
 ) -> crate::cluster::partition_store::PartitionStoreBuilder {
-    builder
+    let mut builder = builder
         .max_fetch_response_size(ctx.max_fetch_response_size)
         .producer_state_cache_ttl_secs(ctx.producer_state_cache_ttl_secs)
         .fail_on_recovery_gap(ctx.fail_on_recovery_gap)
@@ -1797,6 +1872,16 @@ fn apply_store_tuning<C: ClusterCoordinator>(
         .slatedb_max_unflushed_bytes(ctx.slatedb_max_unflushed_bytes)
         .slatedb_l0_sst_size_bytes(ctx.slatedb_l0_sst_size_bytes)
         .slatedb_flush_interval_ms(ctx.slatedb_flush_interval_ms)
+        .slatedb_compaction_handle(ctx.slatedb_resources.compaction_handle.clone());
+    // The cache is `Option<Arc<dyn DbCache>>` — `None` when the
+    // operator zeroes `slatedb_block_cache_bytes` to A/B against the
+    // legacy per-DB-cache behaviour. Only set the builder field when
+    // present so `None` truly falls through to SlateDB's per-DB
+    // default rather than overriding it with a useless wrapper.
+    if let Some(cache) = ctx.slatedb_resources.cache.clone() {
+        builder = builder.slatedb_block_cache(cache);
+    }
+    builder
 }
 
 /// Helper macro to check if zombie mode was re-entered during verification.

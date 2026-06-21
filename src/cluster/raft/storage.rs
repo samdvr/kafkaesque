@@ -3,10 +3,8 @@
 //! This module provides combined log and state machine storage for Raft.
 //! Snapshots are persisted to the object store for production durability.
 //!
-//! Generic over [`GroupKind`] so the same implementation backs the legacy
-//! single-group path, the control group, and every shard group. The legacy
-//! single-group flavour is exposed via the [`LegacyRaftStore`] alias and
-//! removed in step 10 of the sharding plan.
+//! Generic over [`GroupKind`] so the same implementation backs the
+//! control group and every shard group.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -25,7 +23,7 @@ use openraft::{
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
-use super::group::{GroupKind, LegacyGroupKind};
+use super::group::GroupKind;
 use super::types::RaftNodeId;
 
 /// Shorthand for a group's response type — the openraft `R` associated
@@ -33,11 +31,6 @@ use super::types::RaftNodeId;
 /// `Vec<<G::Cfg as RaftTypeConfig>::R>` doesn't drown the rest of the
 /// signature.
 type GroupResponse<G> = <<G as GroupKind>::Cfg as openraft::RaftTypeConfig>::R;
-
-/// Backwards-compat alias for the single-group store. Used by the legacy
-/// [`super::node::RaftNode`] and its tests until the sharded layout
-/// (`RaftCluster` + per-group stores) replaces them in step 10.
-pub type LegacyRaftStore = RaftStore<LegacyGroupKind>;
 
 /// Legacy snapshot metadata layout (pre-pointer scheme), stored alongside a
 /// data object at `current.snapshot`. Still understood on read for

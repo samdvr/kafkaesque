@@ -138,12 +138,16 @@ pub fn cluster_operation_for_api(api_key: crate::server::request::ApiKey) -> Opt
         //   cluster-level Describe that ordinary clients never hold.
         // - FindCoordinator: Describe on the group named in the request.
         // - CreateTopics / DeleteTopics: Create / Delete on the topic.
+        // - DescribeConfigs / AlterConfigs: per-resource check at the handler
+        //   (topic-level DescribeConfigs / AlterConfigs on the named topic).
         ApiKey::Produce
         | ApiKey::Fetch
         | ApiKey::Metadata
         | ApiKey::FindCoordinator
         | ApiKey::CreateTopics
         | ApiKey::DeleteTopics
+        | ApiKey::DescribeConfigs
+        | ApiKey::AlterConfigs
         | ApiKey::ListOffsets
         | ApiKey::OffsetCommit
         | ApiKey::OffsetFetch

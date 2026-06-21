@@ -1,9 +1,17 @@
 //! PartitionCoordinator implementation for RaftCoordinator.
 //!
-//! This module handles:
-//! - Broker registration and heartbeat
-//! - Partition ownership (acquire/renew/release)
-//! - Topic metadata (create/delete/list)
+//! Routing summary:
+//!
+//! - Broker registry / heartbeat / unregister → **control** group
+//!   (`ControlCommand::Broker`).
+//! - Topic registry (create / delete / list / partition count) → **control**
+//!   group (`ControlCommand::TopicRegistry`).
+//! - Per-partition lease ops (acquire / renew / release / expire) → **shard**
+//!   group `hash(topic) % metadata_shards`
+//!   (`ShardCommand::Partition(PartitionStateCommand::*)`).
+//! - Read-side state spans both: ownership reads from a shard's
+//!   `partition_state.partitions` map; broker liveness reads from control's
+//!   `broker_domain.brokers`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,9 +20,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tracing::{debug, info};
 
-use super::super::commands::{CoordinationCommand, CoordinationResponse};
+use super::super::commands::{ControlCommand, ControlResponse, ShardCommand, ShardResponse};
 use super::super::domains::{
-    BrokerCommand, BrokerResponse, BrokerStatus, PartitionCommand, PartitionResponse,
+    BrokerCommand, BrokerResponse, BrokerStatus, PartitionStateCommand, PartitionStateResponse,
+    TopicRegistryCommand, TopicRegistryResponse,
 };
 use super::{RaftCoordinator, current_time_ms};
 
@@ -33,26 +42,33 @@ impl PartitionCoordinator for RaftCoordinator {
     // time), so the current Raft leader's node id IS the controller's
     // broker id. Returns None during elections, which callers report as
     // controller_id = -1 per Kafka convention.
+    //
+    // The "controller" in the multi-group layout is the **control**
+    // group's leader — it's the node that owns broker registry and topic
+    // registry decisions, which is what every "find the controller"
+    // protocol path is asking about.
     async fn current_leader_id(&self) -> SlateDBResult<Option<i32>> {
-        Ok(self.node.current_leader().await.map(|id| id as i32))
+        Ok(self
+            .cluster()
+            .control()
+            .current_leader()
+            .map(|id| id as i32))
     }
 
     async fn register_broker(&self) -> SlateDBResult<()> {
         // Retry with backoff since non-leaders need to forward to leader
-        // and the leader may not be ready immediately after election
+        // and the leader may not be ready immediately after election.
         for attempt in 0..30 {
-            let command = CoordinationCommand::BrokerDomain(BrokerCommand::Register {
+            let command = ControlCommand::Broker(BrokerCommand::Register {
                 broker_id: self.broker_id,
                 host: self.broker_info.host.clone(),
                 port: self.broker_info.port,
                 timestamp_ms: current_time_ms(),
             });
 
-            match self.node.write(command).await {
+            match self.cluster().write_control(command).await {
                 Ok(response) => match response {
-                    CoordinationResponse::BrokerDomainResponse(BrokerResponse::Registered {
-                        ..
-                    }) => {
+                    ControlResponse::Broker(BrokerResponse::Registered { .. }) => {
                         info!(broker_id = self.broker_id, "Broker registered with Raft");
                         return Ok(());
                     }
@@ -65,7 +81,6 @@ impl PartitionCoordinator for RaftCoordinator {
                 },
                 Err(e) => {
                     let err_str = e.to_string();
-                    // Retry on forwarding errors (not the leader)
                     if err_str.contains("forward")
                         || err_str.contains("NotLeader")
                         || err_str.contains("Not the Raft leader")
@@ -90,18 +105,16 @@ impl PartitionCoordinator for RaftCoordinator {
 
     async fn heartbeat(&self) -> SlateDBResult<()> {
         let now = current_time_ms();
-        let command = CoordinationCommand::BrokerDomain(BrokerCommand::Heartbeat {
+        let command = ControlCommand::Broker(BrokerCommand::Heartbeat {
             broker_id: self.broker_id,
             timestamp_ms: now,
             reported_local_timestamp_ms: now,
         });
 
-        let response = self.node.write(command).await?;
+        let response = self.cluster().write_control(command).await?;
         match response {
-            CoordinationResponse::BrokerDomainResponse(BrokerResponse::HeartbeatAck) => Ok(()),
-            CoordinationResponse::BrokerDomainResponse(BrokerResponse::NotFound {
-                broker_id: _,
-            }) => {
+            ControlResponse::Broker(BrokerResponse::HeartbeatAck) => Ok(()),
+            ControlResponse::Broker(BrokerResponse::NotFound { broker_id: _ }) => {
                 // Re-register
                 self.register_broker().await
             }
@@ -114,14 +127,13 @@ impl PartitionCoordinator for RaftCoordinator {
 
     async fn get_live_brokers(&self) -> SlateDBResult<Vec<BrokerInfo>> {
         let start = Instant::now();
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let sm = self.cluster().control().state_machine();
+        let state = sm.state().await;
 
         let now = current_time_ms();
         let ttl_ms = self.config.broker_heartbeat_ttl.as_millis() as u64;
 
-        let brokers: Vec<BrokerInfo> = inner_state
+        let brokers: Vec<BrokerInfo> = state
             .broker_domain
             .brokers
             .values()
@@ -139,11 +151,11 @@ impl PartitionCoordinator for RaftCoordinator {
     }
 
     async fn unregister_broker(&self) -> SlateDBResult<()> {
-        let command = CoordinationCommand::BrokerDomain(BrokerCommand::Unregister {
+        let command = ControlCommand::Broker(BrokerCommand::Unregister {
             broker_id: self.broker_id,
         });
 
-        self.node.write(command).await?;
+        self.cluster().write_control(command).await?;
         Ok(())
     }
 
@@ -169,7 +181,7 @@ impl PartitionCoordinator for RaftCoordinator {
         partition: i32,
         lease_secs: u64,
     ) -> SlateDBResult<Option<i32>> {
-        let command = CoordinationCommand::PartitionDomain(PartitionCommand::AcquirePartition {
+        let command = ShardCommand::Partition(PartitionStateCommand::AcquirePartition {
             topic: topic.to_string(),
             partition,
             broker_id: self.broker_id,
@@ -177,16 +189,14 @@ impl PartitionCoordinator for RaftCoordinator {
             timestamp_ms: current_time_ms(),
         });
 
-        let response = self.node.write(command).await?;
+        let response = self.cluster().write_shard_for_topic(topic, command).await?;
         match response {
-            CoordinationResponse::PartitionDomainResponse(
-                PartitionResponse::PartitionAcquired {
-                    topic,
-                    partition,
-                    leader_epoch,
-                    ..
-                },
-            ) => {
+            ShardResponse::Partition(PartitionStateResponse::PartitionAcquired {
+                topic,
+                partition,
+                leader_epoch,
+                ..
+            }) => {
                 // Update cache. Take the stamp now (after the Raft write
                 // returned and the hook fired synchronously on this replica).
                 // `insert_if_fresh` refuses if a *new* invalidation slips in
@@ -197,15 +207,15 @@ impl PartitionCoordinator for RaftCoordinator {
                     .await;
                 Ok(Some(leader_epoch))
             }
-            CoordinationResponse::PartitionDomainResponse(
-                PartitionResponse::PartitionOwnedByOther { .. },
-            ) => Ok(None),
+            ShardResponse::Partition(PartitionStateResponse::PartitionOwnedByOther { .. }) => {
+                Ok(None)
+            }
             // This broker has been fenced (e.g. marked failed by the fast
             // failure detector while it was partitioned away) — it must not
-            // re-acquire ownership until it re-registers.
-            CoordinationResponse::PartitionDomainResponse(PartitionResponse::BrokerNotActive {
-                ..
-            }) => Ok(None),
+            // re-acquire ownership until it re-registers. The broker
+            // liveness shadow on each shard (reconciler-fed from control)
+            // is what gates this locally.
+            ShardResponse::Partition(PartitionStateResponse::BrokerNotActive { .. }) => Ok(None),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -219,7 +229,7 @@ impl PartitionCoordinator for RaftCoordinator {
         partition: i32,
         lease_secs: u64,
     ) -> SlateDBResult<bool> {
-        let command = CoordinationCommand::PartitionDomain(PartitionCommand::RenewLease {
+        let command = ShardCommand::Partition(PartitionStateCommand::RenewLease {
             topic: topic.to_string(),
             partition,
             broker_id: self.broker_id,
@@ -227,22 +237,16 @@ impl PartitionCoordinator for RaftCoordinator {
             timestamp_ms: current_time_ms(),
         });
 
-        let response = self.node.write(command).await?;
+        let response = self.cluster().write_shard_for_topic(topic, command).await?;
         match response {
-            CoordinationResponse::PartitionDomainResponse(PartitionResponse::LeaseRenewed {
-                ..
-            }) => Ok(true),
-            CoordinationResponse::PartitionDomainResponse(
-                PartitionResponse::PartitionNotOwned { .. },
-            ) => {
+            ShardResponse::Partition(PartitionStateResponse::LeaseRenewed { .. }) => Ok(true),
+            ShardResponse::Partition(PartitionStateResponse::PartitionNotOwned { .. }) => {
                 self.owner_cache_invalidate(&(Arc::from(topic), partition))
                     .await;
                 Ok(false)
             }
             // Fenced broker: lease renewal is refused outright.
-            CoordinationResponse::PartitionDomainResponse(PartitionResponse::BrokerNotActive {
-                ..
-            }) => {
+            ShardResponse::Partition(PartitionStateResponse::BrokerNotActive { .. }) => {
                 self.owner_cache_invalidate(&(Arc::from(topic), partition))
                     .await;
                 Ok(false)
@@ -256,11 +260,12 @@ impl PartitionCoordinator for RaftCoordinator {
 
     /// Renew leases for many partitions in a single Raft proposal.
     ///
-    /// Replaces N round trips for N owned partitions with one. Per the
-    /// audit's C7 finding: a broker owning 1k partitions at 2ms commit
-    /// latency previously paid ~2s of sequential leader-bottlenecked work
-    /// per renewal cycle plus N FSM applies + N fsyncs. This collapses
-    /// to one entry, one fsync, one apply that internally loops.
+    /// Replaces N round trips for N owned partitions with one — *per shard*.
+    /// In the sharded layout we group the request by `hash(topic) %
+    /// metadata_shards`, then one batch proposal to each affected shard.
+    /// For a broker owning partitions across all 8 shards we pay 8 commits
+    /// instead of N. Same per-batch FSM advantage (one fsync, one apply
+    /// that internally loops over partitions) is preserved within each shard.
     async fn renew_partition_leases_batch(
         &self,
         partitions: Vec<(Arc<str>, i32)>,
@@ -270,72 +275,88 @@ impl PartitionCoordinator for RaftCoordinator {
             return Ok(Vec::new());
         }
 
-        // The FSM expects `String` topics (the wire format on disk and in
-        // postcard); we hand back `Arc<str>` to the caller.
-        let request_partitions: Vec<(String, i32)> = partitions
+        // Group by destination shard and remember the request index so
+        // the result vector is in the caller's submitted order.
+        let metadata_shards = self.cluster().metadata_shards();
+        let mut by_shard: HashMap<u16, Vec<(usize, Arc<str>, i32)>> = HashMap::new();
+        for (idx, (topic, partition)) in partitions.iter().enumerate() {
+            let shard_id = self.cluster().router().shard_for_topic(topic);
+            by_shard
+                .entry(shard_id)
+                .or_default()
+                .push((idx, topic.clone(), *partition));
+        }
+        // Pre-fill the result with `false` so a shard that returns
+        // `BrokerNotActive` (the whole batch refused) leaves them as
+        // `not renewed`. This is the same outcome the legacy single-shard
+        // path produced.
+        let mut out: Vec<(Arc<str>, i32, bool)> = partitions
             .iter()
-            .map(|(t, p)| (t.to_string(), *p))
+            .map(|(t, p)| (t.clone(), *p, false))
             .collect();
 
-        let command = CoordinationCommand::PartitionDomain(PartitionCommand::RenewLeases {
-            broker_id: self.broker_id,
-            partitions: request_partitions,
-            lease_duration_ms: lease_secs * 1000,
-            timestamp_ms: current_time_ms(),
-        });
+        let lease_duration_ms = lease_secs * 1000;
+        let timestamp_ms = current_time_ms();
+        let _ = metadata_shards; // kept for clarity; loop uses `by_shard.into_iter()` directly
 
-        let response = self.node.write(command).await?;
-        match response {
-            CoordinationResponse::PartitionDomainResponse(PartitionResponse::LeasesRenewed {
-                results,
-            }) => {
-                if results.len() != partitions.len() {
+        for (shard_id, items) in by_shard {
+            let request_partitions: Vec<(String, i32)> = items
+                .iter()
+                .map(|(_, t, p)| (t.to_string(), *p))
+                .collect();
+            let command = ShardCommand::Partition(PartitionStateCommand::RenewLeases {
+                broker_id: self.broker_id,
+                partitions: request_partitions,
+                lease_duration_ms,
+                timestamp_ms,
+            });
+            let response = self.cluster().write_shard(shard_id, command).await?;
+            match response {
+                ShardResponse::Partition(PartitionStateResponse::LeasesRenewed { results }) => {
+                    if results.len() != items.len() {
+                        return Err(SlateDBError::Storage(format!(
+                            "RenewLeases on shard {} returned {} results for {} partitions",
+                            shard_id,
+                            results.len(),
+                            items.len()
+                        )));
+                    }
+                    for ((idx, topic, partition), outcome) in items.into_iter().zip(results) {
+                        let renewed = match outcome {
+                            crate::cluster::raft::domains::BatchRenewOutcome::Renewed { .. } => {
+                                true
+                            }
+                            crate::cluster::raft::domains::BatchRenewOutcome::NotOwned => {
+                                self.owner_cache_invalidate(&(topic.clone(), partition))
+                                    .await;
+                                false
+                            }
+                        };
+                        out[idx] = (topic, partition, renewed);
+                    }
+                }
+                // Whole-batch refusal because this broker is fenced — the
+                // pre-filled `false` entries already match what we return.
+                ShardResponse::Partition(PartitionStateResponse::BrokerNotActive { .. }) => {}
+                other => {
                     return Err(SlateDBError::Storage(format!(
-                        "RenewLeases returned {} results for {} partitions",
-                        results.len(),
-                        partitions.len()
+                        "Unexpected response on shard {}: {:?}",
+                        shard_id, other
                     )));
                 }
-                let mut out = Vec::with_capacity(partitions.len());
-                for ((topic, partition), outcome) in partitions.into_iter().zip(results.into_iter())
-                {
-                    let renewed = match outcome {
-                        crate::cluster::raft::domains::BatchRenewOutcome::Renewed { .. } => true,
-                        crate::cluster::raft::domains::BatchRenewOutcome::NotOwned => {
-                            // Same as the per-partition `PartitionNotOwned`
-                            // path: we lost the lease, drop any stale owner
-                            // cache entry.
-                            self.owner_cache_invalidate(&(Arc::clone(&topic), partition))
-                                .await;
-                            false
-                        }
-                    };
-                    out.push((topic, partition, renewed));
-                }
-                Ok(out)
             }
-            // The whole batch was refused because this broker was fenced.
-            CoordinationResponse::PartitionDomainResponse(PartitionResponse::BrokerNotActive {
-                ..
-            }) => {
-                let out = partitions.into_iter().map(|(t, p)| (t, p, false)).collect();
-                Ok(out)
-            }
-            other => Err(SlateDBError::Storage(format!(
-                "Unexpected response: {:?}",
-                other
-            ))),
         }
+        Ok(out)
     }
 
     async fn release_partition(&self, topic: &str, partition: i32) -> SlateDBResult<()> {
-        let command = CoordinationCommand::PartitionDomain(PartitionCommand::ReleasePartition {
+        let command = ShardCommand::Partition(PartitionStateCommand::ReleasePartition {
             topic: topic.to_string(),
             partition,
             broker_id: self.broker_id,
         });
 
-        self.node.write(command).await?;
+        self.cluster().write_shard_for_topic(topic, command).await?;
         self.owner_cache_invalidate(&(Arc::from(topic), partition))
             .await;
         Ok(())
@@ -361,23 +382,24 @@ impl PartitionCoordinator for RaftCoordinator {
 
         // Cache miss on routing-critical metadata: confirm we've applied
         // through the leader's commit index before consulting local state.
-        self.node.ensure_linearizable().await?;
+        // The lease/ownership data lives in the shard owning this topic.
+        let shard = self.cluster().shard_for_topic(topic);
+        shard
+            .raft()
+            .ensure_linearizable()
+            .await
+            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
 
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let sm = shard.state_machine();
+        let state = sm.state().await;
 
-        // Use the *replicated* lease clock (`inner_state.lease_clock_ms`)
-        // rather than the local wall clock. Local `SystemTime::now()` skew
-        // would make this broker disagree with the rest of the cluster about
-        // whether a lease has expired — a forward-skewed clock declares the
-        // lease dead and routes elsewhere while the cluster (and the actual
-        // owner) still consider it alive; reverse skew lets us serve stale
-        // reads from a partition that was already re-leased elsewhere. The
-        // replicated clock is monotonic and identical on every replica.
-        let now_ms = inner_state.lease_clock_ms;
-        let owner = inner_state
-            .partition_domain
+        // Use the *replicated* lease clock (`state.lease_clock_ms`) rather
+        // than the local wall clock. Local `SystemTime::now()` skew would
+        // make this broker disagree with the rest of the cluster about
+        // whether a lease has expired.
+        let now_ms = state.lease_clock_ms;
+        let owner = state
+            .partition_state
             .partitions
             .get(&(Arc::from(topic), partition))
             .and_then(|p| {
@@ -413,19 +435,21 @@ impl PartitionCoordinator for RaftCoordinator {
         // can't slip into a fresh-looking insert.
         let stamp = self.owner_cache_read_stamp(&key);
 
-        // Cache miss: use a read-index barrier so ownership checks reflect
-        // the latest committed Raft state, not a follower lag window.
-        self.node.ensure_linearizable().await?;
+        let shard = self.cluster().shard_for_topic(topic);
+        shard
+            .raft()
+            .ensure_linearizable()
+            .await
+            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
 
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let sm = shard.state_machine();
+        let state = sm.state().await;
 
         // See `get_partition_owner` above for why we use the replicated
         // `lease_clock_ms` rather than `current_time_ms()`.
-        let now_ms = inner_state.lease_clock_ms;
-        let owns = inner_state
-            .partition_domain
+        let now_ms = state.lease_clock_ms;
+        let owns = state
+            .partition_state
             .partitions
             .get(&(Arc::from(topic), partition))
             .map(|p| p.owner_broker_id == Some(self.broker_id) && p.lease_expires_at_ms > now_ms)
@@ -446,8 +470,14 @@ impl PartitionCoordinator for RaftCoordinator {
         partition: i32,
         lease_secs: u64,
     ) -> SlateDBResult<u64> {
-        // For writes, ensure linearizable state before checking
-        self.node.ensure_linearizable().await?;
+        // For writes, ensure linearizable state on the topic's shard before
+        // checking ownership.
+        self.cluster()
+            .shard_for_topic(topic)
+            .raft()
+            .ensure_linearizable()
+            .await
+            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
 
         // Now verify and extend lease atomically
         self.verify_and_extend_lease(topic, partition, lease_secs)
@@ -460,7 +490,7 @@ impl PartitionCoordinator for RaftCoordinator {
         partition: i32,
         lease_secs: u64,
     ) -> SlateDBResult<u64> {
-        let command = CoordinationCommand::PartitionDomain(PartitionCommand::RenewLease {
+        let command = ShardCommand::Partition(PartitionStateCommand::RenewLease {
             topic: topic.to_string(),
             partition,
             broker_id: self.broker_id,
@@ -468,27 +498,26 @@ impl PartitionCoordinator for RaftCoordinator {
             timestamp_ms: current_time_ms(),
         });
 
-        let response = self.node.write(command).await?;
+        let response = self.cluster().write_shard_for_topic(topic, command).await?;
         match response {
-            CoordinationResponse::PartitionDomainResponse(PartitionResponse::LeaseRenewed {
+            ShardResponse::Partition(PartitionStateResponse::LeaseRenewed {
                 lease_expires_at_ms,
                 ..
             }) => {
                 let remaining = lease_expires_at_ms.saturating_sub(current_time_ms()) / 1000;
                 Ok(remaining)
             }
-            CoordinationResponse::PartitionDomainResponse(
-                PartitionResponse::PartitionNotOwned { topic, partition },
-            ) => {
+            ShardResponse::Partition(PartitionStateResponse::PartitionNotOwned {
+                topic,
+                partition,
+            }) => {
                 self.owner_cache_invalidate(&(Arc::from(topic.as_str()), partition))
                     .await;
                 Err(SlateDBError::NotOwned { topic, partition })
             }
             // Fenced broker: treat as not owned so the write path returns
             // NotLeaderForPartition to the client instead of retrying.
-            CoordinationResponse::PartitionDomainResponse(PartitionResponse::BrokerNotActive {
-                ..
-            }) => {
+            ShardResponse::Partition(PartitionStateResponse::BrokerNotActive { .. }) => {
                 self.owner_cache_invalidate(&(Arc::from(topic), partition))
                     .await;
                 Err(SlateDBError::NotOwned {
@@ -515,11 +544,12 @@ impl PartitionCoordinator for RaftCoordinator {
     async fn should_own_partition(&self, topic: &str, partition: i32) -> SlateDBResult<bool> {
         use crate::cluster::coordinator::consistent_hash_assignment;
 
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        // Liveness lives on control; this is the same broker list
+        // `get_live_brokers` exposes.
+        let sm = self.cluster().control().state_machine();
+        let state = sm.state().await;
 
-        let brokers: Vec<BrokerInfo> = inner_state
+        let brokers: Vec<BrokerInfo> = state
             .broker_domain
             .brokers
             .values()
@@ -541,21 +571,91 @@ impl PartitionCoordinator for RaftCoordinator {
     }
 
     async fn register_topic(&self, topic: &str, partitions: i32) -> SlateDBResult<()> {
-        let command = CoordinationCommand::PartitionDomain(PartitionCommand::CreateTopic {
+        let command = ControlCommand::TopicRegistry(TopicRegistryCommand::CreateTopic {
             name: topic.to_string(),
             partitions,
             config: HashMap::new(),
             timestamp_ms: current_time_ms(),
         });
 
-        let response = self.node.write(command).await?;
+        // Topic existence is cluster-wide; the per-partition state seeds
+        // (InitPartition) are propagated by the reconciler in the next
+        // step of the sharding plan. Until the reconciler ships, partition
+        // entries appear lazily as brokers AcquirePartition them — same
+        // legacy behaviour for the steady-state hot path, only `CreateTopic`
+        // itself is no longer the seeding point.
+        let response = self.cluster().write_control(command).await?;
         match response {
-            CoordinationResponse::PartitionDomainResponse(PartitionResponse::TopicCreated {
-                ..
-            }) => Ok(()),
-            CoordinationResponse::PartitionDomainResponse(
-                PartitionResponse::TopicAlreadyExists { .. },
-            ) => Ok(()),
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicCreated { .. }) => Ok(()),
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicAlreadyExists { .. }) => {
+                Ok(())
+            }
+            other => Err(SlateDBError::Storage(format!(
+                "Unexpected response: {:?}",
+                other
+            ))),
+        }
+    }
+
+    async fn register_topic_with_config(
+        &self,
+        topic: &str,
+        partitions: i32,
+        config: HashMap<String, String>,
+    ) -> SlateDBResult<()> {
+        let command = ControlCommand::TopicRegistry(TopicRegistryCommand::CreateTopic {
+            name: topic.to_string(),
+            partitions,
+            config,
+            timestamp_ms: current_time_ms(),
+        });
+
+        let response = self.cluster().write_control(command).await?;
+        match response {
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicCreated { .. }) => Ok(()),
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicAlreadyExists { .. }) => {
+                Ok(())
+            }
+            other => Err(SlateDBError::Storage(format!(
+                "Unexpected response: {:?}",
+                other
+            ))),
+        }
+    }
+
+    async fn get_topic_config(
+        &self,
+        topic: &str,
+    ) -> SlateDBResult<Option<HashMap<String, String>>> {
+        let start = Instant::now();
+        let sm = self.cluster().control().state_machine();
+        let state = sm.state().await;
+        let cfg = state
+            .topic_registry
+            .topics
+            .get(&Arc::from(topic) as &Arc<str>)
+            .map(|t| t.config.clone());
+        metrics::record_raft_query("get_topic_config", start.elapsed().as_secs_f64());
+        Ok(cfg)
+    }
+
+    async fn update_topic_config(
+        &self,
+        topic: &str,
+        config: HashMap<String, String>,
+    ) -> SlateDBResult<bool> {
+        let command = ControlCommand::TopicRegistry(TopicRegistryCommand::UpdateTopicConfig {
+            name: topic.to_string(),
+            config,
+        });
+        let response = self.cluster().write_control(command).await?;
+        match response {
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicConfigUpdated { .. }) => {
+                Ok(true)
+            }
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicNotFound { .. }) => {
+                Ok(false)
+            }
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -565,12 +665,11 @@ impl PartitionCoordinator for RaftCoordinator {
 
     async fn get_topics(&self) -> SlateDBResult<Vec<String>> {
         let start = Instant::now();
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let sm = self.cluster().control().state_machine();
+        let state = sm.state().await;
 
-        let topics = inner_state
-            .partition_domain
+        let topics = state
+            .topic_registry
             .topics
             .keys()
             .map(|k| k.to_string())
@@ -581,12 +680,11 @@ impl PartitionCoordinator for RaftCoordinator {
 
     async fn topic_exists(&self, topic: &str) -> SlateDBResult<bool> {
         let start = Instant::now();
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let sm = self.cluster().control().state_machine();
+        let state = sm.state().await;
 
-        let exists = inner_state
-            .partition_domain
+        let exists = state
+            .topic_registry
             .topics
             .contains_key(&Arc::from(topic) as &Arc<str>);
         metrics::record_raft_query("topic_exists", start.elapsed().as_secs_f64());
@@ -595,12 +693,11 @@ impl PartitionCoordinator for RaftCoordinator {
 
     async fn get_partition_count(&self, topic: &str) -> SlateDBResult<Option<i32>> {
         let start = Instant::now();
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        let sm = self.cluster().control().state_machine();
+        let state = sm.state().await;
 
-        let count = inner_state
-            .partition_domain
+        let count = state
+            .topic_registry
             .topics
             .get(topic)
             .map(|t| t.partition_count);
@@ -609,18 +706,16 @@ impl PartitionCoordinator for RaftCoordinator {
     }
 
     async fn delete_topic(&self, topic: &str) -> SlateDBResult<bool> {
-        let command = CoordinationCommand::PartitionDomain(PartitionCommand::DeleteTopic {
+        let command = ControlCommand::TopicRegistry(TopicRegistryCommand::DeleteTopic {
             name: topic.to_string(),
         });
 
-        let response = self.node.write(command).await?;
+        let response = self.cluster().write_control(command).await?;
         match response {
-            CoordinationResponse::PartitionDomainResponse(PartitionResponse::TopicDeleted {
-                ..
-            }) => Ok(true),
-            CoordinationResponse::PartitionDomainResponse(PartitionResponse::TopicNotFound {
-                ..
-            }) => Ok(false),
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicDeleted { .. }) => Ok(true),
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicNotFound { .. }) => {
+                Ok(false)
+            }
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -631,11 +726,13 @@ impl PartitionCoordinator for RaftCoordinator {
     async fn get_assigned_partitions(&self) -> SlateDBResult<Vec<(String, i32)>> {
         use crate::cluster::coordinator::BrokerRing;
 
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
+        // Brokers + topic list both live on control; no shard fan-out.
+        // The hash-ring assignment is computed locally without consulting
+        // any per-partition state.
+        let sm = self.cluster().control().state_machine();
+        let state = sm.state().await;
 
-        let brokers: Vec<BrokerInfo> = inner_state
+        let brokers: Vec<BrokerInfo> = state
             .broker_domain
             .brokers
             .values()
@@ -657,7 +754,7 @@ impl PartitionCoordinator for RaftCoordinator {
             None => return Ok(Vec::new()),
         };
         let mut assigned = Vec::new();
-        for topic in inner_state.partition_domain.topics.values() {
+        for topic in state.topic_registry.topics.values() {
             for partition in 0..topic.partition_count {
                 let owner = ring.assign(&topic.name, partition);
                 if owner == self.broker_id {
@@ -671,29 +768,33 @@ impl PartitionCoordinator for RaftCoordinator {
 
     async fn get_partition_owners(&self, topic: &str) -> SlateDBResult<Vec<(i32, Option<i32>)>> {
         let start = Instant::now();
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
-
-        let topic_state = match inner_state
-            .partition_domain
-            .topics
-            .get(&Arc::from(topic) as &Arc<str>)
-        {
-            Some(t) => t,
-            None => {
-                metrics::record_raft_query("get_partition_owners", start.elapsed().as_secs_f64());
-                return Ok(Vec::new());
+        // Topic existence + partition count → control. Per-partition
+        // ownership → shard owning this topic. Two SM reads, one each.
+        let control_sm = self.cluster().control().state_machine();
+        let topic_state = {
+            let state = control_sm.state().await;
+            match state.topic_registry.topics.get(&Arc::from(topic) as &Arc<str>) {
+                Some(t) => t.clone(),
+                None => {
+                    metrics::record_raft_query(
+                        "get_partition_owners",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    return Ok(Vec::new());
+                }
             }
         };
 
-        // Use the replicated lease clock for ownership gating, see
-        // `get_partition_owner` for the rationale.
-        let now = inner_state.lease_clock_ms;
+        let shard = self.cluster().shard_for_topic(topic);
+        let shard_sm = shard.state_machine();
+        let shard_state = shard_sm.state().await;
+
+        // Use the shard's replicated lease clock for ownership gating.
+        let now = shard_state.lease_clock_ms;
         let mut owners = Vec::new();
         for partition in 0..topic_state.partition_count {
-            let owner = inner_state
-                .partition_domain
+            let owner = shard_state
+                .partition_state
                 .partitions
                 .get(&(Arc::from(topic), partition))
                 .and_then(|p| {
@@ -713,15 +814,18 @@ impl PartitionCoordinator for RaftCoordinator {
 
 impl RaftCoordinator {
     /// Confirm a cached owner entry still matches local state-machine data.
+    ///
+    /// The owner entry lives in the shard owning this topic. We use that
+    /// shard's replicated `lease_clock_ms` for the freshness check — the
+    /// control group's clock is unrelated.
     async fn verify_cached_owner(&self, topic: &str, partition: i32, cached_owner: i32) -> bool {
         let key = (Arc::from(topic), partition);
         let still_valid = {
-            let state_machine = self.node.state_machine();
-            let state = state_machine.read().await;
-            let inner_state = state.state().await;
-            let now_ms = inner_state.lease_clock_ms;
-            inner_state
-                .partition_domain
+            let sm = self.cluster().shard_for_topic(topic).state_machine();
+            let state = sm.state().await;
+            let now_ms = state.lease_clock_ms;
+            state
+                .partition_state
                 .partitions
                 .get(&key)
                 .is_some_and(|p| {

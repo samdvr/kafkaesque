@@ -148,6 +148,7 @@ async fn test_metadata_request_specific_topics() {
             name: "test-topic".to_string(),
             num_partitions: 3,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -180,11 +181,13 @@ async fn test_metadata_request_all_topics() {
                 name: "topic1".to_string(),
                 num_partitions: 1,
                 replication_factor: 1,
+                configs: vec![],
             },
             CreateTopicData {
                 name: "topic2".to_string(),
                 num_partitions: 2,
                 replication_factor: 1,
+                configs: vec![],
             },
         ],
         timeout_ms: 5000,
@@ -303,6 +306,7 @@ async fn test_metadata_isr_nodes_contains_leader_to_prevent_not_leader_error() {
             name: "isr-test-topic".to_string(),
             num_partitions: 10, // Multiple partitions to mimic the error scenario
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -408,6 +412,7 @@ async fn test_create_topics_success() {
             name: "new-topic".to_string(),
             num_partitions: 5,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -430,6 +435,7 @@ async fn test_create_topics_invalid_name() {
             name: "invalid:topic:name".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -451,6 +457,7 @@ async fn test_create_topics_validate_only_dry_run() {
             name: "dry-run-topic".to_string(),
             num_partitions: 3,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: true,
@@ -484,6 +491,7 @@ async fn test_create_topics_zero_partitions() {
             name: "default-partitions".to_string(),
             num_partitions: 0,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -505,6 +513,7 @@ async fn test_delete_topics_success() {
             name: "to-delete".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -576,6 +585,7 @@ async fn test_produce_request_with_acks_1() {
             name: "produce-topic".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -618,6 +628,7 @@ async fn test_produce_request_with_acks_0() {
             name: "fire-forget-topic".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -682,6 +693,7 @@ async fn test_produce_multiple_partitions() {
             name: "multi-partition".to_string(),
             num_partitions: 3,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -735,6 +747,7 @@ async fn test_fetch_request_success() {
             name: "fetch-topic".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -793,6 +806,7 @@ async fn test_fetch_offset_out_of_range() {
             name: "fetch-range-topic".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -864,6 +878,7 @@ async fn test_fetch_nonexistent_partition() {
             name: "single-part".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -910,6 +925,7 @@ async fn test_list_offsets_earliest() {
             name: "offset-topic".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -946,6 +962,7 @@ async fn test_list_offsets_latest() {
             name: "offset-latest-topic".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -996,6 +1013,7 @@ async fn test_offset_commit_and_fetch() {
             name: "commit-topic".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -1277,6 +1295,7 @@ async fn test_list_offsets_nonexistent_partition() {
             name: "list-offsets-single".to_string(),
             num_partitions: 1,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -1315,6 +1334,7 @@ async fn test_list_offsets_multiple_partitions() {
             name: "multi-part-offsets".to_string(),
             num_partitions: 3,
             replication_factor: 1,
+            configs: vec![],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -1414,11 +1434,13 @@ async fn test_offset_commit_multiple_topics() {
                 name: "commit-topic-1".to_string(),
                 num_partitions: 2,
                 replication_factor: 1,
+                configs: vec![],
             },
             CreateTopicData {
                 name: "commit-topic-2".to_string(),
                 num_partitions: 2,
                 replication_factor: 1,
+                configs: vec![],
             },
         ],
         timeout_ms: 5000,
@@ -1549,11 +1571,13 @@ async fn test_list_offsets_multiple_topics() {
                 name: "list-multi-1".to_string(),
                 num_partitions: 1,
                 replication_factor: 1,
+                configs: vec![],
             },
             CreateTopicData {
                 name: "list-multi-2".to_string(),
                 num_partitions: 1,
                 replication_factor: 1,
+                configs: vec![],
             },
         ],
         timeout_ms: 5000,
@@ -1729,4 +1753,216 @@ async fn test_delete_groups() {
 
     assert_eq!(response.results.len(), 1);
     // Deleting non-existent group returns success or appropriate error
+}
+
+// ============================================================================
+// DescribeConfigs / AlterConfigs end-to-end
+// ============================================================================
+
+#[tokio::test]
+async fn test_describe_configs_returns_resolved_topic_config() {
+    let handler = create_test_handler().await;
+    let ctx = create_test_context();
+
+    // Create a topic with cleanup.policy=compact set on the wire.
+    let create_req = CreateTopicsRequestData {
+        topics: vec![CreateTopicData {
+            name: "compacted".to_string(),
+            num_partitions: 1,
+            replication_factor: 1,
+            configs: vec![("cleanup.policy".to_string(), Some("compact".to_string()))],
+        }],
+        timeout_ms: 5000,
+        validate_only: false,
+    };
+    let create_resp = handler.handle_create_topics(&ctx, create_req).await;
+    assert_eq!(create_resp.topics[0].error_code, KafkaCode::None);
+
+    // DescribeConfigs without a key filter must return every recognized
+    // key, with cleanup.policy reflecting the topic-level override.
+    let describe_req = DescribeConfigsRequestData {
+        resources: vec![DescribeConfigsResource {
+            resource_type: 2, // Topic
+            resource_name: "compacted".to_string(),
+            configuration_keys: None,
+        }],
+        include_synonyms: false,
+        include_documentation: false,
+    };
+    let describe_resp = handler.handle_describe_configs(&ctx, describe_req).await;
+    assert_eq!(describe_resp.results.len(), 1);
+    let result = &describe_resp.results[0];
+    assert_eq!(result.error_code, KafkaCode::None);
+    let cleanup = result
+        .configs
+        .iter()
+        .find(|c| c.name == "cleanup.policy")
+        .expect("cleanup.policy must be returned");
+    assert_eq!(cleanup.value.as_deref(), Some("compact"));
+}
+
+#[tokio::test]
+async fn test_alter_configs_round_trip_via_describe() {
+    let handler = create_test_handler().await;
+    let ctx = create_test_context();
+
+    // Create a topic with default configs (no overrides).
+    let create_req = CreateTopicsRequestData {
+        topics: vec![CreateTopicData {
+            name: "alter-target".to_string(),
+            num_partitions: 1,
+            replication_factor: 1,
+            configs: vec![],
+        }],
+        timeout_ms: 5000,
+        validate_only: false,
+    };
+    let _ = handler.handle_create_topics(&ctx, create_req).await;
+
+    // Flip cleanup.policy via AlterConfigs.
+    let alter_req = AlterConfigsRequestData {
+        resources: vec![AlterConfigsResource {
+            resource_type: 2,
+            resource_name: "alter-target".to_string(),
+            configs: vec![AlterConfigsEntry {
+                name: "cleanup.policy".to_string(),
+                value: Some("compact".to_string()),
+            }],
+        }],
+        validate_only: false,
+    };
+    let alter_resp = handler.handle_alter_configs(&ctx, alter_req).await;
+    assert_eq!(
+        alter_resp.responses[0].error_code,
+        KafkaCode::None,
+        "AlterConfigs must succeed on existing topic"
+    );
+
+    // DescribeConfigs must now reflect the new value.
+    let describe_resp = handler
+        .handle_describe_configs(
+            &ctx,
+            DescribeConfigsRequestData {
+                resources: vec![DescribeConfigsResource {
+                    resource_type: 2,
+                    resource_name: "alter-target".to_string(),
+                    configuration_keys: Some(vec!["cleanup.policy".to_string()]),
+                }],
+                include_synonyms: false,
+                include_documentation: false,
+            },
+        )
+        .await;
+    let result = &describe_resp.results[0];
+    assert_eq!(result.error_code, KafkaCode::None);
+    assert_eq!(result.configs.len(), 1);
+    assert_eq!(result.configs[0].name, "cleanup.policy");
+    assert_eq!(result.configs[0].value.as_deref(), Some("compact"));
+}
+
+#[tokio::test]
+async fn test_create_topics_rejects_invalid_config() {
+    let handler = create_test_handler().await;
+    let ctx = create_test_context();
+
+    let req = CreateTopicsRequestData {
+        topics: vec![CreateTopicData {
+            name: "bogus".to_string(),
+            num_partitions: 1,
+            replication_factor: 1,
+            configs: vec![("cleanup.policy".to_string(), Some("compress".to_string()))],
+        }],
+        timeout_ms: 5000,
+        validate_only: false,
+    };
+    let resp = handler.handle_create_topics(&ctx, req).await;
+    assert_eq!(
+        resp.topics[0].error_code,
+        KafkaCode::InvalidConfig,
+        "unknown cleanup.policy mode must be rejected with INVALID_CONFIG"
+    );
+}
+
+#[tokio::test]
+async fn test_alter_configs_unknown_topic_returns_unknown() {
+    let handler = create_test_handler().await;
+    let ctx = create_test_context();
+
+    let req = AlterConfigsRequestData {
+        resources: vec![AlterConfigsResource {
+            resource_type: 2,
+            resource_name: "ghost".to_string(),
+            configs: vec![],
+        }],
+        validate_only: false,
+    };
+    let resp = handler.handle_alter_configs(&ctx, req).await;
+    assert_eq!(
+        resp.responses[0].error_code,
+        KafkaCode::UnknownTopicOrPartition
+    );
+}
+
+#[tokio::test]
+async fn test_alter_configs_validate_only_does_not_persist() {
+    let handler = create_test_handler().await;
+    let ctx = create_test_context();
+
+    // Create a topic first.
+    let _ = handler
+        .handle_create_topics(
+            &ctx,
+            CreateTopicsRequestData {
+                topics: vec![CreateTopicData {
+                    name: "dry-run".to_string(),
+                    num_partitions: 1,
+                    replication_factor: 1,
+                    configs: vec![],
+                }],
+                timeout_ms: 5000,
+                validate_only: false,
+            },
+        )
+        .await;
+
+    // validate_only=true must report success without changing the value.
+    let alter_resp = handler
+        .handle_alter_configs(
+            &ctx,
+            AlterConfigsRequestData {
+                resources: vec![AlterConfigsResource {
+                    resource_type: 2,
+                    resource_name: "dry-run".to_string(),
+                    configs: vec![AlterConfigsEntry {
+                        name: "cleanup.policy".to_string(),
+                        value: Some("compact".to_string()),
+                    }],
+                }],
+                validate_only: true,
+            },
+        )
+        .await;
+    assert_eq!(alter_resp.responses[0].error_code, KafkaCode::None);
+
+    // The persisted value must still be the default ("delete"), not the
+    // compact we asked validate_only to dry-run.
+    let describe = handler
+        .handle_describe_configs(
+            &ctx,
+            DescribeConfigsRequestData {
+                resources: vec![DescribeConfigsResource {
+                    resource_type: 2,
+                    resource_name: "dry-run".to_string(),
+                    configuration_keys: Some(vec!["cleanup.policy".to_string()]),
+                }],
+                include_synonyms: false,
+                include_documentation: false,
+            },
+        )
+        .await;
+    assert_eq!(
+        describe.results[0].configs[0].value.as_deref(),
+        Some("delete"),
+        "validate_only must not persist the new value"
+    );
 }

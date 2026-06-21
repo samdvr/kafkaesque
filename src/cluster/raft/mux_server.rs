@@ -42,11 +42,18 @@
 use std::sync::Arc;
 
 use openraft::{BasicNode, Raft};
+use tokio::time::timeout;
 
-use super::auth::FramePurpose;
+use super::auth::{
+    FramePurpose, MAX_RPC_MESSAGE_BYTES, PeerScope, RaftAuthKeys, read_rpc_frame, write_rpc_frame,
+};
 use super::commands::{ControlCommand, ShardCommand};
 use super::mux::{ControlRpcMessage, MuxRaftRpcMessage, MuxRaftRpcResponse, ShardRpcMessage};
-use super::network::{MAX_FORWARD_HOPS, RpcErrorInfo, RpcErrorKind};
+use super::network::{
+    MAX_FORWARD_HOPS, MaybeTlsStreamServer, RPC_FRAME_IDLE_TIMEOUT, RpcErrorInfo, RpcErrorKind,
+    accept_raft_stream,
+};
+use super::tls::RaftTlsConfig;
 use super::types::{ControlConfig, GroupId, RaftNodeId, ShardConfig, ShardId};
 
 /// Raft handles the multiplexed dispatcher needs to route an inbound frame.
@@ -102,18 +109,33 @@ pub async fn dispatch_mux_frame(
             Some(raft) => dispatch_shard(raft, inner).await,
             None => unknown_shard(id),
         },
-        MuxRaftRpcMessage::JoinCluster { node_id, raft_addr } => {
-            // Learner-add is a control-plane operation: cluster membership
-            // (the list of brokers that participate in *any* group) lives
-            // on the control group. The reconciler then fans the new
-            // broker out to every shard as part of the broker-join loop
-            // (sharding plan, "Bootstrap & membership").
+        MuxRaftRpcMessage::JoinCluster {
+            node_id,
+            raft_addr,
+            group,
+        } => {
+            // Per-group join: each group's leader handles its own
+            // add_learner. The joining broker fans out across all N+1
+            // groups; this handler is local to ONE group at a time. The
+            // alternative — fan-out from the control leader — would put
+            // every join on the control critical path, which the plan
+            // explicitly avoids.
             tracing::info!(
                 node_id,
                 raft_addr = %raft_addr,
+                group = ?group,
                 "mux: received join cluster request (learner only)"
             );
-            match handle_join(&handles.control, node_id, raft_addr).await {
+            let result = match group {
+                GroupId::Control => {
+                    handle_join_control(&handles.control, node_id, raft_addr).await
+                }
+                GroupId::Shard(id) => match handles.shard(id) {
+                    Some(raft) => handle_join_shard(raft, node_id, raft_addr).await,
+                    None => return unknown_shard(id),
+                },
+            };
+            match result {
                 Ok(()) => MuxRaftRpcResponse::JoinClusterOk,
                 Err(msg) => MuxRaftRpcResponse::Error(RpcErrorInfo::new(
                     RpcErrorKind::Internal,
@@ -350,7 +372,7 @@ async fn forward_shard(
 /// string for "already-a-member" would couple us to upstream wording and
 /// silently break on a crate bump, so we check membership structurally
 /// before issuing the change.
-async fn handle_join(
+async fn handle_join_control(
     raft: &Raft<ControlConfig>,
     node_id: RaftNodeId,
     raft_addr: String,
@@ -371,6 +393,38 @@ async fn handle_join(
         }
         Err(e) => {
             tracing::warn!(node_id, error = %e, "mux: failed to add control learner");
+            Err(format!("Failed to add learner: {}", e))
+        }
+    }
+}
+
+/// Add `node_id` as a learner on a shard group.
+///
+/// Same idempotent shape as [`handle_join_control`]: structural membership
+/// check before issuing the change so a retry against a group that already
+/// has the learner is a no-op (and so we never depend on upstream
+/// "already-a-member" error wording).
+async fn handle_join_shard(
+    raft: &Raft<ShardConfig>,
+    node_id: RaftNodeId,
+    raft_addr: String,
+) -> Result<(), String> {
+    {
+        let metrics = raft.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership();
+        if membership.get_node(&node_id).is_some() {
+            tracing::info!(node_id, "mux: node already in shard cluster");
+            return Ok(());
+        }
+    }
+    let node = BasicNode { addr: raft_addr };
+    match raft.add_learner(node_id, node, true).await {
+        Ok(_) => {
+            tracing::info!(node_id, "mux: added node as shard learner");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(node_id, error = %e, "mux: failed to add shard learner");
             Err(format!("Failed to add learner: {}", e))
         }
     }
@@ -430,6 +484,253 @@ async fn handle_promote_shard(
     }
 }
 
+// ============================================================================
+// MuxRaftRpcServer — TCP accept loop for the multiplexed port.
+// ============================================================================
+
+/// Server for the multiplexed Raft RPC port.
+///
+/// Mirrors [`super::network::RaftRpcServer`] one-for-one — same accept-side
+/// gating, same per-IP cap, same TLS handshake helper, same idle timeout —
+/// but routes every accepted frame through [`dispatch_mux_frame`] so it can
+/// land on the control group OR any shard group on a single port. Holding the
+/// dispatch logic in `dispatch_mux_frame` and the I/O scaffolding here keeps
+/// the routing decision testable without standing up a TCP listener.
+///
+/// `RaftCluster::new` constructs one of these per broker and spawns
+/// [`Self::run`] on the control-plane runtime alongside the legacy
+/// `RaftRpcServer` while the migration lands; once the legacy single-group
+/// path is deleted (sharding plan, step 10) this becomes the only Raft RPC
+/// server in the process.
+pub struct MuxRaftRpcServer {
+    /// Raft handles routed to by the dispatcher. `Arc<[…]>` rather than
+    /// `Vec<…>` so per-connection tasks clone the slice with one refcount
+    /// bump instead of N `Arc<Raft<_>>` clones.
+    handles: Arc<MuxRaftHandles>,
+    /// Address to listen on.
+    listen_addr: String,
+    /// Runtime handle for spawning per-connection tasks.
+    runtime: tokio::runtime::Handle,
+    /// HMAC keys verifying every inbound frame and signing every response.
+    auth_keys: Arc<RaftAuthKeys>,
+    /// Optional mTLS configuration. Same shape as the legacy server.
+    tls: Option<RaftTlsConfig>,
+}
+
+impl MuxRaftRpcServer {
+    /// Build a server bound to `listen_addr`. The control + shard handles
+    /// must already be constructed; we don't take ownership of the underlying
+    /// `Raft<_>` because every group is also referenced by `RaftCluster` for
+    /// driving client writes from the local broker.
+    pub fn new(
+        handles: Arc<MuxRaftHandles>,
+        listen_addr: String,
+        runtime: tokio::runtime::Handle,
+        auth_keys: Arc<RaftAuthKeys>,
+        tls: Option<RaftTlsConfig>,
+    ) -> Self {
+        Self {
+            handles,
+            listen_addr,
+            runtime,
+            auth_keys,
+            tls,
+        }
+    }
+
+    /// Start the RPC server.
+    ///
+    /// Stops accepting new connections when `shutdown` fires; in-flight
+    /// per-connection tasks finish naturally. Invariants pinned alongside the
+    /// legacy server (per-IP cap, accept semaphore, TLS handshake before any
+    /// frame bytes flow) are reproduced verbatim — drift between the two
+    /// listeners would mean the same peer behaves differently against the two
+    /// servers running side-by-side during migration.
+    pub async fn run(
+        self,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> Result<(), std::io::Error> {
+        use std::collections::HashMap;
+        use std::net::IpAddr;
+        use std::sync::Mutex as StdMutex;
+        use tokio::sync::Semaphore;
+
+        let listener = tokio::net::TcpListener::bind(&self.listen_addr).await?;
+        tracing::info!(
+            addr = %self.listen_addr,
+            shards = self.handles.shards.len(),
+            cluster_secret = self.auth_keys.cluster_secret_configured(),
+            join_token = self.auth_keys.join_token_configured(),
+            tls = self.tls.is_some(),
+            "Mux Raft RPC server listening"
+        );
+
+        if !self.auth_keys.cluster_secret_configured() {
+            tracing::warn!(
+                addr = %self.listen_addr,
+                "Mux Raft RPC server running without RAFT_CLUSTER_SECRET — control plane is \
+                 unauthenticated. Set RAFT_CLUSTER_SECRET on every node before exposing the \
+                 Raft port to an untrusted network."
+            );
+        }
+
+        // Accept-side gating: same caps as the legacy server. A handshake
+        // semaphore bounds total concurrent inbound TLS handshakes; the
+        // per-IP map bounds how many slots a single peer can hold.
+        const MAX_CONCURRENT_HANDSHAKES: usize = 128;
+        const MAX_PER_IP: usize = 16;
+        let accept_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+        let per_ip_counts: Arc<StdMutex<HashMap<IpAddr, usize>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.recv() => {
+                    tracing::info!(addr = %self.listen_addr, "Mux Raft RPC server shutting down");
+                    return Ok(());
+                }
+                accept_result = listener.accept() => {
+                    let (stream, peer_addr) = match accept_result {
+                        Ok(v) => v,
+                        Err(e) => return Err(e),
+                    };
+                    let handles = self.handles.clone();
+                    let auth_keys = self.auth_keys.clone();
+                    let tls = self.tls.clone();
+                    let accept_semaphore = accept_semaphore.clone();
+                    let per_ip_counts = per_ip_counts.clone();
+                    let peer_ip = peer_addr.ip();
+
+                    let per_ip_admitted = {
+                        let mut counts = per_ip_counts.lock().unwrap_or_else(|e| e.into_inner());
+                        let n = counts.entry(peer_ip).or_insert(0);
+                        if *n >= MAX_PER_IP {
+                            tracing::warn!(peer = %peer_addr, "Rejecting mux Raft RPC: per-IP connection cap reached");
+                            false
+                        } else {
+                            *n += 1;
+                            true
+                        }
+                    };
+                    if !per_ip_admitted {
+                        continue;
+                    }
+
+                    self.runtime.spawn(async move {
+                        let _accept_permit = match accept_semaphore.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        struct PerIpGuard {
+                            counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+                            ip: IpAddr,
+                        }
+                        impl Drop for PerIpGuard {
+                            fn drop(&mut self) {
+                                let mut c = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(n) = c.get_mut(&self.ip) {
+                                    *n = n.saturating_sub(1);
+                                    if *n == 0 {
+                                        c.remove(&self.ip);
+                                    }
+                                }
+                            }
+                        }
+                        let _ip_guard = PerIpGuard {
+                            counts: per_ip_counts.clone(),
+                            ip: peer_ip,
+                        };
+                        let wrapped = match accept_raft_stream(stream, tls.as_ref()).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!(peer = %peer_addr, error = %e, "Mux Raft TLS accept failed");
+                                return;
+                            }
+                        };
+                        if let Err(e) = handle_mux_connection(handles, wrapped, auth_keys, PeerScope::from_ip(peer_ip)).await {
+                            tracing::warn!(peer = %peer_addr, error = %e, "Error handling mux Raft RPC");
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Read frames from a single connection until EOF or idle timeout.
+///
+/// Mirrors [`super::network::RaftRpcServer::handle_connection`]: same
+/// per-frame idle bound, same EOF/reset/broken-pipe quiet-shutdown, same
+/// "decode-failure becomes an InvalidRequest response on the wire rather than
+/// a dropped socket" behaviour. Decode failure must surface as a typed
+/// response — closing the socket without one would force clients to retry
+/// against a closing peer and observe only timeouts.
+async fn handle_mux_connection(
+    handles: Arc<MuxRaftHandles>,
+    mut stream: MaybeTlsStreamServer,
+    auth_keys: Arc<RaftAuthKeys>,
+    peer: PeerScope,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        let read_result = match timeout(
+            RPC_FRAME_IDLE_TIMEOUT,
+            read_rpc_frame(&mut stream, &auth_keys, &peer, MAX_RPC_MESSAGE_BYTES),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::debug!("Closing idle mux Raft RPC connection");
+                break;
+            }
+        };
+
+        let (frame_purpose, msg_buf) = match read_result {
+            Ok(v) => v,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::BrokenPipe =>
+            {
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let response = dispatch_one_frame(&handles, frame_purpose, &msg_buf).await;
+        let response_data = postcard::to_stdvec(&response)?;
+        write_rpc_frame(&mut stream, &auth_keys, false, &response_data).await?;
+    }
+
+    Ok(())
+}
+
+/// Decode and dispatch a single frame from the wire.
+///
+/// Decode failures become a typed [`MuxRaftRpcResponse::Error`] rather than a
+/// connection-fatal error. This matches the legacy server's behaviour: a
+/// malformed frame from one peer must not knock its connection out, because
+/// some implementations of the upstream openraft retry policy multiplex
+/// pipelined requests on a single TCP connection.
+async fn dispatch_one_frame(
+    handles: &MuxRaftHandles,
+    frame_purpose: FramePurpose,
+    msg_buf: &[u8],
+) -> MuxRaftRpcResponse {
+    let message: MuxRaftRpcMessage = match postcard::from_bytes(msg_buf) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to deserialize mux Raft RPC frame");
+            return MuxRaftRpcResponse::Error(RpcErrorInfo::new(
+                RpcErrorKind::InvalidRequest,
+                format!("Malformed mux Raft RPC frame: {}", e),
+            ));
+        }
+    };
+    dispatch_mux_frame(handles, frame_purpose, message).await
+}
+
 #[cfg(test)]
 mod tests {
     //! These tests cover the no-Raft branches of the dispatcher: the
@@ -480,6 +781,7 @@ mod tests {
         MuxRaftRpcMessage::JoinCluster {
             node_id: 7,
             raft_addr: "127.0.0.1:7000".into(),
+            group: GroupId::Control,
         }
     }
 

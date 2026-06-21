@@ -1,14 +1,19 @@
 //! ProducerCoordinator implementation for RaftCoordinator.
 //!
 //! This module handles:
-//! - Producer ID allocation
-//! - Producer state storage and retrieval
+//! - Producer ID allocation (control group — cluster-wide monotonic counter)
+//! - Per-producer epoch / idempotency state (shard group, by `hash(producer_id)`)
+//! - Producer state for delivery semantics (shard group, by `hash(producer_id)`)
+//!
+//! The split is per the sharding plan: only the **counter** is global; every
+//! per-id table is sharded so a 100k-producer cluster doesn't write all its
+//! producer-state commits through a single Raft log.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use super::super::commands::{CoordinationCommand, CoordinationResponse};
+use super::super::commands::{ControlCommand, ControlResponse, ShardCommand, ShardResponse};
 use super::super::domains::{ProducerCommand, ProducerResponse};
 use super::{RaftCoordinator, current_time_ms};
 
@@ -25,15 +30,18 @@ impl ProducerCoordinator for RaftCoordinator {
         // commit. The FSM caches recent (token, producer_id) pairs and
         // returns the cached id on replay, collapsing the duplicate.
         let token = uuid::Uuid::new_v4().as_u128();
-        let command = CoordinationCommand::ProducerDomain(ProducerCommand::AllocateProducerId {
-            request_token: Some(token),
-        });
-        let response = self.node.write(command).await?;
+        let response = self
+            .cluster()
+            .write_control(ControlCommand::AllocateProducerId {
+                request_token: Some(token),
+            })
+            .await?;
 
         match response {
-            CoordinationResponse::ProducerDomainResponse(
-                ProducerResponse::ProducerIdAllocated { producer_id, .. },
-            ) => Ok(producer_id),
+            ControlResponse::Producer(ProducerResponse::ProducerIdAllocated {
+                producer_id,
+                ..
+            }) => Ok(producer_id),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -57,7 +65,7 @@ impl ProducerCoordinator for RaftCoordinator {
         // broker still mint distinct tokens, but at least the openraft-
         // layer dup is collapsed.
         let token = uuid::Uuid::new_v4().as_u128();
-        let command = CoordinationCommand::ProducerDomain(ProducerCommand::InitProducerId {
+        let command = ShardCommand::Producer(ProducerCommand::InitProducerId {
             transactional_id: transactional_id.map(|s| s.to_string()),
             producer_id: requested_producer_id,
             epoch: requested_epoch,
@@ -66,22 +74,29 @@ impl ProducerCoordinator for RaftCoordinator {
             request_token: Some(token),
         });
 
-        let response = self.node.write(command).await?;
+        // Per-producer state lives on the shard owning this producer id.
+        // `requested_producer_id == -1` (caller hasn't allocated one yet)
+        // hashes deterministically too, so the FSM can mint a fresh id and
+        // have its state on the same shard the caller will look it up on
+        // afterwards.
+        let response = self
+            .cluster()
+            .write_shard_for_producer(requested_producer_id, command)
+            .await?;
         match response {
-            CoordinationResponse::ProducerDomainResponse(
-                ProducerResponse::ProducerIdAllocated { producer_id, epoch },
-            ) => Ok((producer_id, epoch)),
+            ShardResponse::Producer(ProducerResponse::ProducerIdAllocated {
+                producer_id,
+                epoch,
+            }) => Ok((producer_id, epoch)),
             // The FSM's ProducerFenced reply maps to a typed FencedProducer
             // error so the handler emits InvalidProducerEpoch (47) on the
             // wire. Returning a generic Storage error would surface as the
             // generic Unknown code and the client would retry indefinitely
             // with the fenced identity.
-            CoordinationResponse::ProducerDomainResponse(
-                ProducerResponse::ProducerFenced {
-                    stored_producer_id,
-                    stored_epoch,
-                },
-            ) => Err(SlateDBError::FencedProducer {
+            ShardResponse::Producer(ProducerResponse::ProducerFenced {
+                stored_producer_id,
+                stored_epoch,
+            }) => Err(SlateDBError::FencedProducer {
                 producer_id: stored_producer_id,
                 expected_epoch: stored_epoch,
                 actual_epoch: requested_epoch,
@@ -101,7 +116,7 @@ impl ProducerCoordinator for RaftCoordinator {
         last_sequence: i32,
         producer_epoch: i16,
     ) -> SlateDBResult<()> {
-        let command = CoordinationCommand::ProducerDomain(ProducerCommand::StoreProducerState {
+        let command = ShardCommand::Producer(ProducerCommand::StoreProducerState {
             topic: topic.to_string(),
             partition,
             producer_id,
@@ -110,7 +125,12 @@ impl ProducerCoordinator for RaftCoordinator {
             timestamp_ms: current_time_ms(),
         });
 
-        self.node.write(command).await?;
+        // Per-producer state is sharded by producer id, not by topic — that
+        // way every produce request from the same producer hits one shard
+        // for its idempotency state regardless of which topic it writes to.
+        self.cluster()
+            .write_shard_for_producer(producer_id, command)
+            .await?;
         Ok(())
     }
 
@@ -119,20 +139,24 @@ impl ProducerCoordinator for RaftCoordinator {
         topic: &str,
         partition: i32,
     ) -> SlateDBResult<HashMap<i64, PersistedProducerState>> {
-        let state_machine = self.node.state_machine();
-        let state = state_machine.read().await;
-        let inner_state = state.state().await;
-
+        // Producer state could live on any shard (sharding is by
+        // producer_id, not by topic), so loading state for a (topic, part)
+        // pair has to scan every shard. This is a startup-time recovery
+        // path, not a hot path, so the O(N) fan-out is acceptable.
         let mut result = HashMap::new();
-        for ((t, p, pid), state) in &inner_state.producer_domain.producer_states {
-            if t.as_ref() == topic && *p == partition {
-                result.insert(
-                    *pid,
-                    PersistedProducerState {
-                        last_sequence: state.last_sequence,
-                        producer_epoch: state.producer_epoch,
-                    },
-                );
+        for shard in self.cluster().shards() {
+            let sm = shard.state_machine();
+            let state = sm.state().await;
+            for ((t, p, pid), s) in &state.producer_state.producer_states {
+                if t.as_ref() == topic && *p == partition {
+                    result.insert(
+                        *pid,
+                        PersistedProducerState {
+                            last_sequence: s.last_sequence,
+                            producer_epoch: s.producer_epoch,
+                        },
+                    );
+                }
             }
         }
 

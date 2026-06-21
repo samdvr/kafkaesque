@@ -62,8 +62,10 @@ tokio-rustls = { version = "0.26.4", optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-pemfile = { version = "2.2.0", optional = true }
 
-# SlateDB storage backend
-slatedb = "0.10.1"
+# SlateDB storage backend.
+# `moka` feature enables `MokaCache` — required for the shared block cache
+# wired through `SharedSlateDbResources` (see `src/cluster/slatedb_resources.rs`).
+slatedb = { version = "0.10.1", features = ["moka"] }
 object_store = { version = "0.12.5", features = ["aws", "gcp", "azure"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"

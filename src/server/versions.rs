@@ -120,6 +120,12 @@ pub const SUPPORTED_VERSIONS: &[SupportedVersion] = &[
     SupportedVersion::new(ApiKey::SaslAuthenticate, 0, 1),
     SupportedVersion::new(ApiKey::InitProducerId, 0, 4),
     SupportedVersion::new(ApiKey::DeleteGroups, 0, 1),
+    // DescribeConfigs / AlterConfigs: v0–v2. KafkaAdminClient defaults to
+    // v2; v3+ adds incremental ops (Append/Subtract) we do not yet
+    // implement. v1 added `include_synonyms`, v2 added `include_documentation`
+    // — both are tolerated and ignored.
+    SupportedVersion::new(ApiKey::DescribeConfigs, 0, 2),
+    SupportedVersion::new(ApiKey::AlterConfigs, 0, 1),
 ];
 
 /// Get the default set of API version data for responses.
@@ -193,6 +199,8 @@ pub const PARSER_ENCODER_COVERAGE: &[(ApiKey, i16, i16)] = &[
     (ApiKey::SaslAuthenticate, 0, 1),
     (ApiKey::InitProducerId, 0, 4),
     (ApiKey::DeleteGroups, 0, 1),
+    (ApiKey::DescribeConfigs, 0, 2),
+    (ApiKey::AlterConfigs, 0, 1),
 ];
 
 #[cfg(test)]

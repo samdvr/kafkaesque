@@ -87,9 +87,11 @@ pub mod raft;
 pub mod rebalance_coordinator;
 #[cfg(feature = "sasl")]
 mod sasl_provider;
+mod slatedb_resources;
 #[cfg(feature = "sasl")]
 pub mod scram;
 mod server_observability;
+pub mod topic_config_view;
 mod traits;
 mod validation;
 pub mod zombie_mode;
@@ -122,11 +124,14 @@ pub use partition_handle::{PartitionHandle, PartitionId, ReadGuard, WriteGuard};
 pub use partition_manager::PartitionManager;
 pub use partition_state::PartitionState;
 pub use partition_store::PartitionStore;
-pub use raft::{RaftConfig, RaftCoordinator, RaftNode};
+pub use raft::{RaftConfig, RaftCoordinator};
 pub use rebalance_coordinator::{
     CoordinatorExecutorAdapter, RebalanceCoordinator, RebalanceCoordinatorConfig,
 };
 pub use server_observability::{ClusterNoopObservability, ClusterObservability};
+pub use topic_config_view::{
+    CleanupPolicy, ConfigError as TopicConfigError, KNOWN_TOPIC_CONFIG_KEYS, TopicCompactionConfig,
+};
 pub use traits::{
     ClusterCoordinator, ConsumerGroupCoordinator, PartitionCoordinator,
     PartitionTransferCoordinator, ProducerCoordinator,

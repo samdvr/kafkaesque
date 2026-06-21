@@ -13,6 +13,16 @@
 //! - [`transfer`]: Partition transfer coordination
 //!
 //! Each module implements a single trait for better separation of concerns.
+//!
+//! # Multi-group routing
+//!
+//! Each method routes by key:
+//!
+//! - **Control** group: broker registry, ACLs, topic registry, producer-id
+//!   allocation. `cluster.write_control(...)` / `cluster.control()`.
+//! - **Shard** group (`hash(key) % metadata_shards`): per-partition leases,
+//!   consumer groups, per-producer idempotency, transfers.
+//!   `cluster.write_shard_for_topic(...)` / `cluster.shard_for_topic(...)`.
 
 mod acl;
 mod groups;
@@ -30,9 +40,11 @@ use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use super::commands::CoordinationCommand;
+use super::cluster::RaftCluster;
+use super::commands::{ControlCommand, ShardCommand};
 use super::config::RaftConfig;
-use super::node::RaftNode;
+use super::domains::{BrokerCommand, PartitionStateCommand};
+use super::reconciler;
 
 use crate::cluster::PartitionKey;
 use crate::cluster::coordinator::BrokerInfo;
@@ -62,15 +74,15 @@ struct CachedOwnerEntry {
 /// is potentially stale; the insert is dropped to avoid landing a stale
 /// entry as fresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OwnerCacheReadStamp {
+pub(super) struct OwnerCacheReadStamp {
     key_gen: u64,
     global_gen: u64,
 }
 
 /// Raft-based coordinator for cluster state.
 pub struct RaftCoordinator {
-    /// The underlying Raft node.
-    node: Arc<RaftNode>,
+    /// The underlying multi-group Raft cluster (one control + N shards).
+    cluster: Arc<RaftCluster>,
     /// This broker's ID.
     broker_id: i32,
     /// Broker info for this node.
@@ -118,8 +130,7 @@ impl RaftCoordinator {
         object_store: Arc<dyn ObjectStore>,
         runtime: Handle,
     ) -> SlateDBResult<Self> {
-        let node = RaftNode::new(config.clone(), object_store, runtime.clone()).await?;
-        let node = Arc::new(node);
+        let cluster = RaftCluster::new(config.clone(), object_store, runtime.clone()).await?;
 
         let broker_info = BrokerInfo {
             broker_id: config.broker_id,
@@ -137,7 +148,7 @@ impl RaftCoordinator {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
 
         let coordinator = Self {
-            node,
+            cluster,
             broker_id: config.broker_id,
             broker_info,
             owner_cache,
@@ -157,37 +168,45 @@ impl RaftCoordinator {
     /// Get a state accessor for reading/writing coordinator state.
     #[inline]
     pub fn state_accessor(&self) -> StateAccessor<'_> {
-        StateAccessor::new(&self.node)
+        StateAccessor::new(&self.cluster)
     }
 
-    /// Get the underlying Raft node.
-    pub fn node(&self) -> &Arc<RaftNode> {
-        &self.node
+    /// Get the underlying multi-group Raft cluster.
+    pub fn cluster(&self) -> &Arc<RaftCluster> {
+        &self.cluster
     }
 
-    /// Initialize the cluster (call on first node only).
+    /// Initialize the cluster (call on first node only). Initializes the
+    /// control group AND every shard in one shot — each `Raft::initialize`
+    /// is idempotent so a partial failure mid-fan-out is recoverable on
+    /// retry.
     pub async fn initialize_cluster(&self) -> SlateDBResult<()> {
-        self.node.initialize_cluster().await
+        self.cluster.initialize_cluster().await
     }
 
     /// Check if the cluster is already initialized.
     ///
-    /// Returns true if the cluster has existing membership from a restored
-    /// snapshot or previous initialization. This should be checked before
-    /// calling `initialize_cluster()` to avoid re-initialization errors on restart.
+    /// "Initialized" means the **control** group has membership. The shard
+    /// groups follow control's bootstrap by way of [`Self::initialize_cluster`];
+    /// if control has voters and shards don't (e.g. an interrupted bootstrap),
+    /// `initialize_cluster` is the recovery path — it's idempotent on the
+    /// already-initialized control group and finishes whichever shards are
+    /// still missing membership.
     pub fn is_initialized(&self) -> bool {
-        self.node.is_initialized()
+        self.cluster.control().is_initialized()
     }
 
     /// Start background tasks.
     pub async fn start_background_tasks(&self) {
-        let node = self.node.clone();
+        let cluster = self.cluster.clone();
         let broker_id = self.broker_id;
         let shutdown_tx = self.shutdown_tx.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let heartbeat_interval = self.config.broker_heartbeat_interval;
 
-        // Broker heartbeat task with jitter to prevent thundering herd
+        // Broker heartbeat task with jitter to prevent thundering herd. The
+        // broker registry is cluster-wide state — heartbeats target the
+        // control group.
         let handle = self.runtime.spawn(async move {
             // Add initial jitter (0-50% of interval) to stagger startup
             let initial_jitter = jitter_duration(heartbeat_interval, 0.5);
@@ -202,14 +221,12 @@ impl RaftCoordinator {
                         tokio::time::sleep(tick_jitter).await;
 
                         let now = current_time_ms();
-                        let command = CoordinationCommand::BrokerDomain(
-                            super::domains::BrokerCommand::Heartbeat {
-                                broker_id,
-                                timestamp_ms: now,
-                                reported_local_timestamp_ms: now,
-                            }
-                        );
-                        if let Err(e) = node.write(command).await {
+                        let command = ControlCommand::Broker(BrokerCommand::Heartbeat {
+                            broker_id,
+                            timestamp_ms: now,
+                            reported_local_timestamp_ms: now,
+                        });
+                        if let Err(e) = cluster.write_control(command).await {
                             warn!(error = %e, "Failed to send broker heartbeat");
                         }
                     }
@@ -221,58 +238,89 @@ impl RaftCoordinator {
         });
         self.task_handles.write().await.push(handle);
 
-        // Lease expiration task with jitter
-        let node = self.node.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        // Lease expiration sweep, fanned out one task per shard. Each task
+        // independently checks `shard.is_leader(broker_id)` and proposes
+        // `ShardCommand::Partition(ExpireLeases)` only if it is the local
+        // shard's leader. Per-shard tasks (rather than one task that loops
+        // through shards) so a stalled shard's metrics watch can't block
+        // sibling shards' sweeps.
         let check_interval = Duration::from_secs(5);
         let clock_skew_tolerance_ms = self.config.clock_skew_tolerance_ms;
+        let node_id = self.config.node_id;
+        for shard_idx in 0..self.cluster.metadata_shards() {
+            let cluster = self.cluster.clone();
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let handle = self.runtime.spawn(async move {
+                // Initial jitter staggers the sweep start across shards too
+                // — N shards all firing at the same wall clock would queue up
+                // on the proposal semaphore.
+                let initial_jitter = jitter_duration(check_interval, 1.0);
+                tokio::time::sleep(initial_jitter).await;
 
-        let handle = self.runtime.spawn(async move {
-            // Add initial jitter (0-100% of interval) to stagger across brokers
-            let initial_jitter = jitter_duration(check_interval, 1.0);
-            tokio::time::sleep(initial_jitter).await;
+                let mut interval = tokio::time::interval(check_interval);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let tick_jitter = jitter_duration(check_interval, 0.2);
+                            tokio::time::sleep(tick_jitter).await;
 
-            let mut interval = tokio::time::interval(check_interval);
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        // Add per-tick jitter (0-20% of interval)
-                        let tick_jitter = jitter_duration(check_interval, 0.2);
-                        tokio::time::sleep(tick_jitter).await;
+                            let Some(shard) = cluster.shard(shard_idx) else { return };
+                            // Leader-only sweep, per shard. Non-leaders skip
+                            // the tick so the sweep neither multiplies write
+                            // load by the cluster size nor stalls on
+                            // forwarding during partitions. Sweeps are
+                            // expire-by-deadline and therefore idempotent;
+                            // a duplicate proposal from a deposed leader is
+                            // a cheap no-op at the FSM.
+                            if !shard.is_leader(node_id) {
+                                continue;
+                            }
 
-                        // Leader-only sweep: every broker runs this task,
-                        // but only the current Raft leader proposes the
-                        // ExpireLeases command. Non-leaders skip the tick
-                        // entirely, so the sweep neither multiplies write
-                        // load by the cluster size nor stalls on proposal
-                        // forwarding during partitions. The sweep itself is
-                        // expire-by-deadline and therefore idempotent: a
-                        // duplicate proposal from a just-deposed leader is
-                        // a cheap no-op at the state machine.
-                        if !node.is_leader().await {
-                            continue;
+                            // Subtract skew tolerance from the expiry comparison.
+                            let now = current_time_ms().saturating_sub(clock_skew_tolerance_ms);
+                            let command = ShardCommand::Partition(
+                                PartitionStateCommand::ExpireLeases { current_time_ms: now }
+                            );
+                            if let Err(e) = cluster.write_shard(shard_idx, command).await {
+                                warn!(shard = shard_idx, error = %e, "Failed to expire leases");
+                            }
                         }
-
-                        // Subtract the configured skew tolerance from the
-                        // expiry comparison so a leader whose clock jumps
-                        // forward doesn't mass-expire valid leases.
-                        let now = current_time_ms().saturating_sub(clock_skew_tolerance_ms);
-                        let command = CoordinationCommand::PartitionDomain(
-                            super::domains::PartitionCommand::ExpireLeases { current_time_ms: now }
-                        );
-                        if let Err(e) = node.write(command).await {
-                            warn!(error = %e, "Failed to expire leases");
+                        _ = shutdown_rx.recv() => {
+                            break;
                         }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        break;
                     }
                 }
-            }
-        });
-        self.task_handles.write().await.push(handle);
+            });
+            self.task_handles.write().await.push(handle);
+        }
 
-        let node = self.node.clone();
+        // Reconciler: propagates control-group decisions (topic registry,
+        // broker liveness) into every shard's state machine. Runs on every
+        // broker; only proposes for shards this broker leads. See
+        // `reconciler` module docs for the full propagation set.
+        {
+            let cluster = self.cluster.clone();
+            let node_id = self.config.node_id;
+            let shutdown_rx = self.shutdown_tx.subscribe();
+            let handle = self.runtime.spawn(async move {
+                reconciler::run(
+                    cluster,
+                    node_id,
+                    reconciler::DEFAULT_RECONCILE_INTERVAL,
+                    shutdown_rx,
+                )
+                .await;
+            });
+            self.task_handles.write().await.push(handle);
+        }
+
+        // Metrics emission: tracks the **control** group's openraft state.
+        // Per-shard metrics live on the shard's own `metrics()` watch; this
+        // tier surfaces the controller-leader signal that operator alerts
+        // ("election storm", "no controller") were originally written
+        // against. Per-shard gauges land alongside step 10's full migration.
+        let cluster = self.cluster.clone();
+        let max_pending_proposals = self.config.max_pending_proposals;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let handle = self.runtime.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -286,7 +334,7 @@ impl RaftCoordinator {
                 tokio::select! {
                     _ = shutdown_rx.recv() => break,
                     _ = interval.tick() => {
-                        let metrics = node.metrics();
+                        let metrics = cluster.control().raft().metrics().borrow().clone();
                         let state_val = match metrics.state {
                             openraft::ServerState::Follower => 0,
                             openraft::ServerState::Candidate => 1,
@@ -305,9 +353,13 @@ impl RaftCoordinator {
                         crate::cluster::metrics::set_raft_log_entries(
                             metrics.last_log_index.unwrap_or(0) as i64,
                         );
-                        crate::cluster::metrics::set_raft_pending_proposals(
-                            node.pending_proposals() as i64,
-                        );
+                        // Pending proposals: control group only for now.
+                        // Per-group gauges are a follow-up — control's
+                        // pressure dominates because it's the only group
+                        // that fans out from a single coordinator-driven
+                        // task (broker heartbeat).
+                        let available = cluster.control().proposal_semaphore().available_permits();
+                        crate::cluster::metrics::set_raft_pending_proposals((max_pending_proposals.saturating_sub(available)) as i64);
 
                         // Record election outcomes on state transitions out
                         // of Candidate. We may miss elections that complete
@@ -361,12 +413,10 @@ impl RaftCoordinator {
             let _ = handle.await;
         }
 
-        // Shut down the underlying Raft node so its RPC server, replication
-        // tasks, and openraft state machine all stop cleanly. Skipping this
-        // step would leave the Raft RPC server bound and openraft
-        // background tasks running past process exit.
-        if let Err(e) = self.node.shutdown().await {
-            tracing::warn!(error = %e, "Raft node shutdown returned an error");
+        // Shut down the underlying multi-group cluster (RPC server +
+        // every group's openraft handle).
+        if let Err(e) = self.cluster.shutdown().await {
+            tracing::warn!(error = %e, "Raft cluster shutdown returned an error");
         }
 
         debug!(
@@ -378,35 +428,100 @@ impl RaftCoordinator {
 
     /// Join a Raft cluster.
     ///
-    /// This initiates the cluster join process by contacting the leader:
-    /// first as a learner ([`JoinCluster`], join HMAC), then promoted to
-    /// voter ([`PromoteMember`], cluster HMAC).
+    /// Two-phase fan-out across all `metadata_shards + 1` groups:
+    ///
+    /// 1. **Phase 1 (learner)** — for each group `(Control, Shard(0..N-1))`,
+    ///    send `JoinCluster { group, node_id, raft_addr }` to `leader_addr`
+    ///    under the **join** HMAC purpose. The receiver's mux dispatcher
+    ///    routes to the addressed group's `Raft<_>` handle and adds this
+    ///    broker as a learner. Each call is structurally idempotent — a
+    ///    retry against a group that already has the learner is a no-op.
+    /// 2. **Phase 2 (promote)** — for each group, send `PromoteMember
+    ///    { node_id, group }` to `leader_addr` under the **cluster** HMAC
+    ///    purpose. The cluster purpose is required to promote, so a
+    ///    holder-of-join-token-only cannot self-promote on any group.
+    ///
+    /// `leader_addr` is the bootstrap contact: at single-broker bootstrap
+    /// it is the leader of every group (because the control leader
+    /// initialized them all). For richer multi-broker join, the receiver
+    /// returns a typed `NotLeader { leader_hint }` and the joining broker
+    /// retries against the hint — that retry loop lives one layer up.
+    ///
+    /// **Sidecar (planned)**: per the sharding plan, `{raft_log_dir}/node-
+    /// {id}/join_state.bin` should record per-group phase progress so a
+    /// half-joined broker resumes from the first incomplete group on
+    /// restart. Not yet implemented — every RPC is idempotent so a fresh
+    /// `join_cluster` call after restart re-runs the full fan-out as a
+    /// no-op for groups already in the right state.
     pub async fn join_cluster(&self, leader_addr: &str) -> SlateDBResult<()> {
-        use super::network::request_cluster_join;
-        request_cluster_join(
-            leader_addr,
-            self.broker_id as u64,
-            &self.config.raft_addr,
-            &self.config.auth_keys,
-            self.config.tls.as_ref(),
-        )
-        .await
-        .map_err(|e| SlateDBError::Storage(format!("Failed to join cluster: {}", e)))
+        use super::mux_client::{request_mux_join, request_mux_promote};
+        use super::types::GroupId;
+
+        let node_id = self.config.node_id;
+        let raft_addr = self.config.raft_addr.clone();
+        let auth_keys = self.config.auth_keys.clone();
+        let tls = self.config.tls.clone();
+        let metadata_shards = self.cluster.metadata_shards();
+
+        // Build the full group list so the order is deterministic across
+        // restarts (control first, shards 0..N-1 in order). Important when
+        // the sidecar lands: a half-joined broker resumes scanning from
+        // the first group not yet in phase 2.
+        let mut groups: Vec<GroupId> = Vec::with_capacity(metadata_shards as usize + 1);
+        groups.push(GroupId::Control);
+        for i in 0..metadata_shards {
+            groups.push(GroupId::Shard(i));
+        }
+
+        // Phase 1: add learner on every group.
+        for group in &groups {
+            request_mux_join(
+                leader_addr,
+                node_id,
+                &raft_addr,
+                *group,
+                &auth_keys,
+                tls.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                SlateDBError::Storage(format!(
+                    "Failed to join cluster (phase 1, {:?}): {}",
+                    group, e
+                ))
+            })?;
+        }
+
+        // Phase 2: promote learner to voter on every group.
+        for group in &groups {
+            request_mux_promote(leader_addr, node_id, *group, &auth_keys, tls.as_ref())
+                .await
+                .map_err(|e| {
+                    SlateDBError::Storage(format!(
+                        "Failed to join cluster (phase 2, {:?}): {}",
+                        group, e
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
-    /// Get the current Raft leader.
+    /// Get the current Raft leader (of the control group — the "controller"
+    /// in Kafka terms).
     pub async fn get_leader(&self) -> Option<u64> {
-        self.node.current_leader().await
+        self.cluster.control().current_leader()
     }
 
-    /// Check if this node is the Raft leader.
+    /// Check if this node is the Raft leader of the **control** group.
+    /// Per-shard leadership is queried directly on `cluster.shard(id)`.
     pub async fn is_leader(&self) -> bool {
-        self.node.is_leader().await
+        self.cluster.control().is_leader(self.config.node_id)
     }
 
-    /// Get Raft metrics.
+    /// Get Raft metrics for the **control** group. Per-shard metrics are
+    /// accessed via `cluster.shard(id).raft().metrics()`.
     pub fn metrics(&self) -> openraft::RaftMetrics<super::types::RaftNodeId, openraft::BasicNode> {
-        self.node.metrics()
+        self.cluster.control().raft().metrics().borrow().clone()
     }
 
     /// Current Raft state code, encoded the same way as the
@@ -414,8 +529,11 @@ impl RaftCoordinator {
     /// healthy non-leader states), 1 = Candidate, 2 = Leader, -1 = Shutdown.
     /// Used by the readiness probe to query state directly instead of
     /// going through the global gauge (which lags by up to 1s).
+    ///
+    /// Reflects the **control** group's state — the controller-leader signal
+    /// the readiness probe was originally wired to track.
     pub fn current_raft_state(&self) -> i64 {
-        match self.node.metrics().state {
+        match self.cluster.control().raft().metrics().borrow().state {
             openraft::ServerState::Follower => 0,
             openraft::ServerState::Candidate => 1,
             openraft::ServerState::Leader => 2,
@@ -424,19 +542,19 @@ impl RaftCoordinator {
         }
     }
 
-    /// Wait for leader election to complete.
+    /// Wait for leader election to complete (control group).
     pub async fn wait_for_leader(&self) -> SlateDBResult<()> {
         self.wait_for_leader_with_timeout(Duration::from_secs(30))
             .await
     }
 
-    /// Wait for leader election with a custom timeout.
+    /// Wait for leader election with a custom timeout (control group).
     pub async fn wait_for_leader_with_timeout(&self, timeout: Duration) -> SlateDBResult<()> {
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(100);
 
         loop {
-            if self.node.current_leader().await.is_some() {
+            if self.cluster.control().current_leader().is_some() {
                 return Ok(());
             }
 
@@ -475,7 +593,7 @@ impl RaftCoordinator {
     /// linearizable read. Pass the result to `owner_cache_insert_if_fresh`
     /// after the read; if either generation has advanced in the meantime,
     /// the insert is skipped to avoid landing a stale value as fresh.
-    fn owner_cache_read_stamp(&self, key: &PartitionKey) -> OwnerCacheReadStamp {
+    pub(super) fn owner_cache_read_stamp(&self, key: &PartitionKey) -> OwnerCacheReadStamp {
         use std::sync::atomic::Ordering;
         OwnerCacheReadStamp {
             key_gen: self
@@ -489,7 +607,7 @@ impl RaftCoordinator {
 
     /// Insert only if neither tombstone has advanced since `stamp` was
     /// taken. Returns true if the insert landed.
-    async fn owner_cache_insert_if_fresh(
+    pub(super) async fn owner_cache_insert_if_fresh(
         &self,
         key: PartitionKey,
         broker_id: i32,
@@ -512,7 +630,7 @@ impl RaftCoordinator {
         true
     }
 
-    async fn owner_cache_get(&self, key: &PartitionKey) -> Option<i32> {
+    pub(super) async fn owner_cache_get(&self, key: &PartitionKey) -> Option<i32> {
         let stamp = self.owner_cache_read_stamp(key);
         self.owner_cache.get(key).await.and_then(|entry| {
             if entry.key_gen == stamp.key_gen && entry.global_gen == stamp.global_gen {
@@ -523,7 +641,7 @@ impl RaftCoordinator {
         })
     }
 
-    async fn owner_cache_invalidate(&self, key: &PartitionKey) {
+    pub(super) async fn owner_cache_invalidate(&self, key: &PartitionKey) {
         // Per-key tombstone only — DOES NOT bump the global generation.
         // Previously this bumped the global counter and silently discarded
         // every cached entry on every per-key invalidation.
@@ -531,7 +649,7 @@ impl RaftCoordinator {
         self.owner_cache.invalidate(key).await;
     }
 
-    async fn owner_cache_invalidate_all(&self) {
+    pub(super) async fn owner_cache_invalidate_all(&self) {
         self.bump_owner_cache_global_generation();
         self.owner_cache.invalidate_all();
         self.owner_cache.run_pending_tasks().await;

@@ -211,6 +211,41 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "api_describe_configs"
+path = "fuzz_targets/api_describe_configs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_alter_configs"
+path = "fuzz_targets/api_alter_configs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_offset_for_leader_epoch"
+path = "fuzz_targets/api_offset_for_leader_epoch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_create_partitions"
+path = "fuzz_targets/api_create_partitions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_incremental_alter_configs"
+path = "fuzz_targets/api_incremental_alter_configs.rs"
+test = false
+doc = false
+bench = false
+
 # ===========================================================================
 # Connection frame reader
 # ===========================================================================

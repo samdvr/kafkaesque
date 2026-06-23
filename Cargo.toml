@@ -174,6 +174,19 @@ stateright = "0.31.0"
 # releases compile cleanly against `bytes 1.11+`; older ones (≤0.13) run
 # into a `try_get_u8` ambiguity with the bytes crate's now-native method.
 kafka-protocol = "0.17"
+# Compression codec test fixtures. Kafka v2 RecordBatches carry the
+# compression algorithm in the low 3 bits of the attributes field
+# (gzip=1, snappy=2, lz4=3, zstd=4). The broker today treats compressed
+# payloads as opaque bytes — CRC validates the wire-level integrity but
+# inner records are never decoded. These crates are pulled in only by
+# `tests/compression_tests.rs` to mint payloads with each codec and
+# assert pass-through correctness; they are NOT linked into the broker.
+# All four are already in the dependency closure transitively via
+# slatedb/object_store, so this adds no new advisories.
+flate2 = "1.1"
+snap = "1.1"
+lz4 = "1.28"
+zstd = "0.13"
 
 [[bench]]
 name = "produce_bench"

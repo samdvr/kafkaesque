@@ -114,6 +114,14 @@ impl ZombieModeState {
         self.entered_at_millis.load(Ordering::SeqCst)
     }
 
+    /// Test-only override for `entered_at_millis`. Used by liveness-grace
+    /// tests that need to fast-forward past the grace window without a
+    /// real-clock delay.
+    #[cfg(test)]
+    pub(crate) fn set_entered_at_millis_for_test(&self, value: u64) {
+        self.entered_at_millis.store(value, Ordering::SeqCst);
+    }
+
     /// Enter zombie mode.
     ///
     /// This atomically sets the zombie flag, increments the session generation,

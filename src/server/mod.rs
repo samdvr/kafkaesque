@@ -117,6 +117,32 @@ enum SlotReservation {
     PerIpLimitReached { current: usize },
 }
 
+/// Classify and (if needed) back off on a `TcpListener::accept()` error so a
+/// transient resource exhaustion or interrupt does not bring down the data
+/// plane. `EMFILE`/`ENFILE` (and OOM/EBUSY) surface as `ErrorKind::Other` on
+/// most Rust versions, so we treat anything that isn't a benign retry signal
+/// as "back off and try again" — never propagate out of `run()`.
+async fn handle_accept_error(err: std::io::Error) {
+    use std::io::ErrorKind;
+    match err.kind() {
+        // Client RST'd or kernel-paused us between accept() being scheduled
+        // and the syscall returning. Both are normal — retry immediately.
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock => {
+            tracing::debug!(error = %err, "transient accept() error, retrying");
+        }
+        // fd exhaustion (EMFILE/ENFILE), buffer/memory pressure, or any
+        // other unexpected accept failure. Sleep briefly so a tight error
+        // loop cannot pin a CPU while the resource recovers.
+        _ => {
+            tracing::warn!(
+                error = %err,
+                "accept() error; backing off 100ms and continuing to accept"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
 /// Atomically reserve a global + per-IP connection slot.
 ///
 /// The previous accept path did `load` → check → `fetch_add` (and a read
@@ -434,7 +460,13 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                 }
                 // Accept new connections
                 accept_result = self.listener.accept() => {
-                    let (stream, addr) = accept_result.map_err(Error::from)?;
+                    let (stream, addr) = match accept_result {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            handle_accept_error(e).await;
+                            continue;
+                        }
+                    };
                     let ip = addr.ip();
 
                     // Disable Nagle so small responses (e.g. heartbeats,
@@ -793,7 +825,13 @@ impl<H: Handler + Send + Sync + 'static> TlsKafkaServer<H> {
                     return Ok(());
                 }
                 accept_result = self.listener.accept() => {
-                    let (stream, addr) = accept_result.map_err(Error::from)?;
+                    let (stream, addr) = match accept_result {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            handle_accept_error(e).await;
+                            continue;
+                        }
+                    };
                     let ip = addr.ip();
 
                     if let Err(e) = stream.set_nodelay(true) {

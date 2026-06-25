@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
     Error, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
@@ -224,7 +224,17 @@ impl ObjectStore for MetricsObjectStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
+        let upstream = self.inner.list_with_offset(prefix, offset);
+        upstream
+            .inspect(|item| {
+                if let Err(e) = item {
+                    metrics::record_object_store_error("list", classify_error(e));
+                    record_health(false);
+                } else {
+                    record_health(true);
+                }
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
@@ -273,8 +283,17 @@ fn wrap_get_result(result: GetResult) -> GetResult {
     let payload = match payload {
         GetResultPayload::Stream(stream) => GetResultPayload::Stream(
             stream
-                .inspect_ok(|chunk| {
-                    metrics::record_object_store_bytes("read", chunk.len() as u64);
+                .inspect(|chunk| match chunk {
+                    Ok(bytes) => {
+                        metrics::record_object_store_bytes("read", bytes.len() as u64);
+                    }
+                    Err(e) => {
+                        // A mid-stream failure (e.g. the S3 connection
+                        // dropping after `get_opts` returned OK) would
+                        // otherwise leave the health gauge unchanged.
+                        metrics::record_object_store_error("get", classify_error(e));
+                        record_health(false);
+                    }
                 })
                 .boxed(),
         ),

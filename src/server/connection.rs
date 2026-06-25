@@ -240,8 +240,18 @@ fn encode_fetch_response_into_chain(
     // total wire frame is 4-byte size + correlation_id + (optional
     // flexible byte) + body. The size field counts everything after
     // itself (correlation_id + flexible byte + body).
+    //
+    // The wire size field is i32, so a multi-partition fetch whose body
+    // exceeds 2 GiB would silently wrap to a negative size and desync the
+    // client. Reject the frame on overflow rather than corrupt it.
     let body_len = body_chain.len();
-    let size: i32 = (body_len + (header_len - 4)) as i32;
+    let size_usize = body_len + (header_len - 4);
+    let size = i32::try_from(size_usize).map_err(|_| {
+        Error::MissingData(format!(
+            "fetch response frame size {} exceeds i32::MAX",
+            size_usize
+        ))
+    })?;
     let mut header = BytesMut::with_capacity(header_len);
     header.extend_from_slice(&size.to_be_bytes());
     header.extend_from_slice(&correlation_id.to_be_bytes());
@@ -904,6 +914,7 @@ pub enum AuthResult {
 /// reducing maintenance burden and potential for divergence.
 ///
 /// Returns auth result for rate limiting purposes.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_request_common<H: Handler>(
     handler: &H,
     data: Bytes,

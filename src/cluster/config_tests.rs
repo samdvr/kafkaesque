@@ -739,7 +739,7 @@ fn test_config_data_integrity_defaults() {
 #[test]
 fn test_config_raft_defaults() {
     let config = ClusterConfig::default();
-    assert_eq!(config.raft_listen_addr, "127.0.0.1:9093");
+    assert_eq!(config.raft_listen_addr, "0.0.0.0:9093");
     assert!(config.raft_peers.is_none());
 }
 

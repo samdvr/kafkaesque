@@ -95,6 +95,18 @@ pub async fn recover_hwm_from_records(
     let start_key = encode_record_key(scan_floor);
     let end_key = [RECORD_KEY_PREFIX + 1];
 
+    // Periodic progress trace. A cold-start recovery after a cluster-wide
+    // outage can scan hours of object-store data per partition; without
+    // this, an operator watching boot logs sees "Opening partition X" and
+    // nothing else until the partition is ready, with no way to tell live
+    // progress from a deadlock. We log every `PROGRESS_BATCH_INTERVAL`
+    // batches scanned, including the latest offset observed so the trail
+    // is monotonic.
+    const PROGRESS_BATCH_INTERVAL: usize = 5_000;
+    let scan_started = std::time::Instant::now();
+    let mut last_progress_log = scan_started;
+    let mut batches_scanned: usize = 0;
+
     // Scan records from the floor. Errors propagate: a mid-scan storage
     // failure must fail the open, not silently truncate recovery (which
     // would under-recover the HWM and overwrite committed offsets).
@@ -140,6 +152,22 @@ pub async fn recover_hwm_from_records(
 
                 // Track batch for continuity validation
                 batches.push((offset, record_count));
+            }
+        }
+
+        batches_scanned += 1;
+        if batches_scanned.is_multiple_of(PROGRESS_BATCH_INTERVAL) {
+            let now = std::time::Instant::now();
+            // Throttle to at most one log every 5s in case batches are
+            // very small and the count threshold ticks faster than that.
+            if now.duration_since(last_progress_log) >= std::time::Duration::from_secs(5) {
+                info!(
+                    batches_scanned,
+                    highest_found,
+                    elapsed_secs = scan_started.elapsed().as_secs(),
+                    "recover_hwm_from_records progress"
+                );
+                last_progress_log = now;
             }
         }
     }

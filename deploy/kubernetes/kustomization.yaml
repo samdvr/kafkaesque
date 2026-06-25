@@ -8,7 +8,12 @@ resources:
   - namespace.yaml
   - serviceaccount.yaml
   - configmap.yaml
-  - secret.yaml
+  # secret.yaml is intentionally omitted: it ships placeholder
+  # ("CHANGE-ME") values that must never reach a real cluster. Create the
+  # `kafkaesque-raft-auth` secret out-of-band before applying — see
+  # secret.yaml's header comment for the recommended kubectl command. The
+  # statefulset references the secret by name, so a missing secret causes
+  # pod creation to fail closed instead of silently using insecure defaults.
   - networkpolicy.yaml
   - service.yaml
   - statefulset.yaml

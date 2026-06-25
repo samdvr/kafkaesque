@@ -112,6 +112,7 @@ fn parse_describe_configs_resource(s: NomBytes) -> IResult<NomBytes, DescribeCon
 /// different requests:
 /// - `null` → return every recognized config (filter omitted)
 /// - `[]`   → return zero configs (an explicit, unusual choice)
+///
 /// We need both, so this is a local re-implementation.
 fn parse_nullable_string_array(s: NomBytes) -> IResult<NomBytes, Option<Vec<String>>> {
     let (mut rest, length) = be_i32(s)?;

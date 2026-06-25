@@ -369,7 +369,7 @@ fn patch_base_offset_preserves_crc_for_every_codec() {
             "{}: pre-patch sanity",
             codec.name(),
         );
-        patch_base_offset(&mut batch, 999_999);
+        patch_base_offset(&mut batch, 999_999).unwrap();
         assert_eq!(
             validate_batch_crc(&batch),
             CrcValidationResult::Valid,

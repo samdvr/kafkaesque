@@ -16,9 +16,13 @@ data:
   # ACL enforcement is required outside CLUSTER_PROFILE=development.
   ACL_ENABLED: "true"
   ACL_DENY_BY_DEFAULT: "true"
-  # Bootstrap ACLs for clients without SASL (internal clusters only).
-  # Replace with SASL + per-principal ACLs before exposing outside the mesh.
-  KAFKAESQUE_SUPER_USERS: "User:ANONYMOUS"
+  # KAFKAESQUE_SUPER_USERS is intentionally NOT set here. Setting it to
+  # `User:ANONYMOUS` (the previous default) made ACLs a no-op for every
+  # non-SASL client, which is the opposite of fail-closed. Operators must
+  # set super-users explicitly for their environment, e.g. in an overlay:
+  #   KAFKAESQUE_SUPER_USERS: "User:admin"
+  # and bind clients to specific principals via SASL/mTLS before exposing
+  # the broker outside a private mesh.
 
   # Network configuration
   HOST: "0.0.0.0"

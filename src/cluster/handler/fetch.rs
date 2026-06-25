@@ -316,6 +316,12 @@ async fn collect_fetch(
                     {
                         Ok(store) => {
                             let current_hwm = store.high_watermark();
+                            // Snapshot log_start once so every return path
+                            // out of this arm can surface it. Returning -1
+                            // forces clients into a separate ListOffsets
+                            // round trip on OffsetOutOfRange and breaks
+                            // `auto.offset.reset=earliest` fast paths.
+                            let current_log_start = store.log_start_offset();
 
                             // KIP-320 fencing: a client whose view predates a
                             // failover must be rejected so it refreshes
@@ -343,7 +349,7 @@ async fn collect_fetch(
                                     high_watermark: current_hwm,
                                     last_stable_offset: -1,
                                     aborted_transactions: vec![],
-                                    log_start_offset: -1,
+                                    log_start_offset: current_log_start,
                                     preferred_read_replica: -1,
                                     records: None,
                                 };
@@ -359,7 +365,7 @@ async fn collect_fetch(
                                         high_watermark: -1,
                                         last_stable_offset: -1,
                                         aborted_transactions: vec![],
-                                        log_start_offset: -1,
+                                        log_start_offset: current_log_start,
                                         preferred_read_replica: -1,
                                         records: None,
                                     };
@@ -374,7 +380,7 @@ async fn collect_fetch(
                                         high_watermark: current_hwm,
                                         last_stable_offset: -1,
                                         aborted_transactions: vec![],
-                                        log_start_offset: -1,
+                                        log_start_offset: log_start,
                                         preferred_read_replica: -1,
                                         records: None,
                                     };
@@ -389,7 +395,7 @@ async fn collect_fetch(
                                     high_watermark: current_hwm,
                                     last_stable_offset: -1,
                                     aborted_transactions: vec![],
-                                    log_start_offset: -1,
+                                    log_start_offset: log_start,
                                     preferred_read_replica: -1,
                                     records: None,
                                 };
@@ -432,7 +438,7 @@ async fn collect_fetch(
                                     high_watermark: current_hwm,
                                     last_stable_offset: current_hwm,
                                     aborted_transactions: vec![],
-                                    log_start_offset: -1,
+                                    log_start_offset: log_start,
                                     preferred_read_replica: -1,
                                     records: None,
                                 };
@@ -468,7 +474,7 @@ async fn collect_fetch(
                                         error_code: KafkaCode::None,
                                         high_watermark,
                                         last_stable_offset: high_watermark,
-                                        log_start_offset: -1,
+                                        log_start_offset: log_start,
                                         aborted_transactions: vec![],
                                         preferred_read_replica: -1,
                                         records,
@@ -484,7 +490,11 @@ async fn collect_fetch(
                                             "Fenced during fetch - returning NotLeaderForPartition"
                                         );
                                     } else {
-                                        error!(error = %e, "Fetch failed");
+                                        // Throttled: per-partition fetch
+                                        // errors during an object-store
+                                        // outage scale with consumer
+                                        // count and would saturate logs.
+                                        crate::error_throttled!(error = %e, "Fetch failed");
                                     }
                                     FetchPartitionResponse {
                                         partition_index: partition.partition_index,
@@ -492,7 +502,7 @@ async fn collect_fetch(
                                         high_watermark: -1,
                                         last_stable_offset: -1,
                                         aborted_transactions: vec![],
-                                        log_start_offset: -1,
+                                        log_start_offset: log_start,
                                         preferred_read_replica: -1,
                                         records: None,
                                     }

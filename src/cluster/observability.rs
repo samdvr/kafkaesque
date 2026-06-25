@@ -289,6 +289,48 @@ macro_rules! record_success {
     };
 }
 
+/// `tracing::error!` with per-call-site rate limiting.
+///
+/// During a sustained outage (e.g. S3 unreachable) the produce/fetch hot
+/// paths can fire one error per request, which floods log shippers and
+/// amplifies the incident itself. This macro logs the first
+/// `MAX_PER_WINDOW` events in each fixed window, emits a single
+/// throttling notice on the (MAX+1)th, then drops the rest until the
+/// window rolls. The counter lives in a `static` so each call site
+/// throttles independently — one noisy site never silences another.
+///
+/// Usage: drop-in replacement for `tracing::error!`.
+#[macro_export]
+macro_rules! error_throttled {
+    ($($arg:tt)*) => {{
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        static WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
+        const WINDOW_MS: u64 = 60_000;
+        const MAX_PER_WINDOW: u64 = 10;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let window = WINDOW_START_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(window) >= WINDOW_MS {
+            WINDOW_START_MS.store(now_ms, Ordering::Relaxed);
+            COUNT.store(0, Ordering::Relaxed);
+        }
+        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < MAX_PER_WINDOW {
+            tracing::error!($($arg)*);
+        } else if n == MAX_PER_WINDOW {
+            tracing::warn!(
+                throttled_after = MAX_PER_WINDOW,
+                window_ms = WINDOW_MS,
+                "Suppressing further error logs from this call site for the rest of the window"
+            );
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

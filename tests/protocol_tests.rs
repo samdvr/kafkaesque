@@ -146,7 +146,7 @@ fn test_patch_base_offset_valid() {
     let mut batch = create_minimal_record_batch(0, 1);
     let new_offset = 100i64;
 
-    patch_base_offset(&mut batch, new_offset);
+    patch_base_offset(&mut batch, new_offset).unwrap();
 
     // Verify the first 8 bytes contain the new offset
     let patched_offset = i64::from_be_bytes([
@@ -160,7 +160,7 @@ fn test_patch_base_offset_large_value() {
     let mut batch = create_minimal_record_batch(0, 1);
     let new_offset = i64::MAX;
 
-    patch_base_offset(&mut batch, new_offset);
+    patch_base_offset(&mut batch, new_offset).unwrap();
 
     let patched_offset = i64::from_be_bytes([
         batch[0], batch[1], batch[2], batch[3], batch[4], batch[5], batch[6], batch[7],
@@ -171,7 +171,7 @@ fn test_patch_base_offset_large_value() {
 #[test]
 fn test_patch_base_offset_zero() {
     let mut batch = create_minimal_record_batch(100, 1);
-    patch_base_offset(&mut batch, 0);
+    patch_base_offset(&mut batch, 0).unwrap();
 
     let patched_offset = i64::from_be_bytes([
         batch[0], batch[1], batch[2], batch[3], batch[4], batch[5], batch[6], batch[7],
@@ -181,10 +181,11 @@ fn test_patch_base_offset_zero() {
 
 #[test]
 fn test_patch_base_offset_too_short() {
-    // Buffer too short to contain base offset (less than 8 bytes)
+    // Buffer too short to contain base offset (less than 8 bytes).
+    // The function now returns an error rather than silently no-op'ing
+    // so the caller can reject the produce.
     let mut batch = BytesMut::from(&[0u8; 7][..]);
-    // Should not panic, just return without modification
-    patch_base_offset(&mut batch, 100);
+    assert!(patch_base_offset(&mut batch, 100).is_err());
     assert_eq!(batch.len(), 7);
 }
 
@@ -197,7 +198,7 @@ fn test_patch_base_offset_preserves_crc() {
 
     // Patch the offset. The v2 batch CRC covers bytes 21+ only, so the
     // stored CRC stays valid — and must not be rewritten.
-    patch_base_offset(&mut batch, 99999);
+    patch_base_offset(&mut batch, 99999).unwrap();
 
     // Verify base offset was patched
     let patched_offset = i64::from_be_bytes([
@@ -217,7 +218,7 @@ fn test_patch_base_offset_does_not_repair_bad_crc() {
     let mut batch = create_minimal_record_batch(0, 1);
     batch[17..21].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
-    patch_base_offset(&mut batch, 7);
+    patch_base_offset(&mut batch, 7).unwrap();
 
     assert_eq!(&batch[17..21], &[0xDE, 0xAD, 0xBE, 0xEF]);
     assert!(matches!(
@@ -243,7 +244,7 @@ fn test_validate_batch_crc_valid_after_patch() {
     // A batch that arrives with a valid CRC stays valid after patching
     // (base offset is outside the checksummed range).
     let mut batch = create_minimal_record_batch(0, 1);
-    patch_base_offset(&mut batch, 12345);
+    patch_base_offset(&mut batch, 12345).unwrap();
 
     let result = validate_batch_crc(&batch);
     assert_eq!(result, CrcValidationResult::Valid);
@@ -253,7 +254,7 @@ fn test_validate_batch_crc_valid_after_patch() {
 fn test_validate_batch_crc_corrupted_data() {
     // Create a valid batch
     let mut batch = create_minimal_record_batch(0, 1);
-    patch_base_offset(&mut batch, 0); // Sets valid CRC
+    patch_base_offset(&mut batch, 0).unwrap(); // Sets valid CRC
 
     // Corrupt some data after the CRC (in the CRC-covered region)
     let data_start = 21;
@@ -272,7 +273,7 @@ fn test_validate_batch_crc_corrupted_data() {
 fn test_validate_batch_crc_single_bit_flip() {
     // Create valid batch
     let mut batch = create_minimal_record_batch(0, 5);
-    patch_base_offset(&mut batch, 0);
+    patch_base_offset(&mut batch, 0).unwrap();
     assert_eq!(validate_batch_crc(&batch), CrcValidationResult::Valid);
 
     // Flip a single bit in the data (after CRC field)

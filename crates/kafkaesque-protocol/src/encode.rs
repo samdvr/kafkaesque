@@ -6,17 +6,32 @@ use crate::constants::{
 };
 use crate::error::{Error, Result};
 
+/// Encode the i16 length prefix and the (byte) payload of a Kafka STRING
+/// field. Truncates payloads longer than the wire field can carry instead
+/// of erroring: a handler that builds an overlong `error_message` (e.g. a
+/// 40 KB serde error pasted into a per-partition response) would otherwise
+/// kill the whole connection, taking down every other in-flight request.
+/// Truncating preserves the operator-facing diagnostic while keeping the
+/// connection alive.
+///
+/// A debug build asserts on truncation so that bugs are caught in tests;
+/// release builds silently clamp, which is the production-safe behavior.
 #[inline]
-fn encode_string_len<T: BufMut>(buffer: &mut T, len: usize) -> Result<()> {
-    if len > i16::MAX as usize {
-        return Err(Error::Config(format!(
-            "string length {} exceeds wire field maximum {}",
-            len,
-            i16::MAX
-        )));
-    }
+fn encode_kafka_string<T: BufMut>(buffer: &mut T, payload: &[u8]) {
+    const MAX: usize = i16::MAX as usize;
+    debug_assert!(
+        payload.len() <= MAX,
+        "Kafka STRING field overflow: {} > {} — caller should clamp before encode",
+        payload.len(),
+        MAX
+    );
+    let (len, slice) = if payload.len() > MAX {
+        (MAX, &payload[..MAX])
+    } else {
+        (payload.len(), payload)
+    };
     buffer.put_i16(len as i16);
-    Ok(())
+    buffer.put(slice);
 }
 
 #[inline]
@@ -112,16 +127,14 @@ impl ToByte for i64 {
 
 impl ToByte for str {
     fn encode<T: BufMut>(&self, buffer: &mut T) -> Result<()> {
-        encode_string_len(buffer, self.len())?;
-        buffer.put(self.as_bytes());
+        encode_kafka_string(buffer, self.as_bytes());
         Ok(())
     }
 }
 
 impl ToByte for String {
     fn encode<T: BufMut>(&self, buffer: &mut T) -> Result<()> {
-        encode_string_len(buffer, self.len())?;
-        buffer.put(self.as_bytes());
+        encode_kafka_string(buffer, self.as_bytes());
         Ok(())
     }
 }

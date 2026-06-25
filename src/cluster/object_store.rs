@@ -188,10 +188,7 @@ pub fn create_object_store_with_faults(
         }
     };
 
-    Ok(wrap_with_cluster_prefix(
-        layered_store(raw, fault_injector),
-        &config.cluster_id,
-    )?)
+    wrap_with_cluster_prefix(layered_store(raw, fault_injector), &config.cluster_id)
 }
 
 fn layered_store(

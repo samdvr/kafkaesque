@@ -142,6 +142,12 @@ pub struct PartitionManager<C: ClusterCoordinator> {
     /// second caller to wait, recheck ownership, and no-op.
     acquire_locks: Arc<DashMap<PartitionKey, Arc<tokio::sync::Mutex<()>>>>,
 
+    /// In-flight reservations against the per-broker owned-partition cap.
+    /// See [`OwnershipContext::pending_acquires`] for the full rationale —
+    /// kept here so the manager owns the counter that every cloned
+    /// `OwnershipContext` shares.
+    pending_acquires: Arc<std::sync::atomic::AtomicUsize>,
+
     /// Rebalance coordinator for fast failover and auto-balancing.
     ///
     /// This is responsible for:
@@ -287,6 +293,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             lease_cache: Arc::new(DashMap::new()),
             topic_name_cache: Arc::new(DashMap::new()),
             acquire_locks: Arc::new(DashMap::new()),
+            pending_acquires: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rebalance_coordinator,
             rebalance_task_handles: RwLock::new(None),
             control_runtime,
@@ -396,6 +403,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             max_owned_partitions_per_broker: self.config.max_owned_partitions_per_broker,
             acquire_locks: self.acquire_locks.clone(),
             topic_name_cache: self.topic_name_cache.clone(),
+            pending_acquires: self.pending_acquires.clone(),
         }
     }
 
@@ -499,26 +507,14 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         self.control_runtime.spawn(async move {
             let mut consecutive_failures: u32 = 0;
 
-            // Spread first ticks uniformly across `interval` so concurrent
-            // heartbeat loops don't synchronize after rebalance.
-            tokio::select! {
-                _ = tokio::time::sleep(initial_jitter(interval)) => {},
-                _ = shutdown_rx.recv() => {
-                    info!(broker_id, "Heartbeat loop received shutdown signal");
-                    return;
-                }
-            }
-
+            // First heartbeat fires immediately, NOT after a full
+            // `initial_jitter(interval)` wait. Waiting up to one interval
+            // before the first announcement made a freshly-started broker
+            // look missing for ~30s under default settings — exactly the
+            // window when rolling deploys want fast visibility. Subsequent
+            // ticks still jitter (`with_jitter`) so the steady-state load
+            // on the Raft leader stays spread out.
             loop {
-                // Use jittered sleep instead of fixed interval to prevent thundering herd
-                tokio::select! {
-                    _ = tokio::time::sleep(with_jitter(interval)) => {},
-                    _ = shutdown_rx.recv() => {
-                        info!(broker_id, "Heartbeat loop received shutdown signal");
-                        break;
-                    }
-                }
-
                 // Refresh the estimated owned-partition memory gauge from the
                 // live owned set. Done here (single periodic source) rather
                 // than at every acquire/release site so it cannot drift.
@@ -630,6 +626,19 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                                 max_consecutive_failures
                             );
                         }
+                    }
+                }
+
+                // Sleep AFTER the heartbeat (with jitter to avoid
+                // thundering-herd against the Raft leader). Doing the
+                // sleep first would delay every loop's first announcement
+                // by up to one interval; here the first iteration runs
+                // immediately and only subsequent ticks are jittered.
+                tokio::select! {
+                    _ = tokio::time::sleep(with_jitter(interval)) => {},
+                    _ = shutdown_rx.recv() => {
+                        info!(broker_id, "Heartbeat loop received shutdown signal");
+                        break;
                     }
                 }
             }
@@ -863,15 +872,25 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                         if let Some((key, prev_state)) =
                             partition_states.remove(&(Arc::clone(&topic), partition))
                         {
-                            if let Some(store) = prev_state.store()
-                                && let Err(e) = store.close().await
-                            {
-                                warn!(
-                                    topic = &*key.0,
-                                    partition = key.1,
-                                    error = %e,
-                                    "Failed to close partition store after lease loss"
-                                );
+                            if let Some(store) = prev_state.store() {
+                                // Spawn the close so a 100-partition
+                                // reassignment storm doesn't serialize 100
+                                // SlateDB flushes on the renewal loop.
+                                // close() is idempotent (internal
+                                // `close_once`), so racing with shutdown
+                                // or another lease-loss path is safe.
+                                let close_topic = Arc::clone(&key.0);
+                                let close_partition = key.1;
+                                tokio::spawn(async move {
+                                    if let Err(e) = store.close().await {
+                                        warn!(
+                                            topic = &*close_topic,
+                                            partition = close_partition,
+                                            error = %e,
+                                            "Failed to close partition store after lease loss"
+                                        );
+                                    }
+                                });
                             }
                             info!(
                                 topic = &*key.0,
@@ -1843,6 +1862,16 @@ struct OwnershipContext<C: ClusterCoordinator> {
     /// bump on the existing `Arc<str>` instead of a fresh heap allocation
     /// per produce/fetch.
     topic_name_cache: Arc<DashMap<String, Arc<str>>>,
+    /// Optimistic reservation counter for the per-broker owned-partition cap.
+    /// Concurrent acquires for *different* partitions used to race past the
+    /// cap check (each saw `owned < cap` and proceeded), letting the broker
+    /// briefly exceed `max_owned_partitions_per_broker` by the concurrency
+    /// factor. Each acquire now `fetch_add`s a slot before the cap check
+    /// and the post-increment value is compared against the cap, so the
+    /// first request to push the count over the limit is the one rejected.
+    /// Decremented unconditionally on every exit from the cap-checked
+    /// region (success or failure) via a scope guard.
+    pending_acquires: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<C: ClusterCoordinator> OwnershipContext<C> {
@@ -1853,6 +1882,21 @@ impl<C: ClusterCoordinator> OwnershipContext<C> {
         let arc: Arc<str> = Arc::from(topic);
         self.topic_name_cache.insert(topic.to_string(), arc.clone());
         (arc, partition)
+    }
+}
+
+/// RAII guard that decrements the broker-wide `pending_acquires` counter
+/// when dropped. Used to release the in-flight slot reserved against the
+/// `max_owned_partitions_per_broker` cap, so every return path out of the
+/// cap-checked region (including panic-via-`?`) gives the slot back.
+struct PendingAcquireGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for PendingAcquireGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2244,23 +2288,34 @@ async fn acquire_partition_core<C: ClusterCoordinator>(
     // set is the most likely OOM vector at high partition density (audit
     // P1-2). Rejecting here turns that into a bounded, observable limit: the
     // partition simply isn't acquired and stays available to another broker.
-    // `0` disables the cap. This check is correct rather than racy because we
-    // hold the per-key acquire lock and count the live owned set directly;
-    // different partitions may still race, so the effective ceiling can
-    // briefly exceed the cap by the number of concurrent acquires, which is
-    // bounded and self-correcting.
-    if ctx.max_owned_partitions_per_broker > 0 {
+    // `0` disables the cap.
+    //
+    // The check is now atomic across concurrent acquires for *different*
+    // partitions: we `fetch_add` an in-flight reservation BEFORE counting
+    // the live owned set, and compare the post-increment total against the
+    // cap. Without that, N concurrent acquires would each read `owned < cap`
+    // independently and all proceed, briefly overshooting the cap by N - 1.
+    // The reservation is released on every exit from the cap-checked block
+    // (success or failure) via `pending_release`.
+    let pending_release = if ctx.max_owned_partitions_per_broker > 0 {
+        use std::sync::atomic::Ordering;
+        let prev = ctx.pending_acquires.fetch_add(1, Ordering::SeqCst);
         let owned = ctx
             .partition_states
             .iter()
             .filter(|e| e.value().is_owned())
             .count();
-        if owned >= ctx.max_owned_partitions_per_broker {
+        // Post-increment count of in-flight reservations is `prev + 1`. We
+        // reject when adding *this* reservation would push the projected
+        // total above the cap. Using `>` lets the very last slot succeed.
+        if owned + prev + 1 > ctx.max_owned_partitions_per_broker {
+            ctx.pending_acquires.fetch_sub(1, Ordering::SeqCst);
             warn!(
                 ctx.broker_id,
                 topic,
                 partition,
                 owned,
+                pending = prev + 1,
                 max_owned = ctx.max_owned_partitions_per_broker,
                 "Rejecting partition acquisition: broker is at its max_owned_partitions_per_broker cap"
             );
@@ -2268,7 +2323,18 @@ async fn acquire_partition_core<C: ClusterCoordinator>(
             super::metrics::record_lease_operation("acquire", "rejected_max_owned");
             return Ok(false);
         }
-    }
+        // Scope guard: decrement on every return path below (Ok(true),
+        // Ok(false), Err) so the counter only reflects truly in-flight
+        // acquires. Decrement happens in the guard's Drop.
+        Some(PendingAcquireGuard {
+            counter: ctx.pending_acquires.clone(),
+        })
+    } else {
+        None
+    };
+    // Keep the guard alive across the rest of the function via a `_` bind
+    // — its Drop fires at the end of the scope.
+    let _pending_release = pending_release;
 
     // Use acquire_partition_with_epoch to get the leader epoch for TOCTOU prevention
     let leader_epoch = match ctx

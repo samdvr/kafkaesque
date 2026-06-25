@@ -485,7 +485,7 @@ fn test_record_batch_patch_base_offset() {
     assert_eq!(initial_offset, 0);
 
     // Patch the offset
-    patch_base_offset(&mut batch, 12345);
+    patch_base_offset(&mut batch, 12345).unwrap();
 
     let patched_offset = i64::from_be_bytes(batch[0..8].try_into().unwrap());
     assert_eq!(patched_offset, 12345);
@@ -928,7 +928,7 @@ fn test_crc_after_multiple_patches() {
     let offsets = [0i64, 100, 1000, 10000, i64::MAX];
 
     for &offset in &offsets {
-        patch_base_offset(&mut batch, offset);
+        patch_base_offset(&mut batch, offset).unwrap();
 
         // Verify offset was patched
         let patched = i64::from_be_bytes(batch[0..8].try_into().unwrap());

@@ -684,7 +684,11 @@ impl SlateDBClusterHandler {
                         "Fenced during produce - returning NotLeaderForPartition"
                     );
                 } else {
-                    error!(error = %e, "Failed to append batch");
+                    // Throttled: during a sustained object-store outage
+                    // every produce error would otherwise land here at
+                    // error level and saturate log shipping, amplifying
+                    // the incident.
+                    crate::error_throttled!(error = %e, "Failed to append batch");
                 }
                 ProducePartitionResponse {
                     partition_index: partition.partition_index,

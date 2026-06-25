@@ -46,6 +46,18 @@ const HEALTH_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// Write deadline for a single health-check response.
 const HEALTH_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a broker may sit in zombie mode before `/health` reports it as
+/// unhealthy. Until this grace period elapses the liveness endpoint stays
+/// 200 so a transient object-store outage doesn't cause kubelet to restart
+/// (and discard buffered state). Past the grace period we WANT kubelet to
+/// recycle the pod — the broker is wedged with no automatic recovery
+/// mechanism that hasn't already had time to fire.
+///
+/// 5 minutes is long enough to ride out typical S3 / GCS blips and short
+/// enough that an unrecoverable broker is replaced before its session
+/// timeouts cascade across the cluster.
+const ZOMBIE_LIVENESS_GRACE_MS: u64 = 5 * 60 * 1000;
+
 /// Maximum concurrent in-flight health-check connections. The server is
 /// internal-facing so this only needs to absorb a probe storm; beyond this
 /// we shed load (and an attacker can't pin all our memory).
@@ -388,19 +400,33 @@ fn liveness_response(broker_id: Option<i32>) -> String {
 
 /// Generate health response.
 ///
-/// Always returns 200 — `/health` is the Kubernetes liveness signal and
-/// failing it would have kubelet kill the pod even though zombie mode is
-/// recoverable. We surface zombie status in the body so dashboards and
-/// `curl` checks can see it without forcing a restart loop on the operator.
+/// Returns 200 while the broker is healthy or only briefly in zombie mode.
+/// Once zombie mode has persisted for [`ZOMBIE_LIVENESS_GRACE_MS`], returns
+/// 503 so kubelet's `livenessProbe` recycles the pod — a wedged broker has
+/// no path back to serving and silent failure here was the prior behavior.
 fn health_response(zombie_state: &ZombieModeState, broker_id: Option<i32>) -> String {
     let broker_str = broker_id
         .map(|id| format!("broker_id: {}\n", id))
         .unwrap_or_default();
-    let zombie_str = if zombie_state.is_active() {
+    let zombie_active = zombie_state.is_active();
+    let zombie_str = if zombie_active {
         "zombie_mode: active\n"
     } else {
         "zombie_mode: inactive\n"
     };
+
+    if zombie_active && zombie_duration_ms(zombie_state) >= ZOMBIE_LIVENESS_GRACE_MS {
+        return format!(
+            "HTTP/1.1 503 Service Unavailable\r\n\
+             Content-Type: text/plain\r\n\
+             Connection: close\r\n\
+             \r\n\
+             status: unhealthy\n\
+             reason: zombie_mode_grace_exceeded\n\
+             {}{}",
+            zombie_str, broker_str
+        );
+    }
 
     format!(
         "HTTP/1.1 200 OK\r\n\
@@ -411,6 +437,23 @@ fn health_response(zombie_state: &ZombieModeState, broker_id: Option<i32>) -> St
          {}{}",
         zombie_str, broker_str
     )
+}
+
+/// Wall-clock milliseconds since the broker entered zombie mode, or 0 if
+/// it isn't currently zombie. Saturates at 0 if the system clock has moved
+/// backwards relative to `entered_at` (e.g. NTP step) — the grace window
+/// then restarts, which is the conservative behavior.
+fn zombie_duration_ms(zombie_state: &ZombieModeState) -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let entered = zombie_state.entered_at();
+    if entered == 0 {
+        return 0;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now_ms.saturating_sub(entered)
 }
 
 /// Generate readiness response (503 if not ready).
@@ -611,10 +654,35 @@ mod tests {
     fn test_handle_health_request_zombie() {
         let state = zombie();
         let response = handle_request("GET /health HTTP/1.1\r\n", &state, Some(1), None, None);
-        // /health stays 200 even in zombie mode (Kubernetes liveness),
-        // but the body surfaces the zombie state for visibility.
+        // /health stays 200 during the zombie grace window so kubelet
+        // doesn't restart on transient outages; once the grace expires
+        // the same path returns 503 (covered by `health_response` directly
+        // in `test_health_response_zombie_grace_exceeded`).
         assert!(response.contains("200 OK"));
         assert!(response.contains("zombie_mode: active"));
+    }
+
+    #[test]
+    fn test_health_response_zombie_grace_exceeded() {
+        // Build a zombie state whose `entered_at` is far enough in the
+        // past that the liveness grace window has expired. The handler
+        // should now return 503 so kubelet's livenessProbe recycles a
+        // wedged broker.
+        let state = ZombieModeState::new();
+        state.enter();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let stale_entered = now_ms.saturating_sub(ZOMBIE_LIVENESS_GRACE_MS + 1_000);
+        state.set_entered_at_millis_for_test(stale_entered);
+
+        let response = health_response(&state, Some(7));
+        assert!(response.contains("503 Service Unavailable"));
+        assert!(response.contains("status: unhealthy"));
+        assert!(response.contains("reason: zombie_mode_grace_exceeded"));
+        assert!(response.contains("zombie_mode: active"));
+        assert!(response.contains("broker_id: 7"));
     }
 
     #[test]

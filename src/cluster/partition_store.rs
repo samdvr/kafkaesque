@@ -1022,8 +1022,21 @@ impl PartitionStore {
         buffer.extend_from_slice(&new_hwm.to_be_bytes());
         buffer.extend_from_slice(records);
 
-        // Patch base_offset in record batch (at offset 8, where the batch starts)
-        patch_base_offset(&mut buffer[8..], base_offset);
+        // Patch base_offset in record batch (at offset 8, where the batch starts).
+        // A short batch here is a defense-in-depth case (the produce path
+        // already validates the record batch upstream), but if it slipped
+        // through, silently storing it would persist a batch with
+        // base_offset=0 under a real key — confusing the fetch path.
+        // Returning the buffer to the pool keeps us honest about the
+        // failure path.
+        if let Err(e) = patch_base_offset(&mut buffer[8..], base_offset) {
+            super::buffer_pool::return_buffer(buffer);
+            return Err(SlateDBError::CorruptBatch {
+                topic: self.topic.to_string(),
+                partition: self.partition,
+                reason: format!("patch_base_offset rejected: {e}"),
+            });
+        }
 
         // For acks>=1 we must wait for SlateDB durability before acking the
         // producer; otherwise an OOM-kill or rolling restart inside the WAL

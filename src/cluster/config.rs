@@ -574,7 +574,11 @@ pub struct ClusterConfig {
 
     // --- Raft configuration ---
     /// Raft RPC listen address (for inter-node communication).
-    /// Default: "127.0.0.1:9093"
+    ///
+    /// Default: `"0.0.0.0:9093"` — bind to all interfaces so a pod that
+    /// missed setting `RAFT_LISTEN_ADDR` is still reachable by peers.
+    /// Override to a specific address (e.g. a private interface) when you
+    /// want to scope Raft traffic.
     pub raft_listen_addr: String,
 
     /// Initial Raft peers for cluster formation.
@@ -1023,7 +1027,7 @@ impl Default for ClusterConfig {
             circuit_breaker_base_reset_window_ms: 60_000, // 1 minute
             circuit_breaker_max_reset_window_ms: 300_000, // 5 minutes
             // Raft configuration
-            raft_listen_addr: "127.0.0.1:9093".to_string(),
+            raft_listen_addr: "0.0.0.0:9093".to_string(),
             raft_peers: None,
             // Metrics tuning
             enable_partition_metrics: true,
@@ -1663,7 +1667,7 @@ impl ClusterConfig {
     /// - `HOST`: Host address (default: 0.0.0.0)
     /// - `PORT`: Kafka port (default: 9092)
     /// - `CLUSTER_ID`: Cluster identifier (default: kafkaesque-cluster)
-    /// - `RAFT_LISTEN_ADDR`: Raft RPC listen address (default: 127.0.0.1:9093)
+    /// - `RAFT_LISTEN_ADDR`: Raft RPC listen address (default: 0.0.0.0:9093)
     /// - `RAFT_PEERS`: Initial peers for cluster formation
     /// - `OBJECT_STORE_TYPE`: "local", "s3", "gcs", or "azure" (default: local)
     /// - `DATA_PATH`: Local path or object store prefix (default: /tmp/kafkaesque-data)
@@ -1777,7 +1781,7 @@ impl ClusterConfig {
             std::env::var("CLUSTER_ID").unwrap_or_else(|_| "kafkaesque-cluster".to_string());
 
         let raft_listen_addr =
-            std::env::var("RAFT_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:9093".to_string());
+            std::env::var("RAFT_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:9093".to_string());
 
         let raft_peers = std::env::var("RAFT_PEERS").ok();
 

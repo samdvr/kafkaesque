@@ -497,7 +497,7 @@ fn patching_base_offset_preserves_crc_validity() {
     let crc_before = batch[17..21].to_vec();
     assert_eq!(validate_batch_crc(&batch), CrcValidationResult::Valid);
 
-    patch_base_offset(&mut batch, 987_654_321);
+    patch_base_offset(&mut batch, 987_654_321).unwrap();
 
     assert_eq!(
         i64::from_be_bytes(batch[0..8].try_into().unwrap()),
@@ -522,7 +522,7 @@ fn patching_base_offset_does_not_bless_corrupt_batches() {
         CrcValidationResult::Invalid { .. }
     ));
 
-    patch_base_offset(&mut batch, 42);
+    patch_base_offset(&mut batch, 42).unwrap();
 
     assert_eq!(&batch[17..21], &[0xDE, 0xAD, 0xBE, 0xEF]);
     assert!(matches!(

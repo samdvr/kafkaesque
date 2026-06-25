@@ -321,21 +321,57 @@ pub fn parse_record_count(batch: &[u8]) -> i32 {
 /// * `batch` - Mutable slice of the RecordBatch bytes
 /// * `base_offset` - The offset to write into the header
 ///
+/// # Errors
+///
+/// Returns [`PatchBaseOffsetError::TooShort`] if `batch.len() < 8`. The
+/// previous version silently no-op'd on short batches, which let a
+/// malformed produce slip through with `base_offset=0` and confused the
+/// downstream fetch path. Callers must handle this explicitly.
+///
 /// # Example
 /// ```
-/// use kafkaesque::protocol::{patch_base_offset, validate_batch_crc, CrcValidationResult};
+/// use kafkaesque::protocol::patch_base_offset;
 ///
 /// let mut batch = vec![0u8; 100];
-/// patch_base_offset(&mut batch, 12345);
+/// patch_base_offset(&mut batch, 12345).unwrap();
 /// assert_eq!(&batch[0..8], &12345i64.to_be_bytes());
 /// ```
-pub fn patch_base_offset(batch: &mut [u8], base_offset: i64) {
+pub fn patch_base_offset(
+    batch: &mut [u8],
+    base_offset: i64,
+) -> Result<(), PatchBaseOffsetError> {
     const BASE_OFFSET_SIZE: usize = 8;
-    if batch.len() >= BASE_OFFSET_SIZE {
-        batch[BATCH_BASE_OFFSET..BATCH_BASE_OFFSET + BASE_OFFSET_SIZE]
-            .copy_from_slice(&base_offset.to_be_bytes());
+    if batch.len() < BASE_OFFSET_SIZE {
+        return Err(PatchBaseOffsetError::TooShort { len: batch.len() });
+    }
+    batch[BATCH_BASE_OFFSET..BATCH_BASE_OFFSET + BASE_OFFSET_SIZE]
+        .copy_from_slice(&base_offset.to_be_bytes());
+    Ok(())
+}
+
+/// Error returned when [`patch_base_offset`] is handed a batch shorter than
+/// the 8-byte base-offset header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchBaseOffsetError {
+    /// Batch length was below the 8-byte base-offset field.
+    TooShort {
+        /// Observed batch length, in bytes.
+        len: usize,
+    },
+}
+
+impl core::fmt::Display for PatchBaseOffsetError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PatchBaseOffsetError::TooShort { len } => write!(
+                f,
+                "record batch too short to patch base_offset (got {len} bytes, need at least 8)"
+            ),
+        }
     }
 }
+
+impl std::error::Error for PatchBaseOffsetError {}
 
 /// Producer information extracted from a RecordBatch header.
 ///
@@ -618,7 +654,7 @@ mod tests {
     #[test]
     fn test_patch_base_offset() {
         let mut batch = vec![0u8; 100];
-        patch_base_offset(&mut batch, 12345);
+        patch_base_offset(&mut batch, 12345).unwrap();
         let patched = i64::from_be_bytes(batch[0..8].try_into().unwrap());
         assert_eq!(patched, 12345);
     }
@@ -626,8 +662,11 @@ mod tests {
     #[test]
     fn test_patch_base_offset_too_small() {
         let mut batch = vec![0u8; 4];
-        // Should not panic, just do nothing
-        patch_base_offset(&mut batch, 12345);
+        // Short batches are now an error rather than a silent no-op so the
+        // caller can reject the produce instead of storing a base_offset=0
+        // record under a real key.
+        let err = patch_base_offset(&mut batch, 12345).unwrap_err();
+        assert_eq!(err, PatchBaseOffsetError::TooShort { len: 4 });
         assert_eq!(&batch, &[0, 0, 0, 0]);
     }
 
@@ -708,7 +747,7 @@ mod tests {
         assert_eq!(validate_batch_crc(&batch), CrcValidationResult::Valid);
 
         // Patch base offset
-        patch_base_offset(&mut batch, 99999);
+        patch_base_offset(&mut batch, 99999).unwrap();
 
         // Verify base offset was patched
         let patched_offset = i64::from_be_bytes(batch[0..8].try_into().unwrap());
@@ -737,7 +776,7 @@ mod tests {
             CrcValidationResult::Invalid { .. }
         ));
 
-        patch_base_offset(&mut batch, 42);
+        patch_base_offset(&mut batch, 42).unwrap();
 
         // Offset patched, CRC bytes untouched and still invalid.
         assert_eq!(i64::from_be_bytes(batch[0..8].try_into().unwrap()), 42);
@@ -1020,7 +1059,7 @@ mod tests {
 
         // Patch to various offsets
         for offset in [0i64, 1, 100, 999999, i64::MAX] {
-            patch_base_offset(&mut batch, offset);
+            patch_base_offset(&mut batch, offset).unwrap();
 
             // Verify offset was patched
             let patched = i64::from_be_bytes(batch[0..8].try_into().unwrap());

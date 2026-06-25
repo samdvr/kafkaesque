@@ -200,15 +200,7 @@ pub(super) async fn handle_join_group(
     // Validate group ID
     if let Err(e) = crate::cluster::coordinator::validate_group_id(&request.group_id) {
         debug!(group_id = %request.group_id, error = %e, "Invalid group ID in join_group request");
-        return JoinGroupResponseData {
-            throttle_time_ms: 0,
-            error_code: KafkaCode::InvalidGroupId,
-            generation_id: -1,
-            protocol_name: String::new(),
-            leader: String::new(),
-            member_id: request.member_id,
-            members: vec![],
-        };
+        return JoinGroupResponseData::error(KafkaCode::InvalidGroupId, request.member_id);
     }
 
     // JoinGroup requires Read on the Group resource.
@@ -221,15 +213,10 @@ pub(super) async fn handle_join_group(
             operation = "Read",
             "ACL denied: JoinGroup"
         );
-        return JoinGroupResponseData {
-            throttle_time_ms: 0,
-            error_code: KafkaCode::GroupAuthorizationFailed,
-            generation_id: -1,
-            protocol_name: String::new(),
-            leader: String::new(),
-            member_id: request.member_id,
-            members: vec![],
-        };
+        return JoinGroupResponseData::error(
+            KafkaCode::GroupAuthorizationFailed,
+            request.member_id,
+        );
     }
 
     // Validate session and rebalance timeouts. A negative value casts to
@@ -250,15 +237,7 @@ pub(super) async fn handle_join_group(
             rebalance_timeout_ms = request.rebalance_timeout_ms,
             "Rejecting JoinGroup with out-of-range timeouts"
         );
-        return JoinGroupResponseData {
-            throttle_time_ms: 0,
-            error_code: KafkaCode::InvalidSessionTimeout,
-            generation_id: -1,
-            protocol_name: String::new(),
-            leader: String::new(),
-            member_id: request.member_id,
-            members: vec![],
-        };
+        return JoinGroupResponseData::error(KafkaCode::InvalidSessionTimeout, request.member_id);
     }
 
     // Collect the member's full protocol list. Every (name, metadata)
@@ -279,15 +258,7 @@ pub(super) async fn handle_join_group(
                 error = %e,
                 "Member metadata too large"
             );
-            return JoinGroupResponseData {
-                throttle_time_ms: 0,
-                error_code: KafkaCode::Unknown,
-                generation_id: -1,
-                protocol_name: String::new(),
-                leader: String::new(),
-                member_id: request.member_id,
-                members: vec![],
-            };
+            return JoinGroupResponseData::error(KafkaCode::Unknown, request.member_id);
         }
     }
 
@@ -317,15 +288,7 @@ pub(super) async fn handle_join_group(
         Err(e) => {
             error!(error = %e, "Failed to join group");
             crate::cluster::metrics::record_group_operation("join", "error");
-            return JoinGroupResponseData {
-                throttle_time_ms: 0,
-                error_code: KafkaCode::Unknown,
-                generation_id: -1,
-                protocol_name: String::new(),
-                leader: String::new(),
-                member_id,
-                members: vec![],
-            };
+            return JoinGroupResponseData::error(KafkaCode::Unknown, member_id);
         }
     };
 
@@ -338,15 +301,7 @@ pub(super) async fn handle_join_group(
                 "Join rejected: no protocol in common with the group"
             );
             crate::cluster::metrics::record_group_operation("join", "error");
-            return JoinGroupResponseData {
-                throttle_time_ms: 0,
-                error_code: KafkaCode::InconsistentGroupProtocol,
-                generation_id: -1,
-                protocol_name: String::new(),
-                leader: String::new(),
-                member_id,
-                members: vec![],
-            };
+            return JoinGroupResponseData::error(KafkaCode::InconsistentGroupProtocol, member_id);
         }
     };
 

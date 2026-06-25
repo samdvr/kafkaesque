@@ -616,6 +616,58 @@ impl<G: GroupKind> RaftStore<G> {
         Ok(())
     }
 
+    /// Group-fsync variant: write+rename `items` in one shot, then fsync the
+    /// shared parent directory exactly once at the end.
+    ///
+    /// `atomic_write_fsync_blocking` does N file fsyncs + N parent-dir fsyncs
+    /// for a batch of N items. The parent-dir fsyncs dominate when the
+    /// directory has many entries (each must walk the dir's inode block).
+    /// For a Raft `append_to_log` batch of 100 entries this is ~200 fsyncs,
+    /// pinning broker metadata throughput at ~1 batch / 2× fsync_latency.
+    ///
+    /// Group-fsync collapses that to N file fsyncs + 1 dir fsync, while
+    /// preserving the same crash semantics: each individual file's data is
+    /// fsynced before its rename, and the dir-fsync at the end makes every
+    /// rename durable atomically. A crash mid-batch can leave a contiguous
+    /// prefix of items renamed-and-durable; the caller (e.g. `append_to_log`)
+    /// only raises the durable bound after this returns, so the suffix of
+    /// items not yet renamed-and-durable is treated as un-acked on recovery.
+    ///
+    /// All `items` must share the same parent directory.
+    fn atomic_write_fsync_batch_blocking(
+        items: &[(PathBuf, Vec<u8>)],
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        if items.is_empty() {
+            return Ok(());
+        }
+        let parent = items[0].0.parent().map(|p| p.to_path_buf());
+        if let Some(ref p) = parent {
+            std::fs::create_dir_all(p)?;
+        }
+        for (path, bytes) in items {
+            // Defensive: a mixed-parent batch would silently skip the dir
+            // fsync for items in the other directory. Reject up front.
+            debug_assert_eq!(
+                path.parent(),
+                parent.as_deref(),
+                "atomic_write_fsync_batch_blocking requires a shared parent dir"
+            );
+            let tmp_path = path.with_extension("tmp");
+            {
+                let mut f = std::fs::File::create(&tmp_path)?;
+                f.write_all(bytes)?;
+                f.sync_all()?;
+            }
+            std::fs::rename(&tmp_path, path)?;
+        }
+        if let Some(p) = parent {
+            let dir = std::fs::File::open(&p)?;
+            dir.sync_all()?;
+        }
+        Ok(())
+    }
+
     /// Async wrapper that runs the blocking write+fsync on a blocking thread.
     /// Each fsync can stall 5–20 ms; running it on the async runtime would
     /// pin a tokio worker for the duration and block all other tasks
@@ -641,6 +693,12 @@ impl<G: GroupKind> RaftStore<G> {
     }
 
     /// Persist a log entry to disk if we have a log_dir configured.
+    ///
+    /// Single-entry path retained for non-batch callers (vote/snapshot
+    /// installs that may persist one entry at a time). The hot
+    /// `append_to_log` path uses `atomic_write_fsync_batch_blocking` to
+    /// amortize the parent-dir fsync across the whole batch.
+    #[allow(dead_code)]
     async fn persist_log_entry(&self, entry: &Entry<G::Cfg>) -> std::io::Result<()> {
         let Some(dir) = self.log_dir.as_ref() else {
             return Ok(());
@@ -1234,18 +1292,46 @@ impl<G: GroupKind> RaftStorage<G::Cfg> for RaftStore<G> {
         I: IntoIterator<Item = Entry<G::Cfg>> + OptionalSend,
     {
         // Collect into a Send-able Vec so the iterator is not held across
-        // the spawn_blocking await inside `persist_log_entry`. Without this
-        // the future would not be Send and openraft refuses to schedule it.
+        // the spawn_blocking await. Without this the future would not be
+        // Send and openraft refuses to schedule it.
         let entries: Vec<Entry<G::Cfg>> = entries.into_iter().collect();
         let mut log = self.log.write().await;
-        for entry in entries {
-            // Persist BEFORE updating in-memory state, otherwise a crash
-            // between map insert and disk write would lose entries.
-            if let Err(e) = self.persist_log_entry(&entry).await {
-                return Err(StorageError::IO {
-                    source: StorageIOError::write_logs(&e),
-                });
+
+        // Build a single batch of (path, bytes) for all entries in this
+        // call so the persist hits the disk as one group-fsync rather than
+        // N independent (file fsync + dir fsync + spawn_blocking) trips.
+        // Without this, every entry pays ≥2 fsyncs and a fresh blocking
+        // worker — bounding metadata throughput to ~1/(N × fsync_latency).
+        if let Some(dir) = self.log_dir.clone() {
+            let mut items: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                let bytes = postcard::to_stdvec(entry).map_err(|e| StorageError::IO {
+                    source: StorageIOError::write_logs(&std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("log serialize: {}", e),
+                    )),
+                })?;
+                let path = dir
+                    .join("log")
+                    .join(format!("{:020}.bin", entry.log_id.index));
+                items.push((path, bytes));
             }
+            tokio::task::spawn_blocking(move || Self::atomic_write_fsync_batch_blocking(&items))
+                .await
+                .map_err(|e| StorageError::IO {
+                    source: StorageIOError::write_logs(&std::io::Error::other(format!(
+                        "spawn_blocking join: {}",
+                        e
+                    ))),
+                })?
+                .map_err(|e| StorageError::IO {
+                    source: StorageIOError::write_logs(&e),
+                })?;
+        }
+
+        // Insert into the in-memory log AFTER the durable batch — entries
+        // become visible to readers only after they are crash-safe.
+        for entry in entries {
             log.insert(entry.log_id.index, entry);
         }
         // Raise the durable log bound AFTER the entries themselves are

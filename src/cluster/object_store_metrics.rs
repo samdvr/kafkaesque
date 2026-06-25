@@ -46,6 +46,24 @@ fn record<T>(operation: &'static str, started: Instant, result: &Result<T>) {
     metrics::record_object_store_operation(operation, status, duration);
     if let Err(e) = result {
         metrics::record_object_store_error(operation, classify_error(e));
+        record_health(false);
+    } else {
+        record_health(true);
+    }
+}
+
+/// Update the consecutive-failure gauge that drives `/readyz` and zombie-mode
+/// detection. Without this every list/delete/head/copy/rename failure is
+/// invisible to the health probe — the gauge is otherwise only updated by
+/// `partition_store.rs` produce/fetch hot paths.
+fn record_health(success: bool) {
+    let still_healthy = metrics::track_object_store_health(success);
+    if !success && !still_healthy {
+        tracing::error!(
+            consecutive_failures = metrics::object_store_consecutive_failures(),
+            "PARTIAL NETWORK PARTITION DETECTED: object store unreachable from \
+             list/delete/head/copy/rename path."
+        );
     }
 }
 
@@ -174,10 +192,14 @@ impl ObjectStore for MetricsObjectStore {
         let upstream = self.inner.delete_stream(locations);
         upstream
             .inspect(|item| match item {
-                Ok(_) => metrics::record_object_store_operation("delete", "success", 0.0),
+                Ok(_) => {
+                    metrics::record_object_store_operation("delete", "success", 0.0);
+                    record_health(true);
+                }
                 Err(e) => {
                     metrics::record_object_store_operation("delete", "error", 0.0);
                     metrics::record_object_store_error("delete", classify_error(e));
+                    record_health(false);
                 }
             })
             .boxed()
@@ -189,6 +211,9 @@ impl ObjectStore for MetricsObjectStore {
             .inspect(|item| {
                 if let Err(e) = item {
                     metrics::record_object_store_error("list", classify_error(e));
+                    record_health(false);
+                } else {
+                    record_health(true);
                 }
             })
             .boxed()

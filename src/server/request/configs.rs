@@ -27,6 +27,7 @@ use nom::{
 };
 use nombytes::NomBytes;
 
+use crate::constants::MAX_PROTOCOL_ARRAY_SIZE;
 use crate::parser::{parse_array, parse_kafka_string, parse_kafka_string_opt};
 
 /// Kafka [`ConfigResource.Type`] enum value carried over the wire as INT8.
@@ -117,14 +118,19 @@ fn parse_nullable_string_array(s: NomBytes) -> IResult<NomBytes, Option<Vec<Stri
     if length == -1 {
         return Ok((rest, None));
     }
-    if length < 0 {
-        // Any other negative value is a protocol error.
+    // Clamp to MAX_PROTOCOL_ARRAY_SIZE before any allocation. A negative
+    // length other than -1 is a protocol error; a length above the cap is
+    // an attacker telling us to allocate gigabytes from a 24-byte payload.
+    if !(0..=MAX_PROTOCOL_ARRAY_SIZE).contains(&length) {
         return Err(nom::Err::Failure(nom::error::Error::new(
             rest,
-            nom::error::ErrorKind::Verify,
+            nom::error::ErrorKind::TooLarge,
         )));
     }
-    let mut out = Vec::with_capacity(length as usize);
+    // Each element is at minimum a 2-byte length prefix, so cap the
+    // pre-allocation by what the remaining buffer could populate.
+    let cap = (length as usize).min(rest.to_bytes().len() / 2);
+    let mut out = Vec::with_capacity(cap);
     for _ in 0..length {
         let (r, item) = parse_kafka_string(rest)?;
         out.push(item);
@@ -329,6 +335,35 @@ mod tests {
         data.extend(build_describe_resource(99, "what", None));
         let (_, parsed) = parse_describe_configs_request(nb(&data), 0).unwrap();
         assert_eq!(parsed.resources[0].resource_type, 99);
+    }
+
+    #[test]
+    fn describe_configs_rejects_oversized_configuration_keys_array() {
+        // A 24-byte hostile payload that would, without the bound, ask
+        // for a ~48 GiB Vec::with_capacity allocation.
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i32.to_be_bytes()); // 1 resource
+        data.push(RESOURCE_TYPE_TOPIC as u8);
+        data.extend_from_slice(&1i16.to_be_bytes()); // name len
+        data.extend_from_slice(b"t");
+        data.extend_from_slice(&i32::MAX.to_be_bytes()); // configuration_keys length
+        let err = parse_describe_configs_request(nb(&data), 0).unwrap_err();
+        assert!(
+            matches!(err, nom::Err::Failure(_)),
+            "i32::MAX configuration_keys length must be a hard failure"
+        );
+    }
+
+    #[test]
+    fn describe_configs_rejects_negative_non_null_configuration_keys() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i32.to_be_bytes());
+        data.push(RESOURCE_TYPE_TOPIC as u8);
+        data.extend_from_slice(&1i16.to_be_bytes());
+        data.extend_from_slice(b"t");
+        data.extend_from_slice(&(-2i32).to_be_bytes());
+        let err = parse_describe_configs_request(nb(&data), 0).unwrap_err();
+        assert!(matches!(err, nom::Err::Failure(_)));
     }
 
     // ------------------------------------------------------------------

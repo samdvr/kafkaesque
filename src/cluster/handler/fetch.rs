@@ -317,6 +317,38 @@ async fn collect_fetch(
                         Ok(store) => {
                             let current_hwm = store.high_watermark();
 
+                            // KIP-320 fencing: a client whose view predates a
+                            // failover must be rejected so it refreshes
+                            // metadata. Without this, a stale consumer
+                            // silently reads from the new owner — README
+                            // advertises the guarantee. Mirror
+                            // `leader_epoch.rs:138`: -1 means "no opinion",
+                            // older→Fenced, newer→Unknown. `leader_epoch == 0`
+                            // means epoch validation is disabled (mock
+                            // coordinators); skip in that case so test
+                            // harnesses keep working.
+                            let broker_epoch = store.leader_epoch();
+                            if broker_epoch != 0
+                                && partition.current_leader_epoch >= 0
+                                && partition.current_leader_epoch != broker_epoch
+                            {
+                                let code = if partition.current_leader_epoch < broker_epoch {
+                                    KafkaCode::FencedLeaderEpoch
+                                } else {
+                                    KafkaCode::UnknownLeaderEpoch
+                                };
+                                return FetchPartitionResponse {
+                                    partition_index: partition.partition_index,
+                                    error_code: code,
+                                    high_watermark: current_hwm,
+                                    last_stable_offset: -1,
+                                    aborted_transactions: vec![],
+                                    log_start_offset: -1,
+                                    preferred_read_replica: -1,
+                                    records: None,
+                                };
+                            }
+
                             let log_start = match store.earliest_offset().await {
                                 Ok(v) => v,
                                 Err(e) => {

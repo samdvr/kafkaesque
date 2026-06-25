@@ -61,7 +61,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::load_metrics::LoadMetricsCollector;
@@ -384,6 +384,23 @@ pub struct PartitionStore {
     /// acquired the partition — by then the producer has already seen a
     /// confusing `NotOwned` instead of a clean `LeaseTooShort` redirect.
     lease_expiry_ms: AtomicI64,
+
+    /// Sticky bit tripped when a SlateDB write returned an error AFTER the
+    /// offset reservation had been disarmed — i.e. when the in-memory
+    /// `next_offset` advanced past `high_watermark` with no durable record
+    /// at the gapped key range. Without this guard, a subsequent append on
+    /// this same instance would write at the post-gap offset, producing the
+    /// "records → gap → records" pattern that bricks recovery under the
+    /// default `fail_on_recovery_gap=true` policy.
+    ///
+    /// Once set, every append short-circuits with `NotOwned` so the lease
+    /// holder fences itself; the next acquirer reopens the partition and
+    /// the recovery scan re-derives `next_offset` from durable state. Either
+    /// the failed write was eventually committed by SlateDB's writer queue
+    /// (recovery sees a contiguous range and the gap was illusory) or it
+    /// wasn't (recovery sees only the pre-gap records and `next_offset`
+    /// resets cleanly to `high_watermark`).
+    append_failed: AtomicBool,
 }
 
 impl PartitionStore {
@@ -507,6 +524,16 @@ impl PartitionStore {
         self.high_watermark.load(Ordering::SeqCst)
     }
 
+    /// The leader epoch this store was opened with. Used by the Fetch and
+    /// Produce handlers to enforce KIP-320 fencing: a client carrying a
+    /// stale `current_leader_epoch` after a failover must be rejected with
+    /// `FencedLeaderEpoch` instead of silently reading from / writing to
+    /// the new owner. Returns `0` when epoch validation is disabled (mock
+    /// coordinators in tests).
+    pub fn leader_epoch(&self) -> i32 {
+        self.leader_epoch
+    }
+
     #[cfg(test)]
     pub fn invalidate_producer_state_cache(&self, producer_id: i64) {
         self.producer_states.invalidate(&producer_id);
@@ -614,6 +641,19 @@ impl PartitionStore {
 
     async fn append_batch_inner(&self, records: &Bytes, durable: bool) -> SlateDBResult<i64> {
         use super::keys::{LEADER_EPOCH_KEY, decode_leader_epoch};
+
+        // Reject immediately if a previous append left a permanent offset
+        // gap (see `append_failed` field doc). Continuing would write the
+        // next batch *past* the gap, producing the records→gap→records
+        // pattern that bricks recovery under `fail_on_recovery_gap=true`.
+        // The lease holder is expected to release this partition on this
+        // signal so the next acquirer reopens cleanly from durable state.
+        if self.append_failed.load(Ordering::Acquire) {
+            return Err(SlateDBError::NotOwned {
+                topic: self.topic.clone(),
+                partition: self.partition,
+            });
+        }
 
         // Wall-clock timestamp captured once at the top of the append. Used
         // to stamp the producer-state value with `last_used_at_ms` so the
@@ -1083,6 +1123,29 @@ impl PartitionStore {
             // empty range. Track the gap as a metric so operators can
             // alarm on persistent gap rates.
             super::metrics::record_partition_offset_gap(&self.topic, self.partition, record_count);
+
+            // Trip the sticky `append_failed` flag so subsequent appends
+            // on this instance are rejected. Without this guard, the next
+            // successful append would write at the post-gap offset and
+            // produce the "records → gap → records" pattern that DOAs the
+            // partition under `fail_on_recovery_gap=true`. Skip the trip
+            // for fenced errors: a fenced writer didn't create a gap (the
+            // in-memory next_offset advance is irrelevant — this instance
+            // is being torn down anyway) and `EpochMismatch`/`Fenced`
+            // already drives the lease release path.
+            if !err.is_fenced() {
+                self.append_failed.store(true, Ordering::Release);
+                error!(
+                    topic = %self.topic,
+                    partition = self.partition,
+                    base_offset,
+                    record_count,
+                    "Marking partition append-failed after durable write error: \
+                     next_offset advanced past high_watermark with no durable \
+                     record. Releasing this lease so the next acquirer can \
+                     re-derive next_offset from durable state."
+                );
+            }
 
             // Track object store health on failure
             // This helps detect partial network partitions where broker can reach
@@ -2872,6 +2935,7 @@ impl PartitionStoreBuilder {
             // store doesn't reject the very first write before the manager
             // gets a chance to record the lease.
             lease_expiry_ms: AtomicI64::new(0),
+            append_failed: AtomicBool::new(false),
         };
 
         // Warm the batch index cache from the recovery scan (one storage

@@ -100,6 +100,18 @@ trap cleanup EXIT
 echo -e "${YELLOW}[Single-Node Tests]${NC}"
 
 # Start Kafkaesque server
+#
+# DEFAULT_NUM_PARTITIONS=1: this is a wire-protocol smoke test, not a
+# partitioning test. On a multi-partition topic only partition 0 is owned the
+# instant the topic is auto-created; the remaining partitions are acquired
+# lazily by the background ownership loop (ownership_check_interval, ~5s) and
+# until then report LeaderNotAvailable in metadata. A real librdkafka client
+# (kcat) then churns on metadata refreshes and a keyless/keyed message can hash
+# to a not-yet-owned partition, so produce stalls and the tight consume
+# timeouts below flake. Pinning every topic to a single partition removes that
+# race so the smoke test deterministically exercises produce/consume/metadata.
+# (The in-process rdkafka_e2e tests use single-partition topics for the same
+# reason.) Multi-partition behavior is covered by run-cluster-e2e.sh.
 echo "Starting Kafkaesque server..."
 mkdir -p /tmp/kafkaesque-data
 BROKER_ID=0 \
@@ -109,6 +121,7 @@ RAFT_LISTEN_ADDR=127.0.0.1:9093 \
 OBJECT_STORE_TYPE=local \
 DATA_PATH=/tmp/kafkaesque-data \
 AUTO_CREATE_TOPICS=true \
+DEFAULT_NUM_PARTITIONS=1 \
 RUST_LOG=kafkaesque=info \
 "$KAFKAESQUE_BIN" > /tmp/server.log 2>&1 &
 SERVER_PID=$!
@@ -132,18 +145,18 @@ done
 run_test "Metadata" "$KCAT -b 127.0.0.1:9092 -L $KCAT_OPTS"
 run_test "Produce" "echo -e 'msg1\nmsg2\nmsg3' | $KCAT -b 127.0.0.1:9092 -t test-topic -P $KCAT_OPTS"
 sleep 2
-run_test "Consume" "timeout 10 $KCAT -b 127.0.0.1:9092 -t test-topic -C -c 3 -q $KCAT_OPTS | grep -q msg1"
+run_test "Consume" "timeout 10 $KCAT -b 127.0.0.1:9092 -t test-topic -C -o beginning -c 3 -q $KCAT_OPTS | grep -q msg1"
 run_test "Keyed produce" "echo 'key1:value1' | $KCAT -b 127.0.0.1:9092 -t keyed-topic -P -K: $KCAT_OPTS"
 sleep 2
-run_test "Keyed consume" "timeout 10 $KCAT -b 127.0.0.1:9092 -t keyed-topic -C -c 1 -q -f '%k:%s\n' $KCAT_OPTS | grep -q key1:value1"
+run_test "Keyed consume" "timeout 10 $KCAT -b 127.0.0.1:9092 -t keyed-topic -C -o beginning -c 1 -q -f '%k:%s\n' $KCAT_OPTS | grep -q key1:value1"
 run_test "Large message" "dd if=/dev/zero bs=1024 count=100 2>/dev/null | base64 | $KCAT -b 127.0.0.1:9092 -t large-topic -P $KCAT_OPTS"
-# Pin all messages to the same key so they hash to a single partition; the
-# default 10-partition topic otherwise scatters keyless messages and makes
-# the first consumed message non-deterministic (Kafka only orders within a
-# partition).
+# Server runs with DEFAULT_NUM_PARTITIONS=1 (see server start above), so every
+# topic has exactly one partition: keyless and keyed messages alike all land in
+# partition 0, and reading offset 0 deterministically yields the first message
+# produced. (Kafka only orders within a partition.)
 run_test "Message ordering" "for i in \$(seq 1 100); do echo \"k:\$i\"; done | $KCAT -b 127.0.0.1:9092 -t order-topic -P -K: $KCAT_OPTS"
 sleep 2
-run_test "Verify ordering" "timeout 10 $KCAT -b 127.0.0.1:9092 -t order-topic -C -c 1 -q $KCAT_OPTS | head -1 | grep -q '^1$'"
+run_test "Verify ordering" "timeout 10 $KCAT -b 127.0.0.1:9092 -t order-topic -C -o beginning -c 1 -q $KCAT_OPTS | head -1 | grep -q '^1$'"
 
 # Stop single-node server
 kill $SERVER_PID 2>/dev/null || true

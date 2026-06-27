@@ -52,10 +52,7 @@ impl PartitionTransferCoordinator for RaftCoordinator {
             timestamp_ms: current_time_ms(),
         });
 
-        let response = self
-            .cluster()
-            .write_shard_for_topic(topic, command)
-            .await?;
+        let response = self.cluster().write_shard_for_topic(topic, command).await?;
         match response {
             ShardResponse::Transfer(TransferResponse::PartitionTransferred { .. }) => {
                 // Update cache to reflect new ownership.
@@ -155,12 +152,8 @@ impl PartitionTransferCoordinator for RaftCoordinator {
                             .any(|(t, p, _)| t == &transfer.topic && *p == transfer.partition);
                         if !is_failed {
                             let stamp = self.owner_cache_read_stamp(&key);
-                            self.owner_cache_insert_if_fresh(
-                                key,
-                                transfer.to_broker_id,
-                                stamp,
-                            )
-                            .await;
+                            self.owner_cache_insert_if_fresh(key, transfer.to_broker_id, stamp)
+                                .await;
                         }
                     }
                     total_successful += successful_transfers;

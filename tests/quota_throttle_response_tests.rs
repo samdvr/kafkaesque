@@ -23,10 +23,8 @@
 //! here continue to hold and the only change at this file is the value.
 
 use kafkaesque::error::KafkaCode;
-use kafkaesque::server::response::{
-    ApiVersionData, ApiVersionsResponseData, ProduceResponseData,
-};
 use kafkaesque::server::request::ApiKey;
+use kafkaesque::server::response::{ApiVersionData, ApiVersionsResponseData, ProduceResponseData};
 
 // ===========================================================================
 // 1. ApiVersions v0 has NO throttle_time_ms
@@ -135,7 +133,11 @@ fn produce_v0_omits_throttle_time_ms() {
     let mut buf = Vec::new();
     resp.encode_versioned(&mut buf, 0).expect("encode v0");
     // v0 body: array_len (4, value 0) = 4 bytes; no throttle.
-    assert_eq!(buf.len(), 4, "v0 produce body must be exactly an empty array");
+    assert_eq!(
+        buf.len(),
+        4,
+        "v0 produce body must be exactly an empty array"
+    );
 }
 
 // ===========================================================================

@@ -55,17 +55,10 @@ pub fn parse_offset_for_leader_epoch_request(
     // replica_id: v3+ only; defaults to -2 (consumer client) so v0-v2
     // requests carry the same "not a replica" semantics through the rest
     // of the broker.
-    let (s, replica_id) = if version >= 3 {
-        be_i32(s)?
-    } else {
-        (s, -2i32)
-    };
+    let (s, replica_id) = if version >= 3 { be_i32(s)? } else { (s, -2i32) };
     let (s, topics) = parse_array(|s| parse_topic(s, version))(s)?;
 
-    Ok((
-        s,
-        OffsetForLeaderEpochRequestData { replica_id, topics },
-    ))
+    Ok((s, OffsetForLeaderEpochRequestData { replica_id, topics }))
 }
 
 fn parse_topic(s: NomBytes, version: i16) -> IResult<NomBytes, OffsetForLeaderEpochTopicData> {
@@ -82,11 +75,7 @@ fn parse_partition(
     // current_leader_epoch (KIP-320) added in v2; default to `-1` so older
     // requests are read as "client has no epoch yet" rather than fenced
     // against an arbitrary value.
-    let (s, current_leader_epoch) = if version >= 2 {
-        be_i32(s)?
-    } else {
-        (s, -1i32)
-    };
+    let (s, current_leader_epoch) = if version >= 2 { be_i32(s)? } else { (s, -1i32) };
     let (s, leader_epoch) = be_i32(s)?;
     Ok((
         s,

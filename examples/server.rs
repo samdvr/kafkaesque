@@ -250,6 +250,7 @@ impl Handler for InMemoryHandler {
                                         leader_id: self.broker_id,
                                         replica_nodes: vec![self.broker_id],
                                         isr_nodes: vec![self.broker_id],
+                                        ..Default::default()
                                     })
                                     .collect()
                             })
@@ -260,6 +261,7 @@ impl Handler for InMemoryHandler {
                                     leader_id: self.broker_id,
                                     replica_nodes: vec![self.broker_id],
                                     isr_nodes: vec![self.broker_id],
+                                    ..Default::default()
                                 }]
                             });
 
@@ -268,6 +270,7 @@ impl Handler for InMemoryHandler {
                             name,
                             is_internal: false,
                             partitions,
+                            ..Default::default()
                         }
                     })
                     .collect()
@@ -287,8 +290,10 @@ impl Handler for InMemoryHandler {
                                 leader_id: self.broker_id,
                                 replica_nodes: vec![self.broker_id],
                                 isr_nodes: vec![self.broker_id],
+                                ..Default::default()
                             })
                             .collect(),
+                        ..Default::default()
                     })
                     .collect()
             }
@@ -303,6 +308,7 @@ impl Handler for InMemoryHandler {
             }],
             controller_id: self.broker_id,
             topics,
+            ..Default::default()
         }
     }
 
@@ -341,7 +347,7 @@ impl Handler for InMemoryHandler {
                             // This is critical: the producer sends batches with base_offset=0,
                             // but the consumer uses base_offset to determine record positions
                             let mut patched_records = partition.records.to_vec();
-                            patch_base_offset(&mut patched_records, offset);
+                            let _ = patch_base_offset(&mut patched_records, offset);
 
                             let batch_size = patched_records.len();
                             log.batches.push(StoredBatch {
@@ -375,6 +381,7 @@ impl Handler for InMemoryHandler {
                     error_code: KafkaCode::None,
                     base_offset,
                     log_append_time: -1,
+                    ..Default::default()
                 });
             }
 
@@ -465,6 +472,7 @@ impl Handler for InMemoryHandler {
                     last_stable_offset: high_watermark,
                     aborted_transactions: vec![],
                     records,
+                    ..Default::default()
                 });
             }
 
@@ -477,6 +485,7 @@ impl Handler for InMemoryHandler {
         FetchResponseData {
             throttle_time_ms: 0,
             responses,
+            ..Default::default()
         }
     }
 

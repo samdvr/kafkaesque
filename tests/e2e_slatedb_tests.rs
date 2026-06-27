@@ -947,11 +947,11 @@ async fn test_e2e_produce_consume_with_advertised_host() {
 
     // Step 1: Verify metadata returns advertised_host, not bind host
     let metadata_req = MetadataRequestData {
-    topics: None,
-    allow_auto_topic_creation: true,
-    include_cluster_authorized_operations: false,
-    include_topic_authorized_operations: false,
-};
+        topics: None,
+        allow_auto_topic_creation: true,
+        include_cluster_authorized_operations: false,
+        include_topic_authorized_operations: false,
+    };
     let metadata_resp = handler.handle_metadata(&ctx, metadata_req).await;
 
     assert!(

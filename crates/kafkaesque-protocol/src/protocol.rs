@@ -336,10 +336,7 @@ pub fn parse_record_count(batch: &[u8]) -> i32 {
 /// patch_base_offset(&mut batch, 12345).unwrap();
 /// assert_eq!(&batch[0..8], &12345i64.to_be_bytes());
 /// ```
-pub fn patch_base_offset(
-    batch: &mut [u8],
-    base_offset: i64,
-) -> Result<(), PatchBaseOffsetError> {
+pub fn patch_base_offset(batch: &mut [u8], base_offset: i64) -> Result<(), PatchBaseOffsetError> {
     const BASE_OFFSET_SIZE: usize = 8;
     if batch.len() < BASE_OFFSET_SIZE {
         return Err(PatchBaseOffsetError::TooShort { len: batch.len() });

@@ -246,7 +246,10 @@ mod tests {
                 timestamp_ms: 2,
             },
         );
-        assert!(matches!(resp, TopicRegistryResponse::TopicAlreadyExists { .. }));
+        assert!(matches!(
+            resp,
+            TopicRegistryResponse::TopicAlreadyExists { .. }
+        ));
     }
 
     #[test]
@@ -261,7 +264,10 @@ mod tests {
                 timestamp_ms: 1,
             },
         );
-        let resp = apply(&mut state, TopicRegistryCommand::DeleteTopic { name: "t".into() });
+        let resp = apply(
+            &mut state,
+            TopicRegistryCommand::DeleteTopic { name: "t".into() },
+        );
         assert!(matches!(resp, TopicRegistryResponse::TopicDeleted { .. }));
         assert!(state.get_topic("t").is_none());
     }
@@ -269,7 +275,12 @@ mod tests {
     #[test]
     fn delete_unknown_returns_not_found() {
         let mut state = TopicRegistryState::new();
-        let resp = apply(&mut state, TopicRegistryCommand::DeleteTopic { name: "ghost".into() });
+        let resp = apply(
+            &mut state,
+            TopicRegistryCommand::DeleteTopic {
+                name: "ghost".into(),
+            },
+        );
         assert!(matches!(resp, TopicRegistryResponse::TopicNotFound { .. }));
     }
 
@@ -294,7 +305,10 @@ mod tests {
                 config: new_cfg.clone(),
             },
         );
-        assert!(matches!(resp, TopicRegistryResponse::TopicConfigUpdated { .. }));
+        assert!(matches!(
+            resp,
+            TopicRegistryResponse::TopicConfigUpdated { .. }
+        ));
         assert_eq!(state.get_topic("t").unwrap().config, new_cfg);
     }
 

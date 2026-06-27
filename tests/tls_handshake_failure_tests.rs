@@ -68,8 +68,8 @@ fn issue_cert(leaf_san: &str) -> TestPki {
 }
 
 fn build_tls_config(pki: &TestPki) -> TlsConfig {
-    use std::io::BufReader;
     use rustls_pemfile;
+    use std::io::BufReader;
 
     let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(pki.leaf_cert_pem.as_bytes()))
         .collect::<Result<_, _>>()
@@ -138,9 +138,10 @@ async fn untrusted_ca_is_rejected_by_client() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(untrusted_pki.ca_cert_der.clone()).unwrap();
-    let client_cfg = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let client_cfg =
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
 
     let stream = TcpStream::connect(addr).await.expect("tcp connect");
@@ -158,7 +159,9 @@ async fn untrusted_ca_is_rejected_by_client() {
     };
     let lower = err.to_lowercase();
     assert!(
-        lower.contains("unknown") || lower.contains("trust") || lower.contains("issuer")
+        lower.contains("unknown")
+            || lower.contains("trust")
+            || lower.contains("issuer")
             || lower.contains("certificate"),
         "expected trust-anchor error, got: {err}",
     );
@@ -180,9 +183,10 @@ async fn tls12_only_client_is_rejected_by_tls13_only_server() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(pki.ca_cert_der.clone()).unwrap();
-    let client_cfg = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let client_cfg =
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
 
     let stream = TcpStream::connect(addr).await.expect("tcp connect");

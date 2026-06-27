@@ -76,8 +76,7 @@ fn validate_raw_rejects_out_of_range_segment_ms() {
         // segment.ms floor is 1 ms.
         (KEY_SEGMENT_MS, "0"),
     ]);
-    let err = TopicCompactionConfig::validate_raw(&map)
-        .expect_err("segment.ms=0 must be rejected");
+    let err = TopicCompactionConfig::validate_raw(&map).expect_err("segment.ms=0 must be rejected");
     let msg = err.to_string();
     assert!(
         msg.contains("segment.ms"),
@@ -108,7 +107,10 @@ fn validate_raw_rejects_unparseable_integer() {
     let map = raw(&[(KEY_RETENTION_MS, "not-a-number")]);
     let err = TopicCompactionConfig::validate_raw(&map).expect_err("garbage must reject");
     let msg = err.to_string();
-    assert!(msg.contains("retention.ms"), "error must name the key; got {msg}");
+    assert!(
+        msg.contains("retention.ms"),
+        "error must name the key; got {msg}"
+    );
 }
 
 // ===========================================================================

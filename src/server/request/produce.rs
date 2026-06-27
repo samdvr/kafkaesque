@@ -180,10 +180,7 @@ fn parse_produce_partition_flexible(s: NomBytes) -> IResult<NomBytes, ProducePar
 }
 
 /// Parse a flexible compact array.
-fn parse_compact_array<O, F>(
-    s: NomBytes,
-    mut item: F,
-) -> IResult<NomBytes, Vec<O>>
+fn parse_compact_array<O, F>(s: NomBytes, mut item: F) -> IResult<NomBytes, Vec<O>>
 where
     F: FnMut(NomBytes) -> IResult<NomBytes, O>,
 {
@@ -372,8 +369,7 @@ mod tests {
         // body tagged fields
         buf.put_u8(0);
 
-        let (rest, req) =
-            parse_produce_request(NomBytes::new(buf.freeze()), 9).expect("v9 valid");
+        let (rest, req) = parse_produce_request(NomBytes::new(buf.freeze()), 9).expect("v9 valid");
         assert!(rest.to_bytes().is_empty());
         assert_eq!(req.transactional_id, None);
         assert_eq!(req.acks, 1);

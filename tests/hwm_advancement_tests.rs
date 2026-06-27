@@ -32,8 +32,8 @@ use kafkaesque::cluster::ClusterProfile;
 use kafkaesque::error::KafkaCode;
 use kafkaesque::server::Handler;
 use kafkaesque::server::request::{
-    CreateTopicData, CreateTopicsRequestData, FetchPartitionData, FetchRequestData,
-    FetchTopicData, ProducePartitionData, ProduceRequestData, ProduceTopicData,
+    CreateTopicData, CreateTopicsRequestData, FetchPartitionData, FetchRequestData, FetchTopicData,
+    ProducePartitionData, ProduceRequestData, ProduceTopicData,
 };
 
 mod common;

@@ -87,10 +87,10 @@ pub mod raft;
 pub mod rebalance_coordinator;
 #[cfg(feature = "sasl")]
 mod sasl_provider;
-mod slatedb_resources;
 #[cfg(feature = "sasl")]
 pub mod scram;
 mod server_observability;
+mod slatedb_resources;
 pub mod topic_config_view;
 mod traits;
 mod validation;

@@ -370,11 +370,7 @@ pub trait PartitionCoordinator: Send + Sync {
     ///
     /// Default returns `false` so test coordinators don't need to
     /// implement growth.
-    async fn grow_topic_partitions(
-        &self,
-        _topic: &str,
-        _new_count: i32,
-    ) -> SlateDBResult<bool> {
+    async fn grow_topic_partitions(&self, _topic: &str, _new_count: i32) -> SlateDBResult<bool> {
         Ok(false)
     }
 }

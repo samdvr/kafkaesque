@@ -127,9 +127,7 @@ pub async fn dispatch_mux_frame(
                 "mux: received join cluster request (learner only)"
             );
             let result = match group {
-                GroupId::Control => {
-                    handle_join_control(&handles.control, node_id, raft_addr).await
-                }
+                GroupId::Control => handle_join_control(&handles.control, node_id, raft_addr).await,
                 GroupId::Shard(id) => match handles.shard(id) {
                     Some(raft) => handle_join_shard(raft, node_id, raft_addr).await,
                     None => return unknown_shard(id),
@@ -137,10 +135,9 @@ pub async fn dispatch_mux_frame(
             };
             match result {
                 Ok(()) => MuxRaftRpcResponse::JoinClusterOk,
-                Err(msg) => MuxRaftRpcResponse::Error(RpcErrorInfo::new(
-                    RpcErrorKind::Internal,
-                    msg,
-                )),
+                Err(msg) => {
+                    MuxRaftRpcResponse::Error(RpcErrorInfo::new(RpcErrorKind::Internal, msg))
+                }
             }
         }
         MuxRaftRpcMessage::PromoteMember { node_id, group } => {
@@ -154,10 +151,9 @@ pub async fn dispatch_mux_frame(
             };
             match result {
                 Ok(()) => MuxRaftRpcResponse::PromoteMemberOk,
-                Err(msg) => MuxRaftRpcResponse::Error(RpcErrorInfo::new(
-                    RpcErrorKind::Internal,
-                    msg,
-                )),
+                Err(msg) => {
+                    MuxRaftRpcResponse::Error(RpcErrorInfo::new(RpcErrorKind::Internal, msg))
+                }
             }
         }
     }
@@ -205,7 +201,10 @@ pub(super) fn check_frame_purpose(
 /// shard-route branch and the promote-shard branch produce identical
 /// errors.
 fn unknown_shard(id: ShardId) -> MuxRaftRpcResponse {
-    tracing::warn!(shard_id = id, "mux: rejecting frame — shard id out of range");
+    tracing::warn!(
+        shard_id = id,
+        "mux: rejecting frame — shard id out of range"
+    );
     MuxRaftRpcResponse::Error(RpcErrorInfo::new(
         RpcErrorKind::InvalidRequest,
         format!("unknown shard id {}", id),
@@ -237,10 +236,7 @@ async fn dispatch_control(
     }
 }
 
-async fn dispatch_shard(
-    raft: &Raft<ShardConfig>,
-    msg: ShardRpcMessage,
-) -> MuxRaftRpcResponse {
+async fn dispatch_shard(raft: &Raft<ShardConfig>, msg: ShardRpcMessage) -> MuxRaftRpcResponse {
     match msg {
         ShardRpcMessage::AppendEntries(req) => match raft.append_entries(req).await {
             Ok(resp) => MuxRaftRpcResponse::AppendEntries(resp),
@@ -457,10 +453,7 @@ async fn handle_promote_control(
     }
 }
 
-async fn handle_promote_shard(
-    raft: &Raft<ShardConfig>,
-    node_id: RaftNodeId,
-) -> Result<(), String> {
+async fn handle_promote_shard(raft: &Raft<ShardConfig>, node_id: RaftNodeId) -> Result<(), String> {
     let metrics = raft.metrics().borrow().clone();
     if metrics.current_leader != Some(metrics.id) {
         return Err("PromoteMember rejected: this node is not the shard leader".to_string());

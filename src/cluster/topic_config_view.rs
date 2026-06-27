@@ -46,12 +46,18 @@ pub enum CleanupPolicy {
 impl CleanupPolicy {
     /// Whether this policy includes compaction.
     pub fn is_compact(self) -> bool {
-        matches!(self, CleanupPolicy::Compact | CleanupPolicy::CompactAndDelete)
+        matches!(
+            self,
+            CleanupPolicy::Compact | CleanupPolicy::CompactAndDelete
+        )
     }
 
     /// Whether this policy includes time/size retention.
     pub fn is_delete(self) -> bool {
-        matches!(self, CleanupPolicy::Delete | CleanupPolicy::CompactAndDelete)
+        matches!(
+            self,
+            CleanupPolicy::Delete | CleanupPolicy::CompactAndDelete
+        )
     }
 
     fn parse(raw: &str) -> Result<CleanupPolicy, ConfigError> {
@@ -200,12 +206,8 @@ impl TopicCompactionConfig {
             None => CleanupPolicy::Delete,
         };
 
-        let retention_ms = parse_i64_or_default(
-            raw,
-            KEY_RETENTION_MS,
-            defaults.log_retention_ms,
-            None,
-        );
+        let retention_ms =
+            parse_i64_or_default(raw, KEY_RETENTION_MS, defaults.log_retention_ms, None);
         let min_cleanable_dirty_bytes = parse_u64_or_default(
             raw,
             KEY_MIN_CLEANABLE_DIRTY_BYTES,
@@ -293,7 +295,10 @@ impl TopicCompactionConfig {
                 KEY_MAX_COMPACTION_LAG_MS,
                 self.max_compaction_lag_ms.to_string(),
             ),
-            (KEY_DELETE_RETENTION_MS, self.delete_retention_ms.to_string()),
+            (
+                KEY_DELETE_RETENTION_MS,
+                self.delete_retention_ms.to_string(),
+            ),
             (KEY_SEGMENT_MS, self.segment_ms.to_string()),
         ]
     }
@@ -394,8 +399,14 @@ mod tests {
 
     #[test]
     fn cleanup_policy_parses_canonical_values() {
-        assert_eq!(CleanupPolicy::parse("delete").unwrap(), CleanupPolicy::Delete);
-        assert_eq!(CleanupPolicy::parse("compact").unwrap(), CleanupPolicy::Compact);
+        assert_eq!(
+            CleanupPolicy::parse("delete").unwrap(),
+            CleanupPolicy::Delete
+        );
+        assert_eq!(
+            CleanupPolicy::parse("compact").unwrap(),
+            CleanupPolicy::Compact
+        );
         assert_eq!(
             CleanupPolicy::parse("compact,delete").unwrap(),
             CleanupPolicy::CompactAndDelete

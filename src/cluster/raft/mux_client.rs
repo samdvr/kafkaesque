@@ -62,13 +62,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use openraft::BasicNode;
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
 use tokio::sync::{Mutex, RwLock};
 
 use super::auth::{
@@ -110,7 +110,11 @@ pub struct MuxFactoryShared {
 
 impl MuxFactoryShared {
     /// Bundle the shared state.
-    pub fn new(addrs: MuxAddrBook, auth_keys: Arc<RaftAuthKeys>, tls: Option<RaftTlsConfig>) -> Self {
+    pub fn new(
+        addrs: MuxAddrBook,
+        auth_keys: Arc<RaftAuthKeys>,
+        tls: Option<RaftTlsConfig>,
+    ) -> Self {
         Self {
             addrs,
             auth_keys,
@@ -323,8 +327,10 @@ impl RaftNetwork<ControlConfig> for MuxControlClient {
         &mut self,
         req: AppendEntriesRequest<ControlConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<RaftNodeId>, RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>>
-    {
+    ) -> Result<
+        AppendEntriesResponse<RaftNodeId>,
+        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>,
+    > {
         let frame = MuxRaftRpcMessage::Control(ControlRpcMessage::AppendEntries(req));
         let resp = self.inner.send(frame).await.map_err(network_error)?;
         match resp {
@@ -358,7 +364,11 @@ impl RaftNetwork<ControlConfig> for MuxControlClient {
         RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, InstallSnapshotError>>,
     > {
         let frame = MuxRaftRpcMessage::Control(ControlRpcMessage::InstallSnapshot(req));
-        let resp = self.inner.send(frame).await.map_err(network_error_install)?;
+        let resp = self
+            .inner
+            .send(frame)
+            .await
+            .map_err(network_error_install)?;
         match resp {
             MuxRaftRpcResponse::InstallSnapshot(r) => Ok(r),
             MuxRaftRpcResponse::Error(info) => Err(rpc_to_network_install(info)),
@@ -379,10 +389,11 @@ impl RaftNetwork<ShardConfig> for MuxShardClient {
         &mut self,
         req: AppendEntriesRequest<ShardConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<RaftNodeId>, RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>>
-    {
-        let frame =
-            MuxRaftRpcMessage::Shard(self.shard_id, ShardRpcMessage::AppendEntries(req));
+    ) -> Result<
+        AppendEntriesResponse<RaftNodeId>,
+        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>,
+    > {
+        let frame = MuxRaftRpcMessage::Shard(self.shard_id, ShardRpcMessage::AppendEntries(req));
         let resp = self.inner.send(frame).await.map_err(network_error)?;
         match resp {
             MuxRaftRpcResponse::AppendEntries(r) => Ok(r),
@@ -414,9 +425,12 @@ impl RaftNetwork<ShardConfig> for MuxShardClient {
         InstallSnapshotResponse<RaftNodeId>,
         RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, InstallSnapshotError>>,
     > {
-        let frame =
-            MuxRaftRpcMessage::Shard(self.shard_id, ShardRpcMessage::InstallSnapshot(req));
-        let resp = self.inner.send(frame).await.map_err(network_error_install)?;
+        let frame = MuxRaftRpcMessage::Shard(self.shard_id, ShardRpcMessage::InstallSnapshot(req));
+        let resp = self
+            .inner
+            .send(frame)
+            .await
+            .map_err(network_error_install)?;
         match resp {
             MuxRaftRpcResponse::InstallSnapshot(r) => Ok(r),
             MuxRaftRpcResponse::Error(info) => Err(rpc_to_network_install(info)),
@@ -465,7 +479,10 @@ where
         RpcErrorKind::Timeout => std::io::ErrorKind::TimedOut,
         RpcErrorKind::Network => std::io::ErrorKind::ConnectionAborted,
     };
-    RPCError::Network(NetworkError::new(&std::io::Error::new(io_kind, info.message)))
+    RPCError::Network(NetworkError::new(&std::io::Error::new(
+        io_kind,
+        info.message,
+    )))
 }
 
 fn rpc_to_network_install(
@@ -481,7 +498,10 @@ fn rpc_to_network_install(
         RpcErrorKind::Timeout => std::io::ErrorKind::TimedOut,
         RpcErrorKind::Network => std::io::ErrorKind::ConnectionAborted,
     };
-    RPCError::Network(NetworkError::new(&std::io::Error::new(io_kind, info.message)))
+    RPCError::Network(NetworkError::new(&std::io::Error::new(
+        io_kind,
+        info.message,
+    )))
 }
 
 fn unexpected_variant<E>(

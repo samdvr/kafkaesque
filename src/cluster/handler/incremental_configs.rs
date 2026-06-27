@@ -31,9 +31,7 @@ use crate::server::request::{
     IncrementalAlterConfigsEntry, IncrementalAlterConfigsRequestData,
     IncrementalAlterConfigsResource, IncrementalAlterOp, RESOURCE_TYPE_TOPIC,
 };
-use crate::server::response::{
-    IncrementalAlterConfigsResponseData, IncrementalAlterConfigsResult,
-};
+use crate::server::response::{IncrementalAlterConfigsResponseData, IncrementalAlterConfigsResult};
 
 use super::SlateDBClusterHandler;
 
@@ -46,8 +44,8 @@ pub(super) async fn handle_incremental_alter_configs(
     let mut responses = Vec::with_capacity(request.resources.len());
 
     for resource in request.resources {
-        let (error_code, error_message) = process_resource(handler, ctx, &resource, validate_only)
-            .await;
+        let (error_code, error_message) =
+            process_resource(handler, ctx, &resource, validate_only).await;
         responses.push(IncrementalAlterConfigsResult {
             error_code,
             error_message,
@@ -278,7 +276,11 @@ mod tests {
             .collect()
     }
 
-    fn entry(name: &str, op: IncrementalAlterOp, value: Option<&str>) -> IncrementalAlterConfigsEntry {
+    fn entry(
+        name: &str,
+        op: IncrementalAlterOp,
+        value: Option<&str>,
+    ) -> IncrementalAlterConfigsEntry {
         IncrementalAlterConfigsEntry {
             name: name.to_string(),
             op,
@@ -291,7 +293,11 @@ mod tests {
         let mut cfg = map_of([("retention.ms", "60000")]);
         apply_ops(
             &mut cfg,
-            &[entry("retention.ms", IncrementalAlterOp::Set, Some("120000"))],
+            &[entry(
+                "retention.ms",
+                IncrementalAlterOp::Set,
+                Some("120000"),
+            )],
         )
         .unwrap();
         assert_eq!(cfg.get("retention.ms").unwrap(), "120000");
@@ -313,7 +319,11 @@ mod tests {
         let mut cfg = map_of([("cleanup.policy", "compact")]);
         apply_ops(
             &mut cfg,
-            &[entry("cleanup.policy", IncrementalAlterOp::Delete, Some("ignored"))],
+            &[entry(
+                "cleanup.policy",
+                IncrementalAlterOp::Delete,
+                Some("ignored"),
+            )],
         )
         .unwrap();
         assert!(!cfg.contains_key("cleanup.policy"));
@@ -324,7 +334,11 @@ mod tests {
         let mut cfg = map_of([("cleanup.policy", "compact")]);
         apply_ops(
             &mut cfg,
-            &[entry("cleanup.policy", IncrementalAlterOp::Append, Some("delete"))],
+            &[entry(
+                "cleanup.policy",
+                IncrementalAlterOp::Append,
+                Some("delete"),
+            )],
         )
         .unwrap();
         assert_eq!(cfg.get("cleanup.policy").unwrap(), "compact,delete");
@@ -335,7 +349,11 @@ mod tests {
         let mut cfg = map_of([("cleanup.policy", "compact,delete")]);
         apply_ops(
             &mut cfg,
-            &[entry("cleanup.policy", IncrementalAlterOp::Append, Some("compact"))],
+            &[entry(
+                "cleanup.policy",
+                IncrementalAlterOp::Append,
+                Some("compact"),
+            )],
         )
         .unwrap();
         // No duplicate inserted.
@@ -347,7 +365,11 @@ mod tests {
         let mut cfg = HashMap::new();
         apply_ops(
             &mut cfg,
-            &[entry("cleanup.policy", IncrementalAlterOp::Append, Some("compact"))],
+            &[entry(
+                "cleanup.policy",
+                IncrementalAlterOp::Append,
+                Some("compact"),
+            )],
         )
         .unwrap();
         assert_eq!(cfg.get("cleanup.policy").unwrap(), "compact");
@@ -358,7 +380,11 @@ mod tests {
         let mut cfg = map_of([("cleanup.policy", "compact,delete")]);
         apply_ops(
             &mut cfg,
-            &[entry("cleanup.policy", IncrementalAlterOp::Subtract, Some("delete"))],
+            &[entry(
+                "cleanup.policy",
+                IncrementalAlterOp::Subtract,
+                Some("delete"),
+            )],
         )
         .unwrap();
         assert_eq!(cfg.get("cleanup.policy").unwrap(), "compact");
@@ -372,7 +398,11 @@ mod tests {
         let mut cfg = map_of([("cleanup.policy", "compact")]);
         apply_ops(
             &mut cfg,
-            &[entry("cleanup.policy", IncrementalAlterOp::Subtract, Some("compact"))],
+            &[entry(
+                "cleanup.policy",
+                IncrementalAlterOp::Subtract,
+                Some("compact"),
+            )],
         )
         .unwrap();
         assert!(!cfg.contains_key("cleanup.policy"));
@@ -383,7 +413,11 @@ mod tests {
         let mut cfg = HashMap::new();
         apply_ops(
             &mut cfg,
-            &[entry("cleanup.policy", IncrementalAlterOp::Subtract, Some("compact"))],
+            &[entry(
+                "cleanup.policy",
+                IncrementalAlterOp::Subtract,
+                Some("compact"),
+            )],
         )
         .unwrap();
         assert!(cfg.is_empty());
@@ -392,11 +426,7 @@ mod tests {
     #[test]
     fn append_with_null_value_rejected() {
         let mut cfg = HashMap::new();
-        let err = apply_ops(
-            &mut cfg,
-            &[entry("k", IncrementalAlterOp::Append, None)],
-        )
-        .unwrap_err();
+        let err = apply_ops(&mut cfg, &[entry("k", IncrementalAlterOp::Append, None)]).unwrap_err();
         assert_eq!(err.0, KafkaCode::InvalidConfig);
     }
 

@@ -60,9 +60,15 @@ async fn global_cap_rejects_when_per_ip_cap_has_room() {
     // 127.0.0.1 must still be subject to the tighter global cap.
     const MAX_TOTAL: usize = 3;
     let server = Arc::new(
-        KafkaServer::with_config("127.0.0.1:0", NoopHandler, 1_000, MAX_TOTAL, Handle::current())
-            .await
-            .expect("bind"),
+        KafkaServer::with_config(
+            "127.0.0.1:0",
+            NoopHandler,
+            1_000,
+            MAX_TOTAL,
+            Handle::current(),
+        )
+        .await
+        .expect("bind"),
     );
     let addr = server.local_addr().expect("local addr");
 
@@ -81,7 +87,11 @@ async fn global_cap_rejects_when_per_ip_cap_has_room() {
     // The active counter must settle at exactly MAX_TOTAL. Beyond that,
     // any extra socket gets rejected by the accept loop.
     assert!(
-        wait_for(|| server.active_connections() == MAX_TOTAL, Duration::from_secs(3)).await,
+        wait_for(
+            || server.active_connections() == MAX_TOTAL,
+            Duration::from_secs(3)
+        )
+        .await,
         "global cap must bound active connections to {MAX_TOTAL}; got {}",
         server.active_connections(),
     );
@@ -137,7 +147,11 @@ async fn per_ip_rejection_releases_global_slot() {
     // ghost global reservations. If the global counter leaks, it would
     // sit somewhere between MAX_PER_IP and MAX_TOTAL, blocking new IPs.
     assert!(
-        wait_for(|| server.active_connections() == MAX_PER_IP, Duration::from_secs(3)).await,
+        wait_for(
+            || server.active_connections() == MAX_PER_IP,
+            Duration::from_secs(3)
+        )
+        .await,
         "active connections must equal per-IP cap; got {}",
         server.active_connections(),
     );

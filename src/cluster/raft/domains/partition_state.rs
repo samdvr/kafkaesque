@@ -437,7 +437,10 @@ mod tests {
             partition: 0,
             created_at_ms: 100,
         });
-        assert!(matches!(resp, PartitionStateResponse::PartitionInitialized { .. }));
+        assert!(matches!(
+            resp,
+            PartitionStateResponse::PartitionInitialized { .. }
+        ));
         let p = s.state.get_partition("t", 0).unwrap();
         assert_eq!(p.owner_broker_id, None);
         assert_eq!(p.leader_epoch, 0);
@@ -456,7 +459,10 @@ mod tests {
             partition: 0,
             created_at_ms: 100,
         });
-        assert!(matches!(resp, PartitionStateResponse::PartitionAlreadyExists { .. }));
+        assert!(matches!(
+            resp,
+            PartitionStateResponse::PartitionAlreadyExists { .. }
+        ));
     }
 
     #[test]
@@ -471,14 +477,20 @@ mod tests {
             topic: "t".into(),
             partition: 0,
         });
-        assert!(matches!(resp, PartitionStateResponse::PartitionPurged { .. }));
+        assert!(matches!(
+            resp,
+            PartitionStateResponse::PartitionPurged { .. }
+        ));
         assert!(s.state.get_partition("t", 0).is_none());
         // Second purge: no-op, same response.
         let resp = s.apply(PartitionStateCommand::PurgePartition {
             topic: "t".into(),
             partition: 0,
         });
-        assert!(matches!(resp, PartitionStateResponse::PartitionPurged { .. }));
+        assert!(matches!(
+            resp,
+            PartitionStateResponse::PartitionPurged { .. }
+        ));
     }
 
     #[test]
@@ -519,7 +531,10 @@ mod tests {
             lease_duration_ms: 1000,
             timestamp_ms: 1,
         });
-        assert!(matches!(resp, PartitionStateResponse::PartitionNotOwned { .. }));
+        assert!(matches!(
+            resp,
+            PartitionStateResponse::PartitionNotOwned { .. }
+        ));
     }
 
     #[test]
@@ -535,7 +550,10 @@ mod tests {
         let resp = s.apply(PartitionStateCommand::ExpireLeases {
             current_time_ms: 1_000,
         });
-        assert!(matches!(resp, PartitionStateResponse::LeasesExpired { count: 1 }));
+        assert!(matches!(
+            resp,
+            PartitionStateResponse::LeasesExpired { count: 1 }
+        ));
         assert!(s.state.get_owner("t", 0).is_none());
     }
 }

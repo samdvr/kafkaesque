@@ -100,7 +100,13 @@ impl Codec {
     /// tests below. `None` is included so the matrix exercises the
     /// "no compression" branch of the same builder/CRC code path.
     fn all() -> [Codec; 5] {
-        [Codec::None, Codec::Gzip, Codec::Snappy, Codec::Lz4, Codec::Zstd]
+        [
+            Codec::None,
+            Codec::Gzip,
+            Codec::Snappy,
+            Codec::Lz4,
+            Codec::Zstd,
+        ]
     }
 }
 
@@ -265,13 +271,22 @@ fn bit_flip_inside_compressed_payload_is_rejected_for_every_codec() {
     for codec in Codec::all() {
         let mut batch = build_canonical_batch(codec);
         let payload_byte_idx = 61; // first byte after header
-        assert!(payload_byte_idx < batch.len(), "{}: empty payload", codec.name());
+        assert!(
+            payload_byte_idx < batch.len(),
+            "{}: empty payload",
+            codec.name()
+        );
 
         let original = batch[payload_byte_idx];
         batch[payload_byte_idx] ^= 0x01; // single-bit flip
         // Skip the test if the flip happens to leave a byte unchanged for
         // some reason (it can't for XOR 0x01, but be explicit).
-        assert_ne!(batch[payload_byte_idx], original, "{}: flip didn't change byte", codec.name());
+        assert_ne!(
+            batch[payload_byte_idx],
+            original,
+            "{}: flip didn't change byte",
+            codec.name()
+        );
 
         match validate_batch_crc(&batch) {
             CrcValidationResult::Invalid { .. } => {} // expected

@@ -282,7 +282,9 @@ fn transaction_coordinator_api_keys_are_unknown_today() {
             parsed,
         );
         assert!(
-            !SUPPORTED_VERSIONS.iter().any(|sv| i16::from(sv.api_key) == key),
+            !SUPPORTED_VERSIONS
+                .iter()
+                .any(|sv| i16::from(sv.api_key) == key),
             "txn coordinator key {} must not appear in SUPPORTED_VERSIONS \
              until the handler is implemented",
             key,
@@ -317,10 +319,7 @@ async fn cleanup_policy_compact_is_accepted_at_create_time_today() {
                     name: COMPACT_TOPIC.into(),
                     num_partitions: 1,
                     replication_factor: 1,
-                    configs: vec![(
-                        "cleanup.policy".to_string(),
-                        Some("compact".to_string()),
-                    )],
+                    configs: vec![("cleanup.policy".to_string(), Some("compact".to_string()))],
                 }],
                 timeout_ms: 5_000,
                 validate_only: false,
@@ -354,10 +353,7 @@ async fn compact_topic_retains_duplicate_keyed_batches_today() {
     ensure_topic(
         &broker,
         COMPACT_TOPIC,
-        vec![(
-            "cleanup.policy".to_string(),
-            Some("compact".to_string()),
-        )],
+        vec![("cleanup.policy".to_string(), Some("compact".to_string()))],
     )
     .await;
 
@@ -445,7 +441,9 @@ fn delegation_token_api_keys_are_unknown_today() {
             parsed,
         );
         assert!(
-            !SUPPORTED_VERSIONS.iter().any(|sv| i16::from(sv.api_key) == key),
+            !SUPPORTED_VERSIONS
+                .iter()
+                .any(|sv| i16::from(sv.api_key) == key),
             "delegation token key {} must not appear in SUPPORTED_VERSIONS",
             key,
         );
@@ -482,7 +480,9 @@ fn acl_admin_rpc_keys_are_unknown_today() {
             parsed,
         );
         assert!(
-            !SUPPORTED_VERSIONS.iter().any(|sv| i16::from(sv.api_key) == key),
+            !SUPPORTED_VERSIONS
+                .iter()
+                .any(|sv| i16::from(sv.api_key) == key),
             "ACL admin key {} must not appear in SUPPORTED_VERSIONS \
              until the handler is wired",
             key,
@@ -517,7 +517,9 @@ fn kip_848_consumer_group_keys_are_unknown_today() {
             parsed,
         );
         assert!(
-            !SUPPORTED_VERSIONS.iter().any(|sv| i16::from(sv.api_key) == key),
+            !SUPPORTED_VERSIONS
+                .iter()
+                .any(|sv| i16::from(sv.api_key) == key),
             "KIP-848 key {} must not appear in SUPPORTED_VERSIONS until \
              the new-protocol handlers are wired",
             key,
@@ -532,13 +534,11 @@ fn classic_group_protocol_remains_supported_today() {
     // are present in SUPPORTED_VERSIONS today; a regression that drops
     // them while the new protocol isn't ready would silently break every
     // existing consumer.
-    for (key, name) in [
-        (11i16, "JoinGroup"),
-        (12, "Heartbeat"),
-        (14, "SyncGroup"),
-    ] {
+    for (key, name) in [(11i16, "JoinGroup"), (12, "Heartbeat"), (14, "SyncGroup")] {
         assert!(
-            SUPPORTED_VERSIONS.iter().any(|sv| i16::from(sv.api_key) == key),
+            SUPPORTED_VERSIONS
+                .iter()
+                .any(|sv| i16::from(sv.api_key) == key),
             "{} (key {}) must remain in SUPPORTED_VERSIONS for classic-protocol consumers",
             name,
             key,

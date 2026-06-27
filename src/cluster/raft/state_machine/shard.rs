@@ -187,9 +187,7 @@ impl ShardStateMachine {
 
             ShardCommand::Group(cmd) => ShardResponse::Group(state.group_domain.apply(cmd)),
 
-            ShardCommand::Producer(cmd) => {
-                ShardResponse::Producer(state.producer_state.apply(cmd))
-            }
+            ShardCommand::Producer(cmd) => ShardResponse::Producer(state.producer_state.apply(cmd)),
 
             ShardCommand::Transfer(cmd) => {
                 let state_mut = &mut *state;

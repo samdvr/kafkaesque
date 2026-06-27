@@ -223,13 +223,19 @@ async fn back_to_back_retention_passes_are_idempotent() {
         .await
         .expect("retention 2");
 
-    assert_eq!(second, 0, "second pass must delete nothing (no intervening append)");
+    assert_eq!(
+        second, 0,
+        "second pass must delete nothing (no intervening append)"
+    );
     assert_eq!(
         store.log_start_offset(),
         lso_after_first,
         "LSO must not move on the idempotent second pass",
     );
-    assert!(first > 0, "first pass must have actually deleted at least one batch");
+    assert!(
+        first > 0,
+        "first pass must have actually deleted at least one batch"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -259,24 +265,25 @@ async fn concurrent_fetch_during_retention_observes_consistent_snapshot() {
             .expect("produce");
     }
 
-    let (offset_before, payload_before) = store
-        .fetch_from(0)
-        .await
-        .expect("fetch before retention");
-    assert!(payload_before.is_some(), "pre-retention fetch must return data");
+    let (offset_before, payload_before) =
+        store.fetch_from(0).await.expect("fetch before retention");
+    assert!(
+        payload_before.is_some(),
+        "pre-retention fetch must return data"
+    );
     assert!(offset_before > 0);
 
-    store.apply_retention(10_000, 50_000).await.expect("retention");
+    store
+        .apply_retention(10_000, 50_000)
+        .await
+        .expect("retention");
     let lso = store.log_start_offset();
     assert!(lso > 0);
 
     // Fetch from offset 0 again — below the new LSO. The store must
     // either return None or advance past LSO; it must not surface the
     // deleted records.
-    let (after_offset, after_payload) = store
-        .fetch_from(0)
-        .await
-        .expect("fetch below new LSO");
+    let (after_offset, after_payload) = store.fetch_from(0).await.expect("fetch below new LSO");
     if let Some(bytes) = after_payload {
         assert!(
             after_offset > lso,

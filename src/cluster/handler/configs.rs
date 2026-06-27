@@ -21,8 +21,7 @@ use crate::cluster::traits::PartitionCoordinator;
 use crate::error::KafkaCode;
 use crate::server::RequestContext;
 use crate::server::request::{
-    AlterConfigsRequestData, DescribeConfigsRequestData, RESOURCE_TYPE_BROKER,
-    RESOURCE_TYPE_TOPIC,
+    AlterConfigsRequestData, DescribeConfigsRequestData, RESOURCE_TYPE_BROKER, RESOURCE_TYPE_TOPIC,
 };
 use crate::server::response::{
     AlterConfigsResponseData, AlterConfigsResult, CONFIG_SOURCE_DEFAULT_CONFIG,
@@ -374,12 +373,11 @@ pub(super) async fn handle_alter_configs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::ClusterConfig;
     use crate::cluster::topic_config_view::{
         KEY_CLEANUP_POLICY, KEY_DELETE_RETENTION_MS, KEY_MAX_COMPACTION_LAG_MS,
-        KEY_MIN_CLEANABLE_DIRTY_BYTES, KEY_MIN_COMPACTION_LAG_MS, KEY_RETENTION_MS,
-        KEY_SEGMENT_MS,
+        KEY_MIN_CLEANABLE_DIRTY_BYTES, KEY_MIN_COMPACTION_LAG_MS, KEY_RETENTION_MS, KEY_SEGMENT_MS,
     };
-    use crate::cluster::ClusterConfig;
 
     fn defaults() -> ClusterConfig {
         ClusterConfig::default()
@@ -420,10 +418,7 @@ mod tests {
     fn build_entries_filter_preserves_order() {
         let raw = HashMap::new();
         let resolved = TopicCompactionConfig::resolve(&raw, &defaults());
-        let filter = vec![
-            KEY_RETENTION_MS.to_string(),
-            KEY_CLEANUP_POLICY.to_string(),
-        ];
+        let filter = vec![KEY_RETENTION_MS.to_string(), KEY_CLEANUP_POLICY.to_string()];
         let entries = build_describe_entries(&resolved, &raw, Some(filter));
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, KEY_RETENTION_MS);

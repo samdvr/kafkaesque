@@ -168,11 +168,7 @@ fn encode_metrics_succeeds_after_overflow_recorded() {
     metrics::configure_metrics(true, 2);
 
     for i in 0..30 {
-        metrics::record_acl_denial(
-            &format!("User:encode-overflow-{}", i),
-            "Produce",
-            "Topic",
-        );
+        metrics::record_acl_denial(&format!("User:encode-overflow-{}", i), "Produce", "Topic");
     }
 
     let text = metrics::encode_metrics().expect("encode_metrics must succeed");

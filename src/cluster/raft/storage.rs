@@ -303,7 +303,6 @@ impl<G: GroupKind<SmInit = ()>> RaftStore<G> {
 }
 
 impl<G: GroupKind> RaftStore<G> {
-
     /// Replay the on-disk WAL into in-memory state. Called once at startup
     /// before openraft is constructed. On a fresh node with no
     /// WAL files this is a no-op; on a restart it loads the durable vote,
@@ -634,9 +633,7 @@ impl<G: GroupKind> RaftStore<G> {
     /// items not yet renamed-and-durable is treated as un-acked on recovery.
     ///
     /// All `items` must share the same parent directory.
-    fn atomic_write_fsync_batch_blocking(
-        items: &[(PathBuf, Vec<u8>)],
-    ) -> std::io::Result<()> {
+    fn atomic_write_fsync_batch_blocking(items: &[(PathBuf, Vec<u8>)]) -> std::io::Result<()> {
         use std::io::Write;
         if items.is_empty() {
             return Ok(());

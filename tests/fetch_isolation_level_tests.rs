@@ -44,8 +44,8 @@ use kafkaesque::cluster::ClusterProfile;
 use kafkaesque::error::KafkaCode;
 use kafkaesque::server::Handler;
 use kafkaesque::server::request::{
-    CreateTopicData, CreateTopicsRequestData, FetchPartitionData, FetchRequestData,
-    FetchTopicData, ProducePartitionData, ProduceRequestData, ProduceTopicData,
+    CreateTopicData, CreateTopicsRequestData, FetchPartitionData, FetchRequestData, FetchTopicData,
+    ProducePartitionData, ProduceRequestData, ProduceTopicData,
 };
 use kafkaesque::server::response::FetchPartitionResponse;
 
@@ -145,7 +145,9 @@ fn fetch_request(isolation_level: i8) -> FetchRequestData {
     }
 }
 
-fn first_partition(resp: &kafkaesque::server::response::FetchResponseData) -> &FetchPartitionResponse {
+fn first_partition(
+    resp: &kafkaesque::server::response::FetchResponseData,
+) -> &FetchPartitionResponse {
     &resp.responses[0].partitions[0]
 }
 
@@ -158,7 +160,10 @@ async fn read_uncommitted_returns_produced_records() {
     let broker = BrokerHandle::spawn(ClusterProfile::Development).await;
     create_topic_and_produce(&broker, 1).await;
 
-    let resp = broker.handler.handle_fetch(&broker.ctx(), fetch_request(0)).await;
+    let resp = broker
+        .handler
+        .handle_fetch(&broker.ctx(), fetch_request(0))
+        .await;
     let p = first_partition(&resp);
     assert_eq!(p.error_code, KafkaCode::None);
     assert!(p.records.is_some(), "read_uncommitted must return records");
@@ -170,7 +175,10 @@ async fn read_committed_returns_produced_records_today() {
     let broker = BrokerHandle::spawn(ClusterProfile::Development).await;
     create_topic_and_produce(&broker, 1).await;
 
-    let resp = broker.handler.handle_fetch(&broker.ctx(), fetch_request(1)).await;
+    let resp = broker
+        .handler
+        .handle_fetch(&broker.ctx(), fetch_request(1))
+        .await;
     let p = first_partition(&resp);
     assert_eq!(p.error_code, KafkaCode::None);
     assert!(
@@ -233,7 +241,10 @@ async fn lso_equals_hwm_when_no_transactions() {
 
     let ctx = broker.ctx();
     for level in [0i8, 1i8] {
-        let resp = broker.handler.handle_fetch(&ctx, fetch_request(level)).await;
+        let resp = broker
+            .handler
+            .handle_fetch(&ctx, fetch_request(level))
+            .await;
         let p = first_partition(&resp);
         assert_eq!(p.error_code, KafkaCode::None, "level {}", level);
         assert_eq!(

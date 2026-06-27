@@ -307,10 +307,7 @@ pub enum GroupResponse {
     /// heartbeat against a stale assignment. Without this typed response,
     /// rebalance latency is bounded by `session_timeout_ms × 2` (the time
     /// for the heartbeat to time out before the client thinks to rejoin).
-    RebalanceInProgress {
-        group_id: String,
-        member_id: String,
-    },
+    RebalanceInProgress { group_id: String, member_id: String },
 
     /// A joining member's protocol list has no protocol in common with the
     /// rest of the group (Kafka: INCONSISTENT_GROUP_PROTOCOL).

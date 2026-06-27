@@ -161,9 +161,15 @@ async fn slow_client_churn_does_not_exhaust_pool() {
     // free again even though we filled the pool to saturation.
     const MAX_TOTAL: usize = 4;
     let server = Arc::new(
-        KafkaServer::with_config("127.0.0.1:0", NoopHandler, 1_000, MAX_TOTAL, Handle::current())
-            .await
-            .expect("bind"),
+        KafkaServer::with_config(
+            "127.0.0.1:0",
+            NoopHandler,
+            1_000,
+            MAX_TOTAL,
+            Handle::current(),
+        )
+        .await
+        .expect("bind"),
     );
     let addr = server.local_addr().expect("local addr");
 
@@ -178,7 +184,11 @@ async fn slow_client_churn_does_not_exhaust_pool() {
         sockets.push(TcpStream::connect(addr).await.expect("connect"));
     }
     assert!(
-        wait_for(|| server.active_connections() == MAX_TOTAL, Duration::from_secs(2)).await,
+        wait_for(
+            || server.active_connections() == MAX_TOTAL,
+            Duration::from_secs(2)
+        )
+        .await,
         "pool must saturate"
     );
 

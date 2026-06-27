@@ -138,15 +138,9 @@ impl ControlStateMachine {
                 // here — that's the shard SM's job — so we conservatively
                 // invalidate everything when the broker exits the Active
                 // set.
-                let pre_status = state
-                    .broker_domain
-                    .get(broker_id)
-                    .map(|b| b.status.clone());
+                let pre_status = state.broker_domain.get(broker_id).map(|b| b.status.clone());
                 let response = ControlResponse::Broker(state.broker_domain.apply(cmd));
-                let post_status = state
-                    .broker_domain
-                    .get(broker_id)
-                    .map(|b| b.status.clone());
+                let post_status = state.broker_domain.get(broker_id).map(|b| b.status.clone());
                 let became_inactive = matches!(
                     (pre_status, post_status),
                     (Some(prev), Some(now))
@@ -320,14 +314,18 @@ mod tests {
         // Same producer id on retry, only one counter advance.
         match (r1, r2) {
             (
-                ControlResponse::Producer(super::super::super::domains::ProducerResponse::ProducerIdAllocated {
-                    producer_id: pid_a,
-                    ..
-                }),
-                ControlResponse::Producer(super::super::super::domains::ProducerResponse::ProducerIdAllocated {
-                    producer_id: pid_b,
-                    ..
-                }),
+                ControlResponse::Producer(
+                    super::super::super::domains::ProducerResponse::ProducerIdAllocated {
+                        producer_id: pid_a,
+                        ..
+                    },
+                ),
+                ControlResponse::Producer(
+                    super::super::super::domains::ProducerResponse::ProducerIdAllocated {
+                        producer_id: pid_b,
+                        ..
+                    },
+                ),
             ) => assert_eq!(pid_a, pid_b),
             _ => panic!("expected ProducerIdAllocated"),
         }
@@ -376,7 +374,13 @@ mod tests {
         let err = sm.try_restore(b"not a postcard frame").await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         // State preserved.
-        assert!(sm.state().await.topic_registry.get_topic("before").is_some());
+        assert!(
+            sm.state()
+                .await
+                .topic_registry
+                .get_topic("before")
+                .is_some()
+        );
     }
 
     #[tokio::test]

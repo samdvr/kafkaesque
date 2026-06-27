@@ -423,10 +423,7 @@ impl SaslProvider {
                         (false, None, response)
                     }
                     _ => {
-                        warn!(
-                            conn_id,
-                            "SCRAM client-first rejected"
-                        );
+                        warn!(conn_id, "SCRAM client-first rejected");
                         (false, None, response)
                     }
                 }
@@ -489,10 +486,7 @@ impl SaslProvider {
         match mechanism_upper.as_str() {
             "PLAIN" => {
                 if self.plain_require_tls && !transport_tls {
-                    warn!(
-                        conn_id,
-                        "Rejecting PLAIN SASL on non-TLS connection"
-                    );
+                    warn!(conn_id, "Rejecting PLAIN SASL on non-TLS connection");
                     return (false, None, Vec::new());
                 }
                 let (success, principal) = self.authenticate_plain(auth_data).await;

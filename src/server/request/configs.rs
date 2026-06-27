@@ -215,11 +215,7 @@ mod tests {
     // DescribeConfigs
     // ------------------------------------------------------------------
 
-    fn build_describe_resource(
-        resource_type: i8,
-        name: &str,
-        keys: Option<&[&str]>,
-    ) -> Vec<u8> {
+    fn build_describe_resource(resource_type: i8, name: &str, keys: Option<&[&str]>) -> Vec<u8> {
         let mut data = Vec::new();
         data.push(resource_type as u8);
         data.extend_from_slice(&(name.len() as i16).to_be_bytes());
@@ -267,7 +263,10 @@ mod tests {
 
         let (_, parsed) = parse_describe_configs_request(nb(&data), 0).unwrap();
         let keys = parsed.resources[0].configuration_keys.as_ref().unwrap();
-        assert_eq!(keys, &vec!["retention.ms".to_string(), "cleanup.policy".to_string()]);
+        assert_eq!(
+            keys,
+            &vec!["retention.ms".to_string(), "cleanup.policy".to_string()]
+        );
     }
 
     #[test]
@@ -291,7 +290,10 @@ mod tests {
         data.push(1); // include_synonyms = true
 
         let (rest, parsed) = parse_describe_configs_request(nb(&data), 1).unwrap();
-        assert!(rest.into_bytes().is_empty(), "v1 must consume the trailing byte");
+        assert!(
+            rest.into_bytes().is_empty(),
+            "v1 must consume the trailing byte"
+        );
         assert!(parsed.include_synonyms);
         assert!(!parsed.include_documentation);
     }
@@ -315,7 +317,11 @@ mod tests {
         // Mixed-type batch: a topic + a broker.
         let mut data = Vec::new();
         data.extend_from_slice(&2i32.to_be_bytes());
-        data.extend(build_describe_resource(RESOURCE_TYPE_TOPIC, "topic-a", None));
+        data.extend(build_describe_resource(
+            RESOURCE_TYPE_TOPIC,
+            "topic-a",
+            None,
+        ));
         data.extend(build_describe_resource(RESOURCE_TYPE_BROKER, "0", None));
 
         let (_, parsed) = parse_describe_configs_request(nb(&data), 0).unwrap();
@@ -471,7 +477,10 @@ mod tests {
 
         let (rest, parsed) = parse_alter_configs_request(nb(&data), 1).unwrap();
         assert!(rest.into_bytes().is_empty());
-        assert_eq!(parsed.resources[0].configs[0].value, Some("60000".to_string()));
+        assert_eq!(
+            parsed.resources[0].configs[0].value,
+            Some("60000".to_string())
+        );
     }
 
     #[test]

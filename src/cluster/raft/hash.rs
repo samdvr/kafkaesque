@@ -129,7 +129,10 @@ mod tests {
         // We encode big-endian explicitly; this test would fail if someone
         // switched to native-endian and ran on a little-endian host.
         let h = shard_for_producer(0x0123_4567_89ab_cdef, 1024);
-        assert_eq!(h, shard_for_key(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef], 1024));
+        assert_eq!(
+            h,
+            shard_for_key(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef], 1024)
+        );
     }
 
     #[test]

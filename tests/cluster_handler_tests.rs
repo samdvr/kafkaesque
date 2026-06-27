@@ -201,11 +201,11 @@ async fn test_metadata_request_all_topics() {
 
     // Request metadata for all topics
     let request = MetadataRequestData {
-    topics: None,
-    allow_auto_topic_creation: true,
-    include_cluster_authorized_operations: false,
-    include_topic_authorized_operations: false,
-};
+        topics: None,
+        allow_auto_topic_creation: true,
+        include_cluster_authorized_operations: false,
+        include_topic_authorized_operations: false,
+    };
 
     let response = handler.handle_metadata(&ctx, request).await;
 
@@ -275,11 +275,11 @@ async fn test_metadata_returns_advertised_host_not_bind_host() {
     let ctx = create_test_context();
 
     let request = MetadataRequestData {
-    topics: None,
-    allow_auto_topic_creation: true,
-    include_cluster_authorized_operations: false,
-    include_topic_authorized_operations: false,
-};
+        topics: None,
+        allow_auto_topic_creation: true,
+        include_cluster_authorized_operations: false,
+        include_topic_authorized_operations: false,
+    };
     let response = handler.handle_metadata(&ctx, request).await;
 
     // Verify broker list uses advertised_host, NOT bind host

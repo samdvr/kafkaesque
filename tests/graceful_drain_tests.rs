@@ -36,7 +36,7 @@ impl Handler for NoopHandler {}
 fn api_versions_v0_frame(correlation_id: i32) -> Vec<u8> {
     let mut body = BytesMut::new();
     body.put_i16(18); // api_key = ApiVersions
-    body.put_i16(0);  // api_version = 0
+    body.put_i16(0); // api_version = 0
     body.put_i32(correlation_id);
     body.put_i16(1); // client_id length
     body.extend_from_slice(b"t");
@@ -100,9 +100,15 @@ async fn server_serves_api_versions_request_end_to_end() {
     let body = read_kafka_response(&mut stream)
         .await
         .expect("must receive a response");
-    assert!(body.len() >= 4, "response must contain at least correlation_id");
+    assert!(
+        body.len() >= 4,
+        "response must contain at least correlation_id"
+    );
     let correlation_id = i32::from_be_bytes(body[0..4].try_into().unwrap());
-    assert_eq!(correlation_id, 42, "response correlation_id must echo the request");
+    assert_eq!(
+        correlation_id, 42,
+        "response correlation_id must echo the request"
+    );
 
     drop(stream);
     server.shutdown_and_wait(Duration::from_secs(2)).await;
@@ -174,7 +180,9 @@ async fn new_connections_refused_after_shutdown_signal() {
 
     // Confirm the server is healthy first.
     {
-        let mut s = TcpStream::connect(addr).await.expect("pre-shutdown connect");
+        let mut s = TcpStream::connect(addr)
+            .await
+            .expect("pre-shutdown connect");
         s.write_all(&api_versions_v0_frame(1)).await.expect("write");
         s.flush().await.expect("flush");
         let body = read_kafka_response(&mut s).await.expect("response");
@@ -189,7 +197,10 @@ async fn new_connections_refused_after_shutdown_signal() {
     // listener is fully torn down before we attempt the post-shutdown
     // connect below — without this barrier the OS may still answer SYN
     // for a brief window after shutdown_and_wait returns.
-    run_task.await.expect("join").expect("run returns Ok on shutdown");
+    run_task
+        .await
+        .expect("join")
+        .expect("run returns Ok on shutdown");
 
     // A fresh connect after shutdown must NOT receive a real response.
     // The exact failure mode is OS-dependent:
@@ -208,11 +219,8 @@ async fn new_connections_refused_after_shutdown_signal() {
             let _ = s.write_all(&api_versions_v0_frame(99)).await;
             let _ = s.flush().await;
             let mut size_buf = [0u8; 4];
-            let read_outcome = tokio::time::timeout(
-                Duration::from_secs(2),
-                s.read_exact(&mut size_buf),
-            )
-            .await;
+            let read_outcome =
+                tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut size_buf)).await;
             match read_outcome {
                 Ok(Ok(_)) => panic!("post-shutdown connection must not receive a response"),
                 Ok(Err(_)) => { /* EOF / reset — expected */ }

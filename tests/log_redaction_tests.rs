@@ -39,9 +39,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use kafkaesque::server::sasl::{
-    PlainAuthenticator, SaslAuthenticator, SaslMechanism,
-};
+use kafkaesque::server::sasl::{PlainAuthenticator, SaslAuthenticator, SaslMechanism};
 use tracing::info_span;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -226,7 +224,10 @@ async fn plain_auth_success_logs_do_not_contain_password() {
     assert_no_secret_in_logs(&logs, &b64, "base64-encoded password");
 
     // Hex-encoded password — same reasoning.
-    let hex: String = TEST_PASSWORD.bytes().map(|b| format!("{:02x}", b)).collect();
+    let hex: String = TEST_PASSWORD
+        .bytes()
+        .map(|b| format!("{:02x}", b))
+        .collect();
     assert_no_secret_in_logs(&logs, &hex, "hex-encoded password");
 }
 
@@ -246,7 +247,11 @@ async fn plain_auth_failure_logs_do_not_contain_password() {
     .await;
 
     assert_no_secret_in_logs(&logs, TEST_PASSWORD, "plaintext password");
-    assert_no_secret_in_logs(&logs, "definitely-wrong-password", "attempted wrong password");
+    assert_no_secret_in_logs(
+        &logs,
+        "definitely-wrong-password",
+        "attempted wrong password",
+    );
 }
 
 #[tokio::test]

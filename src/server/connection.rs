@@ -1393,10 +1393,8 @@ impl AuthGate {
 /// Methods that don't care about the underlying transport
 /// (`set_max_message_size`, `require_sasl`, `record_auth_*`,
 /// `handle_requests`) live in a generic impl block and are shared by both.
-pub struct ClientConnection<
-    R = tokio::net::tcp::OwnedReadHalf,
-    W = tokio::net::tcp::OwnedWriteHalf,
-> {
+pub struct ClientConnection<R = tokio::net::tcp::OwnedReadHalf, W = tokio::net::tcp::OwnedWriteHalf>
+{
     reader: tokio::io::BufReader<R>,
     writer: W,
     addr: SocketAddr,
@@ -1570,14 +1568,7 @@ impl
         rate_limiter: Arc<AuthRateLimiter>,
     ) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
-        Self::from_halves(
-            read_half,
-            write_half,
-            addr,
-            Some(rate_limiter),
-            "tls",
-            true,
-        )
+        Self::from_halves(read_half, write_half, addr, Some(rate_limiter), "tls", true)
     }
 }
 

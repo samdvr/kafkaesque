@@ -49,7 +49,12 @@ const PARTITION: i32 = 0;
 /// distinct appends. With a real `producer_id >= 0`, the broker dedups
 /// exact-replays — exactly what these tests want for producer-state
 /// recovery.
-fn build_batch(producer_id: i64, producer_epoch: i16, base_sequence: i32, record_count: i32) -> Bytes {
+fn build_batch(
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    record_count: i32,
+) -> Bytes {
     let mut batch = vec![0u8; 100];
     batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes());
     batch[16] = 2;
@@ -98,7 +103,10 @@ async fn fresh_partition_reopens_with_zero_hwm() {
         .append_batch_durable(&build_batch(-1, -1, -1, 3))
         .await
         .expect("first append after reopen");
-    assert_eq!(first, 0, "first append on never-written partition must be offset 0");
+    assert_eq!(
+        first, 0,
+        "first append on never-written partition must be offset 0"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +287,10 @@ async fn fresh_producer_after_recovery_starts_at_sequence_zero() {
         .append_batch_durable(&build_batch(100, 0, 0, 5))
         .await
         .expect("A replay must succeed (re-ack)");
-    assert_eq!(replay_a, 0, "A's exact-replay must return original offset 0");
+    assert_eq!(
+        replay_a, 0,
+        "A's exact-replay must return original offset 0"
+    );
 }
 
 // ---------------------------------------------------------------------------

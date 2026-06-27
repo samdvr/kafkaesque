@@ -157,7 +157,9 @@ mod tests {
         let mut buf = BytesMut::new();
         resp.encode_versioned(&mut buf, 1).expect("encode");
         let mut bytes = buf.freeze();
-        bytes.advance(4 /*topics len*/ + 2 + 1 /*name*/ + 4 /*partitions len*/);
+        bytes.advance(
+            4 /*topics len*/ + 2 + 1 /*name*/ + 4, /*partitions len*/
+        );
         assert_eq!(bytes.get_i16(), 0, "error_code");
         assert_eq!(bytes.get_i32(), 3, "partition_index");
         assert_eq!(bytes.get_i32(), 5, "leader_epoch");
@@ -181,10 +183,8 @@ mod tests {
 
     #[test]
     fn error_partition_round_trips_sentinels() {
-        let resp = OffsetForLeaderEpochPartitionResponse::error(
-            5,
-            KafkaCode::NotLeaderForPartition,
-        );
+        let resp =
+            OffsetForLeaderEpochPartitionResponse::error(5, KafkaCode::NotLeaderForPartition);
         assert_eq!(resp.partition_index, 5);
         assert_eq!(resp.error_code, KafkaCode::NotLeaderForPartition);
         assert_eq!(resp.leader_epoch, -1);

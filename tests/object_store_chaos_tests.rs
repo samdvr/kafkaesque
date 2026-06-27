@@ -335,10 +335,7 @@ async fn list_latency_does_not_stall_coordinator() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fail_next_budget_does_not_amplify_under_coordinator_retries() {
     let (coord, injector) = build_faulting_raft().await;
-    coord
-        .register_topic("budget", 2)
-        .await
-        .expect("register");
+    coord.register_topic("budget", 2).await.expect("register");
 
     // A 1-failure plan must produce at most 1 fault no matter how many
     // ops the coordinator drives.
@@ -411,10 +408,7 @@ async fn head_failure_burst_does_not_corrupt_acquire() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn latency_then_failure_ordering_survives_coordinator() {
     let (coord, injector) = build_faulting_raft().await;
-    coord
-        .register_topic("latfail", 2)
-        .await
-        .expect("register");
+    coord.register_topic("latfail", 2).await.expect("register");
 
     injector.restrict_to(&[OpKind::Put]);
     injector.set_latency(Duration::from_millis(60));

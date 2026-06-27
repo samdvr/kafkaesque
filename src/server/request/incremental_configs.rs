@@ -229,10 +229,7 @@ mod tests {
     fn null_set_value_distinct_from_empty() {
         // Set with NULL value is functionally a delete; Set with "" is
         // setting to literal empty string. Parser must surface both.
-        let entries = vec![
-            build_entry("a", 0, None),
-            build_entry("b", 0, Some("")),
-        ];
+        let entries = vec![build_entry("a", 0, None), build_entry("b", 0, Some(""))];
         let mut data = Vec::new();
         data.extend_from_slice(&1i32.to_be_bytes());
         data.extend(build_resource(2, "t", &entries));

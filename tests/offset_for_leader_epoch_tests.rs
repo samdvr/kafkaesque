@@ -103,7 +103,12 @@ async fn ensure_topic(broker: &BrokerHandle, name: &str) {
 /// `current_leader_epoch` (the client's view) and `leader_epoch` (the
 /// epoch the client wants the end-offset for; today the broker ignores
 /// the latter and returns the current HWM regardless).
-fn ofle_request(topic: &str, partition: i32, current_epoch: i32, target_epoch: i32) -> OffsetForLeaderEpochRequestData {
+fn ofle_request(
+    topic: &str,
+    partition: i32,
+    current_epoch: i32,
+    target_epoch: i32,
+) -> OffsetForLeaderEpochRequestData {
     OffsetForLeaderEpochRequestData {
         replica_id: -2,
         topics: vec![OffsetForLeaderEpochTopicData {
@@ -145,10 +150,7 @@ async fn unknown_topic_returns_unknown_topic_or_partition() {
     let broker = BrokerHandle::spawn(ClusterProfile::Development).await;
     let resp = broker
         .handler
-        .handle_offset_for_leader_epoch(
-            &broker.ctx(),
-            ofle_request("does-not-exist", 0, -1, 0),
-        )
+        .handle_offset_for_leader_epoch(&broker.ctx(), ofle_request("does-not-exist", 0, -1, 0))
         .await;
     let p = &resp.topics[0].partitions[0];
     assert_eq!(p.error_code, KafkaCode::UnknownTopicOrPartition);
@@ -186,8 +188,14 @@ async fn current_epoch_negative_one_skips_fence_and_returns_hwm() {
         .await;
     let p = &resp.topics[0].partitions[0];
     assert_eq!(p.error_code, KafkaCode::None);
-    assert!(p.leader_epoch >= 0, "broker must report its epoch on success");
-    assert!(p.end_offset >= 0, "end_offset must be a real offset on success");
+    assert!(
+        p.leader_epoch >= 0,
+        "broker must report its epoch on success"
+    );
+    assert!(
+        p.end_offset >= 0,
+        "end_offset must be a real offset on success"
+    );
 }
 
 #[tokio::test]
@@ -302,7 +310,11 @@ async fn per_partition_errors_are_independent() {
         .handler
         .handle_offset_for_leader_epoch(&broker.ctx(), request)
         .await;
-    assert_eq!(resp.topics.len(), 3, "all three topics must appear in the response");
+    assert_eq!(
+        resp.topics.len(),
+        3,
+        "all three topics must appear in the response"
+    );
     assert_eq!(resp.topics[0].partitions[0].error_code, KafkaCode::None);
     assert_eq!(
         resp.topics[1].partitions[0].error_code,
@@ -363,9 +375,7 @@ async fn multi_partition_per_topic_returns_one_response_per_partition() {
 #[tokio::test]
 async fn end_offset_reflects_live_hwm_after_produce() {
     use bytes::Bytes;
-    use kafkaesque::server::request::{
-        ProducePartitionData, ProduceRequestData, ProduceTopicData,
-    };
+    use kafkaesque::server::request::{ProducePartitionData, ProduceRequestData, ProduceTopicData};
 
     let broker = BrokerHandle::spawn(ClusterProfile::Development).await;
     ensure_topic(&broker, TOPIC).await;
@@ -423,7 +433,11 @@ async fn end_offset_reflects_live_hwm_after_produce() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
-    assert!(prod_ok, "setup produce never succeeded; last error: {:?}", last_err);
+    assert!(
+        prod_ok,
+        "setup produce never succeeded; last error: {:?}",
+        last_err
+    );
 
     let after = broker
         .handler

@@ -357,10 +357,7 @@ mod tests {
         resp.encode_versioned(&mut buf, 0).unwrap();
         let mut bytes = buf.freeze();
         bytes.advance(4 + 4); // throttle + array len
-        assert_eq!(
-            bytes.get_i16(),
-            KafkaCode::UnknownTopicOrPartition as i16
-        );
+        assert_eq!(bytes.get_i16(), KafkaCode::UnknownTopicOrPartition as i16);
         assert_eq!(bytes.get_i16(), "missing".len() as i16);
         bytes.advance("missing".len());
         // resource_type, resource_name, empty configs array

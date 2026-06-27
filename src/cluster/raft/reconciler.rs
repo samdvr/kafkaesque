@@ -204,7 +204,10 @@ async fn propagate_topic_init(
 ) {
     // Pre-compute which partitions are already present on the shard.
     let existing = {
-        let sm = cluster.shard(shard_idx).expect("shard exists").state_machine();
+        let sm = cluster
+            .shard(shard_idx)
+            .expect("shard exists")
+            .state_machine();
         let state = sm.state().await;
         state
             .partition_state
@@ -264,7 +267,10 @@ async fn propagate_topic_purge(
     snapshot: &ControlSnapshot,
 ) {
     let to_purge: Vec<(String, i32)> = {
-        let sm = cluster.shard(shard_idx).expect("shard exists").state_machine();
+        let sm = cluster
+            .shard(shard_idx)
+            .expect("shard exists")
+            .state_machine();
         let state = sm.state().await;
         state
             .partition_state
@@ -306,7 +312,10 @@ async fn propagate_broker_shadow(
     // Snapshot the existing shadow so the propose loop runs without the
     // shard SM read lock held.
     let shadow = {
-        let sm = cluster.shard(shard_idx).expect("shard exists").state_machine();
+        let sm = cluster
+            .shard(shard_idx)
+            .expect("shard exists")
+            .state_machine();
         let state = sm.state().await;
         state.broker_liveness_shadow.clone()
     };

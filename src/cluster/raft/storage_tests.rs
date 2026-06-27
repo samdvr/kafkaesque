@@ -231,9 +231,7 @@ async fn test_apply_normal_entries() {
     // Verify response
     assert_eq!(responses.len(), 1);
     match &responses[0] {
-        ControlResponse::Broker(domains::BrokerResponse::Registered {
-            broker_id,
-        }) => {
+        ControlResponse::Broker(domains::BrokerResponse::Registered { broker_id }) => {
             assert_eq!(*broker_id, 1);
         }
         _ => panic!("Expected BrokerRegistered response"),
@@ -408,7 +406,8 @@ async fn test_snapshot_persistence() {
 
     // Create store and build snapshot
     {
-        let mut store =     RaftStore::<ControlGroupKind>::new(object_store.clone(), "persistence-test");
+        let mut store =
+            RaftStore::<ControlGroupKind>::new(object_store.clone(), "persistence-test");
 
         // Apply some state
         let command = ControlCommand::Broker(domains::BrokerCommand::Register {
@@ -426,7 +425,7 @@ async fn test_snapshot_persistence() {
     }
 
     // Create new store and load snapshot
-    let store2 =     RaftStore::<ControlGroupKind>::new(object_store.clone(), "persistence-test");
+    let store2 = RaftStore::<ControlGroupKind>::new(object_store.clone(), "persistence-test");
     let loaded = store2.load_snapshot_from_store().await.unwrap();
     assert!(loaded);
 
@@ -700,27 +699,23 @@ async fn test_apply_multiple_commands() {
             1,
             0,
             1,
-            EntryPayload::Normal(ControlCommand::Broker(
-                domains::BrokerCommand::Register {
-                    broker_id: 1,
-                    host: "host1".to_string(),
-                    port: 9092,
-                    timestamp_ms: 1000,
-                },
-            )),
+            EntryPayload::Normal(ControlCommand::Broker(domains::BrokerCommand::Register {
+                broker_id: 1,
+                host: "host1".to_string(),
+                port: 9092,
+                timestamp_ms: 1000,
+            })),
         ),
         make_entry(
             1,
             0,
             2,
-            EntryPayload::Normal(ControlCommand::Broker(
-                domains::BrokerCommand::Register {
-                    broker_id: 2,
-                    host: "host2".to_string(),
-                    port: 9093,
-                    timestamp_ms: 1000,
-                },
-            )),
+            EntryPayload::Normal(ControlCommand::Broker(domains::BrokerCommand::Register {
+                broker_id: 2,
+                host: "host2".to_string(),
+                port: 9093,
+                timestamp_ms: 1000,
+            })),
         ),
         make_entry(
             1,

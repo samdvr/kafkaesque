@@ -224,9 +224,7 @@ fn try_exit_with_stale_snapshot_does_not_clear_new_session() {
     // mistake. The stale snapshot's entered_at no longer matches.
     let state = ZombieModeState::new();
     state.enter();
-    let stale = state
-        .snapshot()
-        .expect("first session must be observable");
+    let stale = state.snapshot().expect("first session must be observable");
 
     state.force_exit("test");
     // Sleep long enough for the millisecond-resolution timestamp to

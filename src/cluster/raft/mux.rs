@@ -104,10 +104,7 @@ pub enum MuxRaftRpcMessage {
 
     /// Promote an existing learner on `group` to a voting member.
     #[serde(rename = "mux_promote_v1")]
-    PromoteMember {
-        node_id: RaftNodeId,
-        group: GroupId,
-    },
+    PromoteMember { node_id: RaftNodeId, group: GroupId },
 }
 
 /// Multiplexed RPC response. The inner variants mirror the openraft RPC
@@ -211,8 +208,8 @@ pub fn auth_purpose_for(group: GroupId) -> [u8; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::network::RpcErrorKind;
+    use super::*;
     use openraft::Vote;
 
     fn vote_request(node: u64, term: u64) -> VoteRequest<RaftNodeId> {
@@ -251,10 +248,7 @@ mod tests {
     fn dispatch_target_is_correct_for_each_outer_tag() {
         assert_eq!(dispatch_target(&sample_control()), DispatchTarget::Control);
         assert_eq!(dispatch_target(&sample_shard(0)), DispatchTarget::Shard(0));
-        assert_eq!(
-            dispatch_target(&sample_shard(7)),
-            DispatchTarget::Shard(7)
-        );
+        assert_eq!(dispatch_target(&sample_shard(7)), DispatchTarget::Shard(7));
         // Control join: still routed to control-plane handler.
         assert_eq!(
             dispatch_target(&sample_join()),
@@ -426,7 +420,11 @@ mod tests {
         // u16::MAX shards all derive purposes distinct from control.
         for id in 0u16..=u16::MAX {
             let p = auth_purpose_for(GroupId::Shard(id));
-            assert_ne!(p[0], 1, "shard {} purpose must not start with control tag", id);
+            assert_ne!(
+                p[0], 1,
+                "shard {} purpose must not start with control tag",
+                id
+            );
         }
     }
 

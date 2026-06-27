@@ -203,8 +203,7 @@ fn fetch_v11_response_emits_preferred_read_replica() {
     // v11 adds 4 bytes per partition for preferred_read_replica.
     assert_eq!(buf_v10.len() + 4, buf_v11.len());
     // Confirm the value 7 lands somewhere in v11 but NOT in v10.
-    let v11_has_seven =
-        buf_v11.windows(4).any(|w| w == 7i32.to_be_bytes()) ;
+    let v11_has_seven = buf_v11.windows(4).any(|w| w == 7i32.to_be_bytes());
     assert!(v11_has_seven);
 }
 
@@ -495,7 +494,11 @@ async fn default_metadata_handler_serializes_at_v9() {
     // Should at least contain throttle (4) + brokers compact array (1) +
     // cluster_id (1) + controller_id (4) + topics compact array (1) +
     // cluster_authorized_operations (4) + tagged_fields (1) = 16 bytes.
-    assert!(buf.len() >= 16, "v9 metadata wire frame too small: {}", buf.len());
+    assert!(
+        buf.len() >= 16,
+        "v9 metadata wire frame too small: {}",
+        buf.len()
+    );
     assert_eq!(*buf.last().unwrap(), 0, "trailing tagged-fields byte");
 }
 

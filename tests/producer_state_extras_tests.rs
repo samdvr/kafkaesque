@@ -52,7 +52,12 @@ use common::BrokerHandle;
 
 const TOPIC: &str = "producer-state-extras";
 
-fn build_batch(producer_id: i64, producer_epoch: i16, base_sequence: i32, record_count: i32) -> Bytes {
+fn build_batch(
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    record_count: i32,
+) -> Bytes {
     let mut batch = vec![0u8; 100];
     batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes());
     batch[16] = 2;
@@ -113,8 +118,7 @@ async fn produce(broker: &BrokerHandle, batch: Bytes) -> (KafkaCode, i64) {
             )
             .await;
         let p = &resp.responses[0].partitions[0];
-        if p.error_code != KafkaCode::NotLeaderForPartition
-            || std::time::Instant::now() >= deadline
+        if p.error_code != KafkaCode::NotLeaderForPartition || std::time::Instant::now() >= deadline
         {
             return (p.error_code, p.base_offset);
         }

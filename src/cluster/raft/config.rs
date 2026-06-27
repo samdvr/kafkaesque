@@ -445,12 +445,14 @@ impl ClusterMeta {
     pub fn load(dir: impl AsRef<Path>) -> std::io::Result<Option<Self>> {
         let path = Self::path_in(dir);
         match std::fs::read(&path) {
-            Ok(bytes) => postcard::from_bytes::<ClusterMeta>(&bytes).map(Some).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("cluster_meta.bin at {} is corrupt: {}", path.display(), e),
-                )
-            }),
+            Ok(bytes) => postcard::from_bytes::<ClusterMeta>(&bytes)
+                .map(Some)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("cluster_meta.bin at {} is corrupt: {}", path.display(), e),
+                    )
+                }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -463,9 +465,8 @@ impl ClusterMeta {
         std::fs::create_dir_all(dir)?;
         let final_path = Self::path_in(dir);
         let tmp_path = dir.join("cluster_meta.bin.tmp");
-        let bytes = postcard::to_stdvec(self).map_err(|e| {
-            std::io::Error::other(format!("encoding cluster_meta.bin: {}", e))
-        })?;
+        let bytes = postcard::to_stdvec(self)
+            .map_err(|e| std::io::Error::other(format!("encoding cluster_meta.bin: {}", e)))?;
         std::fs::write(&tmp_path, &bytes)?;
         std::fs::rename(&tmp_path, &final_path)?;
         Ok(())
@@ -522,7 +523,11 @@ impl RaftConfig {
                     hash_algo: HASH_ALGO.to_string(),
                 };
                 meta.save(&dir).map_err(|e| {
-                    format!("failed to write cluster_meta.bin to {}: {}", dir.display(), e)
+                    format!(
+                        "failed to write cluster_meta.bin to {}: {}",
+                        dir.display(),
+                        e
+                    )
                 })
             }
         }

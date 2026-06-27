@@ -47,9 +47,7 @@ use super::commands::{ControlCommand, ControlResponse, ShardCommand, ShardRespon
 use super::config::RaftConfig;
 use super::group::{ControlGroupKind, GroupKind, ShardGroupKind};
 use super::hash;
-use super::mux_client::{
-    MuxAddrBook, MuxFactoryShared, build_mux_factories, new_addr_book,
-};
+use super::mux_client::{MuxAddrBook, MuxFactoryShared, build_mux_factories, new_addr_book};
 use super::mux_server::{MuxRaftHandles, MuxRaftRpcServer};
 use super::storage::RaftStore;
 use super::types::{ControlConfig, RaftNodeId, ShardConfig, ShardId};
@@ -515,16 +513,14 @@ impl RaftCluster {
             build_mux_factories(factory_shared.clone(), config.metadata_shards);
 
         // ---- (4) Build openraft handles --------------------------------------
-        let control_raft =
-            build_raft_handle::<ControlGroupKind, _>(
-                &openraft_config,
-                node_id,
-                control_store,
-                control_factory,
-            )
-            .await?;
-        let mut shard_rafts: Vec<ShardRaft> =
-            Vec::with_capacity(config.metadata_shards as usize);
+        let control_raft = build_raft_handle::<ControlGroupKind, _>(
+            &openraft_config,
+            node_id,
+            control_store,
+            control_factory,
+        )
+        .await?;
+        let mut shard_rafts: Vec<ShardRaft> = Vec::with_capacity(config.metadata_shards as usize);
         // Drain `shard_stores` (move) and zip with the corresponding factory
         // so each shard's store ends up paired with the factory tagged with
         // its `shard_id` — a swap here would silently route writes to the
@@ -537,8 +533,7 @@ impl RaftCluster {
         }
 
         // ---- Wrap each group in a RaftGroup<G> -------------------------------
-        let proposal_semaphore_control =
-            Arc::new(Semaphore::new(config.max_pending_proposals));
+        let proposal_semaphore_control = Arc::new(Semaphore::new(config.max_pending_proposals));
         let control_group = Arc::new(RaftGroup::<ControlGroupKind>::from_parts(
             control_raft.clone(),
             control_sm_handle,
@@ -731,21 +726,12 @@ impl RaftCluster {
     /// factory by design — re-discovering a peer for shard 3 separately
     /// from control would be a footgun on cluster join.
     pub async fn add_node(&self, node_id: RaftNodeId, addr: String) {
-        self.bootstrap()
-            .addrs
-            .write()
-            .await
-            .insert(node_id, addr);
+        self.bootstrap().addrs.write().await.insert(node_id, addr);
     }
 
     /// Lookup the address for `node_id`, or `None` if unknown.
     pub async fn get_node_addr(&self, node_id: RaftNodeId) -> Option<String> {
-        self.bootstrap()
-            .addrs
-            .read()
-            .await
-            .get(&node_id)
-            .cloned()
+        self.bootstrap().addrs.read().await.get(&node_id).cloned()
     }
 
     /// Propose a write to the control group.
@@ -759,7 +745,9 @@ impl RaftCluster {
     /// step 8 (group-tagged forwarding); until then callers handle the
     /// fallback by retrying after a leader-cache refresh.
     pub async fn write_control(&self, command: ControlCommand) -> SlateDBResult<ControlResponse> {
-        let permit = self.acquire_propose_permit(self.control.proposal_semaphore()).await?;
+        let permit = self
+            .acquire_propose_permit(self.control.proposal_semaphore())
+            .await?;
         let _permit = permit;
         match self.control.raft().client_write(command.clone()).await {
             Ok(resp) => Ok(resp.data),
@@ -782,17 +770,16 @@ impl RaftCluster {
         shard_id: ShardId,
         command: ShardCommand,
     ) -> SlateDBResult<ShardResponse> {
-        let shard = self
-            .shards
-            .get(shard_id as usize)
-            .ok_or_else(|| {
-                SlateDBError::Config(format!(
-                    "shard id {} out of range (metadata_shards = {})",
-                    shard_id,
-                    self.shards.len()
-                ))
-            })?;
-        let permit = self.acquire_propose_permit(shard.proposal_semaphore()).await?;
+        let shard = self.shards.get(shard_id as usize).ok_or_else(|| {
+            SlateDBError::Config(format!(
+                "shard id {} out of range (metadata_shards = {})",
+                shard_id,
+                self.shards.len()
+            ))
+        })?;
+        let permit = self
+            .acquire_propose_permit(shard.proposal_semaphore())
+            .await?;
         let _permit = permit;
         match shard.raft().client_write(command.clone()).await {
             Ok(resp) => Ok(resp.data),
@@ -1219,7 +1206,10 @@ mod tests {
         // future refactor that reorders the wrapper can't silently change
         // routing — equivalent to `cluster_meta.bin`'s wire contract.
         let r = ShardRouter::new(8);
-        assert_eq!(r.shard_for_topic("orders"), hash::shard_for_topic("orders", 8));
+        assert_eq!(
+            r.shard_for_topic("orders"),
+            hash::shard_for_topic("orders", 8)
+        );
         assert_eq!(r.shard_for_group("g42"), hash::shard_for_group("g42", 8));
         assert_eq!(
             r.shard_for_producer(0x0123_4567),
@@ -1396,7 +1386,10 @@ mod tests {
 
         // Out-of-range shard write is rejected before touching any Raft
         // handle — same Risk #2 boundary the dispatcher enforces.
-        let err = cluster.write_shard(99, ShardCommand::Noop).await.unwrap_err();
+        let err = cluster
+            .write_shard(99, ShardCommand::Noop)
+            .await
+            .unwrap_err();
         assert!(format!("{}", err).contains("out of range"));
 
         cluster.shutdown().await.expect("shutdown");

@@ -2628,8 +2628,8 @@ impl PartitionStoreBuilder {
         // back to the runtime.
         let open_future = async move {
             let object_path = ObjectPath::from(path_for_task.as_str());
-            let mut db_builder = Db::builder(object_path, object_store_for_task)
-                .with_settings(slatedb_settings);
+            let mut db_builder =
+                Db::builder(object_path, object_store_for_task).with_settings(slatedb_settings);
             // Conditional chaining: only set the cache / compaction
             // runtime when broker-wide pools were configured.
             // `None` paths fall through to SlateDB's per-DB defaults
@@ -2640,10 +2640,7 @@ impl PartitionStoreBuilder {
             if let Some(handle) = compaction_handle {
                 db_builder = db_builder.with_compaction_runtime(handle);
             }
-            let db = db_builder
-                .build()
-                .await
-                .map_err(SlateDBError::from)?;
+            let db = db_builder.build().await.map_err(SlateDBError::from)?;
 
             // ==================================================================
             // FORMAT VERSION: write on first open; reject newer-than-known

@@ -996,10 +996,7 @@ impl Handler for SlateDBClusterHandler {
     }
 
     #[cfg(feature = "sasl")]
-    async fn take_sasl_post_auth(
-        &self,
-        conn_id: u64,
-    ) -> Option<crate::server::SaslPostAuth> {
+    async fn take_sasl_post_auth(&self, conn_id: u64) -> Option<crate::server::SaslPostAuth> {
         self.sasl_post_auth.remove(&conn_id).map(|(_k, v)| v)
     }
 

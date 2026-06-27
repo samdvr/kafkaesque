@@ -300,10 +300,8 @@ impl PartitionCoordinator for RaftCoordinator {
         let _ = metadata_shards; // kept for clarity; loop uses `by_shard.into_iter()` directly
 
         for (shard_id, items) in by_shard {
-            let request_partitions: Vec<(String, i32)> = items
-                .iter()
-                .map(|(_, t, p)| (t.to_string(), *p))
-                .collect();
+            let request_partitions: Vec<(String, i32)> =
+                items.iter().map(|(_, t, p)| (t.to_string(), *p)).collect();
             let command = ShardCommand::Partition(PartitionStateCommand::RenewLeases {
                 broker_id: self.broker_id,
                 partitions: request_partitions,
@@ -323,9 +321,9 @@ impl PartitionCoordinator for RaftCoordinator {
                     }
                     for ((idx, topic, partition), outcome) in items.into_iter().zip(results) {
                         let renewed = match outcome {
-                            crate::cluster::raft::domains::BatchRenewOutcome::Renewed { .. } => {
-                                true
-                            }
+                            crate::cluster::raft::domains::BatchRenewOutcome::Renewed {
+                                ..
+                            } => true,
                             crate::cluster::raft::domains::BatchRenewOutcome::NotOwned => {
                                 self.owner_cache_invalidate(&(topic.clone(), partition))
                                     .await;
@@ -587,9 +585,9 @@ impl PartitionCoordinator for RaftCoordinator {
         let response = self.cluster().write_control(command).await?;
         match response {
             ControlResponse::TopicRegistry(TopicRegistryResponse::TopicCreated { .. }) => Ok(()),
-            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicAlreadyExists { .. }) => {
-                Ok(())
-            }
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicAlreadyExists {
+                ..
+            }) => Ok(()),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -613,9 +611,9 @@ impl PartitionCoordinator for RaftCoordinator {
         let response = self.cluster().write_control(command).await?;
         match response {
             ControlResponse::TopicRegistry(TopicRegistryResponse::TopicCreated { .. }) => Ok(()),
-            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicAlreadyExists { .. }) => {
-                Ok(())
-            }
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicAlreadyExists {
+                ..
+            }) => Ok(()),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -650,9 +648,9 @@ impl PartitionCoordinator for RaftCoordinator {
         });
         let response = self.cluster().write_control(command).await?;
         match response {
-            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicConfigUpdated { .. }) => {
-                Ok(true)
-            }
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicConfigUpdated {
+                ..
+            }) => Ok(true),
             ControlResponse::TopicRegistry(TopicRegistryResponse::TopicNotFound { .. }) => {
                 Ok(false)
             }
@@ -773,7 +771,11 @@ impl PartitionCoordinator for RaftCoordinator {
         let control_sm = self.cluster().control().state_machine();
         let topic_state = {
             let state = control_sm.state().await;
-            match state.topic_registry.topics.get(&Arc::from(topic) as &Arc<str>) {
+            match state
+                .topic_registry
+                .topics
+                .get(&Arc::from(topic) as &Arc<str>)
+            {
                 Some(t) => t.clone(),
                 None => {
                     metrics::record_raft_query(
@@ -843,11 +845,7 @@ impl PartitionCoordinator for RaftCoordinator {
         Ok(entry)
     }
 
-    async fn grow_topic_partitions(
-        &self,
-        topic: &str,
-        new_count: i32,
-    ) -> SlateDBResult<bool> {
+    async fn grow_topic_partitions(&self, topic: &str, new_count: i32) -> SlateDBResult<bool> {
         // Implemented as ControlCommand::TopicRegistry::GrowPartitions.
         // The state machine validates `new_count > existing` and rejects
         // shrinks, so racing growers converge to the largest count.
@@ -863,12 +861,11 @@ impl PartitionCoordinator for RaftCoordinator {
             ControlResponse::TopicRegistry(TopicRegistryResponse::TopicNotFound { .. }) => {
                 Ok(false)
             }
-            ControlResponse::TopicRegistry(TopicRegistryResponse::InvalidPartitionCount { .. }) => {
-                Err(SlateDBError::Storage(
-                    "new_count must be strictly greater than the current partition count"
-                        .to_string(),
-                ))
-            }
+            ControlResponse::TopicRegistry(TopicRegistryResponse::InvalidPartitionCount {
+                ..
+            }) => Err(SlateDBError::Storage(
+                "new_count must be strictly greater than the current partition count".to_string(),
+            )),
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -889,13 +886,9 @@ impl RaftCoordinator {
             let sm = self.cluster().shard_for_topic(topic).state_machine();
             let state = sm.state().await;
             let now_ms = state.lease_clock_ms;
-            state
-                .partition_state
-                .partitions
-                .get(&key)
-                .is_some_and(|p| {
-                    p.lease_expires_at_ms > now_ms && p.owner_broker_id == Some(cached_owner)
-                })
+            state.partition_state.partitions.get(&key).is_some_and(|p| {
+                p.lease_expires_at_ms > now_ms && p.owner_broker_id == Some(cached_owner)
+            })
         };
         if !still_valid {
             self.owner_cache_invalidate(&key).await;

@@ -41,15 +41,66 @@ fn classify_error(err: &Error) -> &'static str {
     }
 }
 
+/// Does this error mean the object store is unreachable?
+///
+/// [`record_health`] feeds the consecutive-failure gauge behind `/readyz`
+/// and zombie-mode entry, so only genuine connectivity failures belong
+/// there. Every error below is a *reply* — the store was reached and
+/// answered — and SlateDB produces them constantly in normal operation:
+///
+/// * `NotFound` — the WAL/manifest pollers probe for not-yet-written
+///   objects (`wal/…0001.sst`, `gc/manifest.boundary`) on every tick.
+/// * `NotImplemented` / `NotSupported` — SlateDB attaches a ULID
+///   attribute to conditional puts so a timeout-after-write is
+///   verifiable; `LocalFileSystem` rejects attributes outright, and
+///   SlateDB then retries the put without one (see its
+///   `retrying_object_store.rs`). The rejected first attempt is expected.
+/// * `Precondition` / `AlreadyExists` / `NotModified` — normal outcomes
+///   of SlateDB's compare-and-swap manifest updates.
+///
+/// Counting these drove the gauge past the unhealthy threshold within
+/// seconds of opening an idle partition, spamming "PARTIAL NETWORK
+/// PARTITION DETECTED" and bouncing the broker through zombie mode.
+/// Unknown (`#[non_exhaustive]`) variants stay unhealthy — fail closed on
+/// anything not classified here.
+fn indicates_unreachable(err: &Error) -> bool {
+    !matches!(
+        err,
+        Error::NotFound { .. }
+            | Error::AlreadyExists { .. }
+            | Error::Precondition { .. }
+            | Error::NotModified { .. }
+            | Error::NotSupported { .. }
+            | Error::NotImplemented { .. }
+            | Error::InvalidPath { .. }
+            | Error::UnknownConfigurationKey { .. }
+    )
+}
+
 fn record<T>(operation: &'static str, started: Instant, result: &Result<T>) {
     let duration = started.elapsed().as_secs_f64();
     let status = if result.is_ok() { "success" } else { "error" };
     metrics::record_object_store_operation(operation, status, duration);
     if let Err(e) = result {
+        // Still counted per error kind: a flood of NotFound is worth
+        // seeing on a dashboard even though it says nothing about
+        // reachability.
         metrics::record_object_store_error(operation, classify_error(e));
-        record_health(false);
+        if indicates_unreachable(e) {
+            record_health(false);
+        }
     } else {
         record_health(true);
+    }
+}
+
+/// Error bookkeeping for a failed item from a streaming operation
+/// (`list`, `delete_stream`, a `GetResult` body), which report per item
+/// rather than per call. Same reachability gate as [`record`].
+fn record_stream_error(operation: &'static str, err: &Error) {
+    metrics::record_object_store_error(operation, classify_error(err));
+    if indicates_unreachable(err) {
+        record_health(false);
     }
 }
 
@@ -166,8 +217,7 @@ impl ObjectStore for MetricsObjectStore {
                 }
                 Err(e) => {
                     metrics::record_object_store_operation("delete", "error", 0.0);
-                    metrics::record_object_store_error("delete", classify_error(e));
-                    record_health(false);
+                    record_stream_error("delete", e);
                 }
             })
             .boxed()
@@ -178,8 +228,7 @@ impl ObjectStore for MetricsObjectStore {
         upstream
             .inspect(|item| {
                 if let Err(e) = item {
-                    metrics::record_object_store_error("list", classify_error(e));
-                    record_health(false);
+                    record_stream_error("list", e);
                 } else {
                     record_health(true);
                 }
@@ -196,8 +245,7 @@ impl ObjectStore for MetricsObjectStore {
         upstream
             .inspect(|item| {
                 if let Err(e) = item {
-                    metrics::record_object_store_error("list", classify_error(e));
-                    record_health(false);
+                    record_stream_error("list", e);
                 } else {
                     record_health(true);
                 }
@@ -249,8 +297,7 @@ fn wrap_get_result(result: GetResult) -> GetResult {
                         // A mid-stream failure (e.g. the S3 connection
                         // dropping after `get_opts` returned OK) would
                         // otherwise leave the health gauge unchanged.
-                        metrics::record_object_store_error("get", classify_error(e));
-                        record_health(false);
+                        record_stream_error("get", e);
                     }
                 })
                 .boxed(),

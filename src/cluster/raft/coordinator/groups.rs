@@ -121,11 +121,9 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         // stale local read here can return a previous generation's protocol
         // and cause SyncGroup to write assignments under the wrong key.
         let shard = self.cluster().shard_for_group(group_id);
-        shard
-            .raft()
-            .ensure_linearizable()
-            .await
-            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+        self.cluster()
+            .linearizable_read_shard_for_group(group_id)
+            .await?;
         let sm = shard.state_machine();
         let state = sm.state().await;
 
@@ -169,11 +167,9 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         // generation lets a member rejoin with a "valid" generation that
         // the new coordinator has already advanced past.
         let shard = self.cluster().shard_for_group(group_id);
-        shard
-            .raft()
-            .ensure_linearizable()
-            .await
-            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+        self.cluster()
+            .linearizable_read_shard_for_group(group_id)
+            .await?;
         let sm = shard.state_machine();
         let state = sm.state().await;
 
@@ -382,11 +378,9 @@ impl ConsumerGroupCoordinator for RaftCoordinator {
         // has already advanced past, allowing a fenced consumer to commit
         // offsets under the old generation.
         let shard = self.cluster().shard_for_group(group_id);
-        shard
-            .raft()
-            .ensure_linearizable()
-            .await
-            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+        self.cluster()
+            .linearizable_read_shard_for_group(group_id)
+            .await?;
         let sm = shard.state_machine();
         let state = sm.state().await;
 

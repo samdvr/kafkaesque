@@ -69,13 +69,15 @@ run_test() {
     echo -n "  $name... "
     if eval "$cmd" > /tmp/kafkaesque-cluster-test/test_out.txt 2>&1; then
         echo -e "${GREEN}✓${NC}"
-        return 0
     else
         echo -e "${RED}✗${NC}"
         cat /tmp/kafkaesque-cluster-test/test_out.txt
         E2E_FAILED=1
-        return 1
     fi
+    # Always succeed: the script runs under `set -e`, so returning non-zero
+    # here would abort at the first failing test and hide every later one.
+    # E2E_FAILED is what drives the exit code in the summary below.
+    return 0
 }
 
 wait_for_broker() {
@@ -202,8 +204,10 @@ for i in $(seq 1 5); do
 done
 sleep 2
 
-# Consume with consumer group from different brokers
-run_test "Consumer group from broker 0" "timeout 10 $KCAT -b 127.0.0.1:9092 -G test-group group-test -c 5 -q $KCAT_OPTS 2>/dev/null | wc -l | grep -q 5"
+# Consume with consumer group from different brokers.
+# In -G mode kcat treats every trailing argument as a topic name, so the
+# flags have to come before the topic list.
+run_test "Consumer group from broker 0" "timeout 20 $KCAT -b 127.0.0.1:9092 -G test-group -c 5 -q $KCAT_OPTS group-test 2>/dev/null | wc -l | grep -q 5"
 
 # =============================================================================
 # Test 5: High throughput
@@ -232,7 +236,9 @@ sleep 2
 run_test "Consume from broker 0" "timeout 10 $KCAT -b 127.0.0.1:9092 -t failover-test -C -c 1 -q $KCAT_OPTS | grep -q failover-msg"
 run_test "Consume from broker 1" "timeout 10 $KCAT -b 127.0.0.1:9094 -t failover-test -C -c 1 -q $KCAT_OPTS | grep -q failover-msg"
 
-# Restart broker 2
+# Restart broker 2 — same DATA_PATH it started with, so it recovers its own
+# Raft log ({DATA_PATH}/raft/log/2) and rejoins as the member it already is
+# instead of coming back as an amnesiac voter.
 echo "  Restarting broker 2..."
 BROKER_ID=2 \
 HOST=127.0.0.1 \
@@ -240,7 +246,7 @@ PORT=9096 \
 RAFT_LISTEN_ADDR=127.0.0.1:9097 \
 RAFT_PEERS="0=127.0.0.1:9093,1=127.0.0.1:9095" \
 OBJECT_STORE_TYPE=local \
-DATA_PATH=/tmp/kafkaesque-cluster-test/broker2 \
+DATA_PATH="$SHARED_DATA_PATH" \
 AUTO_CREATE_TOPICS=true \
 RUST_LOG=kafkaesque=info \
 $BINARY > /tmp/kafkaesque-cluster-test/broker2.log 2>&1 &
@@ -257,9 +263,17 @@ run_test "Consume from restarted broker 2" "timeout 10 $KCAT -b 127.0.0.1:9096 -
 echo ""
 echo -e "${BLUE}[Large Messages]${NC}"
 
-run_test "Produce 1MB message" "dd if=/dev/zero bs=1024 count=1024 2>/dev/null | base64 | $KCAT -b 127.0.0.1:9092 -t large-msg-test -P $KCAT_OPTS"
+# One 500KB message, produced as a single newline-free line.
+#
+# The payload has to be built without `base64`: GNU base64 wraps at 76
+# columns, so piping it into `kcat -P` (newline-delimited) sends thousands of
+# tiny messages instead of one big one, while BSD base64 doesn't wrap and
+# blows past kcat's own 1000001-byte input cap. `tr` over /dev/zero gives the
+# same payload on both.
+LARGE_MSG_BYTES=500000
+run_test "Produce 500KB message" "head -c $LARGE_MSG_BYTES /dev/zero | tr '\\0' 'x' | $KCAT -b 127.0.0.1:9092 -t large-msg-test -P $KCAT_OPTS"
 sleep 2
-run_test "Consume 1MB from another broker" "timeout 30 $KCAT -b 127.0.0.1:9094 -t large-msg-test -C -c 1 -q $KCAT_OPTS | wc -c | awk '{exit (\$1 > 1000000 ? 0 : 1)}'"
+run_test "Consume 500KB from another broker" "timeout 30 $KCAT -b 127.0.0.1:9094 -t large-msg-test -C -c 1 -q $KCAT_OPTS | wc -c | awk '{exit (\$1 >= $LARGE_MSG_BYTES ? 0 : 1)}'"
 
 # =============================================================================
 # Test 8: Multiple topics simultaneously
@@ -267,8 +281,10 @@ run_test "Consume 1MB from another broker" "timeout 30 $KCAT -b 127.0.0.1:9094 -
 echo ""
 echo -e "${BLUE}[Multiple Topics]${NC}"
 
+# Bounded per-produce: a stuck producer here would otherwise park `wait`
+# forever and the whole job would die on the CI step timeout with no output.
 for topic in topic-a topic-b topic-c topic-d topic-e; do
-    echo "msg-for-$topic" | $KCAT -b 127.0.0.1:9092 -t $topic -P $KCAT_OPTS &
+    echo "msg-for-$topic" | timeout 30 $KCAT -b 127.0.0.1:9092 -t $topic -P $KCAT_OPTS &
 done
 wait
 sleep 2

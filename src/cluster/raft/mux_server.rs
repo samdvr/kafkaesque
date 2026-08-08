@@ -233,6 +233,7 @@ async fn dispatch_control(
             expected_term,
             forward_hops,
         } => forward_control(raft, command, expected_term, forward_hops).await,
+        ControlRpcMessage::ReadIndex => read_index(raft).await,
     }
 }
 
@@ -255,6 +256,29 @@ async fn dispatch_shard(raft: &Raft<ShardConfig>, msg: ShardRpcMessage) -> MuxRa
             expected_term,
             forward_hops,
         } => forward_shard(raft, command, expected_term, forward_hops).await,
+        ShardRpcMessage::ReadIndex => read_index(raft).await,
+    }
+}
+
+/// Answer a follower's read-index request for this group.
+///
+/// `get_read_log_id` is the first half of openraft's linearizable read: it
+/// confirms leadership with a heartbeat quorum and returns the log index a
+/// reader must have applied. The follower does the second half locally by
+/// waiting for that index — see `RaftCluster::linearizable_read_*`.
+///
+/// A non-leader receiving this returns the usual forwarding error, which the
+/// caller treats as "refresh the leader and retry" rather than a hard
+/// failure.
+async fn read_index<C>(raft: &Raft<C>) -> MuxRaftRpcResponse
+where
+    C: openraft::RaftTypeConfig<NodeId = RaftNodeId, Node = BasicNode>,
+{
+    match raft.get_read_log_id().await {
+        Ok((read_log_id, _applied)) => MuxRaftRpcResponse::ReadIndexOk {
+            read_index: read_log_id.map(|id| id.index),
+        },
+        Err(e) => MuxRaftRpcResponse::Error(RpcErrorInfo::internal(e)),
     }
 }
 

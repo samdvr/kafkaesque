@@ -87,17 +87,11 @@ impl<'a> StateAccessor<'a> {
     /// Ensure linearizable state on the **control** group before reading.
     ///
     /// Per-shard linearizable reads use
-    /// `cluster.shard(id).raft().ensure_linearizable()` directly because each
-    /// shard's read-index barrier is independent.
+    /// `cluster.linearizable_read_shard*()` because each shard's read-index
+    /// barrier is independent. Both paths work on followers — the barrier
+    /// falls back to fetching a read index from the group's leader.
     pub async fn ensure_linearizable_control(&self) -> SlateDBResult<()> {
-        use crate::cluster::error::SlateDBError;
-        self.cluster
-            .control()
-            .raft()
-            .ensure_linearizable()
-            .await
-            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
-        Ok(())
+        self.cluster.linearizable_read_control().await
     }
 
     /// Underlying cluster handle. Useful when a caller needs direct access

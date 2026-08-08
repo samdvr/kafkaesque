@@ -25,6 +25,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::super::commands::{ShardCommand, ShardResponse};
+use super::super::domains::serde_helpers::serialize_sorted_map;
 use super::super::domains::{
     BrokerStatus, GroupDomainState, PartitionInfo, PartitionStateCommand, PartitionStateDomain,
     PartitionStateResponse, ProducerDomainState, TransferDomainState,
@@ -78,7 +79,13 @@ pub struct ShardState {
     /// reconciler. Used by the shard's cross-domain fencing gate so a fenced
     /// broker can't acquire a partition or renew a lease, without a control
     /// round-trip on the hot path.
-    #[serde(default)]
+    ///
+    /// Serialized sorted by broker id: `HashMap` iteration order is
+    /// randomized per instance, so the default impl would encode the same
+    /// logical shadow to different bytes on every replica (and after every
+    /// restart), breaking snapshot canonicality. See
+    /// [`serialize_sorted_map`].
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub broker_liveness_shadow: HashMap<i32, BrokerLivenessRecord>,
 
     /// Replicated, monotonic lease clock for this shard.
@@ -527,5 +534,34 @@ mod tests {
         let sm = fresh(0);
         let err = sm.try_restore(b"not a postcard frame").await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Regression: `broker_liveness_shadow` shipped without
+    /// `serialize_sorted_map`, so its entries were encoded in `HashMap`
+    /// iteration order. Every decode builds a fresh map with a fresh
+    /// `RandomState`, so re-encoding the same logical state produced
+    /// different bytes — snapshot canonicality drift, caught by the
+    /// `raft_snapshot` fuzz target. One decode/encode cycle can match by
+    /// luck, so iterate.
+    #[tokio::test]
+    async fn liveness_shadow_snapshot_bytes_are_canonical() {
+        let sm = fresh(1);
+        for broker_id in [-1, 0, 3, 7, 11, 42, -9, 100] {
+            sm.apply_command(ShardCommand::UpdateBrokerLivenessShadow {
+                broker_id,
+                status: BrokerStatus::Active,
+                version: 1,
+            })
+            .await;
+        }
+        let first = sm.snapshot().await;
+        for i in 0..64 {
+            let decoded = ShardStateMachine::deserialize_state(&first).unwrap();
+            let again = postcard::to_stdvec(&decoded).unwrap();
+            assert_eq!(
+                first, again,
+                "shard snapshot encoding drifted on iteration {i}"
+            );
+        }
     }
 }

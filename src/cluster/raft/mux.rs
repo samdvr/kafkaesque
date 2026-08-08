@@ -61,6 +61,12 @@ pub enum ControlRpcMessage {
         expected_term: u64,
         forward_hops: u8,
     },
+    /// Read-index request: the sender is a follower that needs a
+    /// linearizable read of the control state machine. The leader confirms
+    /// its own leadership with a heartbeat quorum and answers with the log
+    /// index the reader must have applied. See
+    /// [`MuxRaftRpcResponse::ReadIndexOk`].
+    ReadIndex,
 }
 
 /// Per-group payload of a shard RPC.
@@ -74,6 +80,9 @@ pub enum ShardRpcMessage {
         expected_term: u64,
         forward_hops: u8,
     },
+    /// Read-index request for one shard. Same semantics as
+    /// [`ControlRpcMessage::ReadIndex`].
+    ReadIndex,
 }
 
 /// Multiplexed wire frame for the metadata Raft port.
@@ -128,6 +137,15 @@ pub enum MuxRaftRpcResponse {
     JoinClusterOk,
     /// Promotion accepted.
     PromoteMemberOk,
+    /// Read-index granted by the addressed group's leader.
+    ///
+    /// `read_index` is the log index the *reader* must have applied before
+    /// serving the read; `None` means the leader has an empty log, so any
+    /// state is already up to date. Answering this proves leadership at the
+    /// time of the request (openraft confirms with a heartbeat quorum), so a
+    /// follower that then waits for `read_index` to apply locally gets the
+    /// same linearizability guarantee as a leader-local read.
+    ReadIndexOk { read_index: Option<u64> },
     /// Structured error with retry semantics. Reuses the legacy
     /// [`RpcErrorInfo`] type so client retry logic is identical.
     Error(RpcErrorInfo),

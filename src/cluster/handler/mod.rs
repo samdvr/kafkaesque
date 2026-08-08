@@ -38,6 +38,14 @@ use crate::server::{Handler, RequestContext};
 
 type DynFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+/// First delay between full sweeps of `RAFT_PEERS` when no peer accepted a
+/// join request. Short, because the common cause is a seed that is a few
+/// milliseconds away from finishing its own bootstrap membership change.
+const JOIN_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Ceiling for the exponential join-retry backoff.
+const JOIN_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Sharded dispatch pool for fire-and-forget acks=0 produces.
 ///
 /// Each shard owns a bounded mpsc channel. The hot path picks a shard
@@ -376,43 +384,77 @@ impl SlateDBClusterHandler {
             // (`node_id`, `raft_addr`) flows through the coordinator's
             // join path; no need to re-extract it here.
 
-            // Try each peer until we successfully join
+            // Try each peer until we successfully join, sweeping the peer
+            // list repeatedly until the join deadline. A single sweep is not
+            // enough on a cold start where every broker comes up at once:
+            // the seed rejects joins while its own `initialize()` membership
+            // change is still in flight ("cluster is already undergoing a
+            // configuration change"), and the non-seed peers have no leader
+            // to forward to yet ("has to forward request to: None, None").
+            // Both are transient — retrying the sweep with backoff turns a
+            // startup race into a few seconds of extra wait instead of a
+            // fatal error the operator has to restart out of.
             if let Some(peers) = &config.raft_peers {
+                let deadline = tokio::time::Instant::now() + config.raft_join_timeout();
+                let mut backoff = JOIN_RETRY_INITIAL_BACKOFF;
                 let mut joined = false;
-                for peer_spec in peers.split(',').filter(|s| !s.is_empty()) {
-                    let parts: Vec<&str> = peer_spec.split('=').collect();
-                    if parts.len() == 2 {
-                        let peer_addr = parts[1];
-                        info!(
-                            broker_id = config.broker_id,
-                            peer_addr = %peer_addr,
-                            "Requesting to join cluster via peer"
-                        );
+                let mut last_error: Option<String> = None;
 
-                        // Multi-group fan-out via the coordinator: phase 1
-                        // adds this broker as learner on control + every
-                        // shard, phase 2 promotes to voter on each. Each
-                        // RPC is idempotent server-side so retries against
-                        // a partially-joined cluster recover cleanly.
-                        match coordinator.join_cluster(peer_addr).await {
-                            Ok(()) => {
-                                info!(
-                                    broker_id = config.broker_id,
-                                    "Successfully requested to join cluster"
-                                );
-                                joined = true;
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    broker_id = config.broker_id,
-                                    peer_addr = %peer_addr,
-                                    error = %e,
-                                    "Failed to join via peer, trying next"
-                                );
+                while !joined {
+                    for peer_spec in peers.split(',').filter(|s| !s.is_empty()) {
+                        let parts: Vec<&str> = peer_spec.split('=').collect();
+                        if parts.len() == 2 {
+                            let peer_addr = parts[1];
+                            info!(
+                                broker_id = config.broker_id,
+                                peer_addr = %peer_addr,
+                                "Requesting to join cluster via peer"
+                            );
+
+                            // Multi-group fan-out via the coordinator: phase 1
+                            // adds this broker as learner on control + every
+                            // shard, phase 2 promotes to voter on each. Each
+                            // RPC is idempotent server-side so retries against
+                            // a partially-joined cluster recover cleanly.
+                            match coordinator.join_cluster(peer_addr).await {
+                                Ok(()) => {
+                                    info!(
+                                        broker_id = config.broker_id,
+                                        "Successfully requested to join cluster"
+                                    );
+                                    joined = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        broker_id = config.broker_id,
+                                        peer_addr = %peer_addr,
+                                        error = %e,
+                                        "Failed to join via peer, trying next"
+                                    );
+                                    last_error = Some(e.to_string());
+                                }
                             }
                         }
                     }
+
+                    if joined {
+                        break;
+                    }
+
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let sleep_for = backoff.min(deadline - now);
+                    warn!(
+                        broker_id = config.broker_id,
+                        retry_in_ms = sleep_for.as_millis() as u64,
+                        error = last_error.as_deref().unwrap_or("unknown"),
+                        "No peer accepted the join request; retrying peer sweep"
+                    );
+                    tokio::time::sleep(sleep_for).await;
+                    backoff = (backoff * 2).min(JOIN_RETRY_MAX_BACKOFF);
                 }
 
                 if !joined {
@@ -422,10 +464,14 @@ impl SlateDBClusterHandler {
                     // the operator must restart once the cluster is reachable.
                     return Err(SlateDBError::Config(format!(
                         "Failed to join Raft cluster: tried all peers in \
-                         RAFT_PEERS={:?} and none accepted the join request. \
-                         Verify the seed peers are running and routable, then \
-                         restart this broker.",
-                        peers
+                         RAFT_PEERS={:?} for {:?} and none accepted the join \
+                         request (last error: {}). Verify the seed peers are \
+                         running and routable, then restart this broker. \
+                         Raise RAFT_JOIN_TIMEOUT_SECS if the cluster simply \
+                         needs longer to form.",
+                        peers,
+                        config.raft_join_timeout(),
+                        last_error.as_deref().unwrap_or("none"),
                     )));
                 }
             }

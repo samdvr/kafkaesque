@@ -382,11 +382,9 @@ impl PartitionCoordinator for RaftCoordinator {
         // through the leader's commit index before consulting local state.
         // The lease/ownership data lives in the shard owning this topic.
         let shard = self.cluster().shard_for_topic(topic);
-        shard
-            .raft()
-            .ensure_linearizable()
-            .await
-            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+        self.cluster()
+            .linearizable_read_shard_for_topic(topic)
+            .await?;
 
         let sm = shard.state_machine();
         let state = sm.state().await;
@@ -434,11 +432,9 @@ impl PartitionCoordinator for RaftCoordinator {
         let stamp = self.owner_cache_read_stamp(&key);
 
         let shard = self.cluster().shard_for_topic(topic);
-        shard
-            .raft()
-            .ensure_linearizable()
-            .await
-            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+        self.cluster()
+            .linearizable_read_shard_for_topic(topic)
+            .await?;
 
         let sm = shard.state_machine();
         let state = sm.state().await;
@@ -471,11 +467,8 @@ impl PartitionCoordinator for RaftCoordinator {
         // For writes, ensure linearizable state on the topic's shard before
         // checking ownership.
         self.cluster()
-            .shard_for_topic(topic)
-            .raft()
-            .ensure_linearizable()
-            .await
-            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+            .linearizable_read_shard_for_topic(topic)
+            .await?;
 
         // Now verify and extend lease atomically
         self.verify_and_extend_lease(topic, partition, lease_secs)
@@ -824,11 +817,9 @@ impl PartitionCoordinator for RaftCoordinator {
         // cheap relative to a stale answer that drives a consumer to
         // truncate.
         let shard = self.cluster().shard_for_topic(topic);
-        shard
-            .raft()
-            .ensure_linearizable()
-            .await
-            .map_err(|e| SlateDBError::Storage(format!("Failed to ensure linearizable: {}", e)))?;
+        self.cluster()
+            .linearizable_read_shard_for_topic(topic)
+            .await?;
 
         let sm = shard.state_machine();
         let state = sm.state().await;

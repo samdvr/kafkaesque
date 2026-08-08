@@ -339,7 +339,7 @@ jobs:
       - name: Run Trivy vulnerability scanner
         # Pinned to a release tag so a `master` rewrite can't tamper with the
         # scan. Like the rest of the workflow this is tag-pinned for now;
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: kafkaesque:ci
           format: table

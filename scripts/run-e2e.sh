@@ -39,6 +39,12 @@ echo ""
 # repo's `target/release/`. Override with `KAFKAESQUE_BIN=...` for any
 # other layout. Failing here with a clear error beats running with an
 # stale binary on $PATH.
+#
+# `KAFKAESQUE_BINARY` is the name `run-cluster-e2e.sh` and the CI
+# workflow use; honor it as an alias so an override set for one script
+# isn't silently ignored by the other (it would fall through to the
+# path probe below and quietly test a different binary).
+KAFKAESQUE_BIN="${KAFKAESQUE_BIN:-${KAFKAESQUE_BINARY:-}}"
 if [ -z "${KAFKAESQUE_BIN:-}" ]; then
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
     REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

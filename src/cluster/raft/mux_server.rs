@@ -594,8 +594,18 @@ impl MuxRaftRpcServer {
         // Accept-side gating: same caps as the legacy server. A handshake
         // semaphore bounds total concurrent inbound TLS handshakes; the
         // per-IP map bounds how many slots a single peer can hold.
+        //
+        // The per-IP cap has to scale with the number of Raft groups. Each
+        // peer holds one long-lived connection per group (control + every
+        // shard) for steady-state replication, plus short-lived ones for
+        // forwarded writes and follower read-index requests. A flat cap of
+        // 16 is already below the 9 connections/peer a 8-shard cluster
+        // needs, and every broker on a single host shares one source IP —
+        // so localhost clusters (tests, dev, CI) tripped the cap and lost
+        // quorum as rejected peers reconnect-stormed. Budget 8 slots per
+        // group, floor 32, which still bounds a hostile peer.
         const MAX_CONCURRENT_HANDSHAKES: usize = 128;
-        const MAX_PER_IP: usize = 16;
+        let max_per_ip = ((self.handles.shards.len() + 1) * 8).max(32);
         let accept_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
         let per_ip_counts: Arc<StdMutex<HashMap<IpAddr, usize>>> =
             Arc::new(StdMutex::new(HashMap::new()));
@@ -622,7 +632,7 @@ impl MuxRaftRpcServer {
                     let per_ip_admitted = {
                         let mut counts = per_ip_counts.lock().unwrap_or_else(|e| e.into_inner());
                         let n = counts.entry(peer_ip).or_insert(0);
-                        if *n >= MAX_PER_IP {
+                        if *n >= max_per_ip {
                             tracing::warn!(peer = %peer_addr, "Rejecting mux Raft RPC: per-IP connection cap reached");
                             false
                         } else {

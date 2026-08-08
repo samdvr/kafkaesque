@@ -205,9 +205,11 @@ done
 sleep 2
 
 # Consume with consumer group from different brokers.
-# In -G mode kcat treats every trailing argument as a topic name, so the
-# flags have to come before the topic list.
-run_test "Consumer group from broker 0" "timeout 20 $KCAT -b 127.0.0.1:9092 -G test-group -c 5 -q $KCAT_OPTS group-test 2>/dev/null | wc -l | grep -q 5"
+# Two kcat details matter here: in -G mode every trailing argument is treated
+# as a topic name (so flags come first), and a brand-new group has no
+# committed offsets, which librdkafka resets to *latest* by default — i.e. it
+# would skip the messages produced above.
+run_test "Consumer group from broker 0" "timeout 20 $KCAT -b 127.0.0.1:9092 -G test-group -c 5 -q -X auto.offset.reset=earliest $KCAT_OPTS group-test 2>/dev/null | wc -l | grep -q 5"
 
 # =============================================================================
 # Test 5: High throughput
@@ -281,12 +283,16 @@ run_test "Consume 500KB from another broker" "timeout 30 $KCAT -b 127.0.0.1:9094
 echo ""
 echo -e "${BLUE}[Multiple Topics]${NC}"
 
-# Bounded per-produce: a stuck producer here would otherwise park `wait`
-# forever and the whole job would die on the CI step timeout with no output.
+# Bounded per-produce: a stuck producer here would otherwise park the wait
+# below and the whole job would die on the CI step timeout with no output.
+# Wait on the producer PIDs specifically — a bare `wait` would also wait on
+# the three broker processes started with `&` above, i.e. forever.
+PRODUCE_PIDS=()
 for topic in topic-a topic-b topic-c topic-d topic-e; do
     echo "msg-for-$topic" | timeout 30 $KCAT -b 127.0.0.1:9092 -t $topic -P $KCAT_OPTS &
+    PRODUCE_PIDS+=($!)
 done
-wait
+wait "${PRODUCE_PIDS[@]}" 2>/dev/null || true
 sleep 2
 
 run_test "Verify topic-a" "timeout 10 $KCAT -b 127.0.0.1:9094 -t topic-a -C -c 1 -q $KCAT_OPTS | grep -q topic-a"

@@ -328,14 +328,27 @@ async fn collect_fetch(
                             // metadata. Without this, a stale consumer
                             // silently reads from the new owner — README
                             // advertises the guarantee. Mirror
-                            // `leader_epoch.rs:138`: -1 means "no opinion",
-                            // older→Fenced, newer→Unknown. `leader_epoch == 0`
+                            // `leader_epoch.rs`: older→Fenced,
+                            // newer→Unknown. `leader_epoch == 0`
                             // means epoch validation is disabled (mock
                             // coordinators); skip in that case so test
                             // harnesses keep working.
+                            //
+                            // `current_leader_epoch <= 0` means "no opinion"
+                            // and must NOT be fenced. -1 is the documented
+                            // unknown sentinel, but librdkafka sends a
+                            // literal `0` on its first fetch of a partition
+                            // it has no epoch for (verified on the wire with
+                            // kcat/librdkafka 2.14). Our epochs start at 1 on
+                            // first acquire, so fencing `0` rejected every
+                            // fetch from a fresh consumer forever: the client
+                            // retried, refreshed metadata, and never made
+                            // progress. Epoch 0 is never an epoch we hand
+                            // out, so treating it as "unknown" costs no real
+                            // fencing coverage.
                             let broker_epoch = store.leader_epoch();
                             if broker_epoch != 0
-                                && partition.current_leader_epoch >= 0
+                                && partition.current_leader_epoch > 0
                                 && partition.current_leader_epoch != broker_epoch
                             {
                                 let code = if partition.current_leader_epoch < broker_epoch {

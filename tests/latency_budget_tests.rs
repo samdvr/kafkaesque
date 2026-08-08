@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use kafkaesque::cluster::{FaultInjector, FaultingObjectStore, OpKind};
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 fn build_store() -> (Arc<FaultingObjectStore>, FaultInjector) {
     let injector = FaultInjector::new();

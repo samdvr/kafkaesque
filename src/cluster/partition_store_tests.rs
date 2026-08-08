@@ -1943,7 +1943,6 @@ mod tests {
     //      ambient one.
 
     use super::super::slatedb_resources::SharedSlateDbResources;
-    use slatedb::db_cache::DbCache;
 
     /// Open a partition with the supplied shared resources installed
     /// directly on the builder. Mirrors what `apply_store_tuning` does

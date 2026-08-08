@@ -10,8 +10,9 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    Error, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    CopyOptions, Error, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    Result,
 };
 
 use super::metrics;
@@ -23,7 +24,7 @@ fn classify_error(err: &Error) -> &'static str {
         Error::Unauthenticated { .. } => "permission",
         Error::AlreadyExists { .. } => "already_exists",
         Error::Precondition { .. } | Error::NotModified { .. } => "precondition",
-        Error::NotSupported { .. } | Error::NotImplemented => "not_supported",
+        Error::NotSupported { .. } | Error::NotImplemented { .. } => "not_supported",
         Error::InvalidPath { .. } => "invalid_path",
         Error::JoinError { .. } => "other",
         Error::Generic { source, .. } => {
@@ -92,19 +93,15 @@ impl std::fmt::Display for MetricsObjectStore {
     }
 }
 
+// NOTE: object_store 0.14 moved the convenience methods (`put`, `get`,
+// `get_range`, `head`, `delete`, `copy`, `rename`, and the
+// `*_if_not_exists` pair) out of `ObjectStore` and into the
+// blanket-implemented `ObjectStoreExt`, which routes every one of them
+// through the `*_opts` methods below. Instrumenting the core methods
+// therefore covers the convenience calls too — and can't miss one the
+// way the old per-method interception could.
 #[async_trait]
 impl ObjectStore for MetricsObjectStore {
-    async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-        let started = Instant::now();
-        let bytes = payload.content_length() as u64;
-        let result = self.inner.put(location, payload).await;
-        record("put", started, &result);
-        if result.is_ok() {
-            metrics::record_object_store_bytes("write", bytes);
-        }
-        result
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -121,13 +118,6 @@ impl ObjectStore for MetricsObjectStore {
         result
     }
 
-    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-        let started = Instant::now();
-        let result = self.inner.put_multipart(location).await;
-        record("put", started, &result);
-        result
-    }
-
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -139,28 +129,20 @@ impl ObjectStore for MetricsObjectStore {
         result
     }
 
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        self.get_opts(location, GetOptions::default()).await
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        // `ObjectStoreExt::head` is a `get_opts` with `head: true`, so keep
+        // reporting it under its own operation label rather than folding
+        // metadata probes into the read path's latency histogram.
+        let operation = if options.head { "head" } else { "get" };
         let started = Instant::now();
         let result = self.inner.get_opts(location, options).await;
-        record("get", started, &result);
+        record(operation, started, &result);
         result.map(wrap_get_result)
     }
 
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        let started = Instant::now();
-        let result = self.inner.get_range(location, range).await;
-        record("get", started, &result);
-        if let Ok(bytes) = &result {
-            metrics::record_object_store_bytes("read", bytes.len() as u64);
-        }
-        result
-    }
-
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        // Delegated rather than left to the default impl so the inner
+        // store's range-coalescing still applies.
         let started = Instant::now();
         let result = self.inner.get_ranges(location, ranges).await;
         record("get", started, &result);
@@ -171,24 +153,10 @@ impl ObjectStore for MetricsObjectStore {
         result
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        let started = Instant::now();
-        let result = self.inner.head(location).await;
-        record("head", started, &result);
-        result
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        let started = Instant::now();
-        let result = self.inner.delete(location).await;
-        record("delete", started, &result);
-        result
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<'a, Result<Path>> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
         let upstream = self.inner.delete_stream(locations);
         upstream
             .inspect(|item| match item {
@@ -244,30 +212,19 @@ impl ObjectStore for MetricsObjectStore {
         result
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         let started = Instant::now();
-        let result = self.inner.copy(from, to).await;
+        let result = self.inner.copy_opts(from, to, options).await;
         record("copy", started, &result);
         result
     }
 
-    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
+        // Overridden so renames keep their own label: the default impl is a
+        // `copy_opts` + `delete`, which would report them as two unrelated
+        // operations.
         let started = Instant::now();
-        let result = self.inner.rename(from, to).await;
-        record("rename", started, &result);
-        result
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let started = Instant::now();
-        let result = self.inner.copy_if_not_exists(from, to).await;
-        record("copy", started, &result);
-        result
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let started = Instant::now();
-        let result = self.inner.rename_if_not_exists(from, to).await;
+        let result = self.inner.rename_opts(from, to, options).await;
         record("rename", started, &result);
         result
     }
@@ -279,6 +236,7 @@ fn wrap_get_result(result: GetResult) -> GetResult {
         meta,
         range,
         attributes,
+        extensions,
     } = result;
     let payload = match payload {
         GetResultPayload::Stream(stream) => GetResultPayload::Stream(
@@ -304,5 +262,6 @@ fn wrap_get_result(result: GetResult) -> GetResult {
         meta,
         range,
         attributes,
+        extensions,
     }
 }

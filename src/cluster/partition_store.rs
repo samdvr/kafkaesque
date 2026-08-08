@@ -145,6 +145,10 @@ impl Drop for OffsetReservation<'_> {
 /// See the "Durability contract" section of `README.md`.
 const FAST_WRITE_OPTIONS: WriteOptions = WriteOptions {
     await_durable: false,
+    // 0 = let SlateDB assign the sequence number internally. A non-zero
+    // value must be strictly greater than the current max or the write is
+    // rejected; we have no reason to drive it by hand.
+    seqnum: 0,
 };
 
 /// Write options that block on SlateDB's WAL flush before returning.
@@ -153,6 +157,7 @@ const FAST_WRITE_OPTIONS: WriteOptions = WriteOptions {
 /// contract or the idempotent-producer guarantee (last-sequence cache).
 const DURABLE_WRITE_OPTIONS: WriteOptions = WriteOptions {
     await_durable: true,
+    seqnum: 0,
 };
 
 use super::error::{SlateDBError, SlateDBResult};
@@ -2622,23 +2627,41 @@ impl PartitionStoreBuilder {
             "SlateDB settings configured for backpressure"
         );
 
-        // SlateDB 0.10's open path is already async-only and tokio-friendly, so
-        // a round-trip through a blocking pool would just waste a worker. Run
+        // SlateDB's open path is async-only and tokio-friendly, so a
+        // round-trip through a blocking pool would just waste a worker. Run
         // the open inline; the slow step (object-store metadata I/O) yields
         // back to the runtime.
+        //
+        // Cloned out of `slatedb_settings` before it is moved into
+        // `with_settings`: routing compaction onto the shared runtime below
+        // means building the `CompactorBuilder` ourselves, and that setter
+        // supersedes `Settings::compactor_options` entirely.
+        let compactor_options = slatedb_settings.compactor_options.clone();
         let open_future = async move {
             let object_path = ObjectPath::from(path_for_task.as_str());
             let mut db_builder =
-                Db::builder(object_path, object_store_for_task).with_settings(slatedb_settings);
+                Db::builder(object_path.clone(), Arc::clone(&object_store_for_task))
+                    .with_settings(slatedb_settings);
             // Conditional chaining: only set the cache / compaction
             // runtime when broker-wide pools were configured.
             // `None` paths fall through to SlateDB's per-DB defaults
             // (today's behaviour).
             if let Some(cache) = block_cache {
-                db_builder = db_builder.with_memory_cache(cache);
+                db_builder = db_builder.with_db_cache(cache);
             }
-            if let Some(handle) = compaction_handle {
-                db_builder = db_builder.with_compaction_runtime(handle);
+            // `DbBuilder::with_compaction_runtime` is gone as of slatedb
+            // 0.14; the runtime now belongs to the compactor's own builder.
+            // Reconstruct what `build()` would have derived from the
+            // settings (same path, same main object store, same compactor
+            // options) and add the runtime — and only when compaction is
+            // configured at all, so a `compactor_options: None` setting
+            // still means "no compactor".
+            if let (Some(handle), Some(options)) = (compaction_handle, compactor_options) {
+                db_builder = db_builder.with_compactor_builder(
+                    slatedb::CompactorBuilder::new(object_path, Arc::clone(&object_store_for_task))
+                        .with_options(options)
+                        .with_runtime(handle),
+                );
             }
             let db = db_builder.build().await.map_err(SlateDBError::from)?;
 

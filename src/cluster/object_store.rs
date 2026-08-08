@@ -322,6 +322,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_store_basic_operations() {
+        // `put`/`get`/`delete` live on the extension trait as of
+        // object_store 0.14.
+        use object_store::ObjectStoreExt;
         use object_store::path::Path;
 
         let temp_dir = TempDir::new().unwrap();

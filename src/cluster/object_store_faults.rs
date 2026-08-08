@@ -16,11 +16,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
 };
 
 /// Categories of object-store operations that can be independently faulted.
@@ -204,15 +205,20 @@ impl std::fmt::Display for FaultingObjectStore {
     }
 }
 
+// NOTE: object_store 0.14 moved `put`/`get`/`get_range`/`head`/`delete`/
+// `copy`/`rename` (and the `*_if_not_exists` pair) into the
+// blanket-implemented `ObjectStoreExt`, which funnels all of them through
+// the core `*_opts` methods below. Every `OpKind` therefore still has
+// exactly one interception point:
+//   Put    → put_opts, put_multipart_opts
+//   Get    → get_opts (head == false), get_ranges
+//   Head   → get_opts (head == true)
+//   Delete → delete_stream
+//   List   → list_with_delimiter
+//   Copy   → copy_opts
+//   Rename → rename_opts
 #[async_trait]
 impl ObjectStore for FaultingObjectStore {
-    async fn put(&self, location: &Path, payload: PutPayload) -> Result<PutResult> {
-        if let Some(e) = self.injector.intercept(OpKind::Put).await {
-            return Err(e);
-        }
-        self.inner.put(location, payload).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -223,13 +229,6 @@ impl ObjectStore for FaultingObjectStore {
             return Err(e);
         }
         self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
-        if let Some(e) = self.injector.intercept(OpKind::Put).await {
-            return Err(e);
-        }
-        self.inner.put_multipart(location).await
     }
 
     async fn put_multipart_opts(
@@ -243,25 +242,18 @@ impl ObjectStore for FaultingObjectStore {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        if let Some(e) = self.injector.intercept(OpKind::Get).await {
-            return Err(e);
-        }
-        self.inner.get(location).await
-    }
-
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        if let Some(e) = self.injector.intercept(OpKind::Get).await {
+        // `ObjectStoreExt::head` is a `get_opts` with `head: true`, so the
+        // metadata probe keeps faulting under `OpKind::Head` rather than Get.
+        let kind = if options.head {
+            OpKind::Head
+        } else {
+            OpKind::Get
+        };
+        if let Some(e) = self.injector.intercept(kind).await {
             return Err(e);
         }
         self.inner.get_opts(location, options).await
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        if let Some(e) = self.injector.intercept(OpKind::Get).await {
-            return Err(e);
-        }
-        self.inner.get_range(location, range).await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
@@ -271,25 +263,28 @@ impl ObjectStore for FaultingObjectStore {
         self.inner.get_ranges(location, ranges).await
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        if let Some(e) = self.injector.intercept(OpKind::Head).await {
-            return Err(e);
-        }
-        self.inner.head(location).await
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        if let Some(e) = self.injector.intercept(OpKind::Delete).await {
-            return Err(e);
-        }
-        self.inner.delete(location).await
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<'a, Result<Path>> {
-        self.inner.delete_stream(locations)
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let injector = self.injector.clone();
+        // Gate each location on the injector and hand the still-lazy stream
+        // to the inner store, so bulk-delete batching (S3 `DeleteObjects`)
+        // survives the wrapper. Store impls propagate `Err` items from the
+        // input stream, which is how the injected fault surfaces —
+        // including for `ObjectStoreExt::delete`, a single-element
+        // `delete_stream`.
+        let gated = locations.then(move |location| {
+            let injector = injector.clone();
+            async move {
+                let location = location?;
+                match injector.intercept(OpKind::Delete).await {
+                    Some(e) => Err(e),
+                    None => Ok(location),
+                }
+            }
+        });
+        self.inner.delete_stream(gated.boxed())
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -311,38 +306,30 @@ impl ObjectStore for FaultingObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         if let Some(e) = self.injector.intercept(OpKind::Copy).await {
             return Err(e);
         }
-        self.inner.copy(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 
-    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
+        // Overridden so a rename faults as `OpKind::Rename`: the default
+        // impl is a `copy_opts` + `delete`, which would instead consult the
+        // Copy and Delete masks.
         if let Some(e) = self.injector.intercept(OpKind::Rename).await {
             return Err(e);
         }
-        self.inner.rename(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        if let Some(e) = self.injector.intercept(OpKind::Copy).await {
-            return Err(e);
-        }
-        self.inner.copy_if_not_exists(from, to).await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        if let Some(e) = self.injector.intercept(OpKind::Rename).await {
-            return Err(e);
-        }
-        self.inner.rename_if_not_exists(from, to).await
+        self.inner.rename_opts(from, to, options).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `put`/`get`/`head`/`delete`/`copy`/`rename` live on the extension
+    // trait as of object_store 0.14.
+    use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
 
     fn store_under_test() -> (Arc<FaultingObjectStore>, FaultInjector) {

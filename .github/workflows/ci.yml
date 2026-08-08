@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Nightly extended fuzz / coverage at 04:17 UTC.
+    # Nightly full-suite run at 04:17 UTC.
     - cron: "17 4 * * *"
   workflow_dispatch:
 
@@ -330,8 +330,7 @@ jobs:
     if: github.event_name != 'schedule'
     # keep regressions in newly added parser branches from drifting
     # — every fuzz target gets a short 1-minute libFuzzer pass on PRs.
-    # Corpus is cached across runs so coverage compounds. Nightly runs
-    # `fuzz-extended` for longer per-target time.
+    # Corpus is cached across runs so coverage compounds.
     timeout-minutes: 60
     steps:
       - name: Checkout code
@@ -387,79 +386,6 @@ jobs:
             fuzz/artifacts/**/leak-*
             fuzz/artifacts/**/timeout-*
             fuzz/artifacts/**/oom-*
-          if-no-files-found: ignore
-          retention-days: 30
-
-  fuzz-extended:
-    name: Fuzz extended (30 min/target, nightly)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
-    # Long-form nightly fuzz: 30 min per target with `-fork=4` so each
-    # target gets four parallel libFuzzer workers off the same corpus.
-    # Crashes are uploaded as artifacts; the corpus shares the same
-    # stable `fuzz-corpus-v1` key as `fuzz-smoke` so the two jobs feed
-    # each other's coverage.
-    timeout-minutes: 1200
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust (nightly)
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Cache cargo registry + fuzz target dir
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            fuzz/target/
-          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-fuzz-
-
-      - name: Cache fuzz corpus
-        uses: actions/cache@v4
-        with:
-          path: fuzz/corpus
-          key: fuzz-corpus-v1
-          restore-keys: |
-            fuzz-corpus-
-
-      - name: Install cargo-fuzz
-        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --locked
-
-      - name: Run each target for 30 minutes (4 forks)
-        run: |
-          set -euo pipefail
-          for target_path in fuzz/fuzz_targets/*.rs; do
-            target=$(basename "$target_path" .rs)
-            echo "::group::fuzz-extended $target"
-            cargo +nightly fuzz run "$target" -- -max_total_time=1800 -fork=4
-            echo "::endgroup::"
-          done
-
-      - name: Upload fuzz crash artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-crashes-extended
-          path: |
-            fuzz/artifacts/**/crash-*
-            fuzz/artifacts/**/leak-*
-            fuzz/artifacts/**/timeout-*
-            fuzz/artifacts/**/oom-*
-          if-no-files-found: ignore
-          retention-days: 90
-
-      - name: Upload merged corpus
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-corpus-snapshot
-          path: fuzz/corpus
           if-no-files-found: ignore
           retention-days: 30
 

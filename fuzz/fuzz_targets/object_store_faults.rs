@@ -30,7 +30,9 @@ use tokio::runtime::Runtime;
 use kafkaesque::cluster::{FaultInjector, FaultingObjectStore, OpKind};
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+// `ObjectStoreExt` carries `put`/`get`/`head`/`delete`/`copy`/`rename` as of
+// object_store 0.14; only the `*_opts` methods live on `ObjectStore` itself.
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 #[derive(Arbitrary, Debug)]
 enum Cmd {

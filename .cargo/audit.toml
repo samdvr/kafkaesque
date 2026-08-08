@@ -1,0 +1,27 @@
+# `cargo audit` configuration. CI runs the advisory check via
+# `rustsec/audit-check` (see .github/workflows/ci.yml), which reads this
+# file — it does NOT read `deny.toml`, so the ignore list below is kept
+# in sync with `[advisories].ignore` there by hand.
+[advisories]
+ignore = [
+    # rkyv 0.7.46 — RUSTSEC-2026-0235, out-of-bounds reads when
+    # validating archives containing Rc/Arc. Not compiled: rkyv is an
+    # *optional* feature of rust_decimal, which reaches us only via
+    # byte-unit → openraft and duration-str → slatedb, and neither
+    # enables it. `cargo tree -i rkyv --target all -e normal,build,dev`
+    # finds nothing — this is a Cargo.lock-level false positive, since
+    # the lockfile records optional deps whether or not they resolve
+    # into the build. No upgrade path either: every rust_decimal 1.x
+    # (1.40 through 1.42.1) pins `rkyv ^0.7.46`. Removed when
+    # rust_decimal moves to rkyv 0.8.
+    "RUSTSEC-2026-0235",
+
+    # The four below are unmaintained-crate warnings, not vulnerabilities
+    # — `cargo audit` already exits 0 on them. Listed so the ignore set
+    # matches deny.toml and the job output stays quiet; see deny.toml for
+    # the full rationale on each.
+    "RUSTSEC-2025-0141", # bincode 1.3.3, via foyer → slatedb
+    "RUSTSEC-2024-0436", # paste 1.0.15, via foyer-storage / kafka-protocol
+    "RUSTSEC-2025-0134", # rustls-pemfile 2.2.0, no safe upgrade exists
+    "RUSTSEC-2023-0089", # atomic-polyfill 1.0.3, transitive
+]

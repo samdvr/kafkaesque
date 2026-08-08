@@ -18,9 +18,12 @@ serde = { version = "1.0", features = ["derive"] }
 num-traits = "0.2"
 # Required by the `object_store_faults` fuzz target — the main crate
 # uses object_store as an implementation detail and doesn't re-export its
-# trait, so the fuzzer pulls it in directly. Pinned to the same major as
-# the workspace dependency so the trait/impl shapes line up.
-object_store = "0.12.5"
+# trait, so the fuzzer pulls it in directly. Must track the workspace
+# dependency *exactly*: this is a separate workspace with its own
+# lockfile, so a mismatch resolves two copies of the crate and the
+# `Arc<dyn ObjectStore>` handed to `FaultingObjectStore::new` fails to
+# typecheck against a same-named trait from the other version.
+object_store = "0.14.1"
 
 [dependencies.kafkaesque]
 path = ".."

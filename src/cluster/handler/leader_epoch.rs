@@ -135,6 +135,12 @@ async fn resolve_partition(
     // this partition. -1 means "no opinion, don't fence". A mismatch
     // splits two ways: client older → FencedLeaderEpoch, client newer
     // → UnknownLeaderEpoch (broker likely lagging post-restart).
+    //
+    // Unlike the fetch path (see `handler/fetch.rs`), `0` is fenced here.
+    // OffsetForLeaderEpoch is an explicit validation RPC: the client is
+    // asserting an epoch and a fenced answer is actionable (refresh
+    // metadata, re-validate). A fenced *fetch* is not — the client has no
+    // way to learn the right epoch and simply retries forever.
     if p.current_leader_epoch >= 0 && p.current_leader_epoch != broker_epoch {
         let code = if p.current_leader_epoch < broker_epoch {
             KafkaCode::FencedLeaderEpoch

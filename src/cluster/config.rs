@@ -586,6 +586,18 @@ pub struct ClusterConfig {
     /// Example: "0=127.0.0.1:9093,1=127.0.0.1:9094,2=127.0.0.1:9095"
     pub raft_peers: Option<String>,
 
+    /// How long a fresh non-seed broker keeps retrying its join against
+    /// `raft_peers` before giving up and failing startup.
+    ///
+    /// Cold starts race: every broker boots at once, so the seed rejects
+    /// joins while its own bootstrap membership change is in flight and the
+    /// other peers have no leader to forward to yet. Both conditions clear
+    /// within a second or two, so the join sweep retries with backoff until
+    /// this budget is spent instead of failing on the first sweep.
+    ///
+    /// Default: 60
+    pub raft_join_timeout_secs: u64,
+
     // --- Metrics tuning ---
     /// Whether to enable per-partition metrics.
     ///
@@ -1029,6 +1041,7 @@ impl Default for ClusterConfig {
             // Raft configuration
             raft_listen_addr: "0.0.0.0:9093".to_string(),
             raft_peers: None,
+            raft_join_timeout_secs: 60,
             // Metrics tuning
             enable_partition_metrics: true,
             max_metric_cardinality: 10_000,
@@ -1326,6 +1339,11 @@ impl ClusterConfig {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// Budget for a fresh broker's join retries against `raft_peers`.
+    pub fn raft_join_timeout(&self) -> Duration {
+        Duration::from_secs(self.raft_join_timeout_secs)
     }
 
     /// Validate the configuration and return any errors found.
@@ -1785,6 +1803,11 @@ impl ClusterConfig {
 
         let raft_peers = std::env::var("RAFT_PEERS").ok();
 
+        let raft_join_timeout_secs: u64 = std::env::var("RAFT_JOIN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(defaults.raft_join_timeout_secs);
+
         let data_path =
             std::env::var("DATA_PATH").unwrap_or_else(|_| "/tmp/kafkaesque-data".to_string());
 
@@ -2105,6 +2128,7 @@ impl ClusterConfig {
             cluster_id: cluster_id.clone(),
             raft_listen_addr: raft_listen_addr.clone(),
             raft_peers: raft_peers.clone(),
+            raft_join_timeout_secs,
             object_store,
             object_store_path: data_path.clone(),
             auto_create_topics,
@@ -2181,6 +2205,7 @@ impl ClusterConfig {
             eprintln!("Raft Listen Addr: {}", raft_listen_addr);
             if let Some(ref peers) = raft_peers {
                 eprintln!("Raft Peers: {}", peers);
+                eprintln!("Raft Join Timeout: {}s", raft_join_timeout_secs);
             }
             eprintln!("Object Store: {:?}", object_store_type);
             eprintln!("Data Path: {}", data_path);

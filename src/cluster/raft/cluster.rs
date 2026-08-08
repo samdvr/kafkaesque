@@ -47,7 +47,10 @@ use super::commands::{ControlCommand, ControlResponse, ShardCommand, ShardRespon
 use super::config::RaftConfig;
 use super::group::{ControlGroupKind, GroupKind, ShardGroupKind};
 use super::hash;
-use super::mux_client::{MuxAddrBook, MuxFactoryShared, build_mux_factories, new_addr_book};
+use super::mux::{ControlRpcMessage, MuxRaftRpcMessage, ShardRpcMessage};
+use super::mux_client::{
+    MuxAddrBook, MuxFactoryShared, ReadIndexClient, build_mux_factories, new_addr_book,
+};
 use super::mux_server::{MuxRaftHandles, MuxRaftRpcServer};
 use super::storage::RaftStore;
 use super::types::{ControlConfig, RaftNodeId, ShardConfig, ShardId};
@@ -401,6 +404,12 @@ struct ClusterBootstrap {
     addrs: MuxAddrBook,
     /// Multiplexed network shared state (auth keys, TLS, addrs).
     factory_shared: Arc<MuxFactoryShared>,
+    /// Read-index client for the control group's follower reads.
+    control_read_index: ReadIndexClient,
+    /// Read-index clients for shard follower reads, indexed by [`ShardId`].
+    /// One per shard so a burst of reads on shard 3 doesn't queue behind
+    /// shard 0's socket.
+    shard_read_index: Vec<ReadIndexClient>,
     /// Broadcast channel used to signal the RPC server + background pollers
     /// to stop on shutdown. Receivers are subscribed at spawn time.
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
@@ -559,6 +568,10 @@ impl RaftCluster {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         let bootstrap = ClusterBootstrap {
             addrs,
+            control_read_index: ReadIndexClient::new(factory_shared.clone()),
+            shard_read_index: (0..config.metadata_shards)
+                .map(|_| ReadIndexClient::new(factory_shared.clone()))
+                .collect(),
             factory_shared,
             shutdown_tx: shutdown_tx.clone(),
             background_handles: RwLock::new(Vec::new()),
@@ -882,6 +895,127 @@ impl RaftCluster {
         })
     }
 
+    /// Establish a linearizable read barrier on the **control** group.
+    ///
+    /// On the leader this is openraft's `ensure_linearizable()`. On a
+    /// follower that call fails with `ForwardToLeader`, so we do the read
+    /// index by hand: ask the leader for the index a reader must have
+    /// applied, then wait for the local state machine to reach it. Without
+    /// this every read that needs linearizability (partition ownership,
+    /// consumer-group generation, committed offsets) fails on every broker
+    /// that isn't the group's leader — which, with one leader per group, is
+    /// most of the cluster.
+    pub async fn linearizable_read_control(&self) -> SlateDBResult<()> {
+        match self.control.raft().ensure_linearizable().await {
+            Ok(_) => Ok(()),
+            Err(e) if is_forward_to_leader_error(&e) => self.follower_read_control().await,
+            Err(e) => Err(SlateDBError::Storage(format!(
+                "Failed to ensure linearizable (control): {}",
+                e
+            ))),
+        }
+    }
+
+    /// Establish a linearizable read barrier on shard `shard_id`. Shard
+    /// analog of [`Self::linearizable_read_control`]; each shard's read
+    /// index is independent.
+    pub async fn linearizable_read_shard(&self, shard_id: ShardId) -> SlateDBResult<()> {
+        let shard = self.shards.get(shard_id as usize).ok_or_else(|| {
+            SlateDBError::Config(format!(
+                "shard id {} out of range (metadata_shards = {})",
+                shard_id,
+                self.shards.len()
+            ))
+        })?;
+        match shard.raft().ensure_linearizable().await {
+            Ok(_) => Ok(()),
+            Err(e) if is_forward_to_leader_error(&e) => self.follower_read_shard(shard_id).await,
+            Err(e) => Err(SlateDBError::Storage(format!(
+                "Failed to ensure linearizable (shard {}): {}",
+                shard_id, e
+            ))),
+        }
+    }
+
+    /// Linearizable read barrier on the shard owning `topic`.
+    #[inline]
+    pub async fn linearizable_read_shard_for_topic(&self, topic: &str) -> SlateDBResult<()> {
+        self.linearizable_read_shard(self.router.shard_for_topic(topic))
+            .await
+    }
+
+    /// Linearizable read barrier on the shard owning consumer group `group_id`.
+    #[inline]
+    pub async fn linearizable_read_shard_for_group(&self, group_id: &str) -> SlateDBResult<()> {
+        self.linearizable_read_shard(self.router.shard_for_group(group_id))
+            .await
+    }
+
+    /// Follower half of a control-group linearizable read: fetch the read
+    /// index from the leader, then wait for it locally.
+    async fn follower_read_control(&self) -> SlateDBResult<()> {
+        let metrics = self.control.raft().metrics().borrow().clone();
+        let leader_id = self.control.cached_leader().or(metrics.current_leader);
+        let Some(leader_id) = leader_id else {
+            return Err(SlateDBError::Storage(
+                "control: no leader to read index from".to_string(),
+            ));
+        };
+        let Some(leader_addr) = self.get_node_addr(leader_id).await else {
+            return Err(SlateDBError::Storage(format!(
+                "control: leader id {} not in address book",
+                leader_id
+            )));
+        };
+        let read_index = self
+            .bootstrap()
+            .control_read_index
+            .read_index(
+                &leader_addr,
+                MuxRaftRpcMessage::Control(ControlRpcMessage::ReadIndex),
+            )
+            .await
+            .map_err(|e| {
+                SlateDBError::Storage(format!("Failed to read index from control leader: {}", e))
+            })?;
+        wait_for_applied_index(self.control.raft(), read_index, "control follower read").await
+    }
+
+    /// Follower half of a shard linearizable read.
+    async fn follower_read_shard(&self, shard_id: ShardId) -> SlateDBResult<()> {
+        let shard = self
+            .shards
+            .get(shard_id as usize)
+            .expect("shard_id pre-validated by caller");
+        let metrics = shard.raft().metrics().borrow().clone();
+        let leader_id = shard.cached_leader().or(metrics.current_leader);
+        let Some(leader_id) = leader_id else {
+            return Err(SlateDBError::Storage(format!(
+                "shard {}: no leader to read index from",
+                shard_id
+            )));
+        };
+        let Some(leader_addr) = self.get_node_addr(leader_id).await else {
+            return Err(SlateDBError::Storage(format!(
+                "shard {}: leader id {} not in address book",
+                shard_id, leader_id
+            )));
+        };
+        let read_index = self.bootstrap().shard_read_index[shard_id as usize]
+            .read_index(
+                &leader_addr,
+                MuxRaftRpcMessage::Shard(shard_id, ShardRpcMessage::ReadIndex),
+            )
+            .await
+            .map_err(|e| {
+                SlateDBError::Storage(format!(
+                    "Failed to read index from shard {} leader: {}",
+                    shard_id, e
+                ))
+            })?;
+        wait_for_applied_index(shard.raft(), read_index, "shard follower read").await
+    }
+
     /// Convenience: propose to the shard owning `topic` (one of N shards).
     /// `hash(topic) % metadata_shards`.
     #[inline]
@@ -1045,6 +1179,39 @@ impl RaftCluster {
 fn is_forward_to_leader_error<E: std::fmt::Display>(e: &E) -> bool {
     let s = e.to_string();
     s.contains("forward request to") || s.contains("ForwardToLeader")
+}
+
+/// How long a follower waits for its own state machine to catch up to a
+/// leader-granted read index. Bounded so a lagging follower answers the
+/// client with a retryable error instead of parking the connection: the
+/// client's next attempt may well land on the leader.
+const FOLLOWER_READ_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Second half of a follower-side linearizable read: block until this node
+/// has applied everything up to the leader's read index.
+///
+/// `None` means the leader's log is empty — nothing to catch up to.
+async fn wait_for_applied_index<C>(
+    raft: &Raft<C>,
+    read_index: Option<u64>,
+    what: &str,
+) -> SlateDBResult<()>
+where
+    C: openraft::RaftTypeConfig<NodeId = RaftNodeId, Node = BasicNode>,
+{
+    if read_index.is_none() {
+        return Ok(());
+    }
+    raft.wait(Some(FOLLOWER_READ_CATCHUP_TIMEOUT))
+        .applied_index_at_least(read_index, what)
+        .await
+        .map_err(|e| {
+            SlateDBError::Storage(format!(
+                "Timed out catching up to read index {:?} for {}: {}",
+                read_index, what, e
+            ))
+        })?;
+    Ok(())
 }
 
 /// Build a per-group `RaftStore<G>`, recover its WAL, and load any existing

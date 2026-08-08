@@ -164,13 +164,23 @@ async fn try_reserve_connection_slots(
 ) -> SlotReservation {
     // Global slot first: CAS-increment that rejects at capacity
     // (`max_total_connections == 0` means unlimited).
+    //
+    // `fetch_update` is deprecated in favour of `try_update` on recent
+    // nightlies (the fuzz job's toolchain warns about it), but
+    // `try_update` is still unstable under `atomic_try_update`
+    // (rust-lang/rust#135894) on the 1.91.0 we pin in
+    // rust-toolchain.toml — calling it fails to compile there and in the
+    // MSRV job. Keep `fetch_update` and silence the nightly-only
+    // deprecation; swap it when the MSRV reaches a release where
+    // `try_update` is stable (1.97 has it).
     if max_total_connections == 0 {
         active_connections.fetch_add(1, Ordering::SeqCst);
-    } else if let Err(current) =
+    } else if let Err(current) = {
+        #[allow(deprecated)]
         active_connections.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             (current < max_total_connections).then_some(current + 1)
         })
-    {
+    } {
         return SlotReservation::GlobalLimitReached { current };
     }
 

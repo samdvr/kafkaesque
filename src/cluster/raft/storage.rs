@@ -14,14 +14,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use openraft::{
     BasicNode, Entry, EntryPayload, LogId, OptionalSend, RaftStorage, Snapshot, SnapshotMeta,
     StorageError, StorageIOError, StoredMembership, Vote,
 };
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::group::GroupKind;
 use super::types::RaftNodeId;
@@ -796,6 +796,62 @@ impl<G: GroupKind> RaftStore<G> {
         self.sm.clone()
     }
 
+    /// Drop a recovered `last_applied` marker that no restored FSM state
+    /// backs, so openraft replays the log into the state machine.
+    ///
+    /// The FSM lives in memory; the only thing that makes it durable is a
+    /// snapshot. `last_applied.bin` is persisted on every apply so a restart
+    /// *with* a snapshot doesn't re-run committed commands. But when there is
+    /// no snapshot to restore, that marker describes state this process does
+    /// not have: openraft sees "everything is applied", replays nothing, and
+    /// the broker answers reads (topic registry, live brokers, partition
+    /// ownership) out of an empty state machine while its Raft log is fully
+    /// caught up. In a cluster that shows up as a restarted broker
+    /// auto-creating topics that already exist and stealing their partitions.
+    ///
+    /// Resetting the marker to `None` makes openraft re-apply the log from the
+    /// beginning, which rebuilds the FSM exactly.
+    ///
+    /// If the log has been purged, replay cannot rebuild the FSM (the purged
+    /// prefix only exists inside the snapshot that's now missing). That is
+    /// unrecoverable locally, so fail closed rather than start hollow — the
+    /// operator's remedy is to wipe this node's Raft directory and let it
+    /// rejoin as a fresh member.
+    async fn reset_apply_marker_for_replay(&self) -> Result<(), StorageError<RaftNodeId>> {
+        let Some(applied) = *self.last_applied_log.read().await else {
+            return Ok(());
+        };
+        if let Some(purged) = *self.last_purged_log_id.read().await {
+            error!(
+                applied_index = applied.index,
+                purged_index = purged.index,
+                "CORRUPTION: no snapshot to restore and the Raft log is purged \
+                 below the applied point; the state machine cannot be rebuilt"
+            );
+            return Err(StorageError::from_io_error(
+                openraft::ErrorSubject::Snapshot(None),
+                openraft::ErrorVerb::Read,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "No snapshot found but the log is purged up to index {} \
+                         (applied {}): state machine cannot be rebuilt by replay. \
+                         Wipe this node's Raft directory so it rejoins as a fresh \
+                         member.",
+                        purged.index, applied.index
+                    ),
+                ),
+            ));
+        }
+        warn!(
+            applied_index = applied.index,
+            "No snapshot to restore; resetting the FSM apply marker so the Raft \
+             log replays into the state machine"
+        );
+        *self.last_applied_log.write().await = None;
+        Ok(())
+    }
+
     /// Load the latest snapshot from object store on startup.
     ///
     /// This should be called after creating the store to restore state.
@@ -845,6 +901,7 @@ impl<G: GroupKind> RaftStore<G> {
             Err(object_store::Error::NotFound { .. }) => {
                 // No snapshot exists - this is OK, clean start
                 debug!("No existing snapshot found in object store (clean start)");
+                self.reset_apply_marker_for_replay().await?;
                 self.cleanup_stale_snapshot_files(&std::collections::HashSet::new())
                     .await;
                 return Ok(false);

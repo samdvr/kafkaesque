@@ -233,6 +233,7 @@ async fn dispatch_control(
             expected_term,
             forward_hops,
         } => forward_control(raft, command, expected_term, forward_hops).await,
+        ControlRpcMessage::ReadIndex => read_index(raft).await,
     }
 }
 
@@ -255,6 +256,29 @@ async fn dispatch_shard(raft: &Raft<ShardConfig>, msg: ShardRpcMessage) -> MuxRa
             expected_term,
             forward_hops,
         } => forward_shard(raft, command, expected_term, forward_hops).await,
+        ShardRpcMessage::ReadIndex => read_index(raft).await,
+    }
+}
+
+/// Answer a follower's read-index request for this group.
+///
+/// `get_read_log_id` is the first half of openraft's linearizable read: it
+/// confirms leadership with a heartbeat quorum and returns the log index a
+/// reader must have applied. The follower does the second half locally by
+/// waiting for that index — see `RaftCluster::linearizable_read_*`.
+///
+/// A non-leader receiving this returns the usual forwarding error, which the
+/// caller treats as "refresh the leader and retry" rather than a hard
+/// failure.
+async fn read_index<C>(raft: &Raft<C>) -> MuxRaftRpcResponse
+where
+    C: openraft::RaftTypeConfig<NodeId = RaftNodeId, Node = BasicNode>,
+{
+    match raft.get_read_log_id().await {
+        Ok((read_log_id, _applied)) => MuxRaftRpcResponse::ReadIndexOk {
+            read_index: read_log_id.map(|id| id.index),
+        },
+        Err(e) => MuxRaftRpcResponse::Error(RpcErrorInfo::internal(e)),
     }
 }
 
@@ -570,8 +594,18 @@ impl MuxRaftRpcServer {
         // Accept-side gating: same caps as the legacy server. A handshake
         // semaphore bounds total concurrent inbound TLS handshakes; the
         // per-IP map bounds how many slots a single peer can hold.
+        //
+        // The per-IP cap has to scale with the number of Raft groups. Each
+        // peer holds one long-lived connection per group (control + every
+        // shard) for steady-state replication, plus short-lived ones for
+        // forwarded writes and follower read-index requests. A flat cap of
+        // 16 is already below the 9 connections/peer a 8-shard cluster
+        // needs, and every broker on a single host shares one source IP —
+        // so localhost clusters (tests, dev, CI) tripped the cap and lost
+        // quorum as rejected peers reconnect-stormed. Budget 8 slots per
+        // group, floor 32, which still bounds a hostile peer.
         const MAX_CONCURRENT_HANDSHAKES: usize = 128;
-        const MAX_PER_IP: usize = 16;
+        let max_per_ip = ((self.handles.shards.len() + 1) * 8).max(32);
         let accept_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
         let per_ip_counts: Arc<StdMutex<HashMap<IpAddr, usize>>> =
             Arc::new(StdMutex::new(HashMap::new()));
@@ -598,7 +632,7 @@ impl MuxRaftRpcServer {
                     let per_ip_admitted = {
                         let mut counts = per_ip_counts.lock().unwrap_or_else(|e| e.into_inner());
                         let n = counts.entry(peer_ip).or_insert(0);
-                        if *n >= MAX_PER_IP {
+                        if *n >= max_per_ip {
                             tracing::warn!(peer = %peer_addr, "Rejecting mux Raft RPC: per-IP connection cap reached");
                             false
                         } else {

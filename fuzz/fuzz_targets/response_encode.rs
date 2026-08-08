@@ -24,9 +24,9 @@ use libfuzzer_sys::fuzz_target;
 use kafkaesque::error::KafkaCode;
 use kafkaesque::server::request::ApiKey;
 use kafkaesque::server::response::{
-    ApiVersionData, ApiVersionsResponseData, BrokerData, HeartbeatResponseData,
-    MetadataResponseData, PartitionMetadata, ProducePartitionResponse, ProduceResponseData,
-    ProduceTopicResponse, TopicMetadata,
+    ApiVersionData, ApiVersionsResponseData, BatchIndexAndErrorMessage, BrokerData,
+    HeartbeatResponseData, MetadataResponseData, PartitionMetadata, ProducePartitionResponse,
+    ProduceResponseData, ProduceTopicResponse, TopicMetadata,
 };
 
 const MAX_INPUT: usize = 64 * 1024;
@@ -67,11 +67,16 @@ fn arb_partition(u: &mut Unstructured<'_>) -> arbitrary::Result<PartitionMetadat
         error_code: arb_kafka_code(u)?,
         partition_index: i32::arbitrary(u)?,
         leader_id: i32::arbitrary(u)?,
+        leader_epoch: i32::arbitrary(u)?,
         replica_nodes: Vec::<i32>::arbitrary_take_rest(Unstructured::new(
             u.peek_bytes(64).unwrap_or(&[]),
         ))
         .unwrap_or_default(),
         isr_nodes: Vec::<i32>::arbitrary_take_rest(Unstructured::new(
+            u.peek_bytes(64).unwrap_or(&[]),
+        ))
+        .unwrap_or_default(),
+        offline_replicas: Vec::<i32>::arbitrary_take_rest(Unstructured::new(
             u.peek_bytes(64).unwrap_or(&[]),
         ))
         .unwrap_or_default(),
@@ -89,6 +94,7 @@ fn arb_topic_meta(u: &mut Unstructured<'_>) -> arbitrary::Result<TopicMetadata> 
         name: arb_string(u)?,
         is_internal: bool::arbitrary(u)?,
         partitions,
+        topic_authorized_operations: i32::arbitrary(u)?,
     })
 }
 
@@ -115,10 +121,19 @@ fn arb_metadata_response(u: &mut Unstructured<'_>) -> arbitrary::Result<Metadata
         topics.push(arb_topic_meta(u)?);
     }
 
+    let cluster_id = if bool::arbitrary(u)? {
+        Some(arb_string(u)?)
+    } else {
+        None
+    };
+
     Ok(MetadataResponseData {
+        throttle_time_ms: i32::arbitrary(u)?,
         brokers,
+        cluster_id,
         controller_id: i32::arbitrary(u)?,
         topics,
+        cluster_authorized_operations: i32::arbitrary(u)?,
     })
 }
 
@@ -129,11 +144,30 @@ fn arb_produce_response(u: &mut Unstructured<'_>) -> arbitrary::Result<ProduceRe
         let np = (u8::arbitrary(u)? as usize) % MAX_ITEMS;
         let mut partitions = Vec::with_capacity(np);
         for _ in 0..np {
+            let nre = (u8::arbitrary(u)? as usize) % MAX_ITEMS;
+            let mut record_errors = Vec::with_capacity(nre);
+            for _ in 0..nre {
+                record_errors.push(BatchIndexAndErrorMessage {
+                    batch_index: i32::arbitrary(u)?,
+                    batch_index_error_message: if bool::arbitrary(u)? {
+                        Some(arb_string(u)?)
+                    } else {
+                        None
+                    },
+                });
+            }
             partitions.push(ProducePartitionResponse {
                 partition_index: i32::arbitrary(u)?,
                 error_code: arb_kafka_code(u)?,
                 base_offset: i64::arbitrary(u)?,
                 log_append_time: i64::arbitrary(u)?,
+                log_start_offset: i64::arbitrary(u)?,
+                record_errors,
+                error_message: if bool::arbitrary(u)? {
+                    Some(arb_string(u)?)
+                } else {
+                    None
+                },
             });
         }
         responses.push(ProduceTopicResponse {

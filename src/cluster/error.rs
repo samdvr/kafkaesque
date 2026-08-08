@@ -432,7 +432,7 @@ impl SlateDBError {
             ObjErr::NotSupported { .. } => false,
             ObjErr::InvalidPath { .. } => false,
             ObjErr::JoinError { .. } => false,
-            ObjErr::NotImplemented => false,
+            ObjErr::NotImplemented { .. } => false,
             ObjErr::PermissionDenied { .. } => false,
             ObjErr::Unauthenticated { .. } => false,
             ObjErr::UnknownConfigurationKey { .. } => false,

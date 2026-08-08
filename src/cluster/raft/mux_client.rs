@@ -668,6 +668,105 @@ pub async fn request_mux_promote(
     }
 }
 
+/// Ask the control leader at `addr` for a read index.
+///
+/// First half of a follower-side linearizable read: the leader confirms its
+/// leadership with a heartbeat quorum and returns the log index the reader
+/// must have applied. Cluster purpose tag — a read index leaks the log
+/// position, so join-token holders don't get one.
+pub async fn request_control_read_index(
+    addr: &str,
+    auth_keys: &Arc<RaftAuthKeys>,
+    tls: Option<&RaftTlsConfig>,
+) -> Result<Option<u64>, std::io::Error> {
+    let frame = MuxRaftRpcMessage::Control(ControlRpcMessage::ReadIndex);
+    match send_one_shot(addr, &frame, false, auth_keys, tls).await? {
+        MuxRaftRpcResponse::ReadIndexOk { read_index } => Ok(read_index),
+        MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
+        other => Err(unexpected_io("ReadIndexOk", &other)),
+    }
+}
+
+/// Ask the leader of `shard_id` at `addr` for a read index. Shard analog of
+/// [`request_control_read_index`].
+pub async fn request_shard_read_index(
+    addr: &str,
+    shard_id: RpcShardId,
+    auth_keys: &Arc<RaftAuthKeys>,
+    tls: Option<&RaftTlsConfig>,
+) -> Result<Option<u64>, std::io::Error> {
+    let frame = MuxRaftRpcMessage::Shard(shard_id, ShardRpcMessage::ReadIndex);
+    match send_one_shot(addr, &frame, false, auth_keys, tls).await? {
+        MuxRaftRpcResponse::ReadIndexOk { read_index } => Ok(read_index),
+        MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
+        other => Err(unexpected_io("ReadIndexOk", &other)),
+    }
+}
+
+/// Connection-reusing client for one group's follower read-index requests.
+///
+/// Read indexes are a **hot path**: every linearizable read on a broker that
+/// isn't the group's leader needs one (partition-ownership checks, group
+/// generation lookups, offset fetches). One-shot connections per read melt
+/// the leader's mux port — it hits the per-IP connection cap and starts
+/// rejecting real Raft traffic, which costs the group its quorum. So each
+/// group keeps a single cached connection, re-created only when the leader
+/// address changes or the socket breaks.
+///
+/// The inner connection's mutex serializes requests for this group. That's
+/// deliberate: round trips are sub-millisecond, and queueing behind one
+/// socket is what keeps a burst of reads from becoming a connection storm.
+pub struct ReadIndexClient {
+    shared: Arc<MuxFactoryShared>,
+    conn: Mutex<Option<Arc<MuxConnInner>>>,
+}
+
+impl ReadIndexClient {
+    /// Build a client over the cluster's shared network state.
+    pub fn new(shared: Arc<MuxFactoryShared>) -> Self {
+        Self {
+            shared,
+            conn: Mutex::new(None),
+        }
+    }
+
+    /// Fetch a read index from the group leader at `addr`.
+    ///
+    /// `frame` must be the group's `ReadIndex` variant. Retries once on a
+    /// transport error: the cached socket may have been closed by the peer
+    /// while idle, which is indistinguishable from a real failure until we
+    /// try a fresh connection.
+    pub async fn read_index(
+        &self,
+        addr: &str,
+        frame: MuxRaftRpcMessage,
+    ) -> Result<Option<u64>, std::io::Error> {
+        let conn = self.conn_for(addr).await;
+        let response = match conn.send(frame.clone()).await {
+            Ok(resp) => resp,
+            Err(_) => conn.send(frame).await?,
+        };
+        match response {
+            MuxRaftRpcResponse::ReadIndexOk { read_index } => Ok(read_index),
+            MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
+            other => Err(unexpected_io("ReadIndexOk", &other)),
+        }
+    }
+
+    /// Cached connection for `addr`, replacing it if the leader moved.
+    async fn conn_for(&self, addr: &str) -> Arc<MuxConnInner> {
+        let mut guard = self.conn.lock().await;
+        if let Some(conn) = guard.as_ref()
+            && conn.target_addr == addr
+        {
+            return conn.clone();
+        }
+        let conn = Arc::new(MuxConnInner::new(addr.to_string(), self.shared.clone()));
+        *guard = Some(conn.clone());
+        conn
+    }
+}
+
 /// One-shot send-and-receive helper. Opens a fresh connection (no caching
 /// — these helpers are called rarely: forward only on leader-mismatch,
 /// join only at bootstrap), writes one frame, reads one response, drops

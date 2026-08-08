@@ -1,6 +1,6 @@
 #![no_main]
 
-//! Postcard decode fuzzer for [`RaftRpcMessage`].
+//! Postcard decode fuzzer for [`MuxRaftRpcMessage`].
 //!
 //! Raft RPC frames are HMAC-authenticated on the wire (see
 //! `cluster::raft::auth`), but the postcard decode runs *before* HMAC
@@ -16,7 +16,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use kafkaesque::cluster::raft::RaftRpcMessage;
+use kafkaesque::cluster::raft::MuxRaftRpcMessage;
 
 const MAX_INPUT: usize = 1024 * 1024;
 
@@ -24,16 +24,16 @@ fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_INPUT {
         return;
     }
-    if let Ok(decoded) = postcard::from_bytes::<RaftRpcMessage>(data) {
+    if let Ok(decoded) = postcard::from_bytes::<MuxRaftRpcMessage>(data) {
         let first = match postcard::to_stdvec(&decoded) {
             Ok(v) => v,
-            Err(e) => panic!("decoded RaftRpcMessage failed to re-encode: {e:?}"),
+            Err(e) => panic!("decoded MuxRaftRpcMessage failed to re-encode: {e:?}"),
         };
         let again =
-            postcard::from_bytes::<RaftRpcMessage>(&first).expect("canonical form must decode");
+            postcard::from_bytes::<MuxRaftRpcMessage>(&first).expect("canonical form must decode");
         let second = match postcard::to_stdvec(&again) {
             Ok(v) => v,
-            Err(e) => panic!("re-decoded RaftRpcMessage failed to re-encode: {e:?}"),
+            Err(e) => panic!("re-decoded MuxRaftRpcMessage failed to re-encode: {e:?}"),
         };
         // Encoding is deterministic, so the second pass must match the first.
         assert_eq!(first, second, "postcard canonical roundtrip drift");

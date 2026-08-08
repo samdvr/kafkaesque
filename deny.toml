@@ -3,6 +3,10 @@
 # Checked in CI on every PR. Anything new that trips a finding here
 # either gets fixed (preferred) or explicitly waived in this file with
 # a justification — no silent additions.
+#
+# NOTE: the `rustsec/audit-check` job in CI reads `.cargo/audit.toml`,
+# not this file. Keep the `[advisories].ignore` set below in sync with
+# the one there.
 
 [graph]
 # Limit to the targets we ship.
@@ -35,6 +39,18 @@ ignore = [
     # object_store/slatedb and behind our optional `tls` feature.
     # Removed when those deps migrate to rustls-pki-types' PemObject.
     "RUSTSEC-2025-0134",
+    # atomic-polyfill 1.0.3 — unmaintained, no CVE. Transitive; upstream
+    # points at `portable-atomic`, which we don't control from here.
+    "RUSTSEC-2023-0089",
+    # rkyv 0.7.46 — RUSTSEC-2026-0235, out-of-bounds reads validating
+    # archives with Rc/Arc. Never compiled: it's an *optional* feature of
+    # rust_decimal (reached via byte-unit → openraft and duration-str →
+    # slatedb) that nothing enables, so it appears in Cargo.lock but not
+    # in the build graph — `cargo tree -i rkyv --target all -e
+    # normal,build,dev` finds nothing. No upgrade path regardless: every
+    # rust_decimal 1.x pins `rkyv ^0.7.46`. Removed when rust_decimal
+    # moves to rkyv 0.8.
+    "RUSTSEC-2026-0235",
 ]
 
 [bans]

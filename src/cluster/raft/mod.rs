@@ -91,6 +91,18 @@ pub use domains::{
 };
 #[doc(hidden)]
 pub use state_machine::OwnershipCacheInvalidation;
+// Exported for `fuzz/fuzz_targets/`, which drives the postcard decoders a
+// hostile peer can reach: `mux::{MuxRaftRpcMessage, MuxRaftRpcResponse}`
+// are the wire frames (they replaced the legacy `network::RaftRpcMessage`
+// pair), and the two state machines decode `InstallSnapshot` payloads
+// (they replaced the single `CoordinationStateMachine`). Not part of the
+// supported API — see the `#[doc(hidden)]` items above.
+#[doc(hidden)]
+pub use mux::{MuxRaftRpcMessage, MuxRaftRpcResponse};
+#[doc(hidden)]
+pub use state_machine::control::ControlStateMachine;
+#[doc(hidden)]
+pub use state_machine::shard::ShardStateMachine;
 #[doc(hidden)]
 pub use storage::RaftStore;
 pub use tls::RaftTlsConfig;

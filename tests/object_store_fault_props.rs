@@ -23,7 +23,7 @@ use std::time::Duration;
 use kafkaesque::cluster::{FaultInjector, FaultingObjectStore, OpKind};
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use proptest::prelude::*;
 
 fn op_kind() -> impl Strategy<Value = OpKind> {

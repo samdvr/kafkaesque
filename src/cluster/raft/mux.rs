@@ -145,7 +145,9 @@ pub enum MuxRaftRpcResponse {
     /// time of the request (openraft confirms with a heartbeat quorum), so a
     /// follower that then waits for `read_index` to apply locally gets the
     /// same linearizability guarantee as a leader-local read.
-    ReadIndexOk { read_index: Option<u64> },
+    ReadIndexOk {
+        read_index: Option<u64>,
+    },
     /// Structured error with retry semantics. Reuses the legacy
     /// [`RpcErrorInfo`] type so client retry logic is identical.
     Error(RpcErrorInfo),

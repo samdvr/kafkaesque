@@ -977,7 +977,8 @@ impl RaftCluster {
             .await
             .map_err(|e| {
                 SlateDBError::Storage(format!("Failed to read index from control leader: {}", e))
-            })?;        wait_for_applied_index(self.control.raft(), read_index, "control follower read").await
+            })?;
+        wait_for_applied_index(self.control.raft(), read_index, "control follower read").await
     }
 
     /// Follower half of a shard linearizable read.
@@ -1000,9 +1001,7 @@ impl RaftCluster {
                 shard_id, leader_id
             )));
         };
-        let read_index = self
-            .bootstrap()
-            .shard_read_index[shard_id as usize]
+        let read_index = self.bootstrap().shard_read_index[shard_id as usize]
             .read_index(
                 &leader_addr,
                 MuxRaftRpcMessage::Shard(shard_id, ShardRpcMessage::ReadIndex),

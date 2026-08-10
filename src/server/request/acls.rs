@@ -181,12 +181,12 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&1i32.to_be_bytes());
         data.push(2); // Topic
-        data.extend_from_slice(&(5i16).to_be_bytes());
+        data.extend_from_slice(&(b"orders".len() as i16).to_be_bytes());
         data.extend_from_slice(b"orders");
         data.push(4); // Prefixed
-        data.extend_from_slice(&(9i16).to_be_bytes());
+        data.extend_from_slice(&(b"User:alice".len() as i16).to_be_bytes());
         data.extend_from_slice(b"User:alice");
-        data.extend_from_slice(&(1i16).to_be_bytes());
+        data.extend_from_slice(&(b"*".len() as i16).to_be_bytes());
         data.extend_from_slice(b"*");
         data.push(4); // Write
         data.push(3); // Allow

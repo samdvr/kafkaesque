@@ -108,11 +108,11 @@ impl MultiNodeRaft {
         wait_until_has_leader(&nodes[0], Duration::from_secs(5)).await;
 
         // Add every other node as learner, then promote the full set.
-        for i in 1..n {
+        for (i, addr) in addrs.iter().enumerate().skip(1) {
             let id = (i as u64) + 1;
             nodes[0]
                 .cluster()
-                .add_learner_all_groups(id, addrs[i].clone())
+                .add_learner_all_groups(id, addr.clone())
                 .await
                 .unwrap_or_else(|e| panic!("add_learner node {id}: {e}"));
         }
@@ -167,9 +167,8 @@ impl MultiNodeRaft {
             nodes[i].cluster().add_node(1, addrs[0].clone()).await;
         }
 
-        for i in 1..n {
-            nodes[i]
-                .join_cluster(&addrs[0])
+        for (i, node) in nodes.iter().enumerate().skip(1) {
+            node.join_cluster(&addrs[0])
                 .await
                 .unwrap_or_else(|e| panic!("join_cluster node {}: {e}", i + 1));
         }

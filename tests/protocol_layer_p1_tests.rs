@@ -251,7 +251,7 @@ fn parse_array_rejects_oversize_length() {
 
     // length == MAX_PROTOCOL_ARRAY_SIZE + 1 is rejected.
     let mut data = Vec::new();
-    let bad_len = (MAX_PROTOCOL_ARRAY_SIZE + 1) as i32;
+    let bad_len: i32 = MAX_PROTOCOL_ARRAY_SIZE + 1;
     data.extend_from_slice(&bad_len.to_be_bytes());
     let nb = NomBytes::new(Bytes::from(data));
 

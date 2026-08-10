@@ -51,15 +51,16 @@ fn isolated_test_config(broker_id: i32) -> ClusterConfig {
     enable_single_node_bootstrap();
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.keep();
-    let mut config = ClusterConfig::default();
-    config.broker_id = broker_id;
-    config.object_store_path = root.to_string_lossy().into_owned();
-    config.raft_listen_addr = format!(
-        "127.0.0.1:{}",
-        RAFT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-    );
-    config.auto_create_topics = false;
-    config
+    ClusterConfig {
+        broker_id,
+        object_store_path: root.to_string_lossy().into_owned(),
+        auto_create_topics: false,
+        raft_listen_addr: format!(
+            "127.0.0.1:{}",
+            RAFT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        ),
+        ..Default::default()
+    }
 }
 
 async fn handler() -> SlateDBClusterHandler {
@@ -493,14 +494,16 @@ fn describe_cluster_and_describe_quorum_resolve_to_unknown_api_key_today() {
     // TODO(describe-RPCs): when these RPCs land, replace this
     // test with positive assertions on the response (broker list,
     // controller id, voter set, leader epoch).
-    let from_60 = ApiKey::try_from(60i16).expect("forward-compat: unknown maps to Unknown(_)");
+    // `From<i16>` is infallible precisely because unknown keys land in
+    // `Unknown(_)` instead of failing — that's the contract under test.
+    let from_60 = ApiKey::from(60i16);
     let dbg_60 = format!("{:?}", from_60);
     assert!(
         dbg_60.contains("Unknown") && dbg_60.contains("60"),
         "today's contract: i16=60 (DescribeCluster) maps to Unknown(60); got {:?}",
         from_60,
     );
-    let from_55 = ApiKey::try_from(55i16).expect("forward-compat: unknown maps to Unknown(_)");
+    let from_55 = ApiKey::from(55i16);
     let dbg_55 = format!("{:?}", from_55);
     assert!(
         dbg_55.contains("Unknown") && dbg_55.contains("55"),

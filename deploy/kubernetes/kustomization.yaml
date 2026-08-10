@@ -21,7 +21,7 @@ resources:
 
 commonLabels:
   app.kubernetes.io/name: kafkaesque
-  app.kubernetes.io/version: "0.1.0"
+  app.kubernetes.io/version: "0.2.0"
   app.kubernetes.io/managed-by: kustomize
 
 # Image configuration - override for your registry

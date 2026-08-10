@@ -263,12 +263,11 @@ mod tests {
     /// flexible-encoding equivalent of v1+'s `-1` array length.
     #[test]
     fn test_parse_metadata_v9_all_topics_via_null_array() {
-        let mut data = Vec::new();
-        data.push(0x00); // null compact array
-        data.push(1); // allow_auto_topic_creation
-        data.push(0);
-        data.push(0);
-        data.push(0); // tagged_fields
+        let data = vec![
+            0x00, // null compact array
+            1,    // allow_auto_topic_creation
+            0, 0, 0, // tagged_fields
+        ];
         let (rest, req) = parse_metadata_request(NomBytes::from(data.as_slice()), 9).unwrap();
         assert!(rest.into_bytes().is_empty());
         assert!(req.topics.is_none());

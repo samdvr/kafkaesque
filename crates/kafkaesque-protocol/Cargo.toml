@@ -1,6 +1,6 @@
 [package]
 name = "kafkaesque-protocol"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Wire-protocol layer for the Kafkaesque Kafka-compatible broker (parser, encoder, types, errors)."

@@ -185,19 +185,6 @@ impl SharedSlateDbResources {
             owned,
         )
     }
-
-    /// Non-functional placeholder used inside in-process unit tests that
-    /// exercise the wiring shape but never actually open a `Db` (so the
-    /// cache trait object's identity is irrelevant). The compaction
-    /// handle is `Handle::current()`, so this MUST only be called from
-    /// inside a tokio runtime context.
-    #[cfg(test)]
-    pub fn for_unit_tests() -> Self {
-        Self {
-            cache: None,
-            compaction_handle: Handle::current(),
-        }
-    }
 }
 
 /// Build the dedicated compaction runtime. Lifted to a free helper so
@@ -229,11 +216,13 @@ mod tests {
         // by setting `slatedb_block_cache_bytes = 0`. Pin that the
         // resources struct returns `None` for the cache in that case so
         // the per-DB default kicks in at the builder.
-        let mut cfg = ClusterConfig::default();
-        cfg.slatedb_block_cache_bytes = 0;
-        // Avoid building the dedicated runtime here so we don't have
-        // to enter a tokio context just to build resources.
-        cfg.slatedb_compaction_workers = 0;
+        let cfg = ClusterConfig {
+            slatedb_block_cache_bytes: 0,
+            // Avoid building the dedicated runtime here so we don't have
+            // to enter a tokio context just to build resources.
+            slatedb_compaction_workers: 0,
+            ..Default::default()
+        };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

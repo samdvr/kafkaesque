@@ -19,7 +19,7 @@ homepage = "https://github.com/samdvr/kafkaesque"
 
 [package]
 name = "kafkaesque"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Kafka-compatible broker backed by object storage."
@@ -50,7 +50,7 @@ otel = [
 [dependencies]
 # Wire protocol layer (parser, encoder, types, constants, wire-error).
 # Carries no tokio / slatedb / openraft so it can be reused independently.
-kafkaesque-protocol = { path = "crates/kafkaesque-protocol", version = "0.1.0" }
+kafkaesque-protocol = { path = "crates/kafkaesque-protocol", version = "0.2.0" }
 
 async-trait = "0.1.80"
 # bytes 1.11.1+ closes RUSTSEC-2026-0007 (BytesMut::reserve integer overflow on the wire path).
@@ -152,7 +152,7 @@ crc32c = "0.6.8"
 tempfile = "3.8"
 rdkafka = "0.38.0"
 serial_test = "3.2"
-kafkaesque = { path = ".", version = "0.1.0", features = ["test-utilities"] }
+kafkaesque = { path = ".", version = "0.2.0", features = ["test-utilities"] }
 criterion = { version = "0.8.1", features = ["html_reports"] }
 proptest = "1.5"
 # Self-signed cert generation for TLS misconfig tests (expired cert,

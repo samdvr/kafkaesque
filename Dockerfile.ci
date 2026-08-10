@@ -17,7 +17,10 @@
 # =============================================================================
 # Stage 1: Build and test (Static MUSL build on Alpine)
 # =============================================================================
-FROM rust:1.91-alpine3.20 AS builder
+# Alpine 3.22 (not 3.20): 3.20 is end-of-support since May 2026 and the
+# `rust:*-alpine3.20` variant is no longer published. Kept in lockstep with
+# Dockerfile.minimal.
+FROM rust:1.91-alpine3.22 AS builder
 
 # Install build dependencies (single layer)
 RUN apk add --no-cache \
@@ -87,7 +90,7 @@ RUN cargo test --target x86_64-unknown-linux-musl --lib --release && \
 # =============================================================================
 # Stage 2: E2E test runner (minimal Alpine - ~40MB total)
 # =============================================================================
-FROM alpine:3.20 AS runner
+FROM alpine:3.22 AS runner
 
 # Install ONLY runtime dependencies for E2E tests
 # Note: kafkacat pulls in librdkafka which needs glibc compatibility

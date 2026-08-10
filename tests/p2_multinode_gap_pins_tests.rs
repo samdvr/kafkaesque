@@ -100,7 +100,8 @@ fn change_membership_is_internal_only_no_kafka_rpc_today() {
     // exposed via any Kafka RPC. Operators can't add/remove voters from
     // outside the broker process. This is intentional today (the cluster
     // is statically configured via `RAFT_PEERS`).
-    let from_45 = ApiKey::try_from(45i16).expect("forward-compat: unknown maps to Unknown(_)");
+    // `From<i16>` is infallible: unknown keys map to `Unknown(_)`.
+    let from_45 = ApiKey::from(45i16);
     let dbg = format!("{:?}", from_45);
     assert!(
         dbg.contains("Unknown"),

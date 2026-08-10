@@ -23,6 +23,7 @@
 //!   - `Produce` with a `transactional_id` is rejected with `InvalidRequest`
 //!     on every partition. This is honest: silently accepting it would
 //!     downgrade EOS to idempotence-only.
+//!
 //! The transaction-coordinator API keys (`AddPartitionsToTxn` 24,
 //! `AddOffsetsToTxn` 25, `EndTxn` 26, `TxnOffsetCommit` 28) are not in
 //! the broker's `ApiKey` enum at all.

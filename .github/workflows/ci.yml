@@ -108,6 +108,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install librdkafka (link dep for rdkafka_e2e binary)
+        # `cargo test --tests` builds every integration binary, including
+        # rdkafka_e2e which links system librdkafka via pkg-config. The
+        # dedicated `rdkafka-e2e` job runs those tests; here we only need
+        # the library present so the link step succeeds.
+        run: sudo apt-get update && sudo apt-get install -y librdkafka-dev pkg-config
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -131,9 +138,50 @@ jobs:
         # integration test binaries each statically linking the full dep
         # graph, default parallelism would SIGBUS the 7 GB runner during
         # link even with line-tables-only debuginfo (set in Cargo.toml).
+        #
+        # Skip rdkafka_* here — they run in the dedicated `rdkafka-e2e`
+        # job so client-matrix failures are attributed clearly.
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo test --tests -- --test-threads=4
+        run: cargo test --tests -- --test-threads=4 --skip rdkafka_
+
+  rdkafka-e2e:
+    name: librdkafka Client Matrix
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    # Real librdkafka producer/consumer/admin against an in-process
+    # broker. Catches sticky-partitioner / idempotent-producer /
+    # ApiVersions negotiation bugs that byte-differential tests miss.
+    # Requires system librdkafka (pkg-config); the rdkafka crate links
+    # dynamically by default.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install librdkafka
+        run: sudo apt-get update && sudo apt-get install -y librdkafka-dev pkg-config
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-rdkafka-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-rdkafka-
+            ${{ runner.os }}-cargo-
+
+      - name: Run rdkafka e2e
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo test --test rdkafka_e2e -- --test-threads=1
 
   doc-tests:
     name: Doc Tests

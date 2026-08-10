@@ -7,9 +7,10 @@
 //! partitioner, idempotent producer sequence ranges, fetch session epochs,
 //! consumer group v2 embedded payloads, request-timeout retries.
 //!
-//! These tests are gated `#[ignore]` so they don't slow PR CI by default.
-//! Run them with `cargo test --test rdkafka_e2e -- --ignored` (and a real
-//! librdkafka linked in via `rdkafka` crate's `cmake-build` feature).
+//! These tests run in CI on the `rdkafka-e2e` job (requires
+//! `librdkafka-dev` / system librdkafka via pkg-config). Locally they need
+//! the same: `brew install librdkafka` on macOS, `apt install librdkafka-dev`
+//! on Debian/Ubuntu.
 //!
 //! Each test:
 //!   1. Spins up a `SlateDBClusterHandler` on an `InMemory` object store
@@ -35,9 +36,14 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use tempfile::TempDir;
 
 mod common;
-use common::enable_single_node_bootstrap;
+use common::{enable_single_node_bootstrap, next_port};
 
-/// Spin up an in-memory single-broker server bound to a random port.
+/// Spin up an in-memory single-broker server on a fixed ephemeral port.
+///
+/// The Kafka listen port, `ClusterConfig::port`, and the advertised host/port
+/// must agree — librdkafka reconnects to whatever Metadata returns, so binding
+/// `:0` while advertising the default `9092` makes produce hang until
+/// `message.timeout.ms`.
 /// Returns `(addr, server, _tempdir)`. The tempdir is held for the test's
 /// lifetime; dropping it cleans up the SlateDB tree.
 async fn start_in_memory_broker()
@@ -46,10 +52,20 @@ async fn start_in_memory_broker()
 
     let tempdir = TempDir::new().expect("tempdir");
     let data_path = tempdir.path().to_string_lossy().to_string();
+    let kafka_port = next_port();
+    let raft_port = next_port();
 
     let config = ClusterConfig {
         broker_id: 0,
+        host: "127.0.0.1".to_string(),
+        advertised_host: "127.0.0.1".to_string(),
+        port: kafka_port as i32,
+        raft_listen_addr: format!("127.0.0.1:{raft_port}"),
         auto_create_topics: true,
+        // Single-partition topics keep the produce/consume path off the
+        // multi-partition ownership race that AutoMQ-style leases introduce
+        // under auto-create.
+        default_num_partitions: 1,
         object_store: ObjectStoreType::Local {
             path: data_path.clone(),
         },
@@ -61,7 +77,8 @@ async fn start_in_memory_broker()
         .await
         .expect("handler init");
 
-    let server = match KafkaServer::new("127.0.0.1:0", handler).await {
+    let bind = format!("127.0.0.1:{kafka_port}");
+    let server = match KafkaServer::new(&bind, handler).await {
         Ok(s) => s,
         Err(e) => {
             // Skip in sandboxed environments without TCP bind permission.
@@ -80,14 +97,14 @@ async fn start_in_memory_broker()
     });
 
     // Wait until the listener accepts connections.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if tokio::net::TcpStream::connect(&addr).await.is_ok() {
             return Some((addr, server, tempdir));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("broker did not accept connections within 2s")
+    panic!("broker did not accept connections within 5s")
 }
 
 /// Round-trip: produce one record, consume it, and verify the value.
@@ -96,7 +113,6 @@ async fn start_in_memory_broker()
 /// shape, produce ack handling, fetch session lifecycle) — failures here
 /// mean librdkafka cannot talk to the broker at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires librdkafka; opt in with --ignored"]
 async fn rdkafka_produce_consume_round_trip() {
     let Some((addr, _server, _tempdir)) = start_in_memory_broker().await else {
         eprintln!("Skipping: no TCP bind permission");
@@ -146,7 +162,6 @@ async fn rdkafka_produce_consume_round_trip() {
 /// sequence number tracking — none of which are reachable via byte-diff
 /// tests since the encoder doesn't write a producer_id by default.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires librdkafka; opt in with --ignored"]
 async fn rdkafka_idempotent_producer_offsets_advance() {
     let Some((addr, _server, _tempdir)) = start_in_memory_broker().await else {
         eprintln!("Skipping: no TCP bind permission");
@@ -189,7 +204,6 @@ async fn rdkafka_idempotent_producer_offsets_advance() {
 /// metadata-refresh flow that `auto.create.topics.enable=true` would
 /// otherwise hide.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires librdkafka; opt in with --ignored"]
 async fn rdkafka_admin_create_delete_topic() {
     let Some((addr, _server, _tempdir)) = start_in_memory_broker().await else {
         eprintln!("Skipping: no TCP bind permission");

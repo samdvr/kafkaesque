@@ -97,9 +97,11 @@
 //! exposing the fields: broker-to-broker replication (partitions are stored
 //! once in the object store, `replication_factor > 1` is refused, and
 //! `acks=all` equals `acks=1`), log compaction, incremental fetch sessions,
-//! and transactions. Multi-node failover has no automated test harness yet —
-//! see `tests/p2_multinode_gap_pins_tests.rs`. Read the "Durability
-//! contract" section of `README.md` before relying on it for durability.
+//! and transactions. Multi-node Raft adversarial coverage lives in
+//! `tests/p2_multinode_gap_pins_tests.rs` (in-process harness:
+//! `tests/common/raft_multinode.rs`); process-level failover is exercised
+//! by `scripts/run-cluster-e2e.sh`. Read the "Durability contract" section
+//! of `README.md` before relying on it for durability.
 //!
 //! ## Resources
 //! - [Kafka Protocol Spec](https://kafka.apache.org/protocol.html)

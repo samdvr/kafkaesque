@@ -57,8 +57,6 @@
 //!   then the same call routes `Producer(InitProducerId)` to the shard
 //!   owning that id). This file does not need to do anything for it.
 
-#![allow(dead_code)] // wired by RaftCoordinator::start_background_tasks
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;

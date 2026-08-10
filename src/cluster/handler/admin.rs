@@ -72,6 +72,44 @@ pub(super) async fn handle_create_topics(
             continue;
         }
 
+        // Kafkaesque replicates through the object store, not through peer
+        // brokers: a partition has exactly one live owner and durability comes
+        // from the S3-class bucket underneath it (see the "Durability
+        // contract" section of README.md). There is no follower set, no ISR,
+        // and no acks-counting against replicas.
+        //
+        // A client asking for `replication_factor > 1` is asking for a
+        // guarantee this broker cannot provide. Silently accepting it and
+        // returning NONE was the dishonest answer: `--describe` would report
+        // the topic as healthy while `isr` listed a single node, and an
+        // operator who sized their durability expectations around RF=3 had no
+        // way to find out. Refuse it explicitly instead.
+        //
+        // `-1` is the wire sentinel for "use the broker default" and is the
+        // value every client sends when the user didn't ask for a specific
+        // factor, so it is accepted (the default is 1). `0` is meaningless.
+        if topic.replication_factor != -1 && topic.replication_factor != 1 {
+            warn!(
+                topic = %topic.name,
+                requested_replication_factor = topic.replication_factor,
+                "CreateTopics rejected: replication factor unsupported"
+            );
+            topics.push(CreateTopicResponseData {
+                name: topic.name,
+                error_code: KafkaCode::InvalidReplicationFactor,
+                error_message: Some(format!(
+                    "replication_factor {} is not supported: Kafkaesque stores each \
+                     partition once in the object store and replicates below the \
+                     broker, so the only valid values are 1 and -1 (broker default). \
+                     Durability comes from the backing bucket, not from peer brokers \
+                     — see the Durability contract section of the README before \
+                     sizing durability around a replication factor.",
+                    topic.replication_factor
+                )),
+            });
+            continue;
+        }
+
         let num_partitions = if topic.num_partitions <= 0 {
             DEFAULT_NUM_PARTITIONS
         } else {

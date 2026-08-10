@@ -320,12 +320,31 @@ pub enum AclDecision {
 /// the whole set. Prefixed bindings are kept per resource type because the
 /// pattern only matches names starting with `resource_name`, and there are
 /// typically few of them in practice.
+///
+/// Literal buckets are nested (`type -> name -> bindings`) rather than keyed on
+/// a `(type, name)` tuple. A tuple key forces every lookup to build an owned
+/// `String` just to probe the map — two allocations per authorization check, on
+/// a path Produce and Fetch hit at least once per topic per request. With the
+/// nesting, the inner map is keyed by `Box<str>`, which `Borrow<str>` lets us
+/// probe with a plain `&str`.
 #[derive(Debug, Default)]
 struct AclIndex {
-    literal_deny: HashMap<(AclResourceType, String), Vec<AclBinding>>,
-    literal_allow: HashMap<(AclResourceType, String), Vec<AclBinding>>,
+    literal_deny: HashMap<AclResourceType, HashMap<Box<str>, Vec<AclBinding>>>,
+    literal_allow: HashMap<AclResourceType, HashMap<Box<str>, Vec<AclBinding>>>,
     prefixed_deny: HashMap<AclResourceType, Vec<AclBinding>>,
     prefixed_allow: HashMap<AclResourceType, Vec<AclBinding>>,
+}
+
+impl AclIndex {
+    /// Literal bindings registered for exactly `(resource_type, resource_name)`.
+    /// Allocation-free: the `&str` probes the inner `Box<str>`-keyed map.
+    fn literal<'a>(
+        bucket: &'a HashMap<AclResourceType, HashMap<Box<str>, Vec<AclBinding>>>,
+        resource_type: AclResourceType,
+        resource_name: &str,
+    ) -> Option<&'a Vec<AclBinding>> {
+        bucket.get(&resource_type)?.get(resource_name)
+    }
 }
 
 impl AclIndex {
@@ -341,13 +360,17 @@ impl AclIndex {
         match (b.pattern_type, b.permission) {
             (AclPatternType::Literal, AclPermissionType::Deny) => {
                 self.literal_deny
-                    .entry((b.resource_type, b.resource_name.clone()))
+                    .entry(b.resource_type)
+                    .or_default()
+                    .entry(Box::from(b.resource_name.as_str()))
                     .or_default()
                     .push(b);
             }
             (AclPatternType::Literal, AclPermissionType::Allow) => {
                 self.literal_allow
-                    .entry((b.resource_type, b.resource_name.clone()))
+                    .entry(b.resource_type)
+                    .or_default()
+                    .entry(Box::from(b.resource_name.as_str()))
                     .or_default()
                     .push(b);
             }
@@ -473,10 +496,7 @@ impl AclDomainState {
             b.matches_principal(principal) && b.matches_host(host) && b.operation.implies(op)
         };
 
-        if let Some(bs) = index
-            .literal_deny
-            .get(&(resource_type, resource_name.to_string()))
-        {
+        if let Some(bs) = AclIndex::literal(&index.literal_deny, resource_type, resource_name) {
             for b in bs {
                 if matches(b) {
                     return AclDecision::Denied;
@@ -491,10 +511,7 @@ impl AclDomainState {
             }
         }
 
-        if let Some(bs) = index
-            .literal_allow
-            .get(&(resource_type, resource_name.to_string()))
-        {
+        if let Some(bs) = AclIndex::literal(&index.literal_allow, resource_type, resource_name) {
             for b in bs {
                 if matches(b) {
                     return AclDecision::Allowed;

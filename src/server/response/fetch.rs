@@ -64,31 +64,74 @@ impl Default for FetchPartitionResponse {
     }
 }
 
+/// Constructors for the four shapes the Fetch handler actually emits.
+///
+/// Spelling the struct out per return site meant restating the sentinel
+/// convention — `-1` watermarks, `last_stable_offset == high_watermark`,
+/// empty `aborted_transactions`, `preferred_read_replica: -1` — at every one of
+/// them. That is the copy-paste-a-wrong-sentinel class of bug: nothing stops one
+/// site from returning a real HWM with a `-1` LSO, or from forgetting the log
+/// start and forcing the client into an extra `ListOffsets` round trip. These
+/// four define the convention once.
 impl FetchPartitionResponse {
-    /// Create an error response for a partition.
+    /// Error response with no watermark information (`-1` throughout).
     ///
-    /// Sets watermarks to -1 and records to None.
+    /// Use when the partition could not be resolved at all, so neither the high
+    /// watermark nor the log start is known.
     pub fn error(partition_index: i32, error_code: KafkaCode) -> Self {
+        Self::error_at(partition_index, error_code, -1, -1)
+    }
+
+    /// Error response that still reports the watermarks we do know.
+    ///
+    /// `log_start_offset` matters on `OffsetOutOfRange`: returning `-1` forces
+    /// the client into a separate `ListOffsets` round trip and breaks
+    /// `auto.offset.reset=earliest` fast paths. Pass `-1` for either value only
+    /// when it is genuinely unknown.
+    ///
+    /// `last_stable_offset` stays `-1` — an errored partition has no meaningful
+    /// LSO, and Kafkaesque has no transactions, so no client depends on it here.
+    pub fn error_at(
+        partition_index: i32,
+        error_code: KafkaCode,
+        high_watermark: i64,
+        log_start_offset: i64,
+    ) -> Self {
         Self {
             partition_index,
             error_code,
-            high_watermark: -1,
+            high_watermark,
             last_stable_offset: -1,
-            log_start_offset: -1,
+            log_start_offset,
             aborted_transactions: vec![],
             preferred_read_replica: -1,
             records: None,
         }
     }
 
-    /// Create a success response for a partition.
+    /// Success response without log-start information.
     pub fn success(partition_index: i32, high_watermark: i64, records: Option<Bytes>) -> Self {
+        Self::success_at(partition_index, high_watermark, -1, records)
+    }
+
+    /// Success response carrying the log start.
+    ///
+    /// `records: None` is a legitimate success — an up-to-date consumer, or one
+    /// whose slice of the request `max_bytes` budget was already spent. LSO is
+    /// pinned to the high watermark because transactions are rejected at produce
+    /// time, so the log never holds uncommitted data.
+    pub fn success_at(
+        partition_index: i32,
+        high_watermark: i64,
+        log_start_offset: i64,
+        records: Option<Bytes>,
+    ) -> Self {
         Self {
             partition_index,
             error_code: KafkaCode::None,
             high_watermark,
             last_stable_offset: high_watermark,
-            log_start_offset: -1,
+            log_start_offset,
             aborted_transactions: vec![],
             preferred_read_replica: -1,
             records,

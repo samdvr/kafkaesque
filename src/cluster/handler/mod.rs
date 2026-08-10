@@ -104,6 +104,17 @@ const FIRE_AND_FORGET_SHARDS: usize = 16;
 /// Per-shard bounded queue depth. 16 * 64 = 1024 is the broker-wide
 /// fire-and-forget concurrency cap.
 const FIRE_AND_FORGET_PER_SHARD: usize = 64;
+
+/// Capacity of the per-partition HWM-notify cache.
+///
+/// Sized well above any realistic owned-partition count (the
+/// `max_owned_partitions_per_broker` cap exists precisely because a broker
+/// holding thousands of live SlateDB instances is already the memory
+/// constraint) so a legitimate workload never evicts. The bound exists to
+/// make the map's worst case finite, not to shape steady-state behaviour —
+/// see the `hwm_notifiers` field docs for why an unbounded map there is a
+/// remote OOM.
+const HWM_NOTIFIER_CACHE_CAPACITY: u64 = 65_536;
 use crate::types::BrokerId;
 
 use super::config::ClusterConfig;
@@ -203,10 +214,34 @@ pub struct SlateDBClusterHandler {
     /// This used to be a single broker-wide `Notify`: every produce woke
     /// *every* long-polling fetcher, each of which re-checked all of its
     /// partitions — a thundering herd that scaled with consumers x
-    /// partitions. Entries are created lazily and are tiny (an `Arc<Notify>`
-    /// per partition this broker has served), so the map is bounded by the
-    /// partition count.
-    pub(crate) hwm_notifiers: dashmap::DashMap<(Arc<str>, i32), Arc<tokio::sync::Notify>>,
+    /// partitions.
+    ///
+    /// CAPACITY-BOUNDED, deliberately. Entries are keyed by
+    /// `(topic, partition_index)` taken from client requests, and
+    /// `partition_index` is an arbitrary `i32` off the wire that is never
+    /// checked against the topic's real partition count. An unbounded map
+    /// here is a remote OOM: one Fetch frame may carry
+    /// `MAX_PROTOCOL_ARRAY_SIZE` (100_000) partition entries, so a client
+    /// looping such requests with fresh indices would pin one `Arc<Notify>`
+    /// per bogus index forever. The bound also fixes a steady-state leak —
+    /// nothing ever pruned entries for released, reassigned, or deleted
+    /// partitions.
+    ///
+    /// Eviction is safe: a `Notify` carries no state worth preserving. The
+    /// only consequence of evicting an entry between a fetcher arming it and
+    /// a producer notifying it is one missed wakeup, and the fetcher still
+    /// returns when `max_wait_ms` elapses. Sized well above any realistic
+    /// owned-partition count so that never happens outside abuse.
+    hwm_notifiers: Cache<(Arc<str>, i32), Arc<tokio::sync::Notify>>,
+
+    /// Round-robin cursor for fetch partition ordering.
+    ///
+    /// Partitions in one Fetch request draw from a shared `max_bytes` budget in
+    /// the order they are dispatched, so a fixed order lets the head of a large
+    /// subscription starve the tail indefinitely. Rotating the start per
+    /// request guarantees every partition eventually leads. Wrapping is fine —
+    /// only the value modulo the partition count matters.
+    pub(crate) fetch_rotation: std::sync::atomic::AtomicU64,
 
     /// In-flight acks=0 produce dispatch pool.
     ///
@@ -662,7 +697,8 @@ impl SlateDBClusterHandler {
             topic_name_cache: Cache::new(10_000),
             sasl_required: config.sasl_required,
             authorizer,
-            hwm_notifiers: dashmap::DashMap::new(),
+            hwm_notifiers: Cache::new(HWM_NOTIFIER_CACHE_CAPACITY),
+            fetch_rotation: std::sync::atomic::AtomicU64::new(0),
             fire_and_forget_pool: Arc::new(FireAndForgetPool::new(
                 FIRE_AND_FORGET_SHARDS,
                 FIRE_AND_FORGET_PER_SHARD,
@@ -742,20 +778,24 @@ impl SlateDBClusterHandler {
     ///
     /// Producers call `notify_waiters()` on it after a successful append;
     /// long-poll fetches wait on the notifies of their requested partitions.
+    ///
+    /// Both sides MUST resolve to the same `Arc` for the wakeup to land, so
+    /// this uses `get_with`, which runs the initializer exactly once per key
+    /// even under concurrent callers. A plain `get`-then-`insert` would race
+    /// two appenders into two different `Notify` instances.
     pub(crate) fn hwm_notifier(
         &self,
         topic: &Arc<str>,
         partition: i32,
     ) -> Arc<tokio::sync::Notify> {
-        // Steady-state hot path: shard read lock only. `entry()` always takes
-        // a shard write lock, so two threads producing/fetching against the
-        // same partition would contend on a hashmap *read*. Probe with `get()`
-        // first; only fall back to `entry()` on the cold-path miss.
+        // Steady-state hot path: a borrowed-key probe with no allocation and
+        // no initializer closure. Only the cold-path miss pays `get_with`.
         let key = (Arc::clone(topic), partition);
         if let Some(existing) = self.hwm_notifiers.get(&key) {
-            return existing.value().clone();
+            return existing;
         }
-        self.hwm_notifiers.entry(key).or_default().clone()
+        self.hwm_notifiers
+            .get_with(key, || Arc::new(tokio::sync::Notify::new()))
     }
 
     /// Cluster-level ACL gate, driven by the

@@ -144,6 +144,57 @@ pub fn return_buffer(buffer: Vec<u8>) {
     }
 }
 
+/// RAII handle around a pooled buffer: returns it on drop.
+///
+/// The manual `get_buffer` / `return_buffer` pairing leaks a buffer out of the
+/// pool whenever a `?`, an early return, or — the case that actually bites — a
+/// cancellation at an intervening `.await` skips the return. Losing buffers is
+/// not a correctness bug (the pool refills by allocating), but sustained
+/// cancellation quietly degrades the pool to always-allocate, which is the
+/// opposite of the point.
+///
+/// Derefs to `Vec<u8>`, so it drops into code that wants `&mut Vec<u8>`,
+/// `as_slice()`, or indexing unchanged.
+pub struct PooledBuffer {
+    buf: Option<Vec<u8>>,
+}
+
+impl PooledBuffer {
+    /// Take a cleared buffer with at least `capacity_hint` capacity.
+    pub fn new(capacity_hint: usize) -> Self {
+        Self {
+            buf: Some(get_buffer(capacity_hint)),
+        }
+    }
+
+    /// Detach the buffer, giving up pooled return. Use when ownership has to
+    /// outlive the guard (e.g. handing the `Vec` to a caller).
+    pub fn into_inner(mut self) -> Vec<u8> {
+        self.buf.take().unwrap_or_default()
+    }
+}
+
+impl std::ops::Deref for PooledBuffer {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        self.buf.as_ref().expect("buffer taken only by into_inner")
+    }
+}
+
+impl std::ops::DerefMut for PooledBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buf.as_mut().expect("buffer taken only by into_inner")
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            return_buffer(buf);
+        }
+    }
+}
+
 /// Execute a closure with a pooled buffer, then return the buffer to the pool.
 ///
 /// The closure receives a mutable reference to a cleared buffer.
@@ -194,9 +245,77 @@ pub fn pool_stats() -> PoolStats {
 
 #[cfg(test)]
 mod tests {
+    //! Every test in here mutates the same process-global pool, so they all
+    //! carry one `serial` key. Without it they race each other's `drain_idle`
+    //! and depth assertions — and the pre-existing tests race the newer
+    //! guard tests specifically over the `large` bucket.
     use super::*;
 
+    /// Capacity that lands in the `large` bucket (> `LARGE_BUCKET_THRESHOLD`,
+    /// <= `MAX_POOLED_BUFFER_SIZE` so it is still pooled).
+    ///
+    /// The pool is process-global, so asserting on depth against the `small`
+    /// bucket races every other test that produces or encodes a response. The
+    /// `large` bucket is untouched by the rest of the suite, which makes these
+    /// assertions deterministic. `#[serial]` keeps the three from racing each
+    /// other.
+    const LARGE_TEST_CAPACITY: usize = 256 * 1024;
+
+    /// The guard must hand its buffer back on drop, including on an early
+    /// return or a cancellation — that is the whole reason it exists.
     #[test]
+    #[serial_test::serial(buffer_pool)]
+    fn pooled_buffer_returns_on_drop() {
+        drain_idle(0);
+        let before = pool_stats().large_depth;
+
+        {
+            let mut b = PooledBuffer::new(LARGE_TEST_CAPACITY);
+            b.extend_from_slice(b"payload");
+            assert_eq!(&b[..], b"payload");
+            assert!(b.capacity() >= LARGE_TEST_CAPACITY);
+        } // dropped here without any explicit return_buffer call
+
+        assert_eq!(
+            pool_stats().large_depth,
+            before + 1,
+            "drop must return the buffer to the pool"
+        );
+    }
+
+    /// Dropping via an early return (the `?`-style path) still returns it.
+    #[test]
+    #[serial_test::serial(buffer_pool)]
+    fn pooled_buffer_returns_on_early_return() {
+        fn fails_midway() -> Result<(), ()> {
+            let mut b = PooledBuffer::new(LARGE_TEST_CAPACITY);
+            b.extend_from_slice(b"partial");
+            Err(())
+        }
+        drain_idle(0);
+        let before = pool_stats().large_depth;
+        assert!(fails_midway().is_err());
+        assert_eq!(pool_stats().large_depth, before + 1);
+    }
+
+    /// `into_inner` opts out of pooled return, handing ownership to the caller.
+    #[test]
+    #[serial_test::serial(buffer_pool)]
+    fn pooled_buffer_into_inner_does_not_return() {
+        drain_idle(0);
+        let before = pool_stats().large_depth;
+        let owned = PooledBuffer::new(LARGE_TEST_CAPACITY).into_inner();
+        assert_eq!(
+            pool_stats().large_depth,
+            before,
+            "into_inner transfers ownership, so nothing is pooled yet"
+        );
+        return_buffer(owned);
+        assert_eq!(pool_stats().large_depth, before + 1);
+    }
+
+    #[test]
+    #[serial_test::serial(buffer_pool)]
     fn test_buffer_pool_basic() {
         let buf1 = get_buffer(1000);
         assert!(buf1.capacity() >= 1000);
@@ -208,6 +327,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(buffer_pool)]
     fn test_with_batch_buffer() {
         let result = with_batch_buffer(100, |buf| {
             buf.extend_from_slice(b"hello");
@@ -223,6 +343,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(buffer_pool)]
     fn test_large_buffer_capped_and_pooled() {
         let large_buf = get_buffer(MAX_POOLED_BUFFER_SIZE + 1000);
         assert_eq!(large_buf.capacity(), MAX_POOLED_BUFFER_SIZE);
@@ -234,6 +355,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(buffer_pool)]
     fn test_externally_large_buffer_not_pooled() {
         let mut external_buf = Vec::with_capacity(MAX_POOLED_BUFFER_SIZE + 10000);
         external_buf.push(0);
@@ -252,6 +374,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(buffer_pool)]
     fn test_small_request_does_not_consume_large_buffer() {
         let large = Vec::with_capacity(LARGE_BUCKET_THRESHOLD * 2);
         return_buffer(large);

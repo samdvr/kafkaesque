@@ -1819,13 +1819,18 @@ async fn test_describe_configs_returns_resolved_topic_config() {
     let handler = create_test_handler().await;
     let ctx = create_test_context();
 
-    // Create a topic with cleanup.policy=compact set on the wire.
+    // Create a topic with a topic-level override set on the wire.
+    // `retention.ms` rather than `cleanup.policy=compact`: compaction has no
+    // cleaner, so the write gate refuses that policy (see
+    // `validate_rejects_compact_policies_until_a_cleaner_exists`). The point
+    // of this test is that an override survives into DescribeConfigs, which
+    // any recognized key exercises.
     let create_req = CreateTopicsRequestData {
         topics: vec![CreateTopicData {
             name: "compacted".to_string(),
             num_partitions: 1,
             replication_factor: 1,
-            configs: vec![("cleanup.policy".to_string(), Some("compact".to_string()))],
+            configs: vec![("retention.ms".to_string(), Some("604800000".to_string()))],
         }],
         timeout_ms: 5000,
         validate_only: false,
@@ -1848,12 +1853,20 @@ async fn test_describe_configs_returns_resolved_topic_config() {
     assert_eq!(describe_resp.results.len(), 1);
     let result = &describe_resp.results[0];
     assert_eq!(result.error_code, KafkaCode::None);
+    let retention = result
+        .configs
+        .iter()
+        .find(|c| c.name == "retention.ms")
+        .expect("retention.ms must be returned");
+    assert_eq!(retention.value.as_deref(), Some("604800000"));
+    // Every recognized key is returned, with cluster defaults filled in for
+    // the ones the topic didn't override.
     let cleanup = result
         .configs
         .iter()
         .find(|c| c.name == "cleanup.policy")
         .expect("cleanup.policy must be returned");
-    assert_eq!(cleanup.value.as_deref(), Some("compact"));
+    assert_eq!(cleanup.value.as_deref(), Some("delete"));
 }
 
 #[tokio::test]
@@ -1874,14 +1887,15 @@ async fn test_alter_configs_round_trip_via_describe() {
     };
     let _ = handler.handle_create_topics(&ctx, create_req).await;
 
-    // Flip cleanup.policy via AlterConfigs.
+    // Flip retention.ms via AlterConfigs. (Not `cleanup.policy=compact` —
+    // that policy is refused until a log cleaner exists.)
     let alter_req = AlterConfigsRequestData {
         resources: vec![AlterConfigsResource {
             resource_type: 2,
             resource_name: "alter-target".to_string(),
             configs: vec![AlterConfigsEntry {
-                name: "cleanup.policy".to_string(),
-                value: Some("compact".to_string()),
+                name: "retention.ms".to_string(),
+                value: Some("604800000".to_string()),
             }],
         }],
         validate_only: false,
@@ -1901,7 +1915,7 @@ async fn test_alter_configs_round_trip_via_describe() {
                 resources: vec![DescribeConfigsResource {
                     resource_type: 2,
                     resource_name: "alter-target".to_string(),
-                    configuration_keys: Some(vec!["cleanup.policy".to_string()]),
+                    configuration_keys: Some(vec!["retention.ms".to_string()]),
                 }],
                 include_synonyms: false,
                 include_documentation: false,
@@ -1911,8 +1925,8 @@ async fn test_alter_configs_round_trip_via_describe() {
     let result = &describe_resp.results[0];
     assert_eq!(result.error_code, KafkaCode::None);
     assert_eq!(result.configs.len(), 1);
-    assert_eq!(result.configs[0].name, "cleanup.policy");
-    assert_eq!(result.configs[0].value.as_deref(), Some("compact"));
+    assert_eq!(result.configs[0].name, "retention.ms");
+    assert_eq!(result.configs[0].value.as_deref(), Some("604800000"));
 }
 
 #[tokio::test]
@@ -1936,6 +1950,159 @@ async fn test_create_topics_rejects_invalid_config() {
         KafkaCode::InvalidConfig,
         "unknown cleanup.policy mode must be rejected with INVALID_CONFIG"
     );
+}
+
+/// `cleanup.policy=compact` used to be accepted, persisted, and reported back
+/// by DescribeConfigs while no cleaner ever ran — a keyed topic the operator
+/// believed was collapsing to the latest value per key grew forever. The
+/// broker now refuses the policy at every write path rather than promising
+/// behavior it doesn't implement.
+#[tokio::test]
+async fn test_create_topics_rejects_compact_cleanup_policy() {
+    let handler = create_test_handler().await;
+    let ctx = create_test_context();
+
+    for policy in ["compact", "compact,delete"] {
+        let resp = handler
+            .handle_create_topics(
+                &ctx,
+                CreateTopicsRequestData {
+                    topics: vec![CreateTopicData {
+                        name: format!("compact-{}", policy.replace(',', "-")),
+                        num_partitions: 1,
+                        replication_factor: 1,
+                        configs: vec![("cleanup.policy".to_string(), Some(policy.to_string()))],
+                    }],
+                    timeout_ms: 5000,
+                    validate_only: false,
+                },
+            )
+            .await;
+        assert_eq!(
+            resp.topics[0].error_code,
+            KafkaCode::InvalidConfig,
+            "cleanup.policy={policy} must be rejected: there is no log cleaner"
+        );
+        let msg = resp.topics[0]
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            msg.contains("not implemented"),
+            "the error must tell the operator why, got: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_alter_configs_rejects_compact_cleanup_policy() {
+    let handler = create_test_handler().await;
+    let ctx = create_test_context();
+
+    let _ = handler
+        .handle_create_topics(
+            &ctx,
+            CreateTopicsRequestData {
+                topics: vec![CreateTopicData {
+                    name: "no-compact-alter".to_string(),
+                    num_partitions: 1,
+                    replication_factor: 1,
+                    configs: vec![],
+                }],
+                timeout_ms: 5000,
+                validate_only: false,
+            },
+        )
+        .await;
+
+    let resp = handler
+        .handle_alter_configs(
+            &ctx,
+            AlterConfigsRequestData {
+                resources: vec![AlterConfigsResource {
+                    resource_type: 2,
+                    resource_name: "no-compact-alter".to_string(),
+                    configs: vec![AlterConfigsEntry {
+                        name: "cleanup.policy".to_string(),
+                        value: Some("compact".to_string()),
+                    }],
+                }],
+                validate_only: false,
+            },
+        )
+        .await;
+    assert_eq!(
+        resp.responses[0].error_code,
+        KafkaCode::InvalidConfig,
+        "flipping an existing topic to compact must be refused too — \
+         otherwise AlterConfigs is a back door around CreateTopics"
+    );
+}
+
+/// Kafkaesque stores each partition once in the object store; there is no
+/// follower set. Accepting `replication_factor=3` and returning NONE told the
+/// client it had quorum durability when it had one copy plus whatever the
+/// bucket provides. Refuse it instead.
+#[tokio::test]
+async fn test_create_topics_rejects_replication_factor_above_one() {
+    let handler = create_test_handler().await;
+    let ctx = create_test_context();
+
+    for rf in [2i16, 3, 5] {
+        let resp = handler
+            .handle_create_topics(
+                &ctx,
+                CreateTopicsRequestData {
+                    topics: vec![CreateTopicData {
+                        name: format!("rf-{rf}"),
+                        num_partitions: 1,
+                        replication_factor: rf,
+                        configs: vec![],
+                    }],
+                    timeout_ms: 5000,
+                    validate_only: false,
+                },
+            )
+            .await;
+        assert_eq!(
+            resp.topics[0].error_code,
+            KafkaCode::InvalidReplicationFactor,
+            "replication_factor={rf} must be refused, not silently accepted"
+        );
+    }
+}
+
+/// `1` is the real factor and `-1` is the wire sentinel for "use the broker
+/// default" that clients send when the user didn't ask for a specific value.
+/// Both must keep working, or every default `CreateTopics` call breaks.
+#[tokio::test]
+async fn test_create_topics_accepts_replication_factor_one_and_default() {
+    let handler = create_test_handler().await;
+    let ctx = create_test_context();
+
+    for (name, rf) in [("rf-explicit-one", 1i16), ("rf-broker-default", -1)] {
+        let resp = handler
+            .handle_create_topics(
+                &ctx,
+                CreateTopicsRequestData {
+                    topics: vec![CreateTopicData {
+                        name: name.to_string(),
+                        num_partitions: 1,
+                        replication_factor: rf,
+                        configs: vec![],
+                    }],
+                    timeout_ms: 5000,
+                    validate_only: false,
+                },
+            )
+            .await;
+        assert_eq!(
+            resp.topics[0].error_code,
+            KafkaCode::None,
+            "replication_factor={rf} must be accepted"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1989,8 +2156,8 @@ async fn test_alter_configs_validate_only_does_not_persist() {
                     resource_type: 2,
                     resource_name: "dry-run".to_string(),
                     configs: vec![AlterConfigsEntry {
-                        name: "cleanup.policy".to_string(),
-                        value: Some("compact".to_string()),
+                        name: "retention.ms".to_string(),
+                        value: Some("604800000".to_string()),
                     }],
                 }],
                 validate_only: true,
@@ -1999,8 +2166,8 @@ async fn test_alter_configs_validate_only_does_not_persist() {
         .await;
     assert_eq!(alter_resp.responses[0].error_code, KafkaCode::None);
 
-    // The persisted value must still be the default ("delete"), not the
-    // compact we asked validate_only to dry-run.
+    // The persisted value must still be the cluster default, not the value we
+    // asked validate_only to dry-run.
     let describe = handler
         .handle_describe_configs(
             &ctx,
@@ -2008,16 +2175,16 @@ async fn test_alter_configs_validate_only_does_not_persist() {
                 resources: vec![DescribeConfigsResource {
                     resource_type: 2,
                     resource_name: "dry-run".to_string(),
-                    configuration_keys: Some(vec!["cleanup.policy".to_string()]),
+                    configuration_keys: Some(vec!["retention.ms".to_string()]),
                 }],
                 include_synonyms: false,
                 include_documentation: false,
             },
         )
         .await;
-    assert_eq!(
+    assert_ne!(
         describe.results[0].configs[0].value.as_deref(),
-        Some("delete"),
+        Some("604800000"),
         "validate_only must not persist the new value"
     );
 }

@@ -18,7 +18,7 @@ use tracing::{debug, error, info};
 
 use crate::cluster::coordinator::BrokerInfo;
 use crate::cluster::traits::PartitionCoordinator;
-use crate::constants::VIRTUAL_NODES_PER_BROKER;
+use crate::constants::{MAX_SESSION_TIMEOUT_MS, MIN_SESSION_TIMEOUT_MS, VIRTUAL_NODES_PER_BROKER};
 use crate::error::KafkaCode;
 use crate::server::RequestContext;
 use crate::server::request::{
@@ -223,9 +223,9 @@ pub(super) async fn handle_join_group(
     // u64::MAX in the state-machine layer and permanently holds a group slot
     // (no member ever ages out); a zero or extremely small value would cause
     // the failure detector to reap legitimate consumers between heartbeats.
-    // Bounds match Kafka's group.min/max.session.timeout.ms defaults.
-    const MIN_SESSION_TIMEOUT_MS: i32 = 6_000;
-    const MAX_SESSION_TIMEOUT_MS: i32 = 1_800_000;
+    // Bounds match Kafka's group.min/max.session.timeout.ms defaults and live
+    // in `kafkaesque-protocol::constants` so the wire bound and this handler
+    // bound cannot drift apart.
     if request.session_timeout_ms < MIN_SESSION_TIMEOUT_MS
         || request.session_timeout_ms > MAX_SESSION_TIMEOUT_MS
         || request.rebalance_timeout_ms < 0

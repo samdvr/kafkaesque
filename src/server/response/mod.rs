@@ -118,7 +118,14 @@ impl Response {
         encode_body: F,
     ) -> Result<Self> {
         let header_len = Self::header_len(flexible);
-        let mut framed = Vec::with_capacity(header_len + 64);
+        // Sourced from the shared pool rather than `Vec::with_capacity`: this
+        // runs once per response on every API. The pool is a lock-free
+        // `ArrayQueue`, so the hand-out is a couple of atomics instead of a
+        // malloc, and recycled buffers come back at `DEFAULT_BUFFER_CAPACITY`
+        // — which also stops the encode from reallocating partway through for
+        // any response bigger than the old 64-byte guess. The connection loop
+        // returns the buffer once the frame is on the wire.
+        let mut framed = crate::cluster::buffer_pool::get_buffer(header_len + 64);
         framed.resize(header_len, 0);
         encode_body(&mut framed)?;
         Self::patch_header(&mut framed, correlation_id, flexible);
@@ -128,9 +135,9 @@ impl Response {
     fn from_raw_body(correlation_id: i32, flexible: bool, body: Vec<u8>) -> Result<Self> {
         let header_len = Self::header_len(flexible);
         // If body has at least header_len reserved at the front, splice the
-        // header in. Otherwise allocate a fresh framed buffer and copy once
+        // header in. Otherwise take a pooled framed buffer and copy once
         // (a copy that the caller could have avoided by using `new`/`build`).
-        let mut framed = Vec::with_capacity(header_len + body.len());
+        let mut framed = crate::cluster::buffer_pool::get_buffer(header_len + body.len());
         framed.resize(header_len, 0);
         framed.extend_from_slice(&body);
         Self::patch_header(&mut framed, correlation_id, flexible);

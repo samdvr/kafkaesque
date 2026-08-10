@@ -10,6 +10,7 @@
 //! Raft-backed implementation — tests stub it out with `AllowAll` or
 //! `DenyAll` rather than spinning up a real cluster.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -58,7 +59,11 @@ pub struct RaftAclAuthorizer {
     /// Principals (e.g. `User:admin`) that bypass ACL checks. Useful for
     /// bootstrap and break-glass scenarios. Anonymous (`User:ANONYMOUS`) is
     /// **never** auto-promoted; if you want it as super-user, list it.
-    super_users: Vec<String>,
+    ///
+    /// A set rather than a `Vec`: this is checked on every authorization call,
+    /// so a linear scan with a string compare per entry sits on the Produce and
+    /// Fetch hot paths for no reason.
+    super_users: HashSet<String>,
     /// What to do when no binding matches at all. `true` denies (production
     /// posture). `false` allows (legacy / dev posture, equivalent to "ACLs
     /// auditable but not enforcing").
@@ -73,7 +78,7 @@ impl RaftAclAuthorizer {
     ) -> Self {
         Self {
             coordinator,
-            super_users,
+            super_users: super_users.into_iter().collect(),
             deny_by_default,
         }
     }
@@ -82,7 +87,7 @@ impl RaftAclAuthorizer {
 #[async_trait]
 impl Authorizer for RaftAclAuthorizer {
     async fn authorize(&self, req: AuthorizeRequest<'_>) -> AuthorizeResult {
-        if self.super_users.iter().any(|u| u == req.principal) {
+        if self.super_users.contains(req.principal) {
             return AuthorizeResult::Allowed;
         }
         match self

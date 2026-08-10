@@ -1803,6 +1803,53 @@ fn get_partition_label_sync(topic: &str, partition: i32) -> Cow<'static, str> {
     }
 }
 
+/// Prometheus counters for one `(topic, partition)`, resolved once.
+///
+/// `record_produce` / `record_fetch` each cost a `TRACKED_PARTITIONS` set probe
+/// plus two `with_label_values` label-set hashes — roughly four map lookups per
+/// record batch, on the two hottest paths in the broker. A `PartitionStore`
+/// lives for as long as the broker owns the partition, so it can resolve these
+/// handles once and then pay only the atomic `inc_by`.
+///
+/// Resolution applies the same cardinality limiting as the free functions, so a
+/// partition beyond `MAX_METRIC_CARDINALITY` still collapses into the
+/// `_overflow` series. Because the label is resolved on first use and then
+/// held, a store's series is stable for its lifetime rather than able to flip
+/// between its own label and `_overflow` as other partitions come and go.
+#[derive(Clone)]
+pub struct PartitionCounters {
+    messages_produced: IntCounter,
+    bytes_produced: IntCounter,
+    messages_fetched: IntCounter,
+    bytes_fetched: IntCounter,
+}
+
+impl PartitionCounters {
+    /// Add to the produce counters.
+    pub fn add_produce(&self, message_count: u64, bytes: u64) {
+        self.messages_produced.inc_by(message_count);
+        self.bytes_produced.inc_by(bytes);
+    }
+
+    /// Add to the fetch counters.
+    pub fn add_fetch(&self, message_count: u64, bytes: u64) {
+        self.messages_fetched.inc_by(message_count);
+        self.bytes_fetched.inc_by(bytes);
+    }
+}
+
+/// Resolve the four per-partition throughput counters for `(topic, partition)`.
+pub fn partition_counters(topic: &str, partition: i32) -> PartitionCounters {
+    let partition_str = get_partition_label_sync(topic, partition);
+    let labels = [topic, partition_str.as_ref()];
+    PartitionCounters {
+        messages_produced: MESSAGES_PRODUCED.with_label_values(&labels),
+        bytes_produced: BYTES_PRODUCED.with_label_values(&labels),
+        messages_fetched: MESSAGES_FETCHED.with_label_values(&labels),
+        bytes_fetched: BYTES_FETCHED.with_label_values(&labels),
+    }
+}
+
 /// Record produced messages with cardinality awareness.
 pub fn record_produce(topic: &str, partition: i32, message_count: u64, bytes: u64) {
     let partition_str = get_partition_label_sync(topic, partition);

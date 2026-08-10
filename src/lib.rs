@@ -89,9 +89,17 @@
 //!
 //! See `examples/server.rs` for a complete in-memory Kafka implementation.
 //!
-//! For a production-ready, horizontally scalable broker using SlateDB and
-//! Raft coordination, see the `kafkaesque-bin` crate
+//! For a horizontally scalable broker built on this layer — SlateDB for
+//! storage, embedded Raft for coordination — see the `kafkaesque-bin` crate
 //! (`crates/kafkaesque-bin/`).
+//!
+//! What that broker does **not** implement, despite the wire protocol
+//! exposing the fields: broker-to-broker replication (partitions are stored
+//! once in the object store, `replication_factor > 1` is refused, and
+//! `acks=all` equals `acks=1`), log compaction, incremental fetch sessions,
+//! and transactions. Multi-node failover has no automated test harness yet —
+//! see `tests/p2_multinode_gap_pins_tests.rs`. Read the "Durability
+//! contract" section of `README.md` before relying on it for durability.
 //!
 //! ## Resources
 //! - [Kafka Protocol Spec](https://kafka.apache.org/protocol.html)

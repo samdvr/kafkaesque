@@ -139,6 +139,11 @@ pub enum ConfigError {
         value: String,
         reason: String,
     },
+    /// A known key was set to a syntactically valid value naming a feature
+    /// this broker does not implement. Distinct from [`Self::InvalidValue`]
+    /// because the value is not malformed — it is simply not backed by
+    /// anything, so accepting it would promise behavior that never happens.
+    Unsupported { key: &'static str, detail: String },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -146,6 +151,9 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::InvalidValue { key, value, reason } => {
                 write!(f, "invalid value `{}` for `{}`: {}", value, key, reason)
+            }
+            ConfigError::Unsupported { key, detail } => {
+                write!(f, "unsupported `{}`: {}", key, detail)
             }
         }
     }
@@ -260,9 +268,36 @@ impl TopicCompactionConfig {
     /// AlterConfigs replaces the entire map (we don't yet implement the
     /// per-key Set/Delete/Append/Subtract operations Kafka exposes), so
     /// validation runs over the proposed final state.
+    ///
+    /// This is the *write* gate — the read path ([`Self::resolve`] and
+    /// [`CleanupPolicy::parse`]) stays permissive so a config persisted by an
+    /// earlier build still loads instead of poisoning the topic registry.
     pub fn validate_raw(raw: &HashMap<String, String>) -> Result<(), ConfigError> {
         if let Some(v) = raw.get(KEY_CLEANUP_POLICY) {
-            CleanupPolicy::parse(v)?;
+            let policy = CleanupPolicy::parse(v)?;
+            // There is no log cleaner. Accepting `compact` used to persist the
+            // policy, resolve it into a typed config, and report it back from
+            // DescribeConfigs — while nothing ever compacted the log. A keyed
+            // topic that the operator believed was collapsing to the latest
+            // value per key just grew forever, and the six `compaction.*`
+            // broker knobs made it look supported.
+            //
+            // Refuse the policy at the write gate until a cleaner exists; the
+            // README's "Not yet supported" list already says log compaction
+            // isn't implemented, and this makes the broker agree with it.
+            if policy.is_compact() {
+                return Err(ConfigError::Unsupported {
+                    key: KEY_CLEANUP_POLICY,
+                    detail: format!(
+                        "cleanup.policy={} requires log compaction, which is not \
+                         implemented: no cleaner runs, so a compacted topic would \
+                         grow without bound instead of collapsing to the latest \
+                         value per key. Use cleanup.policy=delete with retention.ms \
+                         for size-bounded topics.",
+                        policy.to_kafka_str()
+                    ),
+                });
+            }
         }
         validate_i64(raw, KEY_RETENTION_MS, None)?;
         validate_u64(raw, KEY_MIN_CLEANABLE_DIRTY_BYTES)?;
@@ -442,6 +477,7 @@ mod tests {
             ConfigError::InvalidValue { key, .. } => {
                 assert_eq!(key, KEY_CLEANUP_POLICY);
             }
+            other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 
@@ -542,8 +578,12 @@ mod tests {
 
     #[test]
     fn validate_accepts_canonical_settings() {
+        // `cleanup.policy=delete`, not `compact,delete`: compaction is
+        // rejected at the write gate until a cleaner exists. The
+        // `*.compaction.*` keys are still validated (and still accepted) so
+        // the values are already correct on the day compaction lands.
         let raw = map_of([
-            ("cleanup.policy", "compact,delete"),
+            ("cleanup.policy", "delete"),
             ("retention.ms", "604800000"),
             ("min.cleanable.dirty.bytes", "67108864"),
             ("min.compaction.lag.ms", "0"),
@@ -554,12 +594,45 @@ mod tests {
         TopicCompactionConfig::validate_raw(&raw).expect("canonical config must be ok");
     }
 
+    /// Compaction has no cleaner, so the write gate must refuse the policy
+    /// rather than persist it and silently never compact. `resolve` (the read
+    /// path) stays permissive so a config written by an older build loads.
+    #[test]
+    fn validate_rejects_compact_policies_until_a_cleaner_exists() {
+        for value in ["compact", "compact,delete", "delete,compact", " compact "] {
+            let raw = map_of([("cleanup.policy", value)]);
+            let err = TopicCompactionConfig::validate_raw(&raw)
+                .expect_err(&format!("cleanup.policy={value} must be rejected"));
+            match err {
+                ConfigError::Unsupported { key, ref detail } => {
+                    assert_eq!(key, KEY_CLEANUP_POLICY);
+                    assert!(
+                        detail.contains("not implemented"),
+                        "error must say why: {detail}"
+                    );
+                }
+                other => panic!("expected Unsupported for {value:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The read path must still load a `compact` policy that an earlier build
+    /// persisted — refusing it here would poison the topic registry.
+    #[test]
+    fn resolve_still_loads_a_previously_persisted_compact_policy() {
+        let raw = map_of([("cleanup.policy", "compact")]);
+        let resolved = TopicCompactionConfig::resolve(&raw, &defaults());
+        assert_eq!(resolved.policy, CleanupPolicy::Compact);
+        assert!(resolved.policy.is_compact());
+    }
+
     #[test]
     fn validate_rejects_invalid_cleanup_policy() {
         let raw = map_of([("cleanup.policy", "compress")]);
         let err = TopicCompactionConfig::validate_raw(&raw).unwrap_err();
         match err {
             ConfigError::InvalidValue { key, .. } => assert_eq!(key, KEY_CLEANUP_POLICY),
+            other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 
@@ -571,6 +644,7 @@ mod tests {
             ConfigError::InvalidValue { key, .. } => {
                 assert_eq!(key, KEY_MIN_COMPACTION_LAG_MS);
             }
+            other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 
@@ -587,6 +661,7 @@ mod tests {
         let err = TopicCompactionConfig::validate_raw(&raw).unwrap_err();
         match err {
             ConfigError::InvalidValue { key, .. } => assert_eq!(key, KEY_RETENTION_MS),
+            other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 

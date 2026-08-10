@@ -28,11 +28,15 @@
 //! the broker's `ApiKey` enum at all.
 //!
 //! ## P4.2 — Log compaction
-//! `cleanup.policy=compact` parses, validates, and persists in the topic
-//! registry (see `src/cluster/topic_config_view.rs`). What's missing is
-//! the cleaner: there's no compaction loop, no `LogCleaner`, no
-//! tombstone collapsing. Two batches produced to a `compact` topic both
-//! survive any number of fetches.
+//! There is no cleaner: no compaction loop, no `LogCleaner`, no tombstone
+//! collapsing. `cleanup.policy=compact` used to parse, validate and persist
+//! anyway, so a keyed topic looked compacted and grew forever. The policy is
+//! now **refused** at the write gate
+//! (`TopicCompactionConfig::validate_raw`, `src/cluster/topic_config_view.rs`)
+//! with `INVALID_CONFIG`, so the broker no longer advertises a guarantee it
+//! doesn't keep. The pins below assert the refusal, and that a
+//! `delete`-policy topic keeps every batch (nothing collapses records behind
+//! the operator's back).
 //!
 //! ## P4.3 — Delegation tokens
 //! Delegation-token RPCs (`CreateDelegationToken` 38, `RenewDelegationToken`
@@ -297,17 +301,15 @@ fn transaction_coordinator_api_keys_are_unknown_today() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn cleanup_policy_compact_is_accepted_at_create_time_today() {
-    // Pin the parser+validator surface: a topic created with
-    // `cleanup.policy=compact` is accepted (not InvalidConfig). The
-    // broker stores the policy in the topic registry; nothing acts on it
-    // yet, but the wire-level acceptance contract matters for clients
-    // that always emit this config (e.g. internal compacted-state topics
-    // a Kafka Streams app would otherwise create).
+async fn cleanup_policy_compact_is_refused_while_no_cleaner_exists() {
+    // Compaction is not implemented, so the policy is refused rather than
+    // accepted-and-ignored. This is the inverse of the pin that used to live
+    // here: it asserted `KafkaCode::None`, which encoded the broker promising
+    // key-collapsing that never happened.
     //
-    // TODO(log compaction): when the cleaner lands, extend this to
-    // verify that the policy is actually read back via DescribeConfigs
-    // and drives compaction scheduling.
+    // TODO(log compaction): when a cleaner lands, flip this back to
+    // asserting acceptance and add a test that the policy actually drives
+    // compaction scheduling.
     let broker = BrokerHandle::spawn(ClusterProfile::Development).await;
 
     let resp = broker
@@ -330,32 +332,27 @@ async fn cleanup_policy_compact_is_accepted_at_create_time_today() {
     let topic = &resp.topics[0];
     assert_eq!(
         topic.error_code,
-        KafkaCode::None,
-        "cleanup.policy=compact must be accepted today; got {:?} ({:?})",
+        KafkaCode::InvalidConfig,
+        "cleanup.policy=compact must be refused while no cleaner exists; got {:?} ({:?})",
         topic.error_code,
         topic.error_message,
     );
 }
 
 #[tokio::test]
-async fn compact_topic_retains_duplicate_keyed_batches_today() {
-    // No cleaner runs. Two batches produced back-to-back to a topic
-    // configured with `cleanup.policy=compact` both survive into the log
-    // and are returned by Fetch. A real compactor would eventually
-    // collapse same-key records, but no logic anywhere in `src/cluster/`
-    // schedules that pass.
+async fn keyed_batches_are_never_collapsed_today() {
+    // No cleaner runs anywhere, so two batches produced back-to-back both
+    // survive into the log and are returned by Fetch. The topic uses the
+    // default `delete` policy because `compact` is now refused at create
+    // time — the point of the pin is that nothing collapses same-key records
+    // behind the operator's back, which holds for every accepted policy.
     //
-    // TODO(log compaction): when the cleaner lands, this test should
-    // become a positive assertion that after waiting `min.cleanable.dirty.bytes`
-    // is exceeded and the cleaner has run, only the latest record per
-    // key remains.
+    // TODO(log compaction): when the cleaner lands, add the mirror of this
+    // test on a `compact` topic — after the dirty-bytes threshold is
+    // exceeded and the cleaner has run, only the latest record per key
+    // remains.
     let broker = BrokerHandle::spawn(ClusterProfile::Development).await;
-    ensure_topic(
-        &broker,
-        COMPACT_TOPIC,
-        vec![("cleanup.policy".to_string(), Some("compact".to_string()))],
-    )
-    .await;
+    ensure_topic(&broker, COMPACT_TOPIC, vec![]).await;
 
     // Produce two independent batches. Without compaction both survive.
     let off_a = produce_with_retry(&broker, COMPACT_TOPIC, make_batch(1)).await;
@@ -404,7 +401,7 @@ async fn compact_topic_retains_duplicate_keyed_batches_today() {
     );
     let returned = p.records.as_ref().expect("fetch must return records");
     // Each make_batch is exactly 100 bytes — both batches must round-trip
-    // intact without any compaction collapsing them.
+    // intact, with nothing collapsing them.
     assert!(
         returned.len() >= 200,
         "both batches must be present (no compaction); got {} bytes",

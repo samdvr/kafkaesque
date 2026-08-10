@@ -130,10 +130,21 @@ fn retention_ms_disable_sentinel_is_accepted() {
 
 #[test]
 fn cleanup_policy_supported_values_validate() {
-    for v in ["delete", "compact", "compact,delete"] {
+    // `delete` is the only *writable* policy: compaction has no cleaner, so
+    // `compact` and `compact,delete` are refused at the write gate rather
+    // than persisted and never acted on.
+    let map = raw(&[(KEY_CLEANUP_POLICY, "delete")]);
+    TopicCompactionConfig::validate_raw(&map)
+        .unwrap_or_else(|e| panic!("cleanup.policy=delete must validate; got {e}"));
+
+    for v in ["compact", "compact,delete"] {
         let map = raw(&[(KEY_CLEANUP_POLICY, v)]);
-        TopicCompactionConfig::validate_raw(&map)
-            .unwrap_or_else(|e| panic!("cleanup.policy={v} must validate; got {e}"));
+        let err = TopicCompactionConfig::validate_raw(&map)
+            .expect_err("compaction policies must be refused while no cleaner exists");
+        assert!(
+            err.to_string().contains("not implemented"),
+            "cleanup.policy={v} must be refused with a reason; got {err}"
+        );
     }
 }
 
@@ -169,8 +180,10 @@ fn unknown_keys_do_not_cause_validation_to_fail() {
 #[test]
 fn resolve_then_to_raw_round_trips_a_typed_config() {
     let cluster = defaults();
+    // `delete`, not `compact,delete`: `to_raw` output is fed back through
+    // `validate_raw` below, and a compaction policy no longer validates.
     let map = raw(&[
-        (KEY_CLEANUP_POLICY, "compact,delete"),
+        (KEY_CLEANUP_POLICY, "delete"),
         (KEY_RETENTION_MS, "60000"),
         (KEY_MIN_COMPACTION_LAG_MS, "0"),
         (KEY_MAX_COMPACTION_LAG_MS, "300000"),

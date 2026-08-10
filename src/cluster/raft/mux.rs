@@ -31,8 +31,6 @@
 //!    here — wiring it through [`super::auth`] is a follow-up alongside
 //!    the actual server in step 5.
 
-#![allow(dead_code)] // wired in step 5 when RaftCluster runs the listener
-
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
@@ -121,7 +119,7 @@ pub enum MuxRaftRpcMessage {
 ///
 /// Not `Clone` because openraft's `AppendEntriesResponse` /
 /// `InstallSnapshotResponse` aren't `Clone` either; the legacy
-/// [`super::network::RaftRpcResponse`] is also non-Clone for the same
+/// `super::network::RaftRpcResponse` is also non-Clone for the same
 /// reason. Responses are produced once per request and consumed in
 /// place, so the missing impl doesn't cost anything.
 #[derive(Debug, Serialize, Deserialize)]
@@ -163,6 +161,12 @@ pub enum MuxRaftRpcResponse {
 /// fuzz test (see `dispatch_target_is_unambiguous`) instead of
 /// corrupting a group's log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// SHIPPED BUT NOT YET WIRED. `mux_server` currently matches on
+// `MuxRaftRpcMessage` inline instead of routing through this helper, so it is
+// exercised only by this module's unit tests. Kept because it is the agreed
+// single place for the dispatch decision; delete it if the server is never
+// converted.
+#[allow(dead_code)]
 pub enum DispatchTarget {
     /// Route to the control-group `Raft` instance.
     Control,
@@ -183,6 +187,8 @@ pub enum DispatchTarget {
 /// network is touched. Correctness here is critical: a bug that routes
 /// `Shard(3, ...)` to control would let bytes drawn for one group's
 /// state machine land in another group's log.
+// SHIPPED BUT NOT YET WIRED — see `DispatchTarget`.
+#[allow(dead_code)]
 pub fn dispatch_target(msg: &MuxRaftRpcMessage) -> DispatchTarget {
     match msg {
         MuxRaftRpcMessage::Control(_) => DispatchTarget::Control,
@@ -212,6 +218,13 @@ pub fn dispatch_target(msg: &MuxRaftRpcMessage) -> DispatchTarget {
 /// module gains the new shape, this helper produces the per-group
 /// distinguishing bytes that step 5's wiring will mix into the HMAC
 /// input.
+// SHIPPED BUT NOT YET WIRED. This is the hook for per-group HMAC purpose
+// mixing described in the module header: today the frame's dispatch tag
+// prevents accidental cross-routing, but a forged Shard(N) frame whose
+// payload deserializes as Control still passes HMAC. Wiring this into
+// `write_rpc_frame`/`read_rpc_frame` is what closes that gap. Unit-tested
+// here so the mapping is pinned before it goes live.
+#[allow(dead_code)]
 pub fn auth_purpose_for(group: GroupId) -> [u8; 4] {
     // Layout: tag byte 0 = group kind (1 = control, 2 = shard), then
     // the shard id big-endian (or zero for control). This is what the

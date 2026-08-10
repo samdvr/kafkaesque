@@ -107,14 +107,11 @@ pub(super) async fn handle_produce(
                 partitions: topic
                     .partitions
                     .iter()
-                    .map(|p| ProducePartitionResponse {
-                        partition_index: p.partition_index,
-                        error_code: KafkaCode::InvalidRequest,
-                        base_offset: -1,
-                        log_append_time: -1,
-                        log_start_offset: -1,
-                        record_errors: vec![],
-                        error_message: None,
+                    .map(|p| {
+                        ProducePartitionResponse::error(
+                            p.partition_index,
+                            KafkaCode::InvalidRequest,
+                        )
                     })
                     .collect(),
                 name: topic.name,
@@ -273,14 +270,8 @@ pub(super) async fn handle_produce(
             let partition_responses: Vec<_> = topic
                 .partitions
                 .iter()
-                .map(|p| ProducePartitionResponse {
-                    partition_index: p.partition_index,
-                    error_code: KafkaCode::InvalidTopic,
-                    base_offset: -1,
-                    log_append_time: -1,
-                    log_start_offset: -1,
-                    record_errors: vec![],
-                    error_message: None,
+                .map(|p| {
+                    ProducePartitionResponse::error(p.partition_index, KafkaCode::InvalidTopic)
                 })
                 .collect();
             responses.push(ProduceTopicResponse {
@@ -316,14 +307,11 @@ pub(super) async fn handle_produce(
             let partition_responses: Vec<_> = topic
                 .partitions
                 .iter()
-                .map(|p| ProducePartitionResponse {
-                    partition_index: p.partition_index,
-                    error_code: KafkaCode::TopicAuthorizationFailed,
-                    base_offset: -1,
-                    log_append_time: -1,
-                    log_start_offset: -1,
-                    record_errors: vec![],
-                    error_message: None,
+                .map(|p| {
+                    ProducePartitionResponse::error(
+                        p.partition_index,
+                        KafkaCode::TopicAuthorizationFailed,
+                    )
                 })
                 .collect();
             responses.push(ProduceTopicResponse {
@@ -367,15 +355,10 @@ pub(super) async fn handle_produce(
                             operation = "IdempotentWrite",
                             "ACL denied: idempotent produce (cluster IdempotentWrite)"
                         );
-                        return ProducePartitionResponse {
-                            partition_index: partition.partition_index,
-                            error_code: KafkaCode::ClusterAuthorizationFailed,
-                            base_offset: -1,
-                            log_append_time: -1,
-                            log_start_offset: -1,
-                            record_errors: vec![],
-                            error_message: None,
-                        };
+                        return ProducePartitionResponse::error(
+                            partition.partition_index,
+                            KafkaCode::ClusterAuthorizationFailed,
+                        );
                     }
                     handler
                         .produce_to_partition(&topic_name, partition, acks)
@@ -494,15 +477,10 @@ impl SlateDBClusterHandler {
         acks: i16,
     ) -> ProducePartitionResponse {
         if self.partition_manager.is_zombie() {
-            return ProducePartitionResponse {
-                partition_index: partition.partition_index,
-                error_code: KafkaCode::NotLeaderForPartition,
-                base_offset: -1,
-                log_append_time: -1,
-                log_start_offset: -1,
-                record_errors: vec![],
-                error_message: None,
-            };
+            return ProducePartitionResponse::error(
+                partition.partition_index,
+                KafkaCode::NotLeaderForPartition,
+            );
         }
 
         // A NULLABLE_BYTES record_set of -1 (or an empty payload) is a legal
@@ -515,15 +493,7 @@ impl SlateDBClusterHandler {
         // ack-strings could not distinguish them). `-1` is the established
         // sentinel for "no record was written" on the produce response.
         if partition.records.is_empty() {
-            return ProducePartitionResponse {
-                partition_index: partition.partition_index,
-                error_code: KafkaCode::None,
-                base_offset: -1,
-                log_append_time: -1,
-                log_start_offset: -1,
-                record_errors: vec![],
-                error_message: None,
-            };
+            return ProducePartitionResponse::empty(partition.partition_index);
         }
 
         if self.validate_record_crc {
@@ -538,15 +508,10 @@ impl SlateDBClusterHandler {
                         "Rejecting batch with invalid CRC"
                     );
                     crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse {
-                        partition_index: partition.partition_index,
-                        error_code: KafkaCode::CorruptMessage,
-                        base_offset: -1,
-                        log_append_time: -1,
-                        log_start_offset: -1,
-                        record_errors: vec![],
-                        error_message: None,
-                    };
+                    return ProducePartitionResponse::error(
+                        partition.partition_index,
+                        KafkaCode::CorruptMessage,
+                    );
                 }
                 CrcValidationResult::TooSmall => {
                     warn!(
@@ -556,15 +521,10 @@ impl SlateDBClusterHandler {
                         "Rejecting batch too small to contain valid CRC"
                     );
                     crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse {
-                        partition_index: partition.partition_index,
-                        error_code: KafkaCode::CorruptMessage,
-                        base_offset: -1,
-                        log_append_time: -1,
-                        log_start_offset: -1,
-                        record_errors: vec![],
-                        error_message: None,
-                    };
+                    return ProducePartitionResponse::error(
+                        partition.partition_index,
+                        KafkaCode::CorruptMessage,
+                    );
                 }
                 CrcValidationResult::FrameMismatch {
                     claimed_size,
@@ -578,15 +538,10 @@ impl SlateDBClusterHandler {
                         "Rejecting batch: header batch_length disagrees with payload size"
                     );
                     crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse {
-                        partition_index: partition.partition_index,
-                        error_code: KafkaCode::CorruptMessage,
-                        base_offset: -1,
-                        log_append_time: -1,
-                        log_start_offset: -1,
-                        record_errors: vec![],
-                        error_message: None,
-                    };
+                    return ProducePartitionResponse::error(
+                        partition.partition_index,
+                        KafkaCode::CorruptMessage,
+                    );
                 }
                 CrcValidationResult::OffloadFailed => {
                     warn!(
@@ -595,29 +550,19 @@ impl SlateDBClusterHandler {
                         "Rejecting batch: CRC offload failed (blocking-pool saturated or panicked)"
                     );
                     crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse {
-                        partition_index: partition.partition_index,
-                        error_code: KafkaCode::CorruptMessage,
-                        base_offset: -1,
-                        log_append_time: -1,
-                        log_start_offset: -1,
-                        record_errors: vec![],
-                        error_message: None,
-                    };
+                    return ProducePartitionResponse::error(
+                        partition.partition_index,
+                        KafkaCode::CorruptMessage,
+                    );
                 }
                 // The CRC enum is non_exhaustive across crate boundaries.
                 // Reject conservatively if a future variant reaches us.
                 _ => {
                     crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse {
-                        partition_index: partition.partition_index,
-                        error_code: KafkaCode::CorruptMessage,
-                        base_offset: -1,
-                        log_append_time: -1,
-                        log_start_offset: -1,
-                        record_errors: vec![],
-                        error_message: None,
-                    };
+                    return ProducePartitionResponse::error(
+                        partition.partition_index,
+                        KafkaCode::CorruptMessage,
+                    );
                 }
             }
         }
@@ -629,15 +574,10 @@ impl SlateDBClusterHandler {
         {
             Ok(s) => s,
             Err(e) => {
-                return ProducePartitionResponse {
-                    partition_index: partition.partition_index,
-                    error_code: e.to_kafka_code(),
-                    base_offset: -1,
-                    log_append_time: -1,
-                    log_start_offset: -1,
-                    record_errors: vec![],
-                    error_message: None,
-                };
+                return ProducePartitionResponse::error(
+                    partition.partition_index,
+                    e.to_kafka_code(),
+                );
             }
         };
 
@@ -653,26 +593,16 @@ impl SlateDBClusterHandler {
                 let record_count = crate::protocol::parse_record_count_checked(&partition.records)
                     .unwrap_or(0)
                     .max(0) as u64;
-                crate::cluster::metrics::record_produce(
-                    topic,
-                    partition.partition_index,
-                    record_count.max(1),
-                    bytes,
-                );
+                // Counters are pre-resolved on the store, so this is four
+                // atomic increments rather than a cardinality probe plus four
+                // label-set hashes per batch.
+                store.record_produce_counters(record_count.max(1), bytes);
 
                 let topic_arc = self.cached_topic_name(topic);
                 self.hwm_notifier(&topic_arc, partition.partition_index)
                     .notify_waiters();
 
-                ProducePartitionResponse {
-                    partition_index: partition.partition_index,
-                    error_code: KafkaCode::None,
-                    base_offset,
-                    log_append_time: -1,
-                    log_start_offset: -1,
-                    record_errors: vec![],
-                    error_message: None,
-                }
+                ProducePartitionResponse::success(partition.partition_index, base_offset)
             }
             Err(e) => {
                 let error_code = e.to_kafka_code();
@@ -690,15 +620,7 @@ impl SlateDBClusterHandler {
                     // the incident.
                     crate::error_throttled!(error = %e, "Failed to append batch");
                 }
-                ProducePartitionResponse {
-                    partition_index: partition.partition_index,
-                    error_code,
-                    base_offset: -1,
-                    log_append_time: -1,
-                    log_start_offset: -1,
-                    record_errors: vec![],
-                    error_message: None,
-                }
+                ProducePartitionResponse::error(partition.partition_index, error_code)
             }
         }
     }

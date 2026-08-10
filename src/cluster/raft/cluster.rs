@@ -1,6 +1,6 @@
 //! Multi-group Raft cluster — `RaftGroup<G>` and `RaftCluster`.
 //!
-//! The single-group [`super::node::RaftNode`] funnels every metadata write
+//! The single-group `super::node::RaftNode` funnels every metadata write
 //! through one log and one leader. The sharded layout introduces:
 //!
 //! - One **control** group ([`super::group::ControlGroupKind`]) carrying
@@ -22,11 +22,9 @@
 //! [`RaftCluster::new`] is the runnable bootstrap path: it builds the
 //! per-group on-disk stores, recovers the WAL + snapshot, wires the
 //! multiplexed network factory and listener, and constructs the openraft
-//! handles. The legacy [`super::node::RaftNode`] continues to back the
+//! handles. The legacy `super::node::RaftNode` continues to back the
 //! running broker until the coordinator is rerouted (sharding plan, step 6);
 //! this module compiles and tests alongside it.
-
-#![allow(dead_code)] // wired in subsequent migration steps
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -49,11 +47,12 @@ use super::group::{ControlGroupKind, GroupKind, ShardGroupKind};
 use super::hash;
 use super::mux::{ControlRpcMessage, MuxRaftRpcMessage, ShardRpcMessage};
 use super::mux_client::{
-    MuxAddrBook, MuxFactoryShared, ReadIndexClient, build_mux_factories, new_addr_book,
+    ForwardClient, MuxAddrBook, MuxFactoryShared, ReadIndexClient, build_mux_factories,
+    new_addr_book,
 };
 use super::mux_server::{MuxRaftHandles, MuxRaftRpcServer};
 use super::storage::RaftStore;
-use super::types::{ControlConfig, RaftNodeId, ShardConfig, ShardId};
+use super::types::{RaftNodeId, ShardConfig, ShardId};
 use crate::cluster::error::{SlateDBError, SlateDBResult};
 
 // ============================================================================
@@ -387,8 +386,10 @@ impl RaftCluster {
 
 /// Per-group Raft handle the network factory and the multiplexed RPC server
 /// both reference. Distinct from [`RaftGroup<G>`] (which carries the SM, leader
-/// cache, etc.) because the listener only needs the openraft handle.
-type ControlRaft = Arc<Raft<ControlConfig>>;
+/// cache, and proposal semaphore alongside the handle).
+///
+/// The control-group counterpart alias was deleted as unused — `self.control`
+/// is reached through `RaftGroup<ControlGroupKind>` everywhere.
 type ShardRaft = Arc<Raft<ShardConfig>>;
 
 /// Cluster-wide bootstrap state held alongside the public [`RaftCluster`].
@@ -402,14 +403,20 @@ struct ClusterBootstrap {
     /// Pre-seeded from `config.cluster_members`; `add_node` on either group's
     /// factory writes here.
     addrs: MuxAddrBook,
-    /// Multiplexed network shared state (auth keys, TLS, addrs).
-    factory_shared: Arc<MuxFactoryShared>,
     /// Read-index client for the control group's follower reads.
     control_read_index: ReadIndexClient,
     /// Read-index clients for shard follower reads, indexed by [`ShardId`].
     /// One per shard so a burst of reads on shard 3 doesn't queue behind
     /// shard 0's socket.
     shard_read_index: Vec<ReadIndexClient>,
+    /// Connection pool for forwarding control-group client writes to the
+    /// leader. Forwarding is steady state on every non-leader broker, so
+    /// these writes must not pay a TCP+TLS handshake each.
+    control_forward: ForwardClient,
+    /// Connection pools for forwarding shard-group client writes, indexed by
+    /// [`ShardId`]. One per shard for the same isolation reason as
+    /// `shard_read_index`.
+    shard_forward: Vec<ForwardClient>,
     /// Broadcast channel used to signal the RPC server + background pollers
     /// to stop on shutdown. Receivers are subscribed at spawn time.
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
@@ -436,7 +443,7 @@ impl RaftCluster {
     ///    `config.metadata_shards` shards). Each store recovers its WAL and
     ///    loads its snapshot before openraft is constructed; corrupt WAL or
     ///    snapshot fails closed (same fail-closed contract as
-    ///    [`super::node::RaftNode::new`]).
+    ///    `super::node::RaftNode::new`).
     /// 3. Build the multiplexed network factory shared across every group.
     ///    The address book is pre-seeded from `config.cluster_members` so
     ///    openraft's first replication attempt has a target to dial.
@@ -572,7 +579,10 @@ impl RaftCluster {
             shard_read_index: (0..config.metadata_shards)
                 .map(|_| ReadIndexClient::new(factory_shared.clone()))
                 .collect(),
-            factory_shared,
+            control_forward: ForwardClient::new(factory_shared.clone()),
+            shard_forward: (0..config.metadata_shards)
+                .map(|_| ForwardClient::new(factory_shared.clone()))
+                .collect(),
             shutdown_tx: shutdown_tx.clone(),
             background_handles: RwLock::new(Vec::new()),
             config: config.clone(),
@@ -749,7 +759,7 @@ impl RaftCluster {
 
     /// Propose a write to the control group.
     ///
-    /// Same backpressure + propose semantics as [`super::node::RaftNode::write`]:
+    /// Same backpressure + propose semantics as `super::node::RaftNode::write`:
     /// per-group proposal semaphore bounds in-flight proposals, then
     /// `client_write` runs through openraft. Forwarded writes (when this
     /// node isn't the control leader) currently bubble up the openraft
@@ -836,14 +846,12 @@ impl RaftCluster {
                 leader_id
             )));
         };
-        let cfg = &self.bootstrap().config;
         super::mux_client::forward_control_write_with_term(
+            &self.bootstrap().control_forward,
             &leader_addr,
             command,
             current_term,
             0,
-            &cfg.auth_keys,
-            cfg.tls.as_ref(),
         )
         .await
         .map_err(|e| SlateDBError::Storage(format!("Failed to forward to control leader: {}", e)))
@@ -876,15 +884,13 @@ impl RaftCluster {
                 shard_id, leader_id
             )));
         };
-        let cfg = &self.bootstrap().config;
         super::mux_client::forward_shard_write_with_term(
+            &self.bootstrap().shard_forward[shard_id as usize],
             &leader_addr,
             shard_id,
             command,
             current_term,
             0,
-            &cfg.auth_keys,
-            cfg.tls.as_ref(),
         )
         .await
         .map_err(|e| {
@@ -1140,7 +1146,7 @@ impl RaftCluster {
     }
 
     /// Stop the cluster: signal background tasks, await them, then shut down
-    /// every group's openraft handle. Mirrors [`super::node::RaftNode::shutdown`]
+    /// every group's openraft handle. Mirrors `super::node::RaftNode::shutdown`
     /// fanned out across all groups.
     pub async fn shutdown(&self) -> SlateDBResult<()> {
         if let Some(b) = self.bootstrap.as_ref() {
@@ -1172,7 +1178,7 @@ impl RaftCluster {
 ///
 /// openraft's `ClientWriteError::ForwardToLeader` is a typed variant, but
 /// it's wrapped in nested generic error enums whose path differs across
-/// crate versions. The legacy [`super::node::RaftNode::write`] also relies
+/// crate versions. The legacy `super::node::RaftNode::write` also relies
 /// on string matching for the same reason — pinning the contract here
 /// keeps both paths in lockstep so a request the legacy path forwards is
 /// also forwarded by the multi-group path (and vice versa).
@@ -1216,7 +1222,7 @@ where
 
 /// Build a per-group `RaftStore<G>`, recover its WAL, and load any existing
 /// snapshot. On any corruption, fails closed with the same error wording as
-/// [`super::node::RaftNode::new`] — the operator restoring at 3am needs a
+/// `super::node::RaftNode::new` — the operator restoring at 3am needs a
 /// crash, not a silently amnesiac broker.
 async fn build_and_recover_store<G: GroupKind>(
     object_store: &Arc<dyn ObjectStore>,
@@ -1281,7 +1287,7 @@ async fn build_and_recover_store<G: GroupKind>(
 
 /// Wire a constructed store + factory into a fresh openraft handle via the
 /// v1→v2 [`Adaptor`]. Mirrors the `Adaptor::new(store) → Raft::new(...)`
-/// pattern used by [`super::node::RaftNode::new`]. The store is consumed
+/// pattern used by `super::node::RaftNode::new`. The store is consumed
 /// here — callers that need an SM read handle must clone it out before
 /// calling.
 async fn build_raft_handle<G, F>(

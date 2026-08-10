@@ -193,7 +193,7 @@ async fn expired_cert_is_rejected_by_client() {
         .expect("server accepts an expired cert at config time — failure is at handshake");
     let (addr, _server_err) = spawn_one_shot_tls_server(cfg).await;
 
-    let err = client_handshake_error(addr, &[pki.ca_cert_der.clone()], "localhost")
+    let err = client_handshake_error(addr, std::slice::from_ref(&pki.ca_cert_der), "localhost")
         .await
         .expect("expired cert must fail the handshake");
     assert!(
@@ -222,7 +222,7 @@ async fn hostname_mismatch_is_rejected_by_client() {
     let cfg = TlsConfig::from_pem_files(cert_f.path(), key_f.path()).unwrap();
     let (addr, _server_err) = spawn_one_shot_tls_server(cfg).await;
 
-    let err = client_handshake_error(addr, &[pki.ca_cert_der.clone()], "localhost")
+    let err = client_handshake_error(addr, std::slice::from_ref(&pki.ca_cert_der), "localhost")
         .await
         .expect("hostname mismatch must fail the handshake");
     let lower = err.to_lowercase();
@@ -255,7 +255,8 @@ async fn mtls_without_client_cert_is_rejected() {
     let (addr, server_err_rx) = spawn_one_shot_tls_server(cfg).await;
 
     // Client configured without a client cert.
-    let err = client_handshake_error(addr, &[pki.ca_cert_der.clone()], "localhost").await;
+    let err =
+        client_handshake_error(addr, std::slice::from_ref(&pki.ca_cert_der), "localhost").await;
     let server_err = timeout(Duration::from_secs(5), server_err_rx)
         .await
         .ok()

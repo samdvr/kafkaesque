@@ -488,29 +488,16 @@ mod tests {
             injector.restrict_to(&[kind]);
             injector.fail_next(1);
             let result: Result<(), Error> = match kind {
-                OpKind::Get => store
-                    .get(&Path::from("seed"))
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e),
+                OpKind::Get => store.get(&Path::from("seed")).await.map(|_| ()),
                 OpKind::Put => store
                     .put(&Path::from("p"), PutPayload::from(b"x".as_slice()))
                     .await
-                    .map(|_| ())
-                    .map_err(|e| e),
+                    .map(|_| ()),
                 OpKind::Delete => store.delete(&Path::from("seed")).await,
-                OpKind::List => store
-                    .list_with_delimiter(None)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e),
+                OpKind::List => store.list_with_delimiter(None).await.map(|_| ()),
                 OpKind::Copy => store.copy(&Path::from("seed"), &Path::from("dst")).await,
                 OpKind::Rename => store.rename(&Path::from("seed"), &Path::from("dst")).await,
-                OpKind::Head => store
-                    .head(&Path::from("seed"))
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e),
+                OpKind::Head => store.head(&Path::from("seed")).await.map(|_| ()),
             };
             let err = result.expect_err("kind under restrict must surface fault");
             let s = err.to_string();

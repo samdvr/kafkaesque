@@ -9,6 +9,7 @@
 
 pub mod broker_handle;
 pub mod raft_helper;
+pub mod raft_multinode;
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ pub use broker_handle::{BrokerHandle, ClusterHandle, bytes_to_vec};
 pub use raft_helper::{
     build_single_node_raft, build_single_node_raft_with_id, raft_test_config, wait_for_raft_leader,
 };
+pub use raft_multinode::{MultiNodeRaft, wait_for_agreed_leader};
 
 /// Allocate a free TCP port on `127.0.0.1` by binding ephemeral and reading
 /// back the assigned port. The listener is dropped before returning, so the

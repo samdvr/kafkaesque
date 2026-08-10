@@ -9,6 +9,7 @@
 //! - `admin` - Topic creation and deletion
 //! - `producer_id` - Producer ID initialization
 
+mod acls;
 mod admin;
 mod configs;
 mod fetch;
@@ -1292,6 +1293,33 @@ impl Handler for SlateDBClusterHandler {
         request: IncrementalAlterConfigsRequestData,
     ) -> IncrementalAlterConfigsResponseData {
         incremental_configs::handle_incremental_alter_configs(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_describe_acls(
+        &self,
+        ctx: &RequestContext,
+        request: DescribeAclsRequestData,
+    ) -> DescribeAclsResponseData {
+        acls::handle_describe_acls(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_create_acls(
+        &self,
+        ctx: &RequestContext,
+        request: CreateAclsRequestData,
+    ) -> CreateAclsResponseData {
+        acls::handle_create_acls(self, ctx, request).await
+    }
+
+    #[tracing::instrument(skip(self, ctx, request), fields(request_id = %ctx.request_id))]
+    async fn handle_delete_acls(
+        &self,
+        ctx: &RequestContext,
+        request: DeleteAclsRequestData,
+    ) -> DeleteAclsResponseData {
+        acls::handle_delete_acls(self, ctx, request).await
     }
 }
 

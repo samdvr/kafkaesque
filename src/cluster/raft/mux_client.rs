@@ -1053,7 +1053,8 @@ mod tests {
         // N shard factories, 1 control factory). Bind the control
         // factory above (not `_`) so it isn't dropped before the count
         // is taken.
-        assert!(Arc::strong_count(&shared) >= 1 + shards.len() + 1);
+        let expected_holders = 1 + shards.len() + 1;
+        assert!(Arc::strong_count(&shared) >= expected_holders);
         // And the address book is still the same allocation we gave it.
         assert!(Arc::ptr_eq(&shared.addrs, book_via_shared));
     }

@@ -167,7 +167,7 @@ async fn read_uncommitted_returns_produced_records() {
     let p = first_partition(&resp);
     assert_eq!(p.error_code, KafkaCode::None);
     assert!(p.records.is_some(), "read_uncommitted must return records");
-    assert!(p.records.as_ref().unwrap().len() > 0);
+    assert!(!p.records.as_ref().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -61,15 +61,16 @@ fn isolated_test_config(broker_id: i32) -> ClusterConfig {
     enable_single_node_bootstrap();
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.keep();
-    let mut config = ClusterConfig::default();
-    config.broker_id = broker_id;
-    config.object_store_path = root.to_string_lossy().into_owned();
-    config.raft_listen_addr = format!(
-        "127.0.0.1:{}",
-        RAFT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-    );
-    config.auto_create_topics = true;
-    config
+    ClusterConfig {
+        broker_id,
+        object_store_path: root.to_string_lossy().into_owned(),
+        auto_create_topics: true,
+        raft_listen_addr: format!(
+            "127.0.0.1:{}",
+            RAFT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        ),
+        ..Default::default()
+    }
 }
 
 async fn handler() -> SlateDBClusterHandler {

@@ -451,6 +451,11 @@ enum OwnerState {
 /// other must have observed the winner's id and backed off. The slot must
 /// hold exactly one owner.
 #[test]
+// The separate `contains_key`-then-`insert` is the shape under test: it
+// mirrors the production acquire path and the point is that the per-key
+// lock — not the map API — is what makes it safe. Collapsing it into the
+// entry API would model a different, trivially-atomic primitive.
+#[allow(clippy::map_entry)]
 fn test_partition_acquire_race_single_winner() {
     loom::model(|| {
         let map: Arc<Mutex<HashMap<i32, OwnerState>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -693,6 +698,7 @@ fn test_producer_state_retry_dedup_pair_atomicity() {
 ///   - eviction wins → producer absent, append takes the no-prior-state
 ///     path (sequence==0 acceptable)
 ///   - append wins → producer present with the appended sequence
+///
 /// What must NOT happen: producer absent in cache but present in
 /// "persisted store" with a stale sequence the next append doesn't know
 /// to dedup.

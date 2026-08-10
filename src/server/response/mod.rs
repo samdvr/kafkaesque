@@ -3,6 +3,7 @@
 //! This module provides encoding for Kafka response types, which is the reverse
 //! of what the client-side protocol module does (parsing responses).
 
+mod acls;
 mod admin;
 mod api_versions;
 mod auth;
@@ -22,6 +23,7 @@ use crate::encode::ToByte;
 use crate::error::Result;
 
 // Re-export all response data types
+pub use acls::*;
 pub use admin::*;
 pub use api_versions::*;
 pub use auth::*;

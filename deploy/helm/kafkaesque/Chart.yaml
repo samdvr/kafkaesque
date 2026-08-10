@@ -2,8 +2,8 @@ apiVersion: v2
 name: kafkaesque
 description: A Kafka-compatible message broker using object storage for durability
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.2.0
+appVersion: "0.2.0"
 keywords:
   - kafka
   - messaging

@@ -22,7 +22,7 @@
 //!
 //! ```sh
 //! cargo test --test linearizability_tests --release
-//! cargo test --test linearizability_real_tests --release   # the load-bearing ones
+//! cargo test --test linearizability_real_tests --release   # the important ones
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet};

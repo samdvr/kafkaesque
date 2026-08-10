@@ -1674,7 +1674,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
 
     /// Delete all data for a partition from object storage.
     ///
-    /// Ordering is load-bearing: we MUST delete the on-disk objects BEFORE
+    /// Ordering is important: we MUST delete the on-disk objects BEFORE
     /// releasing the Raft lease, otherwise another broker can acquire the
     /// partition between our release and our delete-stream and start
     /// writing under the same `topic-X/partition-Y/` prefix — its writes

@@ -9,10 +9,20 @@ check:
 
 # Mirror the test split CI uses (`cargo test --lib` then `cargo test --tests`).
 # Run separately so a slow integration test doesn't hide a fast-suite regression.
+# `rdkafka_e2e` needs system librdkafka (`brew install librdkafka` /
+# `apt install librdkafka-dev`); CI runs it in a dedicated job.
 .PHONY: test
 test:
 	cargo test --lib
 	cargo test --tests
+
+.PHONY: test-rdkafka
+test-rdkafka:
+	cargo test --test rdkafka_e2e -- --test-threads=1
+
+.PHONY: test-multinode
+test-multinode:
+	cargo test --test p2_multinode_gap_pins_tests -- --test-threads=1
 
 # `cargo audit` checks our locked dependencies against RustSec advisories;
 # matches the `audit-check` job in CI. Installs the binary on first run.

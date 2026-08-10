@@ -111,6 +111,9 @@ pub enum RequestResponse {
     DescribeConfigs(DescribeConfigsResponseData),
     AlterConfigs(AlterConfigsResponseData),
     OffsetForLeaderEpoch(OffsetForLeaderEpochResponseData),
+    DescribeAcls(DescribeAclsResponseData),
+    CreateAcls(CreateAclsResponseData),
+    DeleteAcls(DeleteAclsResponseData),
     CreatePartitions(CreatePartitionsResponseData),
     IncrementalAlterConfigs(IncrementalAlterConfigsResponseData),
     /// Used for both `Request::UnsupportedVersion` and `Request::Unknown`.
@@ -201,6 +204,15 @@ pub trait Handler: Send + Sync {
             Request::OffsetForLeaderEpoch(_, req) => RequestResponse::OffsetForLeaderEpoch(
                 self.handle_offset_for_leader_epoch(ctx, req).await,
             ),
+            Request::DescribeAcls(_, req) => {
+                RequestResponse::DescribeAcls(self.handle_describe_acls(ctx, req).await)
+            }
+            Request::CreateAcls(_, req) => {
+                RequestResponse::CreateAcls(self.handle_create_acls(ctx, req).await)
+            }
+            Request::DeleteAcls(_, req) => {
+                RequestResponse::DeleteAcls(self.handle_delete_acls(ctx, req).await)
+            }
             Request::CreatePartitions(_, req) => {
                 RequestResponse::CreatePartitions(self.handle_create_partitions(ctx, req).await)
             }
@@ -749,6 +761,59 @@ pub trait Handler: Send + Sync {
                     error_message: Some("IncrementalAlterConfigs not implemented".to_string()),
                     resource_type: r.resource_type,
                     resource_name: r.resource_name,
+                })
+                .collect(),
+        }
+    }
+
+    /// Handle a DescribeAcls request.
+    async fn handle_describe_acls(
+        &self,
+        _ctx: &RequestContext,
+        _request: DescribeAclsRequestData,
+    ) -> DescribeAclsResponseData {
+        DescribeAclsResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::ClusterAuthorizationFailed,
+            error_message: Some("DescribeAcls not implemented".to_string()),
+            resources: vec![],
+        }
+    }
+
+    /// Handle a CreateAcls request.
+    async fn handle_create_acls(
+        &self,
+        _ctx: &RequestContext,
+        request: CreateAclsRequestData,
+    ) -> CreateAclsResponseData {
+        CreateAclsResponseData {
+            throttle_time_ms: 0,
+            results: request
+                .creations
+                .into_iter()
+                .map(|_| AclCreationResult {
+                    error_code: KafkaCode::ClusterAuthorizationFailed,
+                    error_message: Some("CreateAcls not implemented".to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Handle a DeleteAcls request.
+    async fn handle_delete_acls(
+        &self,
+        _ctx: &RequestContext,
+        request: DeleteAclsRequestData,
+    ) -> DeleteAclsResponseData {
+        DeleteAclsResponseData {
+            throttle_time_ms: 0,
+            filter_results: request
+                .filters
+                .into_iter()
+                .map(|_| DeleteAclsFilterResult {
+                    error_code: KafkaCode::ClusterAuthorizationFailed,
+                    error_message: Some("DeleteAcls not implemented".to_string()),
+                    matching_acls: vec![],
                 })
                 .collect(),
         }

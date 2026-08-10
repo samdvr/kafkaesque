@@ -669,9 +669,9 @@ pub struct ClusterConfig {
     /// startup. The leader writes them via Raft so they replicate
     /// to every node. The format is a JSON array of `AclBinding` records.
     ///
-    /// This is operator-friendly bootstrap; future iterations will accept the
-    /// Kafka `CreateAcls` admin RPC. Until then this is the primary way to
-    /// populate the ACL state machine on a fresh cluster.
+    /// Complements the live Kafka `CreateAcls` admin RPC for
+    /// declarative/GitOps seeding. Re-applying the same file is
+    /// idempotent (`CreateAcls` deduplicates).
     ///
     /// Default: None
     pub acl_bootstrap_file: Option<String>,

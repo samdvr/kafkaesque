@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "kafkaesque"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "kafkaesque-bin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "kafkaesque",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "kafkaesque-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "crc32c",

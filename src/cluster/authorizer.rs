@@ -132,6 +132,9 @@ pub fn cluster_operation_for_api(api_key: crate::server::request::ApiKey) -> Opt
         // Producer-id allocation is a cluster action (it consumes a global
         // counter and is gated by IdempotentWrite in real Kafka).
         ApiKey::InitProducerId => Some(AclOperation::IdempotentWrite),
+        // ACL administration is a cluster Alter / Describe (KIP-140).
+        ApiKey::CreateAcls | ApiKey::DeleteAcls => Some(AclOperation::Alter),
+        ApiKey::DescribeAcls => Some(AclOperation::Describe),
         // ApiVersions / SASL handshake / authenticate run before authn so
         // they bypass authz entirely.
         ApiKey::ApiVersions | ApiKey::SaslHandshake | ApiKey::SaslAuthenticate => None,

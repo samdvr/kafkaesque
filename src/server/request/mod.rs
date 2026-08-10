@@ -3,6 +3,7 @@
 //! This module provides parsers for Kafka request types, which is the reverse
 //! of what the client-side protocol module does (encoding requests).
 
+mod acls;
 mod admin;
 mod api_versions;
 mod auth;
@@ -27,6 +28,7 @@ use crate::error::{Error, Result};
 use crate::parser::{parse_kafka_string_opt, skip_tagged_fields};
 
 // Re-export all request data types
+pub use acls::*;
 pub use admin::*;
 pub use api_versions::*;
 pub use auth::*;
@@ -67,6 +69,9 @@ pub enum ApiKey {
     DeleteTopics = 20,
     InitProducerId = 22,
     OffsetForLeaderEpoch = 23,
+    DescribeAcls = 29,
+    CreateAcls = 30,
+    DeleteAcls = 31,
     DescribeConfigs = 32,
     AlterConfigs = 33,
     SaslAuthenticate = 36,
@@ -102,6 +107,9 @@ impl From<i16> for ApiKey {
             20 => ApiKey::DeleteTopics,
             22 => ApiKey::InitProducerId,
             23 => ApiKey::OffsetForLeaderEpoch,
+            29 => ApiKey::DescribeAcls,
+            30 => ApiKey::CreateAcls,
+            31 => ApiKey::DeleteAcls,
             32 => ApiKey::DescribeConfigs,
             33 => ApiKey::AlterConfigs,
             36 => ApiKey::SaslAuthenticate,
@@ -139,6 +147,9 @@ impl From<ApiKey> for i16 {
             ApiKey::DeleteTopics => 20,
             ApiKey::InitProducerId => 22,
             ApiKey::OffsetForLeaderEpoch => 23,
+            ApiKey::DescribeAcls => 29,
+            ApiKey::CreateAcls => 30,
+            ApiKey::DeleteAcls => 31,
             ApiKey::DescribeConfigs => 32,
             ApiKey::AlterConfigs => 33,
             ApiKey::SaslAuthenticate => 36,
@@ -181,6 +192,9 @@ impl ApiKey {
             ApiKey::DeleteTopics => "DeleteTopics",
             ApiKey::InitProducerId => "InitProducerId",
             ApiKey::OffsetForLeaderEpoch => "OffsetForLeaderEpoch",
+            ApiKey::DescribeAcls => "DescribeAcls",
+            ApiKey::CreateAcls => "CreateAcls",
+            ApiKey::DeleteAcls => "DeleteAcls",
             ApiKey::DescribeConfigs => "DescribeConfigs",
             ApiKey::AlterConfigs => "AlterConfigs",
             ApiKey::SaslAuthenticate => "SaslAuthenticate",
@@ -273,6 +287,9 @@ pub enum Request {
     DescribeConfigs(RequestHeader, DescribeConfigsRequestData),
     AlterConfigs(RequestHeader, AlterConfigsRequestData),
     OffsetForLeaderEpoch(RequestHeader, OffsetForLeaderEpochRequestData),
+    DescribeAcls(RequestHeader, DescribeAclsRequestData),
+    CreateAcls(RequestHeader, CreateAclsRequestData),
+    DeleteAcls(RequestHeader, DeleteAclsRequestData),
     CreatePartitions(RequestHeader, CreatePartitionsRequestData),
     IncrementalAlterConfigs(RequestHeader, IncrementalAlterConfigsRequestData),
     /// A known API key was sent with a version outside the advertised
@@ -311,6 +328,9 @@ impl Request {
             Request::DescribeConfigs(h, _) => h,
             Request::AlterConfigs(h, _) => h,
             Request::OffsetForLeaderEpoch(h, _) => h,
+            Request::DescribeAcls(h, _) => h,
+            Request::CreateAcls(h, _) => h,
+            Request::DeleteAcls(h, _) => h,
             Request::CreatePartitions(h, _) => h,
             Request::IncrementalAlterConfigs(h, _) => h,
             Request::UnsupportedVersion(h) => h,
@@ -391,6 +411,9 @@ impl Request {
             DescribeConfigs => configs::parse_describe_configs_request,
             AlterConfigs => configs::parse_alter_configs_request,
             OffsetForLeaderEpoch => leader_epoch::parse_offset_for_leader_epoch_request,
+            DescribeAcls => acls::parse_describe_acls_request,
+            CreateAcls => acls::parse_create_acls_request,
+            DeleteAcls => acls::parse_delete_acls_request,
             CreatePartitions => partitions::parse_create_partitions_request,
             IncrementalAlterConfigs => incremental_configs::parse_incremental_alter_configs_request,
         );

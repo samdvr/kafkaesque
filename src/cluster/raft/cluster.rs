@@ -752,6 +752,21 @@ impl RaftCluster {
         self.bootstrap().addrs.write().await.insert(node_id, addr);
     }
 
+    /// Drop `node_id` from the shared address book.
+    ///
+    /// Used by the multi-node test harness to simulate a network partition:
+    /// with no dialable address, outbound AppendEntries / RequestVote /
+    /// InstallSnapshot to that peer fail, so the peer is effectively
+    /// unreachable without tearing the process down. Heal by calling
+    /// [`Self::add_node`] again with the restored address.
+    ///
+    /// Already-open TCP connections are not forcibly closed — openraft
+    /// dials per RPC in our mux factory, so clearing the book is enough
+    /// for the next round of traffic.
+    pub async fn remove_node(&self, node_id: RaftNodeId) {
+        self.bootstrap().addrs.write().await.remove(&node_id);
+    }
+
     /// Lookup the address for `node_id`, or `None` if unknown.
     pub async fn get_node_addr(&self, node_id: RaftNodeId) -> Option<String> {
         self.bootstrap().addrs.read().await.get(&node_id).cloned()

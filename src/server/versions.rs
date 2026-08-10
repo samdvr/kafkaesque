@@ -141,6 +141,11 @@ pub const SUPPORTED_VERSIONS: &[SupportedVersion] = &[
     // offset. v3 added the `replica_id` request prefix; v4 (flexible) is
     // not yet emitted.
     SupportedVersion::new(ApiKey::OffsetForLeaderEpoch, 0, 3),
+    // ACL admin RPCs — wire adapters onto the existing Raft ACL state
+    // machine. v1 adds resource_pattern_type; flexible v2+ deferred.
+    SupportedVersion::new(ApiKey::DescribeAcls, 0, 1),
+    SupportedVersion::new(ApiKey::CreateAcls, 0, 1),
+    SupportedVersion::new(ApiKey::DeleteAcls, 0, 1),
     // CreatePartitions: `kafka-topics.sh --alter --partitions N` and
     // AdminClient.createPartitions() use this as the only path to grow a
     // topic. v2+ (flexible) not yet supported.
@@ -228,6 +233,9 @@ pub const PARSER_ENCODER_COVERAGE: &[(ApiKey, i16, i16)] = &[
     (ApiKey::DescribeConfigs, 0, 2),
     (ApiKey::AlterConfigs, 0, 1),
     (ApiKey::OffsetForLeaderEpoch, 0, 3),
+    (ApiKey::DescribeAcls, 0, 1),
+    (ApiKey::CreateAcls, 0, 1),
+    (ApiKey::DeleteAcls, 0, 1),
     (ApiKey::CreatePartitions, 0, 1),
     (ApiKey::IncrementalAlterConfigs, 0, 0),
 ];

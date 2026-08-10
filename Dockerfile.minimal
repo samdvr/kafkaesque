@@ -11,7 +11,13 @@
 # =============================================================================
 # Stage 1: Build with static linking
 # =============================================================================
-FROM rust:1.91-alpine3.20 AS builder
+# Alpine 3.22 (not 3.20): the 3.20 branch reached end-of-support in
+# May 2026, so it stops receiving package security fixes and the CI Trivy
+# scan flags the runtime layer. The `rust:*-alpine3.20` builder variant is
+# also no longer published for current Rust releases, which breaks the
+# build outright. Keep both stages on the same Alpine branch so the binary
+# links against the same musl the runtime ships.
+FROM rust:1.91-alpine3.22 AS builder
 
 RUN apk add --no-cache \
     musl-dev \
@@ -75,7 +81,7 @@ RUN TARGET="$(cat /rust-target)" && \
 # =============================================================================
 # Stage 2: Minimal runtime (scratch + glibc compatibility)
 # =============================================================================
-FROM alpine:3.20
+FROM alpine:3.22
 
 # Install only glibc compatibility (no other tools)
 # This is needed only if the binary has any glibc dependencies

@@ -131,21 +131,16 @@ impl BrokerHandle {
 }
 
 /// A small cluster of in-process brokers. Today this is a thin wrapper
-/// around `Vec<BrokerHandle>`; it exists to give multi-node tests one
-/// place to grow real cross-broker coordination (raft peer wiring,
-/// ownership-balanced topic creation, leadership transfers).
+/// around `Vec<BrokerHandle>` for Kafka-handler-level multi-broker tests
+/// that do not need a shared Raft membership (e.g. parallel produce
+/// stress). For a real peered Raft cluster use
+/// [`super::raft_multinode::MultiNodeRaft`] instead.
 pub struct ClusterHandle {
     pub brokers: Vec<BrokerHandle>,
 }
 
 impl ClusterHandle {
-    /// Spawn `n` independent brokers. They share the in-memory object
-    /// store namespace through the local-filesystem temp dirs but are NOT
-    /// peered through Raft — multi-node Raft wiring is the open work item
-    /// the audit's T4 calls out. Use this for tests that want N
-    /// independent brokers (e.g. parallel produce stress); for tests that
-    /// need a real Raft cluster, extend this builder once the multi-node
-    /// harness lands.
+    /// Spawn `n` independent brokers. They are NOT peered through Raft.
     pub async fn spawn(n: usize, profile: ClusterProfile) -> Self {
         let mut brokers = Vec::with_capacity(n);
         for i in 0..n {

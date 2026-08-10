@@ -630,6 +630,11 @@ impl RaftAuthKeys {
     }
 
     /// Verify a received authenticated frame, including replay defense.
+    ///
+    /// The parameter list is wide because every element is authenticated
+    /// header material that the caller reads straight off the wire; bundling
+    /// them into a struct would only move the frame layout somewhere else.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn verify_authenticated(
         &self,
         peer: &PeerScope,

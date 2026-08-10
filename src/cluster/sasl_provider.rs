@@ -76,7 +76,10 @@ pub struct SaslProvider {
     negotiated_mechanism: Arc<moka::sync::Cache<u64, Arc<str>>>,
     /// Supported SASL mechanisms (advertised in SaslHandshake).
     mechanisms: Vec<String>,
-    /// Whether authentication is required.
+    /// Whether authentication is required. Mirrors `ClusterConfig::sasl_required`
+    /// for completeness of the provider's view; the connection gate itself is
+    /// armed from `Handler::sasl_required`, so nothing reads this copy today.
+    #[allow(dead_code)]
     required: bool,
     /// Reject PLAIN on non-TLS transports (credentials are cleartext on the wire).
     plain_require_tls: bool,
@@ -89,6 +92,10 @@ pub struct SaslProvider {
 
 impl SaslProvider {
     /// Create a new SASL provider with no users.
+    ///
+    /// Production builds construct providers through [`Self::from_config`];
+    /// this shorthand is exercised only by the unit tests below.
+    #[allow(dead_code)]
     pub fn new(required: bool) -> Self {
         Self::with_options(required, true, false)
     }
@@ -224,12 +231,17 @@ impl SaslProvider {
     }
 
     /// Remove a user.
+    ///
+    /// Credentials are loaded once at startup, so no production path revokes
+    /// a user yet; kept as the counterpart to [`Self::add_user`].
+    #[allow(dead_code)]
     pub async fn remove_user(&self, username: &str) -> bool {
         let mut users = self.users.write().await;
         users.remove(username).is_some()
     }
 
     /// Check if a user exists.
+    #[allow(dead_code)]
     pub async fn has_user(&self, username: &str) -> bool {
         let users = self.users.read().await;
         users.contains_key(username)
@@ -240,12 +252,18 @@ impl SaslProvider {
         &self.mechanisms
     }
 
-    /// Check if authentication is required.
+    /// Check if authentication is required. See the `required` field: the
+    /// authoritative gate reads `Handler::sasl_required`, not this accessor.
+    #[allow(dead_code)]
     pub fn is_required(&self) -> bool {
         self.required
     }
 
     /// Check if a mechanism is supported.
+    ///
+    /// The handshake path compares against [`Self::supported_mechanisms`]
+    /// directly; this convenience wrapper is covered by the unit tests.
+    #[allow(dead_code)]
     pub fn is_mechanism_supported(&self, mechanism: &str) -> bool {
         let mechanism_upper = mechanism.to_uppercase();
         self.mechanisms
@@ -506,6 +524,7 @@ impl SaslProvider {
     /// existing tests. New callers should use [`Self::authenticate_with_session`].
     ///
     /// Returns (success, principal) tuple.
+    #[allow(dead_code)]
     pub async fn authenticate(&self, mechanism: &str, auth_data: &[u8]) -> (bool, Option<String>) {
         let mechanism_upper = mechanism.to_uppercase();
 

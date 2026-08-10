@@ -304,27 +304,22 @@ false only during a migration window while existing clients are cut over.
 
 On Kubernetes the Helm chart exposes this as the `sasl` and `tls` value
 blocks — see `values-production.yaml`, which turns both on. ACL bindings
-themselves are currently seeded from static configuration; see
+can be managed over the wire or seeded from a bootstrap file; see
 [Managing ACLs](#managing-acls).
 
 ### Managing ACLs
 
-**ACLs are enforced over the wire but administered out of band.** This is a
-deliberate current limitation, not an oversight, and it has a concrete
-consequence: **standard Kafka admin tooling cannot manage authorization on
-this broker.** `kafka-acls.sh`, the Java `AdminClient`, and anything else
-that speaks `DescribeAcls` / `CreateAcls` / `DeleteAcls` (API keys 29–31)
-will fail — those APIs are not implemented, and the broker does not
-advertise them in its `ApiVersions` response, so a well-behaved client sees
-`UNSUPPORTED_VERSION` rather than silently believing a change was applied.
+**ACL enforcement and administration are both supported over the wire.**
+Every request path authorizes against the replicated ACL state machine
+(`ACL_ENABLED=true`, `ACL_DENY_BY_DEFAULT=true`), including the
+`Describe`/`Read`/`Write`/`Alter` operations on topics, groups, and cluster
+resources. Standard Kafka admin tooling can manage bindings via
+`DescribeAcls` / `CreateAcls` / `DeleteAcls` (API keys 29–31, versions
+0–1) — `kafka-acls.sh` and the Java `AdminClient` speak these APIs.
 
-What *is* supported:
+What is also supported:
 
-- **Enforcement** is complete. Every request path authorizes against the
-  replicated ACL state machine (`ACL_ENABLED=true`,
-  `ACL_DENY_BY_DEFAULT=true`), including the `Describe`/`Read`/`Write`/
-  `Alter` operations on topics, groups, and cluster resources.
-- **Seeding** is by file. Point `KAFKAESQUE_ACL_BOOTSTRAP_FILE` at a JSON
+- **Seeding** by file. Point `KAFKAESQUE_ACL_BOOTSTRAP_FILE` at a JSON
   array of ACL bindings; the leader writes them through Raft on startup so
   they replicate to every node. Re-applying the same file is idempotent
   (`CreateAcls` deduplicates), so this composes with config management.
@@ -332,18 +327,10 @@ What *is* supported:
   (e.g. `User:admin`). On a cluster without SASL the only available
   principal is `User:ANONYMOUS`.
 
-Practical implication: authorization changes require a config change plus a
-rolling restart, rather than a live admin call. If you need runtime ACL
-administration, that is a gap to close before relying on this in an
-environment where authorization must change without a deploy.
-
-Closing it is mostly wire plumbing rather than new design — the replicated
-state machine already implements the full CRUD surface these APIs need
-(`AclCommand::CreateAcls`, `AclCommand::DeleteAcls`, and an `AclFilter`
-type built for `DescribeAcls`/`DeleteAcls` matching), and
-`RaftCoordinator` already exposes `create_acls` / `delete_acls`. What is
-missing is the request parsers, response encoders, handler wiring, and the
-`ApiVersions` entries.
+Supported resource types on the wire today are Topic, Group, and Cluster;
+pattern types are Literal and Prefixed. Unsupported Kafka resource types
+(TransactionalId, User, DelegationToken) and Match patterns are rejected
+with `INVALID_REQUEST`.
 
 ## Deployment
 
@@ -417,7 +404,7 @@ Kafkaesque implements the core Kafka protocol used by modern clients:
   `DeleteGroups`, `FindCoordinator`.
 - **Admin** — `CreateTopics`, `DeleteTopics`, `CreatePartitions`,
   `DescribeConfigs`, `AlterConfigs`, `IncrementalAlterConfigs`,
-  `InitProducerId`.
+  `InitProducerId`, `DescribeAcls`, `CreateAcls`, `DeleteAcls`.
 - **API negotiation** — `ApiVersions`.
 - **Auth** — `SaslHandshake`, `SaslAuthenticate` (PLAIN, SCRAM-SHA-256;
   requires `--features sasl`).

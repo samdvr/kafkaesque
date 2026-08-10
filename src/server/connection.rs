@@ -350,12 +350,34 @@ async fn read_kafka_frame_with_deadline<S: AsyncRead + Unpin>(
     const INITIAL_FRAME_BUF_CAPACITY: usize = 64 * 1024;
     let mut buf = bytes::BytesMut::with_capacity(size.min(INITIAL_FRAME_BUF_CAPACITY));
     {
+        use bytes::BufMut as _;
         use tokio::io::AsyncReadExt;
         // `read_buf` advances the buffer's length as it reads. Loop until we
         // have all `size` bytes; treat 0-length reads as a closed connection
         // mid-message (matches the previous read_exact semantics).
+        //
+        // Each read is windowed to exactly the bytes still missing from THIS
+        // frame. `read_buf` otherwise fills all spare capacity, and once
+        // `BytesMut` grows past `INITIAL_FRAME_BUF_CAPACITY` that spare
+        // capacity extends beyond `size` — so a pipelining client with the
+        // next request already in the socket had request N+1 pulled into
+        // request N's buffer. Those bytes then looked like trailing padding,
+        // `parse_request` tolerated and dropped them, and the client waited
+        // out its full timeout for a response to a request the broker had
+        // eaten but never dispatched. Windowing the read keeps frames exact:
+        // `buf.len()` can never exceed `size`.
         while buf.len() < size {
-            let read_fut = stream.read_buf(&mut buf);
+            let missing = size - buf.len();
+            // `chunk_mut` reserves in small increments when spare capacity is
+            // exhausted, which would turn a large frame into many small
+            // reads. Grow in `INITIAL_FRAME_BUF_CAPACITY` steps instead, which
+            // also preserves the bound on up-front allocation for an
+            // adversarial size prefix.
+            if buf.capacity() == buf.len() {
+                buf.reserve(missing.min(INITIAL_FRAME_BUF_CAPACITY));
+            }
+            let mut window = (&mut buf).limit(missing);
+            let read_fut = stream.read_buf(&mut window);
             let outcome = match body_inter_read_timeout {
                 Some(per_read) => match timeout(per_read, read_fut).await {
                     Ok(r) => r,
@@ -385,6 +407,11 @@ async fn read_kafka_frame_with_deadline<S: AsyncRead + Unpin>(
         }
     }
 
+    debug_assert_eq!(
+        buf.len(),
+        size,
+        "frame buffer must hold exactly the declared frame size"
+    );
     Ok((buf.freeze(), permit))
 }
 

@@ -166,6 +166,35 @@ Set `HEALTH_PORT=0` to disable the health server entirely.
 
 ## Durability contract
 
+### Replication factor and ISR — read this first
+
+**Kafkaesque does not replicate between brokers.** Each partition is stored
+once, in the object store, and has exactly one live owner at a time.
+Durability is the backing bucket's job (S3-class storage replicates
+underneath you), not a follower set's.
+
+Concretely, if you are used to Kafka:
+
+| Kafka concept | Here |
+|---|---|
+| `replication.factor` | Only `1` (or `-1`, "broker default") is accepted. `CreateTopics` with `replication_factor > 1` is **rejected** with `INVALID_REPLICATION_FACTOR`. |
+| ISR (in-sync replicas) | Metadata reports `replicas: [leader]` and `isr: [leader]` to satisfy the wire format. There is no follower set to shrink or expand. |
+| `min.insync.replicas` | Not implemented; has no effect. |
+| `acks=all` | Identical to `acks=1`. It waits for one durable object-store write — it does **not** wait for peer brokers. |
+| Broker loss | The partition's lease expires and another broker takes ownership, reading the same object-store data. Availability, not durability, is what failover buys you. |
+
+This is a deliberate design (the same shape as other object-store-backed
+Kafka implementations), not a missing feature — but it means **your bucket's
+durability is your data's durability**. Use a bucket with cross-AZ or
+cross-region replication if you need more than one failure domain. A single
+local `OBJECT_STORE_TYPE=local` directory has exactly one.
+
+The broker refuses `replication_factor > 1` rather than accepting it and
+reporting a one-node ISR, so a client cannot ask for quorum durability and be
+told it got it.
+
+### `acks`
+
 Kafkaesque honors the standard Kafka `acks` semantics. Every produce
 request opts into one of three durability levels by setting `acks`:
 
@@ -304,8 +333,23 @@ Kafkaesque implements the core Kafka protocol used by modern clients:
 - **Auth** — `SaslHandshake`, `SaslAuthenticate` (PLAIN, SCRAM-SHA-256;
   requires `--features sasl`).
 
-Not yet supported: transactions, log compaction, idempotent-producer
-deduplication beyond the per-session `producer_id`.
+Not yet supported, called out because the wire protocol makes them look
+available:
+
+- **Broker-to-broker replication.** `replication_factor > 1` is rejected;
+  see [Durability contract](#durability-contract).
+- **Log compaction.** `cleanup.policy=compact` (and `compact,delete`) is
+  rejected with `INVALID_CONFIG` — there is no cleaner, so accepting it would
+  promise key-collapsing that never happens. Use `cleanup.policy=delete` with
+  `retention.ms`.
+- **Incremental fetch sessions (KIP-227).** Fetch v7+ is supported for its
+  other fields (`log_start_offset`, leader-epoch fencing, rack-aware replica
+  selection). Responses always carry `session_id = 0`, which is the spec's
+  "sessionless" signal telling clients to keep sending full fetches; a
+  `session_id` the broker never issued is answered with
+  `FETCH_SESSION_ID_NOT_FOUND`.
+- **Transactions.** `transactional_id` is rejected at produce time.
+- **Idempotent-producer deduplication** beyond the per-session `producer_id`.
 
 ## Testing
 

@@ -730,3 +730,59 @@ async fn read_kafka_frame_rejects_oversized_frame() {
         "frames above max_message_size should be rejected before allocation"
     );
 }
+
+/// A frame reader that overreads past its own length prefix silently steals
+/// the next pipelined request out of the socket. The stolen bytes surface as
+/// "trailing bytes" on the current frame, get tolerated and dropped by
+/// `parse_request`, and the client waits forever for a response to a request
+/// the broker consumed but never dispatched.
+///
+/// This reproduces the `run-e2e.sh` "Large message" failure: librdkafka
+/// pipelines several ProduceRequests back to back, the first `read_buf` pulls
+/// request N+1 into request N's buffer, and the producer dies on
+/// `Timed out ProduceRequest in flight (after 60062ms)`.
+///
+/// The frame must exceed `INITIAL_FRAME_BUF_CAPACITY` (64 KiB) for this to
+/// bite — that is when `BytesMut` grows and hands `read_buf` spare capacity
+/// beyond the declared frame size.
+#[tokio::test]
+async fn read_kafka_frame_does_not_overread_into_next_pipelined_frame() {
+    use tokio::io::AsyncWriteExt;
+
+    const FIRST_BODY: usize = 96 * 1024; // > INITIAL_FRAME_BUF_CAPACITY
+    const SECOND_BODY: usize = 9563; // the size seen in the CI failure
+
+    let (mut client, mut server) = tokio::io::duplex(1024 * 1024);
+
+    // Two complete, back-to-back request frames, exactly as a pipelining
+    // client puts them on the wire.
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&(FIRST_BODY as i32).to_be_bytes());
+    wire.extend_from_slice(&vec![0xAAu8; FIRST_BODY]);
+    wire.extend_from_slice(&(SECOND_BODY as i32).to_be_bytes());
+    wire.extend_from_slice(&vec![0xBBu8; SECOND_BODY]);
+    client.write_all(&wire).await.unwrap();
+    client.flush().await.unwrap();
+
+    let first = read_kafka_frame_for_fuzz(&mut server, 10 * 1024 * 1024)
+        .await
+        .expect("first frame should parse");
+    assert_eq!(
+        first.len(),
+        FIRST_BODY,
+        "frame must contain exactly its declared size; a longer frame means \
+         bytes belonging to the next request were swallowed"
+    );
+    assert!(
+        first.iter().all(|b| *b == 0xAA),
+        "frame must not contain any bytes from the following request"
+    );
+
+    // The second request must still be readable — it was never this frame's
+    // to consume.
+    let second = read_kafka_frame_for_fuzz(&mut server, 10 * 1024 * 1024)
+        .await
+        .expect("second pipelined frame should still be readable");
+    assert_eq!(second.len(), SECOND_BODY);
+    assert!(second.iter().all(|b| *b == 0xBB));
+}

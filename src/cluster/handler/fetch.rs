@@ -38,6 +38,27 @@ fn total_record_bytes(responses: &[FetchTopicResponse]) -> usize {
 /// transactions are rejected at produce time, so the log can never contain
 /// uncommitted data and LSO == HWM always. read_committed and
 /// read_uncommitted are therefore identical here.
+///
+/// # Incremental fetch sessions (KIP-227)
+///
+/// Not implemented. Fetch v7+ is advertised for its *other* additions
+/// (`log_start_offset`, `current_leader_epoch` fencing in v9, rack-aware
+/// replica selection in v11), and this broker takes the spec's sessionless
+/// path: every response carries `session_id = 0` (`INVALID_SESSION_ID`),
+/// which tells the client "no session was established, keep sending full
+/// fetch requests". That is a legitimate, client-compatible degradation —
+/// clients fall back to full fetches rather than breaking.
+///
+/// What is NOT legitimate is accepting a `session_id` we never issued. A
+/// client presenting one believes the broker is holding incremental state
+/// for it, and would therefore be entitled to send a *partial* request that
+/// omits partitions it expects the session to remember — and to trust
+/// `forgotten_topics` to actually remove partitions. Since no session state
+/// exists, honoring such a request would silently return data for the wrong
+/// partition set. Kafka's answer for an unknown session is
+/// `FETCH_SESSION_ID_NOT_FOUND`, which makes the client drop its session and
+/// reissue a full fetch; we return the same so the fallback is driven by the
+/// protocol instead of by luck.
 pub(super) async fn handle_fetch(
     handler: &SlateDBClusterHandler,
     ctx: &RequestContext,
@@ -51,6 +72,24 @@ pub(super) async fn handle_fetch(
         min_bytes = request.min_bytes,
         "FETCH request received"
     );
+
+    // Reject any session id we never handed out (we hand out none — see the
+    // "Incremental fetch sessions" section above). `INVALID_SESSION_ID` (0)
+    // is the sessionless full-fetch path and is the normal case.
+    if request.session_id != 0 {
+        debug!(
+            client = %ctx.client_addr,
+            session_id = request.session_id,
+            session_epoch = request.session_epoch,
+            "FETCH rejected: unknown fetch session (sessions are not implemented)"
+        );
+        return FetchResponseData {
+            throttle_time_ms: 0,
+            error_code: KafkaCode::FetchSessionIdNotFound,
+            session_id: 0,
+            responses: vec![],
+        };
+    }
 
     // Time the full fetch path including the long-poll wait so
     // the pre-existing FETCH_DURATION histogram populates with real data.

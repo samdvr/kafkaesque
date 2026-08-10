@@ -24,26 +24,38 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
+# Set before the dependency-caching build so the pre-built deps carry the same
+# fingerprint as the final build; otherwise every dependency is recompiled below.
+ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static -C opt-level=z -C lto=fat -C codegen-units=1"
+
 # Dependency caching
 COPY Cargo.toml Cargo.lock ./
 COPY crates/kafkaesque-protocol/Cargo.toml ./crates/kafkaesque-protocol/Cargo.toml
 COPY crates/kafkaesque-bin/Cargo.toml ./crates/kafkaesque-bin/Cargo.toml
-RUN mkdir -p src examples \
+# The root manifest declares `[[example]] benchmark` and `[[bench]] produce_bench`;
+# cargo refuses to even parse Cargo.toml unless those target files exist, so the
+# dummy tree has to stub them out too (otherwise this layer silently no-ops and
+# no dependencies get cached).
+RUN mkdir -p src examples benches \
         crates/kafkaesque-protocol/src \
         crates/kafkaesque-bin/src && \
     echo 'fn main() {}' > src/main.rs && \
     echo 'pub fn dummy() {}' > src/lib.rs && \
     echo 'pub fn dummy() {}' > crates/kafkaesque-protocol/src/lib.rs && \
     echo 'fn main() {}' > crates/kafkaesque-bin/src/main.rs && \
-    cargo build --release -p kafkaesque-bin --bin kafkaesque 2>/dev/null || true && \
-    rm -rf src examples crates/kafkaesque-protocol/src crates/kafkaesque-bin/src
+    echo 'fn main() {}' > examples/benchmark.rs && \
+    echo 'fn main() {}' > benches/produce_bench.rs && \
+    cargo build --release -p kafkaesque-bin --bin kafkaesque --features tls,sasl || true && \
+    rm -rf src examples benches \
+           crates/kafkaesque-protocol/src crates/kafkaesque-bin/src \
+           target/release/.fingerprint/kafkaesque-*
 
 # Build release binary
 COPY src ./src
 COPY crates ./crates
 COPY examples ./examples
+COPY benches ./benches
 
-ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static -C opt-level=z -C lto=fat -C codegen-units=1"
 RUN cargo build --release -p kafkaesque-bin --bin kafkaesque --features tls,sasl && \
     strip --strip-all target/release/kafkaesque
 

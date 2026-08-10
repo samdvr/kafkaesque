@@ -35,8 +35,12 @@
 //!    as `InvalidRequest` rather than wrapping the index (which could
 //!    otherwise route to the wrong shard).
 //!
-//! A future commit will mix [`super::mux::auth_purpose_for`] into the HMAC
-//! input so a cross-group replay also fails authentication.
+//! 3. **Group tag bound into the HMAC.** Every frame carries an
+//!    authenticated `GroupId` in its header ([`super::auth`] folds it into
+//!    the MAC input), and [`check_frame_group`] rejects any frame whose
+//!    header group disagrees with its payload's outer tag. A cross-group
+//!    replay therefore fails authentication rather than being silently
+//!    applied to the wrong group's log.
 
 use std::sync::Arc;
 
@@ -712,7 +716,7 @@ async fn handle_mux_connection(
             }
         };
 
-        let (frame_purpose, msg_buf) = match read_result {
+        let (frame_purpose, frame_group, msg_buf) = match read_result {
             Ok(v) => v,
             Err(e)
                 if e.kind() == std::io::ErrorKind::UnexpectedEof
@@ -724,9 +728,12 @@ async fn handle_mux_connection(
             Err(e) => return Err(e.into()),
         };
 
-        let response = dispatch_one_frame(&handles, frame_purpose, &msg_buf).await;
+        let response = dispatch_one_frame(&handles, frame_purpose, frame_group, &msg_buf).await;
         let response_data = postcard::to_stdvec(&response)?;
-        write_rpc_frame(&mut stream, &auth_keys, false, &response_data).await?;
+        // Sign the reply under the same group the request was bound to, so a
+        // client can detect a crossed connection (see
+        // `mux_client::MuxConnInner::do_rpc`).
+        write_rpc_frame(&mut stream, &auth_keys, false, frame_group, &response_data).await?;
     }
 
     Ok(())
@@ -742,6 +749,7 @@ async fn handle_mux_connection(
 async fn dispatch_one_frame(
     handles: &MuxRaftHandles,
     frame_purpose: FramePurpose,
+    frame_group: GroupId,
     msg_buf: &[u8],
 ) -> MuxRaftRpcResponse {
     let message: MuxRaftRpcMessage = match postcard::from_bytes(msg_buf) {
@@ -754,7 +762,39 @@ async fn dispatch_one_frame(
             ));
         }
     };
+    if let Err(resp) = check_frame_group(&message, frame_group) {
+        return resp;
+    }
     dispatch_mux_frame(handles, frame_purpose, message).await
+}
+
+/// Cross-check the **authenticated** header group against the group implied
+/// by the decoded payload's outer tag.
+///
+/// This is the second half of the Risk #2 (silent cross-group misdispatch)
+/// defence. The header group is covered by the frame HMAC, so an attacker
+/// cannot edit it without invalidating the tag; this check closes the
+/// remaining direction — a peer that signs a frame correctly for group A but
+/// whose payload addresses group B. Without it the header tag would only
+/// bind the *key*, not the *routing*, and a frame signed as `Shard(3)` whose
+/// payload says `Control` would still reach the control group's log.
+pub(super) fn check_frame_group(
+    msg: &MuxRaftRpcMessage,
+    frame_group: GroupId,
+) -> Result<(), MuxRaftRpcResponse> {
+    let payload_group = super::mux::group_of(msg);
+    if payload_group != frame_group {
+        tracing::warn!(
+            header_group = ?frame_group,
+            payload_group = ?payload_group,
+            "mux: rejecting frame — authenticated header group disagrees with payload target"
+        );
+        return Err(MuxRaftRpcResponse::Error(RpcErrorInfo::new(
+            RpcErrorKind::InvalidRequest,
+            "Frame group tag does not match message target group",
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -792,6 +832,10 @@ mod tests {
         MuxRaftRpcMessage::Shard(id, ShardRpcMessage::Vote(vote()))
     }
 
+    fn control_frame() -> MuxRaftRpcMessage {
+        MuxRaftRpcMessage::Control(ControlRpcMessage::Vote(vote()))
+    }
+
     fn shard_client_write(id: ShardId) -> MuxRaftRpcMessage {
         MuxRaftRpcMessage::Shard(
             id,
@@ -813,6 +857,41 @@ mod tests {
 
     fn promote_frame(group: GroupId) -> MuxRaftRpcMessage {
         MuxRaftRpcMessage::PromoteMember { node_id: 7, group }
+    }
+
+    /// The authenticated header group must agree with the payload's target.
+    ///
+    /// This is the half of the Risk #2 defence that HMAC alone cannot give:
+    /// a peer holding the cluster key can sign a frame correctly *for*
+    /// `Shard(3)` while its payload addresses `Control`. Without this gate
+    /// those bytes would reach the control group's log.
+    #[test]
+    fn frame_group_mismatch_is_rejected() {
+        // Payload says Control, header says Shard(3).
+        let resp = check_frame_group(&control_frame(), GroupId::Shard(3))
+            .expect_err("control payload under a shard header group must be rejected");
+        assert_invalid_request(resp, "does not match message target group");
+
+        // Payload says Shard(1), header says Shard(2).
+        let resp = check_frame_group(&shard_frame(1), GroupId::Shard(2))
+            .expect_err("shard payload under a different shard's header must be rejected");
+        assert_invalid_request(resp, "does not match message target group");
+
+        // Payload says Shard(0), header says Control.
+        let resp = check_frame_group(&shard_frame(0), GroupId::Control)
+            .expect_err("shard payload under a control header group must be rejected");
+        assert_invalid_request(resp, "does not match message target group");
+    }
+
+    #[test]
+    fn frame_group_match_is_accepted() {
+        check_frame_group(&control_frame(), GroupId::Control).expect("control/control");
+        check_frame_group(&shard_frame(3), GroupId::Shard(3)).expect("shard 3/shard 3");
+        // Join and promote carry their own `group` field; the header must
+        // mirror it, not the dispatch target.
+        check_frame_group(&join_frame(), GroupId::Control).expect("control join");
+        check_frame_group(&promote_frame(GroupId::Shard(2)), GroupId::Shard(2))
+            .expect("shard promote");
     }
 
     fn assert_invalid_request(resp: MuxRaftRpcResponse, expected_substr: &str) {

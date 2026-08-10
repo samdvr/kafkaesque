@@ -938,14 +938,31 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                     return;
                 }
             }
+            // Last assigned set this loop acted on, used to detect that the
+            // hash-ring assignment moved (new topic, broker join/fence) and
+            // sweep immediately instead of waiting out the steady-state
+            // interval. `None` until the first sweep completes.
+            let mut last_assigned: Option<HashSet<(String, i32)>> = None;
             loop {
-                // Use jittered sleep instead of fixed interval to prevent thundering herd
-                tokio::select! {
-                    _ = tokio::time::sleep(with_jitter(interval)) => {},
-                    _ = shutdown_rx.recv() => {
+                match wait_for_ownership_sweep(
+                    &ctx,
+                    interval,
+                    last_assigned.as_ref(),
+                    &mut shutdown_rx,
+                )
+                .await
+                {
+                    OwnershipWake::Shutdown => {
                         info!(ctx.broker_id, "Ownership loop received shutdown signal");
                         break;
                     }
+                    OwnershipWake::AssignmentChanged => {
+                        debug!(
+                            ctx.broker_id,
+                            "Ownership sweep triggered early by assignment change"
+                        );
+                    }
+                    OwnershipWake::Interval => {}
                 }
 
                 // Check object store health for partial network partition detection
@@ -1000,6 +1017,13 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                     }
                 };
                 let assigned_set: HashSet<_> = assigned.into_iter().collect();
+                // Record what this sweep is acting on so the waiter can tell
+                // a genuine assignment change from steady state. Set before
+                // the acquire/release work below: if that work partly fails,
+                // the next interval tick retries it, whereas leaving
+                // `last_assigned` stale would make the waiter re-trigger on
+                // every poll and spin the sweep.
+                last_assigned = Some(assigned_set.clone());
 
                 // Collect partition states by category
                 let mut actively_owned: HashSet<(String, i32)> = HashSet::new();
@@ -1889,6 +1913,87 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             "Partition manager shutdown complete"
         );
         Ok(())
+    }
+}
+
+/// How often the ownership loop re-checks whether its hash-ring assignment
+/// moved while it is waiting out the steady-state interval.
+///
+/// Matches the reconciler's 200ms-class cadence. The check is a local
+/// control-SM read plus a ring computation (no RPC, no object-store I/O), so
+/// the cost is a read-lock and O(topics × partitions) hashing per poll.
+const ASSIGNMENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Why [`wait_for_ownership_sweep`] returned.
+enum OwnershipWake {
+    /// The steady-state jittered interval elapsed.
+    Interval,
+    /// This broker's assigned-partition set changed — sweep now.
+    AssignmentChanged,
+    /// Shutdown was signalled; the loop must exit.
+    Shutdown,
+}
+
+/// Wait until it is time for the next ownership sweep.
+///
+/// Returns as soon as **either** the jittered steady-state interval elapses
+/// or this broker's assigned-partition set changes.
+///
+/// The second condition is what makes a freshly created topic usable
+/// promptly. `CreateTopic` reaches every broker's control state machine in
+/// one Raft round trip, so each broker can compute its new hash-ring
+/// assignment almost immediately — but before this, acquisition only
+/// happened on the next blind sweep, up to `ownership_check_interval` (5s by
+/// default, ±15% jitter) later. In the meantime every partition of the new
+/// topic that this broker owned reported `LeaderNotAvailable` in metadata,
+/// and a consumer subscribed across all partitions could not make progress
+/// on any of them. A 10-partition auto-created topic routinely showed 6 of
+/// 10 partitions leaderless seconds after a successful produce.
+///
+/// Waking on assignment change also shortens rebalance after a broker joins
+/// or is fenced, since that moves the ring too.
+///
+/// Acquisition is idempotent and lease-guarded, so an extra sweep is safe;
+/// the `last_assigned` comparison keeps steady state at zero extra sweeps.
+async fn wait_for_ownership_sweep<C: ClusterCoordinator>(
+    ctx: &OwnershipContext<C>,
+    interval: Duration,
+    last_assigned: Option<&HashSet<(String, i32)>>,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) -> OwnershipWake {
+    // Jittered deadline prevents a thundering herd of synchronized sweeps.
+    let deadline = tokio::time::Instant::now() + with_jitter(interval);
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return OwnershipWake::Interval;
+        }
+        let nap = ASSIGNMENT_POLL_INTERVAL.min(deadline - now);
+        tokio::select! {
+            _ = tokio::time::sleep(nap) => {}
+            _ = shutdown_rx.recv() => return OwnershipWake::Shutdown,
+        }
+
+        // Only meaningful once a sweep has established a baseline. Before
+        // that, fall through to the interval so the first sweep still runs
+        // on the initial-jitter schedule.
+        let Some(previous) = last_assigned else {
+            continue;
+        };
+        match ctx.coordinator.get_assigned_partitions().await {
+            Ok(assigned) => {
+                let current: HashSet<(String, i32)> = assigned.into_iter().collect();
+                if current != *previous {
+                    return OwnershipWake::AssignmentChanged;
+                }
+            }
+            // A failed read is not a reason to sweep early; the interval
+            // still fires and the sweep logs its own failure there.
+            Err(e) => {
+                debug!(error = %e, "Assignment-change poll failed; waiting for interval");
+            }
+        }
     }
 }
 

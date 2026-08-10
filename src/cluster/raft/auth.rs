@@ -25,8 +25,9 @@
 //! ```text
 //! [u32 total_len]
 //! [u8 purpose=0]
+//! [4 bytes group tag]     // GroupId::auth_tag — see below
 //! [32 bytes hmac=0]
-//! [bincode payload]
+//! [postcard payload]
 //! ```
 //!
 //! **Authenticated** (`purpose=1|2`, cluster/join keys configured):
@@ -34,16 +35,40 @@
 //! ```text
 //! [u32 total_len]
 //! [u8 purpose]              // 1=cluster, 2=join
+//! [4 bytes group tag]     // 1=control / 2=shard + u16 shard id BE
 //! [u64 timestamp_ms BE]   // sender wall clock; replay window enforced
 //! [16 bytes nonce]        // unique per frame; tracked in replay cache
-//! [32 bytes hmac]         // HMAC-SHA256(key, purpose || ts || nonce || payload)
-//! [bincode payload]
+//! [32 bytes hmac]         // HMAC-SHA256(key, purpose || group || ts || nonce || payload)
+//! [postcard payload]
 //! ```
 //!
-//! The HMAC is computed over `purpose || timestamp || nonce || payload` (or
-//! `purpose || payload` for unauthenticated frames) so an attacker cannot
-//! relabel a cluster-key frame as a join-key frame and have it accepted by a
-//! receiver that knows both keys.
+//! The HMAC is computed over `purpose || group || timestamp || nonce ||
+//! payload` (or `purpose || group || payload` for unauthenticated frames) so
+//! an attacker cannot relabel a cluster-key frame as a join-key frame, nor
+//! relabel one Raft group's frame as another's, and have it accepted by a
+//! receiver that knows the key.
+//!
+//! ### Why the group is in the header, not just the payload
+//!
+//! The multiplexed port (see [`super::mux`]) carries a control group plus N
+//! shard groups. The target group *is* recoverable from the payload — it is
+//! the outer tag of [`super::mux::MuxRaftRpcMessage`] — but recovering it
+//! that way would mean running the postcard decoder over unverified bytes.
+//! Putting an explicit group tag in the authenticated header lets the
+//! receiver bind the frame to exactly one group *before* it decodes
+//! anything, and gives the sharding plan's Risk #2 (silent cross-group
+//! misdispatch) a cryptographic answer rather than a structural one:
+//!
+//! 1. Rewriting the header tag invalidates the HMAC → rejected here.
+//! 2. A frame whose header tag disagrees with its decoded payload tag is
+//!    rejected by `mux_server::dispatch_mux_frame`.
+//! 3. Distinct per-group keys can be introduced later with no frame-layout
+//!    change, because the group already participates in the MAC.
+//!
+//! **This is a breaking wire change** relative to builds that predate the
+//! group tag: an old peer's frames are 4 bytes short and MAC over a
+//! different input, so they fail authentication. Upgrade all brokers
+//! together (no published release depends on the old layout).
 //!
 //! When neither key is configured cluster-wide (legacy / dev), `purpose=0` is
 //! sent with a zero-byte HMAC. A receiver that *has* a key configured will
@@ -61,6 +86,8 @@ use moka::sync::Cache;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::types::{GROUP_TAG_LEN, GroupId};
 
 /// Read a secret either inline (`{name}`) or from a file (`{file_var}`).
 /// Inline wins when both are set. Files with permissive group/other read
@@ -133,11 +160,11 @@ pub(crate) const TIMESTAMP_LEN: usize = 8;
 pub(crate) const NONCE_LEN: usize = 16;
 
 /// Framing overhead for unauthenticated frames.
-pub(crate) const FRAME_HEADER_LEN: usize = PURPOSE_LEN + HMAC_LEN;
+pub(crate) const FRAME_HEADER_LEN: usize = PURPOSE_LEN + GROUP_TAG_LEN + HMAC_LEN;
 
 /// Framing overhead for authenticated (cluster/join) frames.
 pub(crate) const AUTHENTICATED_FRAME_HEADER_LEN: usize =
-    PURPOSE_LEN + TIMESTAMP_LEN + NONCE_LEN + HMAC_LEN;
+    PURPOSE_LEN + GROUP_TAG_LEN + TIMESTAMP_LEN + NONCE_LEN + HMAC_LEN;
 
 /// How long signed frames stay valid and how long nonces are remembered.
 ///
@@ -537,13 +564,19 @@ impl RaftAuthKeys {
 
     /// Compute the HMAC tag for an unauthenticated (legacy) frame.
     #[cfg(test)]
-    pub(crate) fn sign(&self, purpose: FramePurpose, payload: &[u8]) -> [u8; HMAC_LEN] {
-        self.sign_authenticated(purpose, None, None, payload)
+    pub(crate) fn sign(
+        &self,
+        purpose: FramePurpose,
+        group: GroupId,
+        payload: &[u8],
+    ) -> [u8; HMAC_LEN] {
+        self.sign_authenticated(purpose, group, None, None, payload)
     }
 
     fn sign_authenticated(
         &self,
         purpose: FramePurpose,
+        group: GroupId,
         timestamp_ms: Option<u64>,
         nonce: Option<&[u8; NONCE_LEN]>,
         payload: &[u8],
@@ -558,6 +591,13 @@ impl RaftAuthKeys {
         };
         let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
         mac.update(&[purpose as u8]);
+        // Per-group domain separation. Folding the target group into the MAC
+        // input is what makes a frame signed for one group unverifiable as
+        // another: the group tag is authenticated header material, so an
+        // attacker cannot rewrite it without invalidating the tag, and two
+        // groups can be given distinct keys later without the frame layout
+        // changing. See `GroupId::auth_tag` for the (wire-stable) encoding.
+        mac.update(&group.auth_tag());
         if let (Some(ts), Some(nonce)) = (timestamp_ms, nonce) {
             mac.update(&ts.to_be_bytes());
             mac.update(nonce);
@@ -574,10 +614,19 @@ impl RaftAuthKeys {
     pub(crate) fn verify(
         &self,
         purpose: FramePurpose,
+        group: GroupId,
         tag: &[u8; HMAC_LEN],
         payload: &[u8],
     ) -> std::io::Result<()> {
-        self.verify_authenticated(&PeerScope::unknown(), purpose, None, None, tag, payload)
+        self.verify_authenticated(
+            &PeerScope::unknown(),
+            purpose,
+            group,
+            None,
+            None,
+            tag,
+            payload,
+        )
     }
 
     /// Verify a received authenticated frame, including replay defense.
@@ -585,6 +634,7 @@ impl RaftAuthKeys {
         &self,
         peer: &PeerScope,
         purpose: FramePurpose,
+        group: GroupId,
         timestamp_ms: Option<u64>,
         nonce: Option<&[u8; NONCE_LEN]>,
         tag: &[u8; HMAC_LEN],
@@ -642,6 +692,7 @@ impl RaftAuthKeys {
         // — i.e. a replay-cache DoS plus a timing oracle on live nonces.
         let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
         mac.update(&[purpose as u8]);
+        mac.update(&group.auth_tag());
         if let (Some(ts), Some(nonce)) = (ts, nonce) {
             mac.update(&ts.to_be_bytes());
             mac.update(nonce);
@@ -678,15 +729,19 @@ impl RaftAuthKeys {
 /// callers can use the full message cap because they have already
 /// authenticated their peer via the request.
 ///
-/// Returns `(purpose, payload)`. Callers that route on message type (e.g.
-/// "JoinCluster must arrive under the Join purpose") use the returned
-/// `purpose` to enforce that policy.
+/// Returns `(purpose, group, payload)`. Callers that route on message type
+/// (e.g. "JoinCluster must arrive under the Join purpose") use the returned
+/// `purpose` to enforce that policy. `group` is the **authenticated** target
+/// group: it is covered by the HMAC, so callers must cross-check it against
+/// the group implied by the decoded payload and reject a mismatch (see
+/// `mux_server::dispatch_mux_frame`). That cross-check is what turns the
+/// group tag from a hint into a guarantee.
 pub(crate) async fn read_rpc_frame<S: AsyncReadExt + Unpin>(
     stream: &mut S,
     keys: &RaftAuthKeys,
     peer: &PeerScope,
     max_payload_len: usize,
-) -> std::io::Result<(FramePurpose, Vec<u8>)> {
+) -> std::io::Result<(FramePurpose, GroupId, Vec<u8>)> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let total_len = u32::from_be_bytes(len_buf) as usize;
@@ -714,6 +769,19 @@ pub(crate) async fn read_rpc_frame<S: AsyncReadExt + Unpin>(
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Unknown Raft RPC frame purpose tag {}", purpose_byte[0]),
+        )
+    })?;
+
+    // Authenticated group tag. Read straight off the header so the HMAC can
+    // be verified without deserializing any attacker-supplied payload — the
+    // group must be known *before* verify, and decoding the postcard frame
+    // first would expose the parser to unauthenticated bytes.
+    let mut group_tag = [0u8; GROUP_TAG_LEN];
+    stream.read_exact(&mut group_tag).await?;
+    let group = GroupId::from_auth_tag(group_tag).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Unknown Raft RPC frame group tag {:?}", group_tag),
         )
     })?;
 
@@ -784,17 +852,30 @@ pub(crate) async fn read_rpc_frame<S: AsyncReadExt + Unpin>(
     let mut payload = vec![0u8; payload_len];
     stream.read_exact(&mut payload).await?;
 
-    keys.verify_authenticated(peer, purpose, timestamp_ms, nonce.as_ref(), &tag, &payload)?;
-    Ok((purpose, payload))
+    keys.verify_authenticated(
+        peer,
+        purpose,
+        group,
+        timestamp_ms,
+        nonce.as_ref(),
+        &tag,
+        &payload,
+    )?;
+    Ok((purpose, group, payload))
 }
 
 /// Sign and send a length-prefixed Raft RPC payload over `stream`. The chosen
 /// purpose is `Cluster` for ordinary traffic and `Join` for `JoinCluster`
 /// requests; falls back to `Unauthenticated` when no matching key is set.
+///
+/// `group` is the Raft group this frame targets. It is written into the frame
+/// header **and** folded into the HMAC input, so the receiver can bind the
+/// frame to one group before it decodes anything.
 pub(crate) async fn write_rpc_frame<S: AsyncWriteExt + Unpin>(
     stream: &mut S,
     keys: &RaftAuthKeys,
     is_join: bool,
+    group: GroupId,
     payload: &[u8],
 ) -> std::io::Result<()> {
     let purpose = keys.outbound_purpose(is_join);
@@ -805,7 +886,7 @@ pub(crate) async fn write_rpc_frame<S: AsyncWriteExt + Unpin>(
         let nonce = ReplayCache::fresh_nonce();
         (Some(ts), Some(nonce), AUTHENTICATED_FRAME_HEADER_LEN)
     };
-    let tag = keys.sign_authenticated(purpose, timestamp_ms, nonce.as_ref(), payload);
+    let tag = keys.sign_authenticated(purpose, group, timestamp_ms, nonce.as_ref(), payload);
     let total_len = payload
         .len()
         .checked_add(header_len)
@@ -824,6 +905,7 @@ pub(crate) async fn write_rpc_frame<S: AsyncWriteExt + Unpin>(
     })?;
     stream.write_all(&total_len_u32.to_be_bytes()).await?;
     stream.write_all(&[purpose as u8]).await?;
+    stream.write_all(&group.auth_tag()).await?;
     if let (Some(ts), Some(nonce)) = (timestamp_ms, nonce) {
         stream.write_all(&ts.to_be_bytes()).await?;
         stream.write_all(&nonce).await?;
@@ -841,10 +923,15 @@ mod tests {
     fn unauthenticated_keys_accept_unsigned() {
         let keys = RaftAuthKeys::dev_unauthenticated();
         let payload = b"hello";
-        let tag = keys.sign(FramePurpose::Unauthenticated, payload);
+        let tag = keys.sign(FramePurpose::Unauthenticated, GroupId::Control, payload);
         assert_eq!(tag, [0u8; HMAC_LEN]);
-        keys.verify(FramePurpose::Unauthenticated, &tag, payload)
-            .expect("unauthenticated traffic accepted with no key set");
+        keys.verify(
+            FramePurpose::Unauthenticated,
+            GroupId::Control,
+            &tag,
+            payload,
+        )
+        .expect("unauthenticated traffic accepted with no key set");
     }
 
     #[test]
@@ -853,7 +940,12 @@ mod tests {
         let payload = b"hello";
         let tag = [0u8; HMAC_LEN];
         let err = keys
-            .verify(FramePurpose::Unauthenticated, &tag, payload)
+            .verify(
+                FramePurpose::Unauthenticated,
+                GroupId::Control,
+                &tag,
+                payload,
+            )
             .expect_err("default RaftAuthKeys must deny unauthenticated frames");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
@@ -865,7 +957,12 @@ mod tests {
         let payload = b"hello";
         let tag = [0u8; HMAC_LEN];
         let err = keys
-            .verify(FramePurpose::Unauthenticated, &tag, payload)
+            .verify(
+                FramePurpose::Unauthenticated,
+                GroupId::Control,
+                &tag,
+                payload,
+            )
             .expect_err("server with key set must reject unsigned frame");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
@@ -877,10 +974,17 @@ mod tests {
         let payload = b"vote-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
-        let tag = keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
+        let tag = keys.sign_authenticated(
+            FramePurpose::Cluster,
+            GroupId::Control,
+            Some(ts),
+            Some(&nonce),
+            payload,
+        );
         keys.verify_authenticated(
             &PeerScope::unknown(),
             FramePurpose::Cluster,
+            GroupId::Control,
             Some(ts),
             Some(&nonce),
             &tag,
@@ -896,13 +1000,19 @@ mod tests {
         let payload = b"vote-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
-        let mut tag =
-            keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
+        let mut tag = keys.sign_authenticated(
+            FramePurpose::Cluster,
+            GroupId::Control,
+            Some(ts),
+            Some(&nonce),
+            payload,
+        );
         tag[0] ^= 0xff;
         let err = keys
             .verify_authenticated(
                 &PeerScope::unknown(),
                 FramePurpose::Cluster,
+                GroupId::Control,
                 Some(ts),
                 Some(&nonce),
                 &tag,
@@ -919,10 +1029,17 @@ mod tests {
         let payload = b"vote-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
-        let tag = keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
+        let tag = keys.sign_authenticated(
+            FramePurpose::Cluster,
+            GroupId::Control,
+            Some(ts),
+            Some(&nonce),
+            payload,
+        );
         keys.verify_authenticated(
             &PeerScope::unknown(),
             FramePurpose::Cluster,
+            GroupId::Control,
             Some(ts),
             Some(&nonce),
             &tag,
@@ -933,6 +1050,7 @@ mod tests {
             .verify_authenticated(
                 &PeerScope::unknown(),
                 FramePurpose::Cluster,
+                GroupId::Control,
                 Some(ts),
                 Some(&nonce),
                 &tag,
@@ -955,12 +1073,18 @@ mod tests {
         let payload = b"join-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
-        let cluster_tag =
-            keys.sign_authenticated(FramePurpose::Cluster, Some(ts), Some(&nonce), payload);
+        let cluster_tag = keys.sign_authenticated(
+            FramePurpose::Cluster,
+            GroupId::Control,
+            Some(ts),
+            Some(&nonce),
+            payload,
+        );
         let err = keys
             .verify_authenticated(
                 &PeerScope::unknown(),
                 FramePurpose::Join,
+                GroupId::Control,
                 Some(ts),
                 Some(&nonce),
                 &cluster_tag,
@@ -977,10 +1101,17 @@ mod tests {
         let payload = b"join-request";
         let ts = ReplayCache::now_ms();
         let nonce = ReplayCache::fresh_nonce();
-        let tag = keys.sign_authenticated(FramePurpose::Join, Some(ts), Some(&nonce), payload);
+        let tag = keys.sign_authenticated(
+            FramePurpose::Join,
+            GroupId::Control,
+            Some(ts),
+            Some(&nonce),
+            payload,
+        );
         keys.verify_authenticated(
             &PeerScope::unknown(),
             FramePurpose::Join,
+            GroupId::Control,
             Some(ts),
             Some(&nonce),
             &tag,
@@ -1007,7 +1138,7 @@ mod tests {
         let send_keys = keys.clone();
         let send_payload = payload.clone();
         let writer = tokio::spawn(async move {
-            write_rpc_frame(&mut a, &send_keys, false, &send_payload)
+            write_rpc_frame(&mut a, &send_keys, false, GroupId::Shard(3), &send_payload)
                 .await
                 .unwrap();
         });
@@ -1017,7 +1148,140 @@ mod tests {
             .unwrap();
         writer.await.unwrap();
         assert_eq!(recv.0, FramePurpose::Cluster);
-        assert_eq!(recv.1, payload);
+        assert_eq!(
+            recv.1,
+            GroupId::Shard(3),
+            "group must survive the round trip"
+        );
+        assert_eq!(recv.2, payload);
+    }
+
+    /// A frame signed for one group must not verify as another. This is the
+    /// per-group HMAC domain separation: rewriting the header's group tag
+    /// (the only place the routing decision is carried before decode)
+    /// invalidates the MAC.
+    #[tokio::test]
+    async fn frame_rejects_rewritten_group_tag() {
+        use tokio::io::duplex;
+        let keys =
+            RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
+        let payload = b"append-entries-for-control".to_vec();
+
+        // Capture a legitimately-signed Control frame's bytes.
+        let (mut w, mut r) = duplex(4096);
+        let send_keys = keys.clone();
+        let send_payload = payload.clone();
+        tokio::spawn(async move {
+            write_rpc_frame(&mut w, &send_keys, false, GroupId::Control, &send_payload)
+                .await
+                .unwrap();
+        });
+        let mut framed = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut framed)
+            .await
+            .unwrap();
+
+        // Group tag sits immediately after the u32 length + purpose byte.
+        let group_off = 4 + PURPOSE_LEN;
+        assert_eq!(
+            &framed[group_off..group_off + GROUP_TAG_LEN],
+            &GroupId::Control.auth_tag(),
+            "expected a Control tag at the documented offset"
+        );
+        // Forge: relabel the frame as Shard(3) without re-signing.
+        framed[group_off..group_off + GROUP_TAG_LEN].copy_from_slice(&GroupId::Shard(3).auth_tag());
+
+        let (mut a, mut b) = duplex(4096);
+        tokio::spawn(async move {
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut a, &framed).await;
+        });
+        let err = read_rpc_frame(&mut b, &keys, &PeerScope::unknown(), MAX_RPC_MESSAGE_BYTES)
+            .await
+            .expect_err("relabelled group tag must fail HMAC verification");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// An unrecognized group-kind byte is rejected as malformed rather than
+    /// coerced onto a real group.
+    #[tokio::test]
+    async fn frame_rejects_unknown_group_tag() {
+        use tokio::io::duplex;
+        let keys = RaftAuthKeys::dev_unauthenticated();
+        let payload = b"x".to_vec();
+
+        let (mut w, mut r) = duplex(4096);
+        let send_keys = keys.clone();
+        let send_payload = payload.clone();
+        tokio::spawn(async move {
+            write_rpc_frame(&mut w, &send_keys, false, GroupId::Control, &send_payload)
+                .await
+                .unwrap();
+        });
+        let mut framed = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut framed)
+            .await
+            .unwrap();
+
+        // Kind byte 9 is not a group we ever emit.
+        framed[4 + PURPOSE_LEN] = 9;
+
+        let (mut a, mut b) = duplex(4096);
+        tokio::spawn(async move {
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut a, &framed).await;
+        });
+        let err = read_rpc_frame(&mut b, &keys, &PeerScope::unknown(), MAX_RPC_MESSAGE_BYTES)
+            .await
+            .expect_err("unknown group kind must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Same payload + same key, two different groups → two different tags.
+    #[test]
+    fn signing_is_domain_separated_per_group() {
+        let keys =
+            RaftAuthKeys::from_strings(Some("hunter2-with-32-bytes-minimum-len".into()), None);
+        let payload = b"identical-bytes";
+        let ts = ReplayCache::now_ms();
+        let nonce = ReplayCache::fresh_nonce();
+
+        let control = keys.sign_authenticated(
+            FramePurpose::Cluster,
+            GroupId::Control,
+            Some(ts),
+            Some(&nonce),
+            payload,
+        );
+        let shard3 = keys.sign_authenticated(
+            FramePurpose::Cluster,
+            GroupId::Shard(3),
+            Some(ts),
+            Some(&nonce),
+            payload,
+        );
+        let shard4 = keys.sign_authenticated(
+            FramePurpose::Cluster,
+            GroupId::Shard(4),
+            Some(ts),
+            Some(&nonce),
+            payload,
+        );
+
+        assert_ne!(control, shard3, "control and shard tags must differ");
+        assert_ne!(shard3, shard4, "distinct shards must differ");
+
+        // And cross-verification fails, not just differs.
+        let err = keys
+            .verify_authenticated(
+                &PeerScope::unknown(),
+                FramePurpose::Cluster,
+                GroupId::Shard(3),
+                Some(ts),
+                Some(&nonce),
+                &control,
+                payload,
+            )
+            .expect_err("a Control-signed tag must not verify as Shard(3)");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[tokio::test]

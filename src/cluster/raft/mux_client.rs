@@ -74,10 +74,12 @@ use tokio::sync::{Mutex, RwLock};
 use super::auth::{
     FramePurpose, MAX_RPC_MESSAGE_BYTES, PeerScope, RaftAuthKeys, read_rpc_frame, write_rpc_frame,
 };
-use super::mux::{ControlRpcMessage, MuxRaftRpcMessage, MuxRaftRpcResponse, ShardRpcMessage};
+use super::mux::{
+    ControlRpcMessage, MuxRaftRpcMessage, MuxRaftRpcResponse, ShardRpcMessage, group_of,
+};
 use super::network::{MaybeTlsStreamClient, RpcErrorInfo, RpcErrorKind, connect_raft};
 use super::tls::RaftTlsConfig;
-use super::types::{ControlConfig, RaftNodeId, ShardConfig, ShardId};
+use super::types::{ControlConfig, GroupId, RaftNodeId, ShardConfig, ShardId};
 
 // ============================================================================
 // Address book + factory shared state.
@@ -283,6 +285,7 @@ impl MuxConnInner {
 
     /// Send a multiplexed frame and read back the response.
     async fn send(&self, frame: MuxRaftRpcMessage) -> std::io::Result<MuxRaftRpcResponse> {
+        let group = group_of(&frame);
         let data = postcard::to_stdvec(&frame)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -292,7 +295,7 @@ impl MuxConnInner {
             None => connect_raft(&self.target_addr, self.shared.tls.as_ref()).await?,
         };
 
-        match Self::do_rpc(&mut stream, &data, &self.shared.auth_keys).await {
+        match Self::do_rpc(&mut stream, group, &data, &self.shared.auth_keys).await {
             Ok(resp) => {
                 // Commit the still-clean stream back to the cache.
                 *guard = Some(stream);
@@ -311,6 +314,7 @@ impl MuxConnInner {
     /// [`MuxRaftRpcResponse`].
     async fn do_rpc(
         stream: &mut MaybeTlsStreamClient,
+        group: GroupId,
         data: &[u8],
         auth_keys: &RaftAuthKeys,
     ) -> std::io::Result<MuxRaftRpcResponse> {
@@ -318,14 +322,28 @@ impl MuxConnInner {
         // through their own helper (lands with the bootstrap commit) and
         // don't reach `RaftNetwork`'s RPC verbs. Steady-state Raft RPCs
         // always use the cluster purpose.
-        write_rpc_frame(stream, auth_keys, false, data).await?;
-        let (_purpose, response_buf) = read_rpc_frame(
+        write_rpc_frame(stream, auth_keys, false, group, data).await?;
+        let (_purpose, resp_group, response_buf) = read_rpc_frame(
             stream,
             auth_keys,
             &PeerScope::unknown(),
             MAX_RPC_MESSAGE_BYTES,
         )
         .await?;
+        // The peer echoes the group it answered under. A response bound to a
+        // different group than we asked about means the connection is
+        // crossed (or a MITM is splicing frames between two live groups), so
+        // fail loudly instead of feeding another group's reply into this
+        // group's Raft state machine.
+        if resp_group != group {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "mux response group mismatch: asked {:?}, answered {:?}",
+                    group, resp_group
+                ),
+            ));
+        }
         postcard::from_bytes(&response_buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
@@ -574,7 +592,7 @@ use tokio::time::timeout;
 
 use super::commands::{ControlCommand, ControlResponse, ShardCommand, ShardResponse};
 use super::network::MAX_FORWARD_HOPS;
-use super::types::{GroupId, ShardId as RpcShardId};
+use super::types::ShardId as RpcShardId;
 
 /// Timeout for one-shot mux client operations (forward, join, promote).
 const MUX_RPC_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
@@ -867,17 +885,27 @@ async fn send_one_shot(
 ) -> std::io::Result<MuxRaftRpcResponse> {
     let data = postcard::to_stdvec(frame)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let group = group_of(frame);
     let mut stream = super::network::connect_raft(peer_addr, tls).await?;
 
     timeout(MUX_RPC_OPERATION_TIMEOUT, async {
-        write_rpc_frame(&mut stream, auth_keys, is_join, &data).await?;
-        let (_purpose, response_buf) = read_rpc_frame(
+        write_rpc_frame(&mut stream, auth_keys, is_join, group, &data).await?;
+        let (_purpose, resp_group, response_buf) = read_rpc_frame(
             &mut stream,
             auth_keys,
             &PeerScope::from_addr_str(peer_addr),
             MAX_RPC_MESSAGE_BYTES,
         )
         .await?;
+        if resp_group != group {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "mux response group mismatch: asked {:?}, answered {:?}",
+                    group, resp_group
+                ),
+            ));
+        }
         postcard::from_bytes::<MuxRaftRpcResponse>(&response_buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })

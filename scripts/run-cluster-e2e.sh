@@ -103,6 +103,41 @@ wait_for_broker() {
     return 1
 }
 
+# Block until every partition of $1 reports a leader (as seen from broker $2),
+# or until $3 seconds elapse.
+#
+# A freshly auto-created topic has DEFAULT_NUM_PARTITIONS partitions, and each
+# is acquired by whichever broker the consistent-hash ring assigns it to. That
+# is a distributed convergence, not an atomic step: partitions appear as
+# `Leader not available` in metadata until their owner picks them up. Consuming
+# with kcat spans *all* partitions, so a consume issued mid-convergence stalls
+# on the not-yet-owned ones and returns nothing.
+#
+# The previous shape here was a flat `sleep 2`, which is a bet on convergence
+# latency rather than an observation of it — it failed reliably in CI. Waiting
+# on the actual condition removes the race in both directions: it does not
+# flake when convergence is slow, and it does not waste 2s when it is fast.
+wait_for_partition_leaders() {
+    local topic=$1
+    local broker=$2
+    local timeout_secs=${3:-30}
+    echo -n "  Waiting for all partitions of $topic to have leaders... "
+    for i in $(seq 1 "$timeout_secs"); do
+        # `-L -t <topic>` lists partitions with their leader; kcat prints
+        # "Leader not available" for any partition whose owner is unknown.
+        if ! timeout 10 $KCAT -b 127.0.0.1:$broker -L -t "$topic" $KCAT_OPTS 2>/dev/null \
+             | grep -q "Leader not available"; then
+            echo -e "${GREEN}converged (${i}s)${NC}"
+            return 0
+        fi
+        sleep 1
+    done
+    echo -e "${YELLOW}timeout after ${timeout_secs}s${NC}"
+    echo "  --- metadata for $topic at timeout ---"
+    timeout 15 $KCAT -b 127.0.0.1:$broker -L -t "$topic" $KCAT_OPTS 2>&1 | sed 's/^/    /' || true
+    return 1
+}
+
 # =============================================================================
 # Start 3-node Raft cluster
 # =============================================================================
@@ -287,13 +322,25 @@ echo -e "${BLUE}[Multiple Topics]${NC}"
 # below and the whole job would die on the CI step timeout with no output.
 # Wait on the producer PIDs specifically — a bare `wait` would also wait on
 # the three broker processes started with `&` above, i.e. forever.
-PRODUCE_PIDS=()
+#
+# Each produce is asserted. The previous shape backgrounded all five and
+# swallowed their exit codes with `|| true`, so a failed produce was
+# indistinguishable from a failed consume — the suite reported "Verify
+# topic-a ✗" while the actual fault was upstream. Produce serially through
+# run_test so the failing side is named.
 for topic in topic-a topic-b topic-c topic-d topic-e; do
-    echo "msg-for-$topic" | timeout 30 $KCAT -b 127.0.0.1:9092 -t $topic -P $KCAT_OPTS &
-    PRODUCE_PIDS+=($!)
+    run_test "Produce to $topic" \
+      "echo msg-for-$topic | timeout 30 $KCAT -b 127.0.0.1:9092 -t $topic -P $KCAT_OPTS"
 done
-wait "${PRODUCE_PIDS[@]}" 2>/dev/null || true
-sleep 2
+
+# Wait for leadership to converge on each topic we are about to read, from
+# the broker we are about to read it from. This is an assertion too: a topic
+# that never converges fails the suite instead of silently producing an
+# empty consume.
+for spec in "topic-a 9094" "topic-c 9096" "topic-e 9092"; do
+    set -- $spec
+    run_test "Leaders converged for $1" "wait_for_partition_leaders $1 $2 30"
+done
 
 run_test "Verify topic-a" "timeout 10 $KCAT -b 127.0.0.1:9094 -t topic-a -C -c 1 -q $KCAT_OPTS | grep -q topic-a"
 run_test "Verify topic-c" "timeout 10 $KCAT -b 127.0.0.1:9096 -t topic-c -C -c 1 -q $KCAT_OPTS | grep -q topic-c"

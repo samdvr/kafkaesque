@@ -63,9 +63,9 @@ local-disk reliability requirement.
 ## Quick Start
 
 Building from source needs the Rust toolchain pinned in
-[`rust-toolchain.toml`](rust-toolchain.toml) (Rust 1.89, edition 2024).
-`rustup` picks it up automatically. The pre-built Docker image below needs
-only Docker.
+[`rust-toolchain.toml`](rust-toolchain.toml) (Rust 1.91, edition 2024).
+`rustup` picks it up automatically. Running under Docker needs only Docker,
+but there is no published image yet — you build it locally (see below).
 
 ### Run locally (standalone)
 
@@ -81,6 +81,12 @@ plane for local use. Outside the development profile the broker refuses to
 start unless `RAFT_CLUSTER_SECRET` is set — see [Security](#security).
 
 ### Run with Docker
+
+No image is published to a registry yet, so build one first:
+
+```bash
+docker build -f Dockerfile.minimal -t kafkaesque:latest .
+```
 
 ```bash
 docker run --rm -p 9092:9092 -p 8080:8080 \
@@ -255,6 +261,89 @@ For the public Kafka listener, enable SASL/PLAIN and TLS at compile time:
 ```bash
 cargo build --release --features sasl,tls
 ```
+
+### Securing the Kafka listener
+
+The Raft port and the Kafka port are secured independently, and it is worth
+being explicit about what each default gives you. Outside
+`CLUSTER_PROFILE=development` the broker refuses to start without
+`RAFT_CLUSTER_SECRET`, `RAFT_JOIN_TOKEN`, and `ACL_ENABLED` — so
+authorization is always on. What is *not* required is **authentication** on
+the Kafka listener: a broker with ACLs but no SASL sees every client as the
+single principal `User:ANONYMOUS`. That is a deliberate allowance for
+internal-only clusters sitting behind a network boundary, but it means ACLs
+can only express "everyone" until SASL is turned on.
+
+To run a listener with real per-client principals, set all of the following
+(TLS is not optional here — the broker rejects `SASL_ENABLED=true` without
+`SASL_REQUIRE_TLS=true` outside the development profile, because PLAIN puts
+the password on the wire):
+
+```bash
+# Authentication
+SASL_ENABLED=true \
+SASL_REQUIRED=true \
+SASL_USERS_FILE=/etc/kafkaesque/sasl/users.json \
+SASL_REQUIRE_TLS=true \
+# Transport
+TLS_ENABLED=true \
+TLS_CERT_PATH=/etc/kafkaesque/tls/tls.crt \
+TLS_KEY_PATH=/etc/kafkaesque/tls/tls.key \
+# Authorization — drop the ANONYMOUS bootstrap super-user once SASL is on
+ACL_ENABLED=true \
+ACL_DENY_BY_DEFAULT=true \
+KAFKAESQUE_SUPER_USERS="User:admin" \
+# Control plane
+RAFT_CLUSTER_SECRET="$SHARED_SECRET" \
+RAFT_JOIN_TOKEN="$JOIN_TOKEN" \
+  kafkaesque
+```
+
+`SASL_REQUIRED=true` rejects unauthenticated connections outright; leave it
+false only during a migration window while existing clients are cut over.
+
+On Kubernetes the Helm chart exposes this as the `sasl` and `tls` value
+blocks — see `values-production.yaml`, which turns both on. ACL bindings
+themselves are currently seeded from static configuration; see
+[Managing ACLs](#managing-acls).
+
+### Managing ACLs
+
+**ACLs are enforced over the wire but administered out of band.** This is a
+deliberate current limitation, not an oversight, and it has a concrete
+consequence: **standard Kafka admin tooling cannot manage authorization on
+this broker.** `kafka-acls.sh`, the Java `AdminClient`, and anything else
+that speaks `DescribeAcls` / `CreateAcls` / `DeleteAcls` (API keys 29–31)
+will fail — those APIs are not implemented, and the broker does not
+advertise them in its `ApiVersions` response, so a well-behaved client sees
+`UNSUPPORTED_VERSION` rather than silently believing a change was applied.
+
+What *is* supported:
+
+- **Enforcement** is complete. Every request path authorizes against the
+  replicated ACL state machine (`ACL_ENABLED=true`,
+  `ACL_DENY_BY_DEFAULT=true`), including the `Describe`/`Read`/`Write`/
+  `Alter` operations on topics, groups, and cluster resources.
+- **Seeding** is by file. Point `KAFKAESQUE_ACL_BOOTSTRAP_FILE` at a JSON
+  array of ACL bindings; the leader writes them through Raft on startup so
+  they replicate to every node. Re-applying the same file is idempotent
+  (`CreateAcls` deduplicates), so this composes with config management.
+- **Super-users** bypass ACL checks entirely via `KAFKAESQUE_SUPER_USERS`
+  (e.g. `User:admin`). On a cluster without SASL the only available
+  principal is `User:ANONYMOUS`.
+
+Practical implication: authorization changes require a config change plus a
+rolling restart, rather than a live admin call. If you need runtime ACL
+administration, that is a gap to close before relying on this in an
+environment where authorization must change without a deploy.
+
+Closing it is mostly wire plumbing rather than new design — the replicated
+state machine already implements the full CRUD surface these APIs need
+(`AclCommand::CreateAcls`, `AclCommand::DeleteAcls`, and an `AclFilter`
+type built for `DescribeAcls`/`DeleteAcls` matching), and
+`RaftCoordinator` already exposes `create_acls` / `delete_acls`. What is
+missing is the request parsers, response encoders, handler wiring, and the
+`ApiVersions` entries.
 
 ## Deployment
 

@@ -78,6 +78,40 @@ config:
   logLevel: "info"
   logFormat: "json"
 
+# SASL authentication for the Kafka client port.
+#
+# Without this the broker has no way to tell clients apart: every
+# connection is the `User:ANONYMOUS` principal, so ACLs can only be written
+# against ANONYMOUS and authorization degrades to a network-boundary
+# decision. Enabling SASL is what makes per-principal ACLs meaningful.
+#
+# Requires an image built with `--features sasl` (the published Dockerfiles
+# already do). `requireTls` is enforced by the broker outside
+# CLUSTER_PROFILE=development: PLAIN puts the password on the wire and
+# SCRAM leaves post-auth payloads unencrypted, so SASL without TLS refuses
+# to start. Turn on `tls.enabled` in the same release.
+#
+# Credentials come from a Kubernetes Secret mounted as a file, not from
+# values — putting passwords in values.yaml lands them in the Helm release
+# manifest. Create it with e.g.:
+#   kubectl create secret generic kafkaesque-sasl-users \
+#     --from-file=users.json=./users.json
+sasl:
+  enabled: false
+  # Reject any connection that has not authenticated. Leave false only for
+  # a migration window where existing ANONYMOUS clients must keep working
+  # while they are cut over.
+  required: true
+  # Enforce TLS for the SASL handshake. The broker requires this outside the
+  # development profile; setting it false there is a startup error.
+  requireTls: true
+  # Secret holding the credentials file, and the key within it.
+  usersSecretName: ""
+  usersKey: users.json
+  # Mount path inside the container. SASL_USERS_FILE points at
+  # `<mountPath>/<usersKey>`.
+  mountPath: /etc/kafkaesque/sasl
+
 # TLS for the Kafka client port.
 #
 # When `enabled` is true the StatefulSet mounts the configured Kubernetes

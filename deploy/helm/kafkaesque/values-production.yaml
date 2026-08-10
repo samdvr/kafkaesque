@@ -12,6 +12,11 @@
 #     --from-file=tls.crt=raft.crt --from-file=tls.key=raft.key \
 #     --from-file=ca.crt=raft-ca.crt
 #
+#   # SASL credentials for the Kafka client port. See the chart README for
+#   # the users-file format.
+#   kubectl create secret generic kafkaesque-sasl-users -n kafkaesque \
+#     --from-file=users.json=./users.json
+#
 #   helm install kafkaesque ./kafkaesque -n kafkaesque --create-namespace \
 #     -f values-production.yaml \
 #     --set raftAuth.existingSecret=kafkaesque-raft-auth
@@ -23,13 +28,27 @@ config:
   security:
     aclEnabled: true
     aclDenyByDefault: true
-    # Remove ANONYMOUS super-user; configure SASL and ACL bindings instead.
+    # Remove ANONYMOUS super-user; SASL (below) supplies real principals and
+    # ACL bindings decide what each may do.
     superUsers: ""
   objectStore:
     type: s3
     s3:
       bucket: "your-kafkaesque-bucket"
       region: "us-east-1"
+
+# SASL on the Kafka client port. This is what makes `superUsers: ""` +
+# `aclDenyByDefault: true` workable: without authentication every client is
+# `User:ANONYMOUS`, so denying ANONYMOUS locks everyone out while allowing it
+# grants everyone the same rights. With SASL on, ACLs bind to real
+# principals.
+sasl:
+  enabled: true
+  required: true
+  requireTls: true
+  usersSecretName: kafkaesque-sasl-users
+  usersKey: users.json
+  mountPath: /etc/kafkaesque/sasl
 
 # TLS for the Kafka client port. PRODUCTION REQUIRES TLS: with
 # `superUsers: ""` (above) clients authenticate over SASL, and PLAIN

@@ -10,9 +10,9 @@ keywords:
   - message-broker
   - object-storage
   - raft
-home: https://github.com/kafkaesque/kafkaesque
+home: https://github.com/samdvr/kafkaesque
 sources:
-  - https://github.com/kafkaesque/kafkaesque
+  - https://github.com/samdvr/kafkaesque
 maintainers:
-  - name: Kafkaesque Team
-    email: kafkaesque@example.com
+  - name: samdvr
+    url: https://github.com/samdvr

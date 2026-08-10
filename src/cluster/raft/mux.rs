@@ -24,12 +24,14 @@
 //!    payload bytes, so the dispatcher *must* inspect the variant before
 //!    handing bytes to a specific group's RPC handler. The
 //!    `dispatch_target` helper makes that ordering explicit.
-//! 2. **Per-group HMAC purpose mix-in (planned).** The plan calls for
-//!    each frame's HMAC to fold in the target group id so a control
-//!    frame replayed under a shard tag fails authentication, not just
-//!    deserialisation. The hook for that lives in [`auth_purpose_for`]
-//!    here — wiring it through [`super::auth`] is a follow-up alongside
-//!    the actual server in step 5.
+//! 2. **Per-group HMAC purpose mix-in.** Each frame's HMAC folds in the
+//!    target group id (and the group travels in the authenticated frame
+//!    header), so a control frame relabelled under a shard tag fails
+//!    authentication rather than merely failing to deserialize. The
+//!    mapping lives in [`GroupId::auth_tag`] and is
+//!    applied by [`super::auth::write_rpc_frame`] /
+//!    [`super::auth::read_rpc_frame`]. `mux_server` additionally rejects
+//!    any frame whose header group disagrees with its payload's outer tag.
 
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -209,33 +211,24 @@ pub fn dispatch_target(msg: &MuxRaftRpcMessage) -> DispatchTarget {
     }
 }
 
-/// Per-group HMAC purpose mix-in.
+/// The Raft group a multiplexed frame targets.
 ///
-/// The legacy [`super::auth::FramePurpose`] is a flat enum. Per the
-/// sharding plan (Risk #2 mitigation), the multiplexed port should fold
-/// the target group into the HMAC input so a frame signed for one group
-/// fails authentication when interpreted as another. Until the auth
-/// module gains the new shape, this helper produces the per-group
-/// distinguishing bytes that step 5's wiring will mix into the HMAC
-/// input.
-// SHIPPED BUT NOT YET WIRED. This is the hook for per-group HMAC purpose
-// mixing described in the module header: today the frame's dispatch tag
-// prevents accidental cross-routing, but a forged Shard(N) frame whose
-// payload deserializes as Control still passes HMAC. Wiring this into
-// `write_rpc_frame`/`read_rpc_frame` is what closes that gap. Unit-tested
-// here so the mapping is pinned before it goes live.
-#[allow(dead_code)]
-pub fn auth_purpose_for(group: GroupId) -> [u8; 4] {
-    // Layout: tag byte 0 = group kind (1 = control, 2 = shard), then
-    // the shard id big-endian (or zero for control). This is what the
-    // sign/verify path will mix into the HMAC alongside the existing
-    // `FramePurpose` byte. Stable on the wire — never re-number tags.
-    match group {
-        GroupId::Control => [1, 0, 0, 0],
-        GroupId::Shard(id) => {
-            let [hi, lo] = id.to_be_bytes();
-            [2, 0, hi, lo]
-        }
+/// This is the *payload-derived* group: it reads the decoded outer tag. The
+/// frame header carries an independently-authenticated copy (see
+/// [`super::auth`]), and `mux_server::dispatch_mux_frame` rejects any frame
+/// where the two disagree. Senders use this to pick the group tag to sign
+/// with, so the two agree by construction on the happy path.
+///
+/// Note this is deliberately *not* [`dispatch_target`]: a
+/// `JoinCluster { group: Control }` frame targets the control group for
+/// signing purposes even though its dispatch target is the cluster-control
+/// handler.
+pub fn group_of(msg: &MuxRaftRpcMessage) -> GroupId {
+    match msg {
+        MuxRaftRpcMessage::Control(_) => GroupId::Control,
+        MuxRaftRpcMessage::Shard(id, _) => GroupId::Shard(*id),
+        MuxRaftRpcMessage::JoinCluster { group, .. } => *group,
+        MuxRaftRpcMessage::PromoteMember { group, .. } => *group,
     }
 }
 
@@ -433,10 +426,10 @@ mod tests {
     }
 
     #[test]
-    fn auth_purpose_distinguishes_groups() {
-        let control = auth_purpose_for(GroupId::Control);
-        let shard_3 = auth_purpose_for(GroupId::Shard(3));
-        let shard_5 = auth_purpose_for(GroupId::Shard(5));
+    fn auth_tag_distinguishes_groups() {
+        let control = GroupId::Control.auth_tag();
+        let shard_3 = GroupId::Shard(3).auth_tag();
+        let shard_5 = GroupId::Shard(5).auth_tag();
 
         assert_ne!(control, shard_3, "control vs shard purposes must differ");
         assert_ne!(shard_3, shard_5, "different shards must differ");
@@ -449,10 +442,10 @@ mod tests {
     }
 
     #[test]
-    fn auth_purpose_for_shard_max_does_not_collide_with_control() {
+    fn auth_tag_for_shard_max_does_not_collide_with_control() {
         // u16::MAX shards all derive purposes distinct from control.
         for id in 0u16..=u16::MAX {
-            let p = auth_purpose_for(GroupId::Shard(id));
+            let p = GroupId::Shard(id).auth_tag();
             assert_ne!(
                 p[0], 1,
                 "shard {} purpose must not start with control tag",

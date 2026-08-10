@@ -7,7 +7,12 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.89"
+# MSRV. Must stay in lockstep with `rust-toolchain.toml`, the two crates
+# under `crates/`, the README "Quick Start" note, and the CI "MSRV Check"
+# job — a manifest that understates the real MSRV is a broken promise to
+# downstream consumers, and nothing rebuilds on the understated version to
+# catch it.
+rust-version = "1.91"
 license-file = "LICENSE"
 repository = "https://github.com/samdvr/kafkaesque"
 homepage = "https://github.com/samdvr/kafkaesque"
@@ -16,7 +21,7 @@ homepage = "https://github.com/samdvr/kafkaesque"
 name = "kafkaesque"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.91"
 description = "Kafka-compatible broker backed by object storage."
 license-file = "LICENSE"
 readme = "README.md"

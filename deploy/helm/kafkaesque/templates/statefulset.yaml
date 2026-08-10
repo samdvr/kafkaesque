@@ -145,6 +145,19 @@ spec:
             - name: TLS_KEY_PATH
               value: "{{ .Values.tls.mountPath }}/tls.key"
             {{- end }}
+            {{- if .Values.sasl.enabled }}
+            # SASL on the Kafka client port. Credentials live in a mounted
+            # Secret (see volumes below) rather than an env var so they do
+            # not show up in `kubectl describe pod` or the Helm release.
+            - name: SASL_ENABLED
+              value: "true"
+            - name: SASL_REQUIRED
+              value: {{ .Values.sasl.required | quote }}
+            - name: SASL_REQUIRE_TLS
+              value: {{ .Values.sasl.requireTls | quote }}
+            - name: SASL_USERS_FILE
+              value: "{{ .Values.sasl.mountPath }}/{{ .Values.sasl.usersKey }}"
+            {{- end }}
             {{- if .Values.raftTls.enabled }}
             # Raft mTLS. CA cert validates peer certificates
             # in both directions; same cert/key pair identifies this
@@ -198,6 +211,11 @@ spec:
               mountPath: {{ .Values.tls.mountPath }}
               readOnly: true
             {{- end }}
+            {{- if .Values.sasl.enabled }}
+            - name: sasl-users
+              mountPath: {{ .Values.sasl.mountPath }}
+              readOnly: true
+            {{- end }}
             {{- if .Values.raftTls.enabled }}
             - name: raft-tls
               mountPath: {{ .Values.raftTls.mountPath }}
@@ -215,6 +233,12 @@ spec:
         - name: tls
           secret:
             secretName: {{ .Values.tls.certSecretName | required "tls.certSecretName is required when tls.enabled" }}
+            defaultMode: 0o400
+        {{- end }}
+        {{- if .Values.sasl.enabled }}
+        - name: sasl-users
+          secret:
+            secretName: {{ .Values.sasl.usersSecretName | required "sasl.usersSecretName is required when sasl.enabled" }}
             defaultMode: 0o400
         {{- end }}
         {{- if .Values.raftTls.enabled }}

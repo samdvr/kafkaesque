@@ -4,19 +4,20 @@
 //! addresses. This module wires that decision through to a concrete
 //! `Raft<ControlConfig>` / `Raft<ShardConfig>` and produces a
 //! [`MuxRaftRpcResponse`]. The TCP accept loop that calls into here lives
-//! alongside `RaftCluster` (sharding plan step 5); the dispatch core is
+//! alongside `RaftCluster`, which runs it; the dispatch core is
 //! split out as a pure async fn so the routing decisions can be exercised
 //! without standing up a full openraft fixture.
 //!
 //! # Relationship to the legacy `RaftRpcServer`
 //!
-//! The single-group [`super::network::RaftRpcServer::dispatch_rpc_message`]
+//! The single-group `super::network::RaftRpcServer::dispatch_rpc_message`
 //! handles the legacy [`super::network::RaftRpcMessage`] frame. This module
 //! is its multiplexed twin: same RPC verbs (vote / append-entries /
 //! install-snapshot / forwarded client-write / join / promote), but routed
-//! to one of N+1 Raft instances rather than the single legacy one. The
-//! plan calls for both to coexist until step 10, when the legacy
-//! `RaftNode` is deleted; until then we keep the dispatch logic *parallel*
+//! to one of N+1 Raft instances rather than the single legacy one. The legacy
+//! single-group server and `RaftNode` have since been **deleted** — this is now
+//! the only Raft RPC path. The dispatch logic was deliberately kept *parallel*
+//! to the legacy one while both existed
 //! (same error variants, same hop cap, same purpose-tag cross-check) so a
 //! frame's meaning never depends on which dispatcher it reaches.
 //!
@@ -36,8 +37,6 @@
 //!
 //! A future commit will mix [`super::mux::auth_purpose_for`] into the HMAC
 //! input so a cross-group replay also fails authentication.
-
-#![allow(dead_code)] // wired in step 5 when RaftCluster runs the listener
 
 use std::sync::Arc;
 
@@ -86,7 +85,7 @@ impl MuxRaftHandles {
 /// Ordering of checks is load-bearing (see Risk #2 in the module docs):
 ///
 /// 1. Cross-check the wire purpose tag against the variant — same gate the
-///    legacy [`super::network::RaftRpcServer`] applies.
+///    legacy `super::network::RaftRpcServer` applies.
 /// 2. Bounds-check the shard id on `Shard(id, _)` frames before touching
 ///    `handles.shards`.
 /// 3. Match the outer enum tag and forward to the corresponding Raft.
@@ -507,7 +506,7 @@ async fn handle_promote_shard(raft: &Raft<ShardConfig>, node_id: RaftNodeId) -> 
 
 /// Server for the multiplexed Raft RPC port.
 ///
-/// Mirrors [`super::network::RaftRpcServer`] one-for-one — same accept-side
+/// Mirrors `super::network::RaftRpcServer` one-for-one — same accept-side
 /// gating, same per-IP cap, same TLS handshake helper, same idle timeout —
 /// but routes every accepted frame through [`dispatch_mux_frame`] so it can
 /// land on the control group OR any shard group on a single port. Holding the
@@ -687,7 +686,7 @@ impl MuxRaftRpcServer {
 
 /// Read frames from a single connection until EOF or idle timeout.
 ///
-/// Mirrors [`super::network::RaftRpcServer::handle_connection`]: same
+/// Mirrors `super::network::RaftRpcServer::handle_connection`: same
 /// per-frame idle bound, same EOF/reset/broken-pipe quiet-shutdown, same
 /// "decode-failure becomes an InvalidRequest response on the wire rather than
 /// a dropped socket" behaviour. Decode failure must surface as a typed

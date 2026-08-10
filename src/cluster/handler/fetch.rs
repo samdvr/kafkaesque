@@ -11,6 +11,7 @@ use crate::server::response::{FetchPartitionResponse, FetchResponseData, FetchTo
 
 use super::SlateDBClusterHandler;
 use crate::cluster::coordinator::validate_topic_name;
+use crate::constants::DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS;
 
 /// Total bytes of records contained in `responses`. Used by the long-poll
 /// loop to compare against the client's `min_bytes`.
@@ -66,9 +67,28 @@ pub(super) async fn handle_fetch(
     // Cap `max_wait_ms` to a sane upper bound. Without this, a misbehaving
     // (or hostile) client requesting i32::MAX pins a connection task for
     // ~24.8 days; with a typical max_total_connections of ~1k that is a
-    // trivial denial-of-service. 60s matches Kafka's default `fetch.max.wait.ms`
-    // ceiling-of-reasonable.
-    const MAX_FETCH_WAIT_MS: i32 = 60_000;
+    // trivial denial-of-service.
+    //
+    // The ceiling is derived from the per-request handler timeout rather than
+    // hardcoded, and MUST stay strictly below it. `dispatch_request_common`
+    // is wrapped in `timeout(DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS, ..)`
+    // (`server/connection.rs`), and losing that race is not graceful: the
+    // connection is answered with `RequestTimedOut` and then **shut down**.
+    // These two constants used to both be 60s, so any consumer configured
+    // with `fetch.max.wait.ms >= 60000` was clamped to exactly the handler
+    // deadline and had its connection torn down on every fetch cycle. The
+    // headroom below covers the post-wait work (final `collect_fetch`,
+    // response encode) that still has to happen after the long poll ends.
+    const FETCH_WAIT_HEADROOM_MS: i32 = 5_000;
+    const MAX_FETCH_WAIT_MS: i32 =
+        (DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS as i32) * 1_000 - FETCH_WAIT_HEADROOM_MS;
+    // Fail the build rather than ship a silently-torn-down long poll if the
+    // handler timeout is ever lowered to (or below) the headroom.
+    const _: () = assert!(
+        MAX_FETCH_WAIT_MS > 0
+            && MAX_FETCH_WAIT_MS < (DEFAULT_REQUEST_HANDLER_TIMEOUT_SECS as i32) * 1_000,
+        "fetch long-poll ceiling must be strictly below the request handler timeout"
+    );
     let bounded_wait_ms = request.max_wait_ms.clamp(0, MAX_FETCH_WAIT_MS);
     let max_wait = Duration::from_millis(bounded_wait_ms as u64);
     let min_bytes = request.min_bytes.max(0) as usize;
@@ -78,45 +98,18 @@ pub(super) async fn handle_fetch(
         Some(tokio::time::Instant::now() + max_wait)
     };
 
-    // Resolve the per-partition notifies BEFORE the first `collect_fetch`
-    // and stash a `Notified` future on each one. `Notify::notify_waiters()`
-    // only wakes futures that already exist when it fires, so a producer
-    // commit landing between the read and the wait would otherwise be lost
-    // and the fetch would block until `max_wait_ms` for no reason.
-    //
-    // Skip the pre-arm entirely when there is no long-poll window —
-    // `min_bytes <= 0` or `max_wait_ms == 0` means we're going to take
-    // whatever's available right now and return, never entering the
-    // long-poll loop. The previous shape paid one `Arc<Notify>` lookup,
-    // one `Vec` collect, and one `Box::pin(notified())` heap allocation
-    // per requested partition, for every fetch — including the common
-    // committed-consumer case where the wakeup machinery is never used.
-    let needs_long_poll = min_bytes > 0 && bounded_wait_ms > 0;
-    let watched: Vec<Arc<tokio::sync::Notify>> = if needs_long_poll {
-        request
-            .topics
-            .iter()
-            .flat_map(|t| {
-                let topic = handler.cached_topic_name(&t.name);
-                t.partitions
-                    .iter()
-                    .map(|p| handler.hwm_notifier(&topic, p.partition_index))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    // Pre-arm a notification per watched partition. `Notified` is held
-    // across the loop so a wake that fires before we await still counts.
-    let pre_armed: Vec<_> = watched.iter().map(|n| Box::pin(n.notified())).collect();
-
     // Validate topic names and authorize once per request — these results
     // are stable across long-poll iterations, but the previous version
     // re-ran `validate_topic_name` and the async ACL check inside
     // `collect_fetch` on every wakeup. With max_wait_ms = 1s and HWM-driven
     // wakes every ~200ms, that quintuples the per-request authorize cost
     // for no semantic gain.
+    //
+    // This MUST run before the long-poll pre-arm below: arming a notify
+    // interns a `(topic, partition_index)` entry, and `partition_index` is
+    // an unchecked `i32` off the wire. Interning before the ACL check let an
+    // unauthorized client mint cache entries for partitions that do not
+    // exist — see the `hwm_notifiers` field docs.
     let mut topic_plans: Vec<TopicFetchPlan> = Vec::with_capacity(request.topics.len());
     for topic in &request.topics {
         if validate_topic_name(&topic.name).is_err() {
@@ -155,6 +148,48 @@ pub(super) async fn handle_fetch(
             topic_arc: handler.cached_topic_name(&topic.name),
         });
     }
+
+    // Resolve the per-partition notifies BEFORE the first `collect_fetch`
+    // and stash a `Notified` future on each one. `Notify::notify_waiters()`
+    // only wakes futures that already exist when it fires, so a producer
+    // commit landing between the read and the wait would otherwise be lost
+    // and the fetch would block until `max_wait_ms` for no reason.
+    //
+    // Skip the pre-arm entirely when there is no long-poll window —
+    // `min_bytes <= 0` or `max_wait_ms == 0` means we're going to take
+    // whatever's available right now and return, never entering the
+    // long-poll loop. The previous shape paid one `Arc<Notify>` lookup,
+    // one `Vec` collect, and one `Box::pin(notified())` heap allocation
+    // per requested partition, for every fetch — including the common
+    // committed-consumer case where the wakeup machinery is never used.
+    //
+    // Only `Allowed` topics arm: a rejected topic never reaches
+    // `collect_fetch`'s partition fan-out, so it can never produce records
+    // to wait for. Reusing `topic_arc` from the plan also drops the second
+    // `cached_topic_name` lookup the old shape paid per topic.
+    let needs_long_poll = min_bytes > 0 && bounded_wait_ms > 0;
+    let watched: Vec<Arc<tokio::sync::Notify>> = if needs_long_poll {
+        request
+            .topics
+            .iter()
+            .zip(topic_plans.iter())
+            .filter_map(|(t, plan)| match plan {
+                TopicFetchPlan::Allowed { topic_arc } => Some((t, topic_arc)),
+                TopicFetchPlan::Reject { .. } => None,
+            })
+            .flat_map(|(t, topic_arc)| {
+                t.partitions
+                    .iter()
+                    .map(|p| handler.hwm_notifier(topic_arc, p.partition_index))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Pre-arm a notification per watched partition. `Notified` is held
+    // across the loop so a wake that fires before we await still counts.
+    let pre_armed: Vec<_> = watched.iter().map(|n| Box::pin(n.notified())).collect();
 
     // First pass: build the response with whatever's currently available.
     let mut responses = collect_fetch(handler, &request, &topic_plans).await;
@@ -220,6 +255,35 @@ enum TopicFetchPlan {
     Reject { error_code: KafkaCode },
 }
 
+/// Atomically claim this partition's slice of the request-level `max_bytes`
+/// budget, returning the number of bytes reserved (0 when exhausted).
+///
+/// Two concurrent partitions must not both observe `remaining = R` and both
+/// fetch up to `R` bytes, so the claim is a CAS loop rather than a
+/// load-then-subtract. Any unused portion is refunded by the caller after the
+/// fetch returns.
+///
+/// `partition_cap` bounds a single partition's claim. It must never be
+/// `usize::MAX`: an unbounded cap lets whichever partition reaches this first
+/// take the entire request budget, leaving every other partition in the request
+/// with a zero reservation and an empty response.
+fn reserve_from_budget(budget: &std::sync::atomic::AtomicI64, partition_cap: usize) -> i64 {
+    use std::sync::atomic::Ordering;
+    loop {
+        let current = budget.load(Ordering::SeqCst);
+        if current <= 0 {
+            return 0;
+        }
+        let want = partition_cap.min(current as usize) as i64;
+        if budget
+            .compare_exchange(current, current - want, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return want;
+        }
+    }
+}
+
 /// One pass of per-partition fetching for every topic in the request. Pulled
 /// out of `handle_fetch` so the long-poll loop can re-run it on each wakeup.
 ///
@@ -251,6 +315,10 @@ async fn collect_fetch(
         i64::MAX
     }));
 
+    // Per-partition ceiling used when the client doesn't specify one. Matches
+    // the cap `PartitionStore::fetch_from_with_budget` enforces internally.
+    let broker_partition_cap = handler.config.max_fetch_response_size.max(1);
+
     // Flatten (topic_idx, partition) pairs so we can fan out across the
     // entire request rather than per-topic. Rejected topics emit
     // pre-computed per-partition error responses without touching the
@@ -271,16 +339,10 @@ async fn collect_fetch(
         match plan {
             TopicFetchPlan::Reject { error_code } => {
                 for p in &topic.partitions {
-                    topic_partitions[topic_idx].push(FetchPartitionResponse {
-                        partition_index: p.partition_index,
-                        error_code: *error_code,
-                        high_watermark: -1,
-                        last_stable_offset: -1,
-                        aborted_transactions: vec![],
-                        log_start_offset: -1,
-                        preferred_read_replica: -1,
-                        records: None,
-                    });
+                    topic_partitions[topic_idx].push(FetchPartitionResponse::error(
+                        p.partition_index,
+                        *error_code,
+                    ));
                 }
             }
             TopicFetchPlan::Allowed { topic_arc } => {
@@ -293,6 +355,24 @@ async fn collect_fetch(
                 }
             }
         }
+    }
+
+    // FAIRNESS: rotate the starting point so a given partition is not always
+    // served last.
+    //
+    // Partitions draw from one shared `request_budget` in the order they reach
+    // the reservation loop below. With a fixed order, a client whose
+    // head-of-request partitions always have data can never make progress on
+    // the tail of a large subscription: the budget is exhausted before those
+    // partitions are reached, every time. Kafka rotates for exactly this
+    // reason. The rotation is per-request and monotonic, so over N requests
+    // every partition gets to lead.
+    if !pending.is_empty() {
+        let start = handler
+            .fetch_rotation
+            .fetch_add(1, Ordering::Relaxed)
+            .rem_euclid(pending.len() as u64) as usize;
+        pending.rotate_left(start);
     }
 
     let fetched: Vec<(usize, FetchPartitionResponse)> = stream::iter(pending)
@@ -356,68 +436,56 @@ async fn collect_fetch(
                                 } else {
                                     KafkaCode::UnknownLeaderEpoch
                                 };
-                                return FetchPartitionResponse {
-                                    partition_index: partition.partition_index,
-                                    error_code: code,
-                                    high_watermark: current_hwm,
-                                    last_stable_offset: -1,
-                                    aborted_transactions: vec![],
-                                    log_start_offset: current_log_start,
-                                    preferred_read_replica: -1,
-                                    records: None,
-                                };
+                                return FetchPartitionResponse::error_at(
+                                    partition.partition_index,
+                                    code,
+                                    current_hwm,
+                                    current_log_start,
+                                );
                             }
 
-                            let log_start = match store.earliest_offset().await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    error!(error = %e, "earliest_offset failed");
-                                    return FetchPartitionResponse {
-                                        partition_index: partition.partition_index,
-                                        error_code: KafkaCode::Unknown,
-                                        high_watermark: -1,
-                                        last_stable_offset: -1,
-                                        aborted_transactions: vec![],
-                                        log_start_offset: current_log_start,
-                                        preferred_read_replica: -1,
-                                        records: None,
-                                    };
-                                }
-                            };
+                            // `earliest_offset()` used to be awaited here as
+                            // well. It is the same `log_start_offset` atomic
+                            // load already taken above, so the second call was
+                            // redundant and its `Err` arm unreachable.
+                            let log_start = current_log_start;
 
                             let effective_offset = match partition.fetch_offset {
                                 o if o < 0 => {
-                                    return FetchPartitionResponse {
-                                        partition_index: partition.partition_index,
-                                        error_code: KafkaCode::OffsetOutOfRange,
-                                        high_watermark: current_hwm,
-                                        last_stable_offset: -1,
-                                        aborted_transactions: vec![],
-                                        log_start_offset: log_start,
-                                        preferred_read_replica: -1,
-                                        records: None,
-                                    };
+                                    return FetchPartitionResponse::error_at(
+                                        partition.partition_index,
+                                        KafkaCode::OffsetOutOfRange,
+                                        current_hwm,
+                                        log_start,
+                                    );
                                 }
                                 o => o,
                             };
 
                             if effective_offset > current_hwm || effective_offset < log_start {
-                                return FetchPartitionResponse {
-                                    partition_index: partition.partition_index,
-                                    error_code: KafkaCode::OffsetOutOfRange,
-                                    high_watermark: current_hwm,
-                                    last_stable_offset: -1,
-                                    aborted_transactions: vec![],
-                                    log_start_offset: log_start,
-                                    preferred_read_replica: -1,
-                                    records: None,
-                                };
+                                return FetchPartitionResponse::error_at(
+                                    partition.partition_index,
+                                    KafkaCode::OffsetOutOfRange,
+                                    current_hwm,
+                                    log_start,
+                                );
                             }
 
+                            // A client that sets `max_bytes` but leaves
+                            // `partition_max_bytes` unset used to yield
+                            // `usize::MAX` here, which meant the first
+                            // partition to reach the reservation loop claimed
+                            // the ENTIRE request budget and every other
+                            // partition returned empty. Fall back to the
+                            // broker's own per-partition ceiling instead, so
+                            // the budget is shared. `fetch_from_with_budget`
+                            // applies the same ceiling internally, so this
+                            // reserves no more than the fetch can actually
+                            // return.
                             let partition_cap = if partition.partition_max_bytes > 0 {
                                 partition.partition_max_bytes as usize
                             } else {
-                                usize::MAX
+                                broker_partition_cap
                             };
                             // Atomically reserve the partition's slice of the
                             // request-level budget. Two concurrent partitions
@@ -426,35 +494,14 @@ async fn collect_fetch(
                             // client's `max_bytes` by (concurrency - 1) *
                             // partition_cap. Any unused portion is refunded
                             // after the fetch returns.
-                            let reservation = loop {
-                                let current = request_budget.load(Ordering::SeqCst);
-                                if current <= 0 {
-                                    break 0i64;
-                                }
-                                let want = partition_cap.min(current as usize) as i64;
-                                if request_budget
-                                    .compare_exchange(
-                                        current,
-                                        current - want,
-                                        Ordering::SeqCst,
-                                        Ordering::SeqCst,
-                                    )
-                                    .is_ok()
-                                {
-                                    break want;
-                                }
-                            };
+                            let reservation = reserve_from_budget(&request_budget, partition_cap);
                             if reservation == 0 {
-                                return FetchPartitionResponse {
-                                    partition_index: partition.partition_index,
-                                    error_code: KafkaCode::None,
-                                    high_watermark: current_hwm,
-                                    last_stable_offset: current_hwm,
-                                    aborted_transactions: vec![],
-                                    log_start_offset: log_start,
-                                    preferred_read_replica: -1,
-                                    records: None,
-                                };
+                                return FetchPartitionResponse::success_at(
+                                    partition.partition_index,
+                                    current_hwm,
+                                    log_start,
+                                    None,
+                                );
                             }
                             let budget = reservation as usize;
 
@@ -474,24 +521,15 @@ async fn collect_fetch(
                                         .unwrap_or(0)
                                         .max(0)
                                             as u64;
-                                        crate::cluster::metrics::record_fetch(
-                                            &topic_name,
-                                            partition.partition_index,
-                                            msg_count,
-                                            bytes,
-                                        );
+                                        store.record_fetch_counters(msg_count, bytes);
                                     }
 
-                                    FetchPartitionResponse {
-                                        partition_index: partition.partition_index,
-                                        error_code: KafkaCode::None,
+                                    FetchPartitionResponse::success_at(
+                                        partition.partition_index,
                                         high_watermark,
-                                        last_stable_offset: high_watermark,
-                                        log_start_offset: log_start,
-                                        aborted_transactions: vec![],
-                                        preferred_read_replica: -1,
+                                        log_start,
                                         records,
-                                    }
+                                    )
                                 }
                                 Err(e) => {
                                     request_budget.fetch_add(reservation, Ordering::SeqCst);
@@ -509,29 +547,19 @@ async fn collect_fetch(
                                         // count and would saturate logs.
                                         crate::error_throttled!(error = %e, "Fetch failed");
                                     }
-                                    FetchPartitionResponse {
-                                        partition_index: partition.partition_index,
+                                    FetchPartitionResponse::error_at(
+                                        partition.partition_index,
                                         error_code,
-                                        high_watermark: -1,
-                                        last_stable_offset: -1,
-                                        aborted_transactions: vec![],
-                                        log_start_offset: log_start,
-                                        preferred_read_replica: -1,
-                                        records: None,
-                                    }
+                                        -1,
+                                        log_start,
+                                    )
                                 }
                             }
                         }
-                        Err(e) => FetchPartitionResponse {
-                            partition_index: partition.partition_index,
-                            error_code: e.to_kafka_code(),
-                            high_watermark: -1,
-                            last_stable_offset: -1,
-                            aborted_transactions: vec![],
-                            log_start_offset: -1,
-                            preferred_read_replica: -1,
-                            records: None,
-                        },
+                        Err(e) => FetchPartitionResponse::error(
+                            partition.partition_index,
+                            e.to_kafka_code(),
+                        ),
                     }
                 }
                 .instrument(span.clone())
@@ -1371,5 +1399,90 @@ mod tests {
         };
 
         assert_eq!(response.error_code, KafkaCode::None);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::reserve_from_budget;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    /// The starvation bug: with an unbounded per-partition cap the first
+    /// claimant takes the whole request budget and every later partition gets
+    /// nothing. Pinned as the behaviour we must NOT have.
+    #[test]
+    fn unbounded_cap_would_starve_later_partitions() {
+        let budget = AtomicI64::new(1_000);
+        assert_eq!(reserve_from_budget(&budget, usize::MAX), 1_000);
+        assert_eq!(
+            reserve_from_budget(&budget, usize::MAX),
+            0,
+            "this is exactly why partition_cap must never be usize::MAX"
+        );
+    }
+
+    /// With a real per-partition ceiling the budget is shared, so several
+    /// partitions in one request each get a workable slice.
+    #[test]
+    fn bounded_cap_shares_budget_across_partitions() {
+        let budget = AtomicI64::new(1_000);
+        let cap = 256;
+        let claims: Vec<i64> = (0..4).map(|_| reserve_from_budget(&budget, cap)).collect();
+        assert_eq!(claims, vec![256, 256, 256, 232]);
+        assert_eq!(
+            claims.iter().sum::<i64>(),
+            1_000,
+            "must never over-commit the request budget"
+        );
+        assert_eq!(budget.load(Ordering::SeqCst), 0);
+    }
+
+    /// An exhausted budget yields zero rather than going negative.
+    #[test]
+    fn exhausted_budget_reserves_nothing() {
+        let budget = AtomicI64::new(0);
+        assert_eq!(reserve_from_budget(&budget, 4096), 0);
+        assert_eq!(budget.load(Ordering::SeqCst), 0);
+
+        let negative = AtomicI64::new(-5);
+        assert_eq!(reserve_from_budget(&negative, 4096), 0);
+        assert_eq!(negative.load(Ordering::SeqCst), -5, "must not be mutated");
+    }
+
+    /// A partition asking for less than the remaining budget takes only what
+    /// it asked for, leaving the rest for its peers.
+    #[test]
+    fn reserves_at_most_the_partition_cap() {
+        let budget = AtomicI64::new(i64::MAX);
+        assert_eq!(reserve_from_budget(&budget, 1_024), 1_024);
+        assert_eq!(budget.load(Ordering::SeqCst), i64::MAX - 1_024);
+    }
+
+    /// Concurrent claimants never over-commit: the CAS loop is what makes the
+    /// shared budget safe under `buffer_unordered` fan-out.
+    #[test]
+    fn concurrent_claims_never_overcommit() {
+        let budget = std::sync::Arc::new(AtomicI64::new(10_000));
+        let cap = 128;
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let budget = std::sync::Arc::clone(&budget);
+                std::thread::spawn(move || {
+                    (0..50)
+                        .map(|_| reserve_from_budget(&budget, cap))
+                        .sum::<i64>()
+                })
+            })
+            .collect();
+        let total: i64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(
+            total + budget.load(Ordering::SeqCst),
+            10_000,
+            "every reserved byte must be accounted for exactly once"
+        );
+        assert!(
+            budget.load(Ordering::SeqCst) >= 0,
+            "budget must not go negative"
+        );
     }
 }

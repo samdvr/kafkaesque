@@ -17,8 +17,6 @@
 //! `RenewLeases`) decide locally without a control round-trip on the hot
 //! path.
 
-#![allow(dead_code)] // wired in subsequent migration steps
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

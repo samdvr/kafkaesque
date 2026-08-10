@@ -2,7 +2,7 @@
 //!
 //! Each Raft group inside [`super::cluster::RaftCluster`] needs to drive
 //! outbound `AppendEntries` / `Vote` / `InstallSnapshot` RPCs against
-//! peers. The legacy [`super::network::RaftNetworkFactoryImpl`] provides
+//! peers. The legacy `super::network::RaftNetworkFactoryImpl` provides
 //! that for the single-group `RaftNode`; this module is the multiplexed
 //! analog. Two factories are exported — one per group kind — both pointing
 //! at the *same* address book so a broker registered into the cluster
@@ -44,20 +44,20 @@
 //!
 //! # What's left for follow-up
 //!
-//! This commit gets openraft talking over the multiplexed wire. It
-//! deliberately **omits**:
+//! Forwarded client writes, join, and promote now all run over this port
+//! (`forward_control_write_with_term`, `request_mux_join`,
+//! `request_mux_promote`), and the legacy single-group path has been deleted.
+//! Still **not** implemented here:
 //!
-//! - Per-target retry with exponential backoff.
+//! - Per-target retry with exponential backoff. openraft's replication stream
+//!   does its own retry/backoff, so `RaftNetwork` verbs deliberately fail fast;
+//!   the one-shot join/promote helpers have no retry at all.
 //! - Circuit breaker.
-//! - Dual control/bulk lanes (one socket per priority class).
-//! - `forward_client_write_with_term` and `request_cluster_join` on the
-//!   mux port.
-//!
-//! Those land alongside the runnable bootstrap in step 5b — at that point
-//! we'll be able to test resilience under churn end-to-end. Splitting
-//! them out keeps this commit's surface area auditable.
-
-#![allow(dead_code)] // wired in step 5b when RaftCluster::new bootstraps a real cluster
+//! - Dual control/bulk lanes (one socket per priority class). A large
+//!   `install_snapshot` and a heartbeat to the same peer share one connection.
+//!   They cannot interleave concurrently — `RaftNetwork` verbs take `&mut self`
+//!   and each `(group, peer)` gets its own client — so this is about
+//!   prioritisation, not head-of-line blocking.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -125,6 +125,11 @@ impl MuxFactoryShared {
     /// Borrow the address book — useful for callers that need to pre-seed
     /// it from `RaftConfig::cluster_members` before any factory hands out
     /// a client.
+    ///
+    /// Currently unused: `RaftCluster::new` seeds the book it owns directly
+    /// before handing it to `MuxFactoryShared::new`. Kept as the read accessor
+    /// for the shared book.
+    #[allow(dead_code)]
     pub fn addrs(&self) -> &MuxAddrBook {
         &self.addrs
     }
@@ -163,13 +168,20 @@ pub struct MuxControlFactory {
 }
 
 impl MuxControlFactory {
+    /// Unused today: openraft records and refreshes peer addresses through
+    /// `new_client`, so nothing calls these explicitly. Retained because the
+    /// coordinator's `add_learner` path is expected to seed an address before
+    /// the first RPC to a brand-new peer.
+    #[allow(dead_code)]
     /// Update the address for `node_id`. Same `add_node` shape as the
-    /// legacy [`super::network::RaftNetworkFactoryImpl`] so the
+    /// legacy `super::network::RaftNetworkFactoryImpl` so the
     /// coordinator's `add_learner` path stays uniform.
+    #[allow(dead_code)]
     pub async fn add_node(&self, node_id: RaftNodeId, addr: String) {
         self.shared.addrs.write().await.insert(node_id, addr);
     }
 
+    #[allow(dead_code)]
     pub async fn get_node_addr(&self, node_id: RaftNodeId) -> Option<String> {
         self.shared.addrs.read().await.get(&node_id).cloned()
     }
@@ -184,15 +196,22 @@ pub struct MuxShardFactory {
 }
 
 impl MuxShardFactory {
+    /// Unused today: openraft records and refreshes peer addresses through
+    /// `new_client`, so nothing calls these explicitly. Retained because the
+    /// coordinator's `add_learner` path is expected to seed an address before
+    /// the first RPC to a brand-new peer.
+    #[allow(dead_code)]
     /// The shard id this factory tags its outbound frames with.
     pub fn shard_id(&self) -> ShardId {
         self.shard_id
     }
 
+    #[allow(dead_code)]
     pub async fn add_node(&self, node_id: RaftNodeId, addr: String) {
         self.shared.addrs.write().await.insert(node_id, addr);
     }
 
+    #[allow(dead_code)]
     pub async fn get_node_addr(&self, node_id: RaftNodeId) -> Option<String> {
         self.shared.addrs.read().await.get(&node_id).cloned()
     }
@@ -542,9 +561,12 @@ fn unexpected_variant_install(
 const _: Option<FramePurpose> = None;
 
 // ============================================================================
-// One-shot client helpers — used by the coordinator's forward path and join
-// fan-out. Each opens a fresh connection, sends one frame, reads one
-// response, and drops the socket.
+// Client helpers for the coordinator's forward path and the join fan-out.
+//
+// Forwarded writes go through a pooled `ForwardClient` (they are steady-state
+// traffic — see its docs). Join / promote / read-index-by-hand keep one-shot
+// connections: they run at most a couple of times per broker lifetime, so a
+// pool would only add idle sockets.
 // ============================================================================
 
 use std::time::Duration as StdDuration;
@@ -565,12 +587,11 @@ const MUX_RPC_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 /// forward_hops })`. The receiver's mux dispatcher applies the same
 /// hop-cap, term, and is-leader checks as the legacy server.
 pub async fn forward_control_write_with_term(
+    client: &ForwardClient,
     addr: &str,
     command: ControlCommand,
     expected_term: u64,
     forward_hops: u8,
-    auth_keys: &Arc<RaftAuthKeys>,
-    tls: Option<&RaftTlsConfig>,
 ) -> Result<ControlResponse, std::io::Error> {
     if forward_hops >= MAX_FORWARD_HOPS {
         return Err(std::io::Error::other(format!(
@@ -583,7 +604,7 @@ pub async fn forward_control_write_with_term(
         expected_term,
         forward_hops: forward_hops + 1,
     });
-    match send_one_shot(addr, &frame, false, auth_keys, tls).await? {
+    match client.send(addr, frame).await? {
         MuxRaftRpcResponse::ControlClientWriteOk(resp) => Ok(resp),
         MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
         other => Err(unexpected_io("ControlClientWriteOk", &other)),
@@ -594,13 +615,12 @@ pub async fn forward_control_write_with_term(
 ///
 /// Same hop / term semantics as [`forward_control_write_with_term`].
 pub async fn forward_shard_write_with_term(
+    client: &ForwardClient,
     addr: &str,
     shard_id: RpcShardId,
     command: ShardCommand,
     expected_term: u64,
     forward_hops: u8,
-    auth_keys: &Arc<RaftAuthKeys>,
-    tls: Option<&RaftTlsConfig>,
 ) -> Result<ShardResponse, std::io::Error> {
     if forward_hops >= MAX_FORWARD_HOPS {
         return Err(std::io::Error::other(format!(
@@ -616,7 +636,7 @@ pub async fn forward_shard_write_with_term(
             forward_hops: forward_hops + 1,
         },
     );
-    match send_one_shot(addr, &frame, false, auth_keys, tls).await? {
+    match client.send(addr, frame).await? {
         MuxRaftRpcResponse::ShardClientWriteOk(resp) => Ok(resp),
         MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
         other => Err(unexpected_io("ShardClientWriteOk", &other)),
@@ -670,39 +690,6 @@ pub async fn request_mux_promote(
 
 /// Ask the control leader at `addr` for a read index.
 ///
-/// First half of a follower-side linearizable read: the leader confirms its
-/// leadership with a heartbeat quorum and returns the log index the reader
-/// must have applied. Cluster purpose tag — a read index leaks the log
-/// position, so join-token holders don't get one.
-pub async fn request_control_read_index(
-    addr: &str,
-    auth_keys: &Arc<RaftAuthKeys>,
-    tls: Option<&RaftTlsConfig>,
-) -> Result<Option<u64>, std::io::Error> {
-    let frame = MuxRaftRpcMessage::Control(ControlRpcMessage::ReadIndex);
-    match send_one_shot(addr, &frame, false, auth_keys, tls).await? {
-        MuxRaftRpcResponse::ReadIndexOk { read_index } => Ok(read_index),
-        MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
-        other => Err(unexpected_io("ReadIndexOk", &other)),
-    }
-}
-
-/// Ask the leader of `shard_id` at `addr` for a read index. Shard analog of
-/// [`request_control_read_index`].
-pub async fn request_shard_read_index(
-    addr: &str,
-    shard_id: RpcShardId,
-    auth_keys: &Arc<RaftAuthKeys>,
-    tls: Option<&RaftTlsConfig>,
-) -> Result<Option<u64>, std::io::Error> {
-    let frame = MuxRaftRpcMessage::Shard(shard_id, ShardRpcMessage::ReadIndex);
-    match send_one_shot(addr, &frame, false, auth_keys, tls).await? {
-        MuxRaftRpcResponse::ReadIndexOk { read_index } => Ok(read_index),
-        MuxRaftRpcResponse::Error(info) => Err(rpc_error_to_io(info)),
-        other => Err(unexpected_io("ReadIndexOk", &other)),
-    }
-}
-
 /// Connection-reusing client for one group's follower read-index requests.
 ///
 /// Read indexes are a **hot path**: every linearizable read on a broker that
@@ -767,6 +754,106 @@ impl ReadIndexClient {
     }
 }
 
+/// Maximum idle connections retained per [`ForwardClient`].
+///
+/// Bounds how many sockets a group keeps open against the leader once a
+/// forward burst subsides. Connections beyond this are closed on release
+/// rather than pooled; the pool refills on demand.
+const FORWARD_POOL_MAX_IDLE: usize = 8;
+
+/// Connection-pooling client for one group's forwarded client writes.
+///
+/// Forwarding is the **steady state**, not an exceptional path: any metadata
+/// write proposed on a broker that isn't the group's leader fails
+/// `client_write` with `ForwardToLeader` and lands here. With one leader per
+/// group that is `(N-1)/N` of the cluster, and the traffic includes
+/// `verify_and_extend_lease` — which every owned partition re-issues every
+/// few seconds. Opening a fresh TCP (+TLS) connection per forward, as this
+/// path used to, put a full handshake in front of every one of those writes
+/// and pointed a connection storm at the leader's mux port.
+///
+/// Unlike [`ReadIndexClient`], this pools **several** connections instead of
+/// caching one. A read index is a sub-millisecond round trip, so queueing
+/// those behind a single socket is free. A forwarded write is not: it
+/// includes the leader's Raft commit and its fsync, so serializing all of a
+/// group's forwards onto one socket would convert concurrent writes into a
+/// strictly serial queue — trading a handshake for a much worse bottleneck.
+/// Each in-flight forward therefore gets exclusive use of a connection, and
+/// returns it to the free list on success.
+pub struct ForwardClient {
+    shared: Arc<MuxFactoryShared>,
+    /// Leader address the pooled connections point at, plus the free list.
+    /// Held together so a leader change atomically invalidates the pool.
+    pool: Mutex<(String, Vec<Arc<MuxConnInner>>)>,
+}
+
+impl ForwardClient {
+    /// Build a client over the cluster's shared network state.
+    pub fn new(shared: Arc<MuxFactoryShared>) -> Self {
+        Self {
+            shared,
+            pool: Mutex::new((String::new(), Vec::new())),
+        }
+    }
+
+    /// Send `frame` to the group leader at `addr` on a pooled connection.
+    ///
+    /// Retries once on a transport error: a pooled socket may have been
+    /// closed by the peer while idle, which is indistinguishable from a real
+    /// failure until a fresh connection is tried. The retry runs on a
+    /// definitely-new connection, not the one that just failed.
+    pub async fn send(
+        &self,
+        addr: &str,
+        frame: MuxRaftRpcMessage,
+    ) -> std::io::Result<MuxRaftRpcResponse> {
+        let conn = self.acquire(addr).await;
+        match conn.send(frame.clone()).await {
+            Ok(resp) => {
+                self.release(addr, conn).await;
+                Ok(resp)
+            }
+            Err(_) => {
+                // Don't pool the failed connection. `MuxConnInner::send`
+                // already dropped its stream, but a peer that just closed on
+                // us is likely to do so again; start clean.
+                let fresh = Arc::new(MuxConnInner::new(addr.to_string(), self.shared.clone()));
+                let result = fresh.send(frame).await;
+                if result.is_ok() {
+                    self.release(addr, fresh).await;
+                }
+                result
+            }
+        }
+    }
+
+    /// Take a connection for exclusive use, reusing a pooled one when the
+    /// leader address still matches.
+    async fn acquire(&self, addr: &str) -> Arc<MuxConnInner> {
+        let mut guard = self.pool.lock().await;
+        let (pooled_addr, free) = &mut *guard;
+        if pooled_addr != addr {
+            // Leader moved — every pooled socket points at the old one.
+            free.clear();
+            *pooled_addr = addr.to_string();
+        }
+        match free.pop() {
+            Some(conn) => conn,
+            None => Arc::new(MuxConnInner::new(addr.to_string(), self.shared.clone())),
+        }
+    }
+
+    /// Return a connection to the free list, unless the leader moved while
+    /// the request was in flight or the pool is already at its idle cap.
+    async fn release(&self, addr: &str, conn: Arc<MuxConnInner>) {
+        let mut guard = self.pool.lock().await;
+        let (pooled_addr, free) = &mut *guard;
+        if pooled_addr == addr && free.len() < FORWARD_POOL_MAX_IDLE {
+            free.push(conn);
+        }
+    }
+}
+
 /// One-shot send-and-receive helper. Opens a fresh connection (no caching
 /// — these helpers are called rarely: forward only on leader-mismatch,
 /// join only at bootstrap), writes one frame, reads one response, drops
@@ -826,10 +913,11 @@ fn unexpected_io(expected: &str, actual: &MuxRaftRpcResponse) -> std::io::Error 
 #[cfg(test)]
 mod tests {
     //! These tests cover the address-book sharing contract — the part of
-    //! the factory that's exercisable without TCP. The full
-    //! send/receive path needs a live `RaftRpcServer` running the mux
-    //! dispatcher; that integration test lands with the runnable
-    //! bootstrap in step 5b.
+    //! the factory that's exercisable without TCP. The full send/receive
+    //! path needs a live mux dispatcher; that is covered by the
+    //! `RaftCluster` integration tests in `cluster.rs`
+    //! (`cluster_bootstraps_initializes_writes_and_shuts_down`,
+    //! `write_on_non_leader_broker_is_forwarded_to_control_leader`).
     //!
     //! What we pin here:
     //!

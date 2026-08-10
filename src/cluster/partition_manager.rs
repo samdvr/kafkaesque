@@ -142,6 +142,22 @@ pub struct PartitionManager<C: ClusterCoordinator> {
     /// second caller to wait, recheck ownership, and no-op.
     acquire_locks: Arc<DashMap<PartitionKey, Arc<tokio::sync::Mutex<()>>>>,
 
+    /// Per-partition serialization for lease-cache refreshes.
+    ///
+    /// `LEASE_CACHE_REFRESH_THRESHOLD_SECS` is deliberately aggressive (55s
+    /// against a 60s lease), so each partition leaves the cache-trusted
+    /// window every few seconds and every in-flight produce to it races into
+    /// the slow path at once. Without this lock each of those produces fires
+    /// its own `verify_and_extend_lease` — a Raft *write* — so the proposal
+    /// rate scales with produce concurrency rather than with partition count.
+    ///
+    /// Holding a per-key mutex across the refresh collapses N racing
+    /// produces into one Raft round-trip: the winner refreshes and populates
+    /// the cache, the rest re-check under the lock and take the cached value.
+    /// Keyed per partition, so different partitions still refresh
+    /// concurrently. Entries are pruned wherever the lease cache is.
+    lease_refresh_locks: Arc<DashMap<PartitionKey, Arc<tokio::sync::Mutex<()>>>>,
+
     /// In-flight reservations against the per-broker owned-partition cap.
     /// See [`OwnershipContext::pending_acquires`] for the full rationale —
     /// kept here so the manager owns the counter that every cloned
@@ -293,6 +309,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             lease_cache: Arc::new(DashMap::new()),
             topic_name_cache: Arc::new(DashMap::new()),
             acquire_locks: Arc::new(DashMap::new()),
+            lease_refresh_locks: Arc::new(DashMap::new()),
             pending_acquires: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rebalance_coordinator,
             rebalance_task_handles: RwLock::new(None),
@@ -1240,8 +1257,10 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
     async fn release_partition_inner(&self, topic: &str, partition: i32) -> SlateDBResult<()> {
         let key = self.partition_key(topic, partition);
 
-        // Invalidate lease cache for this partition
+        // Invalidate lease cache for this partition, and the refresh lock
+        // that guards it, so both maps track the owned set.
         self.lease_cache.remove(&key);
+        self.lease_refresh_locks.remove(&key);
 
         // Race-guard against a concurrent caller releasing the same partition:
         // `DashMap::remove` returns `None` for a missing key, so a second
@@ -1425,6 +1444,48 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             })
     }
 
+    /// Try to admit a write from the lease cache alone.
+    ///
+    /// Returns `Some(Ok(()))` when the cached lease is fresh enough to admit
+    /// the write (having published the wall-clock expiry to the store),
+    /// `Some(Err(..))` when the cached lease is fresh but too short for a
+    /// safe write, and `None` when the cache cannot answer and a Raft
+    /// refresh is required.
+    ///
+    /// Deliberately sync and `await`-free so no `DashMap` guard is ever held
+    /// across a suspension point. Shared by the pre-lock fast path and the
+    /// post-lock re-check in `get_for_write`.
+    fn try_cached_lease(
+        &self,
+        cache_key: &PartitionKey,
+        store: &Arc<PartitionStore>,
+    ) -> Option<SlateDBResult<()>> {
+        use crate::constants::LEASE_CACHE_REFRESH_THRESHOLD_SECS;
+
+        let cached_expiry = self.lease_cache.get(cache_key)?;
+        let now = Instant::now();
+        if *cached_expiry <= now {
+            return None;
+        }
+        let remaining_secs = cached_expiry.duration_since(now).as_secs();
+        // Not enough runway left to trust the cache — force a Raft refresh.
+        if remaining_secs < LEASE_CACHE_REFRESH_THRESHOLD_SECS {
+            return None;
+        }
+        // Validate lease is sufficient for write (MIN_LEASE_TTL_FOR_WRITE_SECS).
+        if let Err(e) = store.validate_lease_for_write(remaining_secs) {
+            return Some(Err(e));
+        }
+        // Publish the wall-clock expiry to the store so the partition's
+        // `append_batch_inner` can re-validate against decay between
+        // admission and write. We use wall clock here (not the cached
+        // `Instant`) because the store reads `SystemTime::now`; on a single
+        // host the two clocks track within microseconds, well below the
+        // safety floor.
+        store.set_lease_expiry_ms(wall_clock_expiry_ms(remaining_secs));
+        Some(Ok(()))
+    }
+
     /// Get a partition store for writing with fresh ownership verification.
     ///
     /// Use this for produce/write operations where strong consistency is required.
@@ -1461,8 +1522,6 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         topic: &str,
         partition: i32,
     ) -> SlateDBResult<Arc<PartitionStore>> {
-        use crate::constants::LEASE_CACHE_REFRESH_THRESHOLD_SECS;
-
         if self.is_zombie() {
             return Err(SlateDBError::NotOwned {
                 topic: topic.to_string(),
@@ -1483,32 +1542,32 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                     partition,
                 })?;
 
-        // Fast path: Check lease cache first to avoid Raft overhead
+        // Fast path: Check lease cache first to avoid Raft overhead.
         let cache_key = self.partition_key(topic, partition);
-        if let Some(cached_expiry) = self.lease_cache.get(&cache_key) {
-            let now = Instant::now();
-            if *cached_expiry > now {
-                let remaining_secs = cached_expiry.duration_since(now).as_secs();
-                // If sufficient TTL remaining, use cached lease
-                if remaining_secs >= LEASE_CACHE_REFRESH_THRESHOLD_SECS {
-                    // Validate lease is sufficient for write (MIN_LEASE_TTL_FOR_WRITE_SECS = 15s)
-                    store.validate_lease_for_write(remaining_secs)?;
-                    // Publish the wall-clock expiry to the store so the
-                    // partition's `append_batch_inner` can re-validate
-                    // against decay between admission and write. We use
-                    // wall clock here (not the cached Instant) because the
-                    // store reads `SystemTime::now`; on a single host the
-                    // two clocks track within microseconds, well below the
-                    // 15s safety floor.
-                    let expiry_ms = wall_clock_expiry_ms(remaining_secs);
-                    store.set_lease_expiry_ms(expiry_ms);
-                    super::metrics::record_lease_cache("hit");
-                    return Ok(store);
-                }
-            }
+        if let Some(result) = self.try_cached_lease(&cache_key, &store) {
+            super::metrics::record_lease_cache("hit");
+            return result.map(|()| store);
         }
 
-        // Slow path: Verify ownership and extend lease via Raft
+        // Slow path. Serialize per partition so a burst of concurrent
+        // produces crossing the refresh threshold together costs ONE Raft
+        // write instead of one per produce. See `lease_refresh_locks`.
+        let refresh_lock = self
+            .lease_refresh_locks
+            .entry(cache_key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _refresh_guard = refresh_lock.lock().await;
+
+        // Re-check under the lock: whoever won the race has already
+        // refreshed the lease and populated the cache, so everyone queued
+        // behind them can take the cached value without touching Raft.
+        if let Some(result) = self.try_cached_lease(&cache_key, &store) {
+            super::metrics::record_lease_cache("hit_coalesced");
+            return result.map(|()| store);
+        }
+
+        // We are the designated refresher for this partition.
         super::metrics::record_lease_cache("miss");
         let lease_secs = self.config.lease_duration.as_secs();
         let remaining_ttl = match self
@@ -1546,6 +1605,10 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
                     }
                 }
                 self.lease_cache.remove(&cache_key);
+                // Drop the per-partition refresh lock alongside the cache
+                // entry it guards, so the map tracks the owned set. Safe
+                // while we hold the guard: a later acquire re-creates it.
+                self.lease_refresh_locks.remove(&cache_key);
                 return Err(SlateDBError::NotOwned {
                     topic: topic.to_string(),
                     partition,
@@ -1612,6 +1675,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         if owned {
             let key = self.partition_key(topic, partition);
             self.lease_cache.remove(&key);
+            self.lease_refresh_locks.remove(&key);
             if let Some((_, state)) = self.partition_states.remove(&key)
                 && let Some(store) = state.store()
             {
@@ -1711,6 +1775,7 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
         // from being used if the PartitionManager instance is somehow reused or if
         // shutdown is interrupted. This provides defense-in-depth.
         self.lease_cache.clear();
+        self.lease_refresh_locks.clear();
 
         // Stop rebalance coordinator if enabled
         if let Some(ref rebalance_coord) = self.rebalance_coordinator {

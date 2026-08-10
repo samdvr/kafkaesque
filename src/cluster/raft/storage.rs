@@ -150,6 +150,18 @@ pub struct RaftStore<G: GroupKind> {
     /// `apply` is gated on a small fsync, and openraft serializes
     /// `apply_to_state_machine` callbacks through its own pipeline.
     apply_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Cached append handle for `last_applied.log`.
+    ///
+    /// Held open across applies so the per-entry marker write is a bare
+    /// `write` + `sync_data` on an already-open fd, with no `open`, no
+    /// rename, and no parent-directory fsync. Reopened lazily after a
+    /// compaction or an I/O error. A `std::sync::Mutex` (not tokio's) because
+    /// it is only ever locked inside `spawn_blocking`; `apply_lock` already
+    /// serializes callers, so it is uncontended in practice.
+    last_applied_writer: Arc<std::sync::Mutex<Option<std::fs::File>>>,
+    /// Number of records appended to `last_applied.log`, driving periodic
+    /// compaction. See [`LAST_APPLIED_LOG_COMPACT_RECORDS`].
+    last_applied_appends: Arc<std::sync::atomic::AtomicU64>,
     /// Single-flight mutex around the full `persist_snapshot` flow: data
     /// write, pointer commit, mirror refresh, and best-effort delete of
     /// the generation that fell off retention. Without this, two persisters
@@ -159,6 +171,161 @@ pub struct RaftStore<G: GroupKind> {
     /// Snapshot persistence is rare (driven by openraft's snapshot
     /// scheduler), so the serialization cost is negligible.
     snapshot_persist_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Filename of the append-only FSM apply-marker log.
+const LAST_APPLIED_LOG_FILE: &str = "last_applied.log";
+
+/// Filename of the pre-marker-log apply marker, written by older versions as
+/// a single atomically-renamed blob. Still read on recovery so an upgrade
+/// does not lose the marker and replay the log; never written any more.
+const LAST_APPLIED_LEGACY_FILE: &str = "last_applied.bin";
+
+/// `[len: u32 LE][crc32c: u32 LE]` ahead of each marker-log payload.
+const LAST_APPLIED_RECORD_HEADER: usize = 8;
+
+/// Compact `last_applied.log` back to one record every this many appends.
+///
+/// Bounds the file (a marker payload is a few dozen bytes, so this caps it in
+/// the low hundreds of KiB) and amortizes the expensive tmp-write + rename +
+/// directory-fsync path to one write in N. Large enough that the amortized
+/// cost is negligible; small enough that recovery never scans much.
+const LAST_APPLIED_LOG_COMPACT_RECORDS: u64 = 4096;
+
+/// Frame one marker payload as `[len][crc32c][payload]`.
+///
+/// The length lets recovery walk records without deserializing, and the CRC
+/// is what makes a torn tail (crash mid-append) detectable rather than
+/// silently deserialized as a bogus marker.
+fn encode_last_applied_record(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(LAST_APPLIED_RECORD_HEADER + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc32c::crc32c(payload).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Last marker in `bytes` that passes its CRC and deserializes.
+///
+/// Stops at the first malformed record rather than trying to resynchronize:
+/// records are only ever appended under `apply_lock`, so the sole way to get
+/// a bad record is a torn write at the tail, and everything after it is by
+/// definition not durable.
+fn scan_last_applied_log(bytes: &[u8]) -> Option<LogId<RaftNodeId>> {
+    let mut pos = 0usize;
+    let mut last = None;
+    while pos + LAST_APPLIED_RECORD_HEADER <= bytes.len() {
+        let len = u32::from_le_bytes(
+            bytes[pos..pos + 4]
+                .try_into()
+                .expect("4-byte slice from a bounds-checked range"),
+        ) as usize;
+        let crc = u32::from_le_bytes(
+            bytes[pos + 4..pos + 8]
+                .try_into()
+                .expect("4-byte slice from a bounds-checked range"),
+        );
+        let start = pos + LAST_APPLIED_RECORD_HEADER;
+        let Some(end) = start.checked_add(len) else {
+            break;
+        };
+        if end > bytes.len() {
+            break; // truncated payload — torn tail
+        }
+        let payload = &bytes[start..end];
+        if crc32c::crc32c(payload) != crc {
+            break; // corrupt / torn tail
+        }
+        match postcard::from_bytes::<LogId<RaftNodeId>>(payload) {
+            Ok(id) => last = Some(id),
+            Err(_) => break,
+        }
+        pos = end;
+    }
+    last
+}
+
+/// Atomically replace `path` with `bytes`, fsyncing the file and its parent.
+///
+/// Same shape as `RaftStore::atomic_write_fsync_blocking` but with a `.tmp`
+/// *suffix* rather than a replaced extension: `last_applied.log` and the
+/// legacy `last_applied.bin` both map to `last_applied.tmp` under
+/// `with_extension`, so an extension-replacing temp name would have them
+/// racing for the same scratch file.
+fn atomic_write_marker_blocking(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+    {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    if let Some(parent) = path.parent() {
+        let dir = std::fs::File::open(parent)?;
+        dir.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Durably record one apply marker. Blocking; call from `spawn_blocking`.
+///
+/// On the compaction pass, rewrites the log as a single record through
+/// [`atomic_write_marker_blocking`]. Otherwise appends one framed record to
+/// the cached handle and `sync_data`s it.
+fn write_last_applied_blocking(
+    dir: &std::path::Path,
+    writer: &std::sync::Mutex<Option<std::fs::File>>,
+    payload: &[u8],
+    compact: bool,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let record = encode_last_applied_record(payload);
+    let path = dir.join(LAST_APPLIED_LOG_FILE);
+    // Poisoning carries no meaning here: the guarded value is just a cached
+    // fd, and any panic holding it left no partial state to recover.
+    let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
+
+    if compact {
+        // Drop the stale append handle first: it points at the file we are
+        // about to replace. If the atomic write fails we stay at `None`, and
+        // the next append reopens the (still valid) existing log.
+        *guard = None;
+        atomic_write_marker_blocking(&path, &record)?;
+        return Ok(());
+    }
+
+    if guard.is_none() {
+        std::fs::create_dir_all(dir)?;
+        *guard = Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?,
+        );
+    }
+    let file = guard
+        .as_mut()
+        .expect("handle populated immediately above this line");
+
+    // On any write/sync error drop the handle so the next call reopens
+    // rather than reusing an fd whose position may be past a short write.
+    let result = file
+        .write_all(&record)
+        // `sync_data` is the append-only-log primitive: it flushes the record
+        // plus the metadata needed to read it back (the new file size),
+        // skipping the full inode sync `sync_all` would pay.
+        .and_then(|()| file.sync_data());
+    if result.is_err() {
+        *guard = None;
+    }
+    result
 }
 
 /// Atomic update to one or more `RaftStore` fields.
@@ -251,6 +418,8 @@ impl<G: GroupKind> RaftStore<G> {
             snapshot_path: ObjectPath::from(snapshot_prefix),
             log_dir: None,
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            last_applied_writer: Arc::new(std::sync::Mutex::new(None)),
+            last_applied_appends: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             snapshot_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -278,6 +447,8 @@ impl<G: GroupKind> RaftStore<G> {
             snapshot_path: ObjectPath::from(snapshot_prefix),
             log_dir: Some(log_dir),
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            last_applied_writer: Arc::new(std::sync::Mutex::new(None)),
+            last_applied_appends: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             snapshot_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -376,15 +547,50 @@ impl<G: GroupKind> RaftStore<G> {
         // every entry above the snapshot's last_applied (the snapshot
         // can lag the actual apply point by hundreds or thousands of
         // entries) — re-running non-idempotent FSM commands.
-        let last_applied_path = dir.join("last_applied.bin");
-        if last_applied_path.exists() {
-            let bytes = std::fs::read(&last_applied_path)?;
-            let applied: LogId<RaftNodeId> = postcard::from_bytes(&bytes).map_err(|e| {
+        //
+        // Two sources, because the marker moved from a single
+        // atomically-renamed blob to an append-only log (see
+        // `persist_last_applied`): the current `last_applied.log` and, for a
+        // broker upgrading in place, the legacy `last_applied.bin`. Take
+        // whichever is further along rather than preferring one file — the
+        // marker is monotone, so the higher index is always the correct
+        // answer, and that holds whichever order the two were last written
+        // in. Ignoring the legacy file outright would replay every entry
+        // since the last snapshot on the first boot after upgrade.
+        let mut recovered: Option<LogId<RaftNodeId>> = None;
+
+        let marker_log_path = dir.join(LAST_APPLIED_LOG_FILE);
+        if marker_log_path.exists() {
+            let bytes = std::fs::read(&marker_log_path)?;
+            // A torn tail is expected after a crash and is not corruption:
+            // `scan_last_applied_log` stops at the first bad record and
+            // returns the last durable one.
+            recovered = scan_last_applied_log(&bytes);
+            if recovered.is_none() && !bytes.is_empty() {
+                warn!(
+                    path = %marker_log_path.display(),
+                    bytes = bytes.len(),
+                    "apply-marker log holds no complete record; falling back to \
+                     the legacy marker / snapshot apply point"
+                );
+            }
+        }
+
+        let legacy_path = dir.join(LAST_APPLIED_LEGACY_FILE);
+        if legacy_path.exists() {
+            let bytes = std::fs::read(&legacy_path)?;
+            let legacy: LogId<RaftNodeId> = postcard::from_bytes(&bytes).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("last_applied.bin deserialize: {}", e),
+                    format!("{} deserialize: {}", LAST_APPLIED_LEGACY_FILE, e),
                 )
             })?;
+            if recovered.is_none_or(|current| legacy.index > current.index) {
+                recovered = Some(legacy);
+            }
+        }
+
+        if let Some(applied) = recovered {
             *self.last_applied_log.write().await = Some(applied);
         }
 
@@ -778,17 +984,53 @@ impl<G: GroupKind> RaftStore<G> {
     /// every entry whose log_id is >= the snapshot's last_applied. That
     /// double-applies non-idempotent commands (producer-id allocation,
     /// leader-epoch bumps, transactional epoch bumps) on every restart.
+    ///
+    /// # Why this is an append, not an atomic rewrite
+    ///
+    /// This runs once per applied entry and is the hottest durability point
+    /// in the whole metadata plane: `apply_to_state_machine` advances the
+    /// marker per entry (deliberately — a batch-end advance would replay
+    /// non-idempotent commands after a crash), and every call is serialized
+    /// behind `apply_lock`. Writing it as tmp-write + rename cost **two**
+    /// fsyncs per entry (the file, then the parent directory), pinning
+    /// cluster metadata throughput at roughly `1 / (2 x fsync_latency)` —
+    /// order 100 entries/s on NVMe and far worse on network storage.
+    ///
+    /// An append-only marker log costs **one** `sync_data` on an fd that
+    /// stays open, with no rename and no directory fsync. The durability
+    /// contract is unchanged: the record is on disk before this returns, and
+    /// recovery takes the last record that passes its CRC. A torn tail from
+    /// a crash mid-append fails the CRC and is ignored, which leaves the
+    /// marker one entry behind and replays exactly that entry — the same
+    /// worst case the rename-based version had.
+    ///
+    /// The log is compacted back to a single record every
+    /// [`LAST_APPLIED_LOG_COMPACT_RECORDS`] appends so it cannot grow without
+    /// bound; only that 1-in-N write pays the old two-fsync path.
     async fn persist_last_applied(&self, log_id: &LogId<RaftNodeId>) -> std::io::Result<()> {
         let Some(dir) = self.log_dir.as_ref() else {
             return Ok(());
         };
-        let bytes = postcard::to_stdvec(log_id).map_err(|e| {
+        let payload = postcard::to_stdvec(log_id).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("last_applied serialize: {}", e),
             )
         })?;
-        Self::atomic_write_fsync(dir.join("last_applied.bin"), bytes).await
+        // Compact on the first write of a process too (counter starts at 0),
+        // which collapses whatever the previous process left behind into a
+        // single record and gives us a known-clean file to append to.
+        let compact = self
+            .last_applied_appends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(LAST_APPLIED_LOG_COMPACT_RECORDS);
+        let dir = dir.clone();
+        let writer = self.last_applied_writer.clone();
+        tokio::task::spawn_blocking(move || {
+            write_last_applied_blocking(&dir, &writer, &payload, compact)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("spawn_blocking join: {}", e)))?
     }
 
     /// Get the state machine for reading.
@@ -1307,6 +1549,8 @@ impl<G: GroupKind> RaftStorage<G::Cfg> for RaftStore<G> {
             snapshot_path: self.snapshot_path.clone(),
             log_dir: self.log_dir.clone(),
             apply_lock: self.apply_lock.clone(),
+            last_applied_writer: self.last_applied_writer.clone(),
+            last_applied_appends: self.last_applied_appends.clone(),
             snapshot_persist_lock: self.snapshot_persist_lock.clone(),
         }
     }
@@ -1538,6 +1782,8 @@ impl<G: GroupKind> RaftStorage<G::Cfg> for RaftStore<G> {
             snapshot_path: self.snapshot_path.clone(),
             log_dir: self.log_dir.clone(),
             apply_lock: self.apply_lock.clone(),
+            last_applied_writer: self.last_applied_writer.clone(),
+            last_applied_appends: self.last_applied_appends.clone(),
             snapshot_persist_lock: self.snapshot_persist_lock.clone(),
         }
     }

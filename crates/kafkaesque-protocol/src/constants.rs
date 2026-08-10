@@ -276,6 +276,25 @@ pub const DEFAULT_OWNERSHIP_CHECK_INTERVAL_SECS: u64 = 5;
 /// How often to check for expired consumer group members.
 pub const DEFAULT_SESSION_TIMEOUT_CHECK_INTERVAL_SECS: u64 = 10;
 
+/// Minimum consumer-group session timeout a `JoinGroup` may request (ms).
+///
+/// Matches Kafka's `group.min.session.timeout.ms` default. A zero or very
+/// small value lets the failure detector reap legitimate consumers between
+/// heartbeats.
+///
+/// Lives here, beside the other wire bounds, rather than as a function-local
+/// in the JoinGroup handler: this is a protocol bound, and any wire-level
+/// validation must agree with the handler's check or the two silently drift.
+pub const MIN_SESSION_TIMEOUT_MS: i32 = 6_000;
+
+/// Maximum consumer-group session timeout a `JoinGroup` may request (ms).
+///
+/// Matches Kafka's `group.max.session.timeout.ms` default. Also bounds
+/// `rebalance_timeout_ms`. A negative value casts to `u64::MAX` in the
+/// state-machine layer and permanently holds a group slot, so the handler
+/// rejects out-of-range values before they reach it.
+pub const MAX_SESSION_TIMEOUT_MS: i32 = 1_800_000;
+
 /// Minimum remaining lease TTL (in seconds) to use cached lease.
 ///
 /// When a cached lease has less than this remaining, we refresh via Raft.

@@ -19,8 +19,6 @@
 //! Hot-path domains (per-partition leases, consumer groups, per-producer
 //! idempotency, transfers) live on [`super::shard::ShardStateMachine`].
 
-#![allow(dead_code)] // wired in subsequent migration steps
-
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;

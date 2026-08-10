@@ -66,6 +66,21 @@ impl ProducePartitionResponse {
         }
     }
 
+    /// Response for a structurally-empty produce: a legal per-partition slot
+    /// that carried no records.
+    ///
+    /// Success with `base_offset = -1`, never the partition's high watermark.
+    /// Returning the HWM here leaked the next assignable offset, so a
+    /// `produce(empty)` and a concurrent `produce(record)` reported the same
+    /// `base_offset` and a consumer of those acks could not tell them apart.
+    /// `-1` is the established "no record was written" sentinel.
+    ///
+    /// Distinct from `error(.., KafkaCode::None)`, which produces the same
+    /// bytes today but reads as an error path at the call site.
+    pub fn empty(partition_index: i32) -> Self {
+        Self::error(partition_index, KafkaCode::None)
+    }
+
     /// Create a success response for a partition.
     pub fn success(partition_index: i32, base_offset: i64) -> Self {
         Self {

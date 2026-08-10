@@ -636,7 +636,13 @@ where
 
                     match dispatch_result {
                         Ok(Ok(DispatchedResponse::Buffer(response))) => {
-                            write_kafka_frame(writer, &response, client).await?
+                            write_kafka_frame(writer, &response, client).await?;
+                            // Response buffers come from the shared pool (see
+                            // `Response::build`); hand this one back now that
+                            // the frame is on the wire. Dropping it instead
+                            // would silently degrade the pool to
+                            // always-allocate under steady load.
+                            crate::cluster::buffer_pool::return_buffer(response);
                         }
                         Ok(Ok(DispatchedResponse::Chain(chain))) => {
                             write_kafka_frame_chain(writer, &chain, client).await?
@@ -760,22 +766,19 @@ fn encode_api_versions_standard(
     api_version: i16,
     resp: &super::response::ApiVersionsResponseData,
 ) -> Result<Vec<u8>> {
-    use crate::encode::ToByte;
-
-    // Encode the body using version-aware format
-    let mut body = Vec::new();
-    resp.encode_versioned(&mut body, api_version)?;
-
-    // Build response with standard header (no tagged fields)
-    let mut header = Vec::new();
-    correlation_id.encode(&mut header)?;
-
-    let total_size = (header.len() + body.len()) as i32;
-    let mut result = Vec::with_capacity(4 + total_size as usize);
-    total_size.encode(&mut result)?;
-    result.extend_from_slice(&header);
-    result.extend_from_slice(&body);
-    Ok(result)
+    // One pooled buffer, encoded in place: reserve the 4-byte size prefix and
+    // 4-byte correlation id, append the body after them, then patch the
+    // prefix. The previous shape allocated three `Vec`s (body, header, result)
+    // and copied the first two into the third for every ApiVersions response —
+    // which is the first response on every single connection.
+    const API_VERSIONS_HEADER_LEN: usize = 8; // size prefix + correlation id
+    let mut out = crate::cluster::buffer_pool::get_buffer(API_VERSIONS_HEADER_LEN + 256);
+    out.resize(API_VERSIONS_HEADER_LEN, 0);
+    resp.encode_versioned(&mut out, api_version)?;
+    let total_size = (out.len() - 4) as i32;
+    out[0..4].copy_from_slice(&total_size.to_be_bytes());
+    out[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+    Ok(out)
 }
 
 /// Encode an ApiVersions response for flexible version (v3+).
@@ -788,28 +791,22 @@ fn encode_api_versions_flexible(
     correlation_id: i32,
     resp: &super::response::ApiVersionsResponseData,
 ) -> Result<Vec<u8>> {
-    use crate::encode::ToByte;
-
-    // Encode the body using flexible format
-    let mut body = Vec::new();
-    resp.encode_flexible(&mut body)?;
-
-    // Build response with OLD header format (NO tagged fields per KIP-511)
-    // ApiVersions is special: even v3 uses old header format for compatibility
-    let mut header = Vec::new();
-    correlation_id.encode(&mut header)?;
-    // NOTE: No tagged fields byte here! ApiVersions v3 response uses old header format.
-
-    let total_size = (header.len() + body.len()) as i32;
-    let mut result = Vec::with_capacity(4 + total_size as usize);
-    total_size.encode(&mut result)?;
-    result.extend_from_slice(&header);
-    result.extend_from_slice(&body);
-
+    // Same single-pooled-buffer shape as the standard encoder above.
+    // NOTE: the header stays the OLD format (correlation id only, NO tagged
+    // fields byte) per KIP-511 — ApiVersions v3 is deliberately parseable
+    // before protocol negotiation. Only the BODY is flexible-encoded.
+    const API_VERSIONS_HEADER_LEN: usize = 8; // size prefix + correlation id
+    let mut result = crate::cluster::buffer_pool::get_buffer(API_VERSIONS_HEADER_LEN + 256);
+    result.resize(API_VERSIONS_HEADER_LEN, 0);
+    resp.encode_flexible(&mut result)?;
+    let total_size = (result.len() - 4) as i32;
+    result[0..4].copy_from_slice(&total_size.to_be_bytes());
+    result[4..8].copy_from_slice(&correlation_id.to_be_bytes());
+    let body = &result[API_VERSIONS_HEADER_LEN..];
     tracing::debug!(
         correlation_id,
         total_size,
-        header_bytes = ?header,
+        header_bytes = ?&result[4..API_VERSIONS_HEADER_LEN],
         body_len = body.len(),
         first_body_bytes = ?&body[..body.len().min(32)],
         "Encoded ApiVersions v3 flexible response (old header format per KIP-511)"

@@ -25,8 +25,6 @@
 //! change it, even to fix a uniformity issue, without a full cluster
 //! re-bootstrap.
 
-#![allow(dead_code)] // wired in subsequent migration steps
-
 use twox_hash::XxHash3_64;
 
 use super::types::ShardId;

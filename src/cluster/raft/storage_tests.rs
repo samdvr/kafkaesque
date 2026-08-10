@@ -783,3 +783,255 @@ async fn test_log_indexing() {
     assert!(log.contains_key(&7));
     assert!(!log.contains_key(&1));
 }
+
+// ============================================================================
+// Append-only `last_applied` marker log.
+//
+// This is crash-recovery-critical: the marker is what stops a restart from
+// re-applying non-idempotent commands (producer-id allocation, leader-epoch
+// bumps). The append path trades the old tmp-write+rename for one
+// `sync_data`, so these tests pin the properties that made the rename safe —
+// last-record-wins, torn tails ignored, bounded growth, and legacy upgrade.
+// ============================================================================
+
+/// Round-trip: several appends, last one wins.
+#[test]
+fn marker_log_scan_returns_last_record() {
+    let mut buf = Vec::new();
+    for index in 1..=5u64 {
+        let id = make_log_id(1, 1, index);
+        buf.extend_from_slice(&encode_last_applied_record(
+            &postcard::to_stdvec(&id).unwrap(),
+        ));
+    }
+    let recovered = scan_last_applied_log(&buf).expect("a complete record");
+    assert_eq!(recovered.index, 5);
+}
+
+#[test]
+fn marker_log_scan_empty_is_none() {
+    assert!(scan_last_applied_log(&[]).is_none());
+}
+
+/// A crash mid-append leaves a partial record. Recovery must ignore it and
+/// return the last *complete* one rather than deserializing garbage.
+#[test]
+fn marker_log_scan_ignores_torn_tail() {
+    let mut buf = Vec::new();
+    for index in 1..=3u64 {
+        let id = make_log_id(1, 1, index);
+        buf.extend_from_slice(&encode_last_applied_record(
+            &postcard::to_stdvec(&id).unwrap(),
+        ));
+    }
+    let complete_len = buf.len();
+
+    // Append a record and truncate it partway through the payload.
+    let id = make_log_id(1, 1, 4);
+    let full = encode_last_applied_record(&postcard::to_stdvec(&id).unwrap());
+    buf.extend_from_slice(&full[..LAST_APPLIED_RECORD_HEADER + 1]);
+
+    let recovered = scan_last_applied_log(&buf).expect("earlier records survive");
+    assert_eq!(recovered.index, 3, "must not observe the torn record");
+
+    // Truncating inside the *header* is also a torn tail.
+    let mut header_torn = buf[..complete_len].to_vec();
+    header_torn.extend_from_slice(&full[..3]);
+    assert_eq!(
+        scan_last_applied_log(&header_torn).map(|id| id.index),
+        Some(3)
+    );
+}
+
+/// A flipped payload byte must fail the CRC, not silently deserialize.
+#[test]
+fn marker_log_scan_rejects_corrupt_payload() {
+    let id = make_log_id(7, 2, 99);
+    let mut buf = encode_last_applied_record(&postcard::to_stdvec(&id).unwrap());
+    let last = buf.len() - 1;
+    buf[last] ^= 0xFF;
+    assert!(
+        scan_last_applied_log(&buf).is_none(),
+        "CRC mismatch must be rejected"
+    );
+}
+
+/// A bogus length field must not panic or over-read.
+#[test]
+fn marker_log_scan_rejects_absurd_length() {
+    let mut buf = u32::MAX.to_le_bytes().to_vec();
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(b"short");
+    assert!(scan_last_applied_log(&buf).is_none());
+}
+
+/// The append path is durable and readable, and compaction collapses the log
+/// to a single record without losing the marker.
+#[test]
+fn marker_log_append_then_compact_preserves_latest() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = std::sync::Mutex::new(None);
+    let path = dir.path().join(LAST_APPLIED_LOG_FILE);
+
+    // First write compacts (counter starts at 0 in the real caller), so drive
+    // it explicitly here to establish the file.
+    let first = postcard::to_stdvec(&make_log_id(1, 1, 1)).unwrap();
+    write_last_applied_blocking(dir.path(), &writer, &first, true).unwrap();
+    assert_eq!(
+        scan_last_applied_log(&std::fs::read(&path).unwrap())
+            .unwrap()
+            .index,
+        1
+    );
+
+    // Appends accumulate; last wins.
+    for index in 2..=10u64 {
+        let payload = postcard::to_stdvec(&make_log_id(1, 1, index)).unwrap();
+        write_last_applied_blocking(dir.path(), &writer, &payload, false).unwrap();
+    }
+    let grown = std::fs::read(&path).unwrap();
+    assert_eq!(scan_last_applied_log(&grown).unwrap().index, 10);
+
+    // Compaction keeps the newest marker and shrinks the file.
+    let payload = postcard::to_stdvec(&make_log_id(1, 1, 11)).unwrap();
+    write_last_applied_blocking(dir.path(), &writer, &payload, true).unwrap();
+    let compacted = std::fs::read(&path).unwrap();
+    assert_eq!(scan_last_applied_log(&compacted).unwrap().index, 11);
+    assert!(
+        compacted.len() < grown.len(),
+        "compaction should shrink the log ({} -> {} bytes)",
+        grown.len(),
+        compacted.len()
+    );
+
+    // No temp file left behind.
+    assert!(!dir.path().join("last_applied.log.tmp").exists());
+}
+
+/// Appending after a compaction must continue from the compacted record
+/// rather than clobbering it (the cached handle is dropped by compaction).
+#[test]
+fn marker_log_append_after_compaction_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = std::sync::Mutex::new(None);
+
+    for (index, compact) in [(1u64, true), (2, false), (3, true), (4, false)] {
+        let payload = postcard::to_stdvec(&make_log_id(1, 1, index)).unwrap();
+        write_last_applied_blocking(dir.path(), &writer, &payload, compact).unwrap();
+    }
+
+    let bytes = std::fs::read(dir.path().join(LAST_APPLIED_LOG_FILE)).unwrap();
+    assert_eq!(scan_last_applied_log(&bytes).unwrap().index, 4);
+}
+
+/// The temp name must not collide with the legacy `last_applied.bin` marker,
+/// which `Path::with_extension("tmp")` would have mapped to the same path.
+#[test]
+fn marker_log_temp_name_does_not_collide_with_legacy() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join(LAST_APPLIED_LEGACY_FILE);
+    let legacy_bytes = postcard::to_stdvec(&make_log_id(9, 9, 42)).unwrap();
+    std::fs::write(&legacy, &legacy_bytes).unwrap();
+
+    let writer = std::sync::Mutex::new(None);
+    let payload = postcard::to_stdvec(&make_log_id(1, 1, 1)).unwrap();
+    write_last_applied_blocking(dir.path(), &writer, &payload, true).unwrap();
+
+    // The legacy blob is untouched — a shared temp path would have eaten it.
+    assert_eq!(std::fs::read(&legacy).unwrap(), legacy_bytes);
+}
+
+/// Upgrading in place: the legacy marker is ahead of (or the only) marker, so
+/// recovery must adopt it instead of replaying from the snapshot point.
+#[tokio::test]
+async fn recover_prefers_further_along_marker_across_formats() {
+    // Legacy only.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(LAST_APPLIED_LEGACY_FILE),
+        postcard::to_stdvec(&make_log_id(3, 1, 77)).unwrap(),
+    )
+    .unwrap();
+    let store = RaftStore::<ControlGroupKind>::new_with_log_dir(
+        Arc::new(InMemory::new()),
+        "marker-upgrade/snapshots",
+        dir.path().to_path_buf(),
+    );
+    store.recover_from_disk().await.unwrap();
+    assert_eq!(
+        store.last_applied_log.read().await.unwrap().index,
+        77,
+        "legacy marker must be recovered on first boot after upgrade"
+    );
+
+    // Both present: the higher index wins regardless of which file it's in.
+    let dir2 = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir2.path().join(LAST_APPLIED_LEGACY_FILE),
+        postcard::to_stdvec(&make_log_id(3, 1, 77)).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir2.path().join(LAST_APPLIED_LOG_FILE),
+        encode_last_applied_record(&postcard::to_stdvec(&make_log_id(3, 1, 120)).unwrap()),
+    )
+    .unwrap();
+    let store2 = RaftStore::<ControlGroupKind>::new_with_log_dir(
+        Arc::new(InMemory::new()),
+        "marker-upgrade2/snapshots",
+        dir2.path().to_path_buf(),
+    );
+    store2.recover_from_disk().await.unwrap();
+    assert_eq!(store2.last_applied_log.read().await.unwrap().index, 120);
+
+    // Legacy ahead of a stale marker log (crash right after upgrade wrote
+    // the legacy file but before the new log caught up).
+    let dir3 = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir3.path().join(LAST_APPLIED_LEGACY_FILE),
+        postcard::to_stdvec(&make_log_id(3, 1, 200)).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir3.path().join(LAST_APPLIED_LOG_FILE),
+        encode_last_applied_record(&postcard::to_stdvec(&make_log_id(3, 1, 5)).unwrap()),
+    )
+    .unwrap();
+    let store3 = RaftStore::<ControlGroupKind>::new_with_log_dir(
+        Arc::new(InMemory::new()),
+        "marker-upgrade3/snapshots",
+        dir3.path().to_path_buf(),
+    );
+    store3.recover_from_disk().await.unwrap();
+    assert_eq!(store3.last_applied_log.read().await.unwrap().index, 200);
+}
+
+/// End-to-end through the real `RaftStore` API: applying entries persists the
+/// marker, and a fresh store over the same directory recovers it.
+#[tokio::test]
+async fn apply_persists_marker_recoverable_by_fresh_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = RaftStore::<ControlGroupKind>::new_with_log_dir(
+        Arc::new(InMemory::new()),
+        "marker-e2e/snapshots",
+        dir.path().to_path_buf(),
+    );
+
+    let entries: Vec<_> = (1..=3u64)
+        .map(|i| make_entry(1, 1, i, EntryPayload::Blank))
+        .collect();
+    store.apply_to_state_machine(&entries).await.unwrap();
+    assert_eq!(store.last_applied_log.read().await.unwrap().index, 3);
+
+    let recovered = RaftStore::<ControlGroupKind>::new_with_log_dir(
+        Arc::new(InMemory::new()),
+        "marker-e2e-2/snapshots",
+        dir.path().to_path_buf(),
+    );
+    recovered.recover_from_disk().await.unwrap();
+    assert_eq!(
+        recovered.last_applied_log.read().await.unwrap().index,
+        3,
+        "marker must survive a restart so the entries are not re-applied"
+    );
+}

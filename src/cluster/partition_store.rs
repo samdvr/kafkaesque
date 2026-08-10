@@ -390,6 +390,14 @@ pub struct PartitionStore {
     /// confusing `NotOwned` instead of a clean `LeaseTooShort` redirect.
     lease_expiry_ms: AtomicI64,
 
+    /// Pre-resolved Prometheus throughput counters for this partition.
+    ///
+    /// Resolved on first record rather than at open so the cardinality decision
+    /// happens at the same moment it does today; held afterwards so the hot
+    /// produce/fetch paths pay four atomic `inc_by`s instead of a tracked-set
+    /// probe plus four label-set hashes. See `metrics::PartitionCounters`.
+    prom_counters: std::sync::OnceLock<super::metrics::PartitionCounters>,
+
     /// Sticky bit tripped when a SlateDB write returned an error AFTER the
     /// offset reservation had been disarmed — i.e. when the in-memory
     /// `next_offset` advanced past `high_watermark` with no durable record
@@ -588,6 +596,22 @@ impl PartitionStore {
         if let Some(collector) = self.load_collector.swap(None) {
             collector.clear_partition(&self.topic, self.partition);
         }
+    }
+
+    /// Pre-resolved Prometheus counters for this partition.
+    fn prom_counters(&self) -> &super::metrics::PartitionCounters {
+        self.prom_counters
+            .get_or_init(|| super::metrics::partition_counters(&self.topic, self.partition))
+    }
+
+    /// Add to this partition's Prometheus produce counters.
+    pub fn record_produce_counters(&self, message_count: u64, bytes: u64) {
+        self.prom_counters().add_produce(message_count, bytes);
+    }
+
+    /// Add to this partition's Prometheus fetch counters.
+    pub fn record_fetch_counters(&self, message_count: u64, bytes: u64) {
+        self.prom_counters().add_fetch(message_count, bytes);
     }
 
     /// Record a produce operation in the load metrics.
@@ -1023,7 +1047,11 @@ impl PartitionStore {
         // PERFORMANCE: Using get_buffer/return_buffer pattern instead of with_batch_buffer
         // to avoid clone() across async boundary. The buffer is borrowed for the SlateDB
         // write and returned to the pool afterward, eliminating allocation overhead.
-        let mut buffer = super::buffer_pool::get_buffer(8 + records.len());
+        // RAII: the buffer is returned to the pool on every exit from this
+        // function, including a cancellation at the `write_with_options`
+        // await below. The previous explicit `return_buffer` sat *after* that
+        // await, so a cancelled produce dropped its buffer on the floor.
+        let mut buffer = super::buffer_pool::PooledBuffer::new(8 + records.len());
         buffer.extend_from_slice(&new_hwm.to_be_bytes());
         buffer.extend_from_slice(records);
 
@@ -1035,7 +1063,6 @@ impl PartitionStore {
         // Returning the buffer to the pool keeps us honest about the
         // failure path.
         if let Err(e) = patch_base_offset(&mut buffer[8..], base_offset) {
-            super::buffer_pool::return_buffer(buffer);
             return Err(SlateDBError::CorruptBatch {
                 topic: self.topic.to_string(),
                 partition: self.partition,
@@ -1122,9 +1149,6 @@ impl PartitionStore {
                 write_started_at.elapsed().as_secs_f64(),
             );
         }
-
-        // Return buffer to pool BEFORE handling result (ensures buffer is always returned)
-        super::buffer_pool::return_buffer(buffer);
 
         if let Err(e) = write_result {
             let err = SlateDBError::from(e);
@@ -2969,6 +2993,7 @@ impl PartitionStoreBuilder {
             // gets a chance to record the lease.
             lease_expiry_ms: AtomicI64::new(0),
             append_failed: AtomicBool::new(false),
+            prom_counters: std::sync::OnceLock::new(),
         };
 
         // Warm the batch index cache from the recovery scan (one storage

@@ -26,7 +26,17 @@ WORKDIR /app
 
 # Set before the dependency-caching build so the pre-built deps carry the same
 # fingerprint as the final build; otherwise every dependency is recompiled below.
+#
+# These flags MUST NOT reach proc-macro/build-script crates: a musl target with
+# `crt-static` cannot produce the cdylib that a proc macro needs ("cannot produce
+# proc-macro for `async-trait` as the target ... does not support these crate
+# types"). Cargo only limits RUSTFLAGS to the target units when `--target` is
+# passed explicitly, so every cargo invocation below passes it. The triple is
+# resolved from rustc rather than hardcoded, because this image is also built
+# for linux/arm64.
 ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static -C opt-level=z -C lto=fat -C codegen-units=1"
+
+RUN rustc -vV | sed -n 's/^host: //p' > /rust-target && cat /rust-target
 
 # Dependency caching
 COPY Cargo.toml Cargo.lock ./
@@ -36,7 +46,8 @@ COPY crates/kafkaesque-bin/Cargo.toml ./crates/kafkaesque-bin/Cargo.toml
 # cargo refuses to even parse Cargo.toml unless those target files exist, so the
 # dummy tree has to stub them out too (otherwise this layer silently no-ops and
 # no dependencies get cached).
-RUN mkdir -p src examples benches \
+RUN TARGET="$(cat /rust-target)" && \
+    mkdir -p src examples benches \
         crates/kafkaesque-protocol/src \
         crates/kafkaesque-bin/src && \
     echo 'fn main() {}' > src/main.rs && \
@@ -45,10 +56,10 @@ RUN mkdir -p src examples benches \
     echo 'fn main() {}' > crates/kafkaesque-bin/src/main.rs && \
     echo 'fn main() {}' > examples/benchmark.rs && \
     echo 'fn main() {}' > benches/produce_bench.rs && \
-    cargo build --release -p kafkaesque-bin --bin kafkaesque --features tls,sasl || true && \
+    cargo build --target "$TARGET" --release -p kafkaesque-bin --bin kafkaesque --features tls,sasl || true && \
     rm -rf src examples benches \
            crates/kafkaesque-protocol/src crates/kafkaesque-bin/src \
-           target/release/.fingerprint/kafkaesque-*
+           "target/$TARGET/release/.fingerprint/kafkaesque-"*
 
 # Build release binary
 COPY src ./src
@@ -56,8 +67,10 @@ COPY crates ./crates
 COPY examples ./examples
 COPY benches ./benches
 
-RUN cargo build --release -p kafkaesque-bin --bin kafkaesque --features tls,sasl && \
-    strip --strip-all target/release/kafkaesque
+RUN TARGET="$(cat /rust-target)" && \
+    cargo build --target "$TARGET" --release -p kafkaesque-bin --bin kafkaesque --features tls,sasl && \
+    strip --strip-all "target/$TARGET/release/kafkaesque" && \
+    cp "target/$TARGET/release/kafkaesque" /app/kafkaesque
 
 # =============================================================================
 # Stage 2: Minimal runtime (scratch + glibc compatibility)
@@ -75,7 +88,7 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 # Copy only the binary
-COPY --from=builder /app/target/release/kafkaesque /app/kafkaesque
+COPY --from=builder /app/kafkaesque /app/kafkaesque
 
 # Non-root user for security
 RUN adduser -D -u 1000 kafkaesque && \

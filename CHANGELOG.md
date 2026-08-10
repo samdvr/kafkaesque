@@ -59,6 +59,9 @@ the code again.
 - DescribeConfigs (v0–v2)
 - AlterConfigs (v0–v1)
 - OffsetForLeaderEpoch (v0–v3)
+- DescribeAcls (v0–v1)
+- CreateAcls (v0–v1)
+- DeleteAcls (v0–v1)
 - CreatePartitions (v0–v1)
 - IncrementalAlterConfigs (v0)
 

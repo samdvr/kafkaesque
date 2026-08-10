@@ -1316,6 +1316,31 @@ async fn dispatch_request_common<H: Handler>(
             }
             encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
+        Request::DescribeAcls(header, req) => {
+            let resp = handler.handle_describe_acls(&ctx, req).await;
+            error_code_label = resp.error_code.metric_label();
+            let mut body = Vec::new();
+            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
+                return (Err(e), auth_result);
+            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
+        }
+        Request::CreateAcls(_, req) => {
+            encode_response(correlation_id, &handler.handle_create_acls(&ctx, req).await)
+        }
+        Request::DeleteAcls(header, req) => {
+            let resp = handler.handle_delete_acls(&ctx, req).await;
+            error_code_label = resp
+                .filter_results
+                .first()
+                .map(|r| r.error_code.metric_label())
+                .unwrap_or(KafkaCode::None.metric_label());
+            let mut body = Vec::new();
+            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
+                return (Err(e), auth_result);
+            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
+        }
         Request::CreatePartitions(_, req) => encode_response(
             correlation_id,
             &handler.handle_create_partitions(&ctx, req).await,

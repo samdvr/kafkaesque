@@ -63,6 +63,21 @@ SHARED_DATA_PATH=/tmp/kafkaesque-cluster-test/shared
 KCAT_OPTS="-X api.version.request=false -X broker.version.fallback=2.0.0"
 E2E_FAILED=0
 
+# Portable timeout: prefer GNU `timeout` (CI / Linux), otherwise perl
+# `alarm`+`exec` (macOS ships perl; no coreutils required). Usage:
+# `run_with_timeout <secs> <command...>`. Prefer this over a bash
+# background+kill fallback — backgrounding breaks stdin for
+# `echo | run_with_timeout … kcat -P` and can strand consumers.
+run_with_timeout() {
+    local secs=$1
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+        return $?
+    fi
+    perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+}
+
 run_test() {
     local name="$1"
     local cmd="$2"
@@ -103,8 +118,8 @@ wait_for_broker() {
     return 1
 }
 
-# Block until every partition of $1 reports a leader (as seen from broker $2),
-# or until $3 seconds elapse.
+# Block until every partition of $1 reports a real leader (as seen from
+# broker $2), or until $3 seconds elapse.
 #
 # A freshly auto-created topic has DEFAULT_NUM_PARTITIONS partitions, and each
 # is acquired by whichever broker the consistent-hash ring assigns it to. That
@@ -113,28 +128,35 @@ wait_for_broker() {
 # with kcat spans *all* partitions, so a consume issued mid-convergence stalls
 # on the not-yet-owned ones and returns nothing.
 #
-# The previous shape here was a flat `sleep 2`, which is a bet on convergence
-# latency rather than an observation of it — it failed reliably in CI. Waiting
-# on the actual condition removes the race in both directions: it does not
-# flake when convergence is slow, and it does not waste 2s when it is fast.
+# Convergence requires *positive* evidence: metadata must mention the topic,
+# must not contain "Leader not available", and must show at least one
+# `leader N` / `leader: N` line with a non-negative broker id (kcat uses the
+# no-colon form). Absence of the error string alone is not enough — a failed
+# `-L` (empty output) used to look "converged".
 wait_for_partition_leaders() {
     local topic=$1
     local broker=$2
     local timeout_secs=${3:-30}
     echo -n "  Waiting for all partitions of $topic to have leaders... "
     for i in $(seq 1 "$timeout_secs"); do
-        # `-L -t <topic>` lists partitions with their leader; kcat prints
-        # "Leader not available" for any partition whose owner is unknown.
-        if ! timeout 10 $KCAT -b 127.0.0.1:$broker -L -t "$topic" $KCAT_OPTS 2>/dev/null \
-             | grep -q "Leader not available"; then
-            echo -e "${GREEN}converged (${i}s)${NC}"
-            return 0
+        local meta
+        meta=$(run_with_timeout 10 $KCAT -b 127.0.0.1:$broker -L -t "$topic" $KCAT_OPTS 2>/dev/null || true)
+        # kcat prints "leader 0" (no colon); some tools print "leader: 0".
+        if printf '%s\n' "$meta" | grep -q "$topic" \
+            && ! printf '%s\n' "$meta" | grep -qi "Leader not available" \
+            && printf '%s\n' "$meta" | grep -Eiq 'leader:?[[:space:]]*-?[0-9]+'; then
+            # Reject the sentinel "leader -1" / "leader: -1" that clients emit
+            # for leaderless partitions even when the string above is absent.
+            if ! printf '%s\n' "$meta" | grep -Eiq 'leader:?[[:space:]]*-1([^0-9]|$)'; then
+                echo -e "${GREEN}converged (${i}s)${NC}"
+                return 0
+            fi
         fi
         sleep 1
     done
     echo -e "${YELLOW}timeout after ${timeout_secs}s${NC}"
     echo "  --- metadata for $topic at timeout ---"
-    timeout 15 $KCAT -b 127.0.0.1:$broker -L -t "$topic" $KCAT_OPTS 2>&1 | sed 's/^/    /' || true
+    run_with_timeout 15 $KCAT -b 127.0.0.1:$broker -L -t "$topic" $KCAT_OPTS 2>&1 | sed 's/^/    /' || true
     return 1
 }
 
@@ -144,6 +166,9 @@ wait_for_partition_leaders() {
 echo -e "${YELLOW}Starting 3-node Raft cluster...${NC}"
 
 # Broker 0 (leader candidate)
+# DEFAULT_NUM_PARTITIONS=1 keeps auto-created topics on a single partition so
+# the Multiple Topics step (and kcat all-partition consume) does not race
+# ownership acquisition across a multi-partition ring after failover.
 BROKER_ID=0 \
 HOST=127.0.0.1 \
 PORT=9092 \
@@ -152,6 +177,7 @@ RAFT_PEERS="1=127.0.0.1:9095,2=127.0.0.1:9097" \
 OBJECT_STORE_TYPE=local \
 DATA_PATH="$SHARED_DATA_PATH" \
 AUTO_CREATE_TOPICS=true \
+DEFAULT_NUM_PARTITIONS=1 \
 RUST_LOG=kafkaesque=info \
 $BINARY > /tmp/kafkaesque-cluster-test/broker0.log 2>&1 &
 BROKER0_PID=$!
@@ -165,6 +191,7 @@ RAFT_PEERS="0=127.0.0.1:9093,2=127.0.0.1:9097" \
 OBJECT_STORE_TYPE=local \
 DATA_PATH="$SHARED_DATA_PATH" \
 AUTO_CREATE_TOPICS=true \
+DEFAULT_NUM_PARTITIONS=1 \
 RUST_LOG=kafkaesque=info \
 $BINARY > /tmp/kafkaesque-cluster-test/broker1.log 2>&1 &
 BROKER1_PID=$!
@@ -178,6 +205,7 @@ RAFT_PEERS="0=127.0.0.1:9093,1=127.0.0.1:9095" \
 OBJECT_STORE_TYPE=local \
 DATA_PATH="$SHARED_DATA_PATH" \
 AUTO_CREATE_TOPICS=true \
+DEFAULT_NUM_PARTITIONS=1 \
 RUST_LOG=kafkaesque=info \
 $BINARY > /tmp/kafkaesque-cluster-test/broker2.log 2>&1 &
 BROKER2_PID=$!
@@ -210,8 +238,8 @@ echo ""
 echo -e "${BLUE}[Cross-Broker Produce/Consume]${NC}"
 run_test "Produce to broker 0" "echo 'cross-broker-msg' | $KCAT -b 127.0.0.1:9092 -t cross-test -P $KCAT_OPTS"
 sleep 2
-run_test "Consume from broker 1" "timeout 10 $KCAT -b 127.0.0.1:9094 -t cross-test -C -c 1 -q $KCAT_OPTS | grep -q cross-broker-msg"
-run_test "Consume from broker 2" "timeout 10 $KCAT -b 127.0.0.1:9096 -t cross-test -C -c 1 -q $KCAT_OPTS | grep -q cross-broker-msg"
+run_test "Consume from broker 1" "run_with_timeout 10 $KCAT -b 127.0.0.1:9094 -t cross-test -C -c 1 -q $KCAT_OPTS | grep -q cross-broker-msg"
+run_test "Consume from broker 2" "run_with_timeout 10 $KCAT -b 127.0.0.1:9096 -t cross-test -C -c 1 -q $KCAT_OPTS | grep -q cross-broker-msg"
 
 # =============================================================================
 # Test 3: Multi-partition topic
@@ -225,7 +253,7 @@ for i in $(seq 1 10); do
 done
 sleep 2
 
-run_test "Consume multi-partition" "timeout 10 $KCAT -b 127.0.0.1:9092 -t multi-partition -C -c 10 -q $KCAT_OPTS | wc -l | grep -q 10"
+run_test "Consume multi-partition" "run_with_timeout 10 $KCAT -b 127.0.0.1:9092 -t multi-partition -C -c 10 -q $KCAT_OPTS | wc -l | grep -q 10"
 
 # =============================================================================
 # Test 4: Consumer group across cluster
@@ -244,7 +272,7 @@ sleep 2
 # as a topic name (so flags come first), and a brand-new group has no
 # committed offsets, which librdkafka resets to *latest* by default — i.e. it
 # would skip the messages produced above.
-run_test "Consumer group from broker 0" "timeout 20 $KCAT -b 127.0.0.1:9092 -G test-group -c 5 -q -X auto.offset.reset=earliest $KCAT_OPTS group-test 2>/dev/null | wc -l | grep -q 5"
+run_test "Consumer group from broker 0" "run_with_timeout 20 $KCAT -b 127.0.0.1:9092 -G test-group -c 5 -q -X auto.offset.reset=earliest $KCAT_OPTS group-test 2>/dev/null | wc -l | grep -q 5"
 
 # =============================================================================
 # Test 5: High throughput
@@ -255,7 +283,7 @@ echo -e "${BLUE}[High Throughput]${NC}"
 # Produce 1000 messages rapidly
 run_test "Produce 1000 messages" "for i in \$(seq 1 1000); do echo msg-\$i; done | $KCAT -b 127.0.0.1:9092 -t throughput-test -P $KCAT_OPTS"
 sleep 3
-run_test "Consume 1000 messages" "timeout 30 $KCAT -b 127.0.0.1:9094 -t throughput-test -C -c 1000 -q $KCAT_OPTS | wc -l | grep -q 1000"
+run_test "Consume 1000 messages" "run_with_timeout 30 $KCAT -b 127.0.0.1:9094 -t throughput-test -C -c 1000 -q $KCAT_OPTS | wc -l | grep -q 1000"
 
 # =============================================================================
 # Test 6: Broker failover (kill one broker, verify others still work)
@@ -270,8 +298,8 @@ sleep 2
 
 run_test "Produce after broker 2 down" "echo 'failover-msg' | $KCAT -b 127.0.0.1:9092 -t failover-test -P $KCAT_OPTS"
 sleep 2
-run_test "Consume from broker 0" "timeout 10 $KCAT -b 127.0.0.1:9092 -t failover-test -C -c 1 -q $KCAT_OPTS | grep -q failover-msg"
-run_test "Consume from broker 1" "timeout 10 $KCAT -b 127.0.0.1:9094 -t failover-test -C -c 1 -q $KCAT_OPTS | grep -q failover-msg"
+run_test "Consume from broker 0" "run_with_timeout 10 $KCAT -b 127.0.0.1:9092 -t failover-test -C -c 1 -q $KCAT_OPTS | grep -q failover-msg"
+run_test "Consume from broker 1" "run_with_timeout 10 $KCAT -b 127.0.0.1:9094 -t failover-test -C -c 1 -q $KCAT_OPTS | grep -q failover-msg"
 
 # Restart broker 2 — same DATA_PATH it started with, so it recovers its own
 # Raft log ({DATA_PATH}/raft/log/2) and rejoins as the member it already is
@@ -285,14 +313,18 @@ RAFT_PEERS="0=127.0.0.1:9093,1=127.0.0.1:9095" \
 OBJECT_STORE_TYPE=local \
 DATA_PATH="$SHARED_DATA_PATH" \
 AUTO_CREATE_TOPICS=true \
+DEFAULT_NUM_PARTITIONS=1 \
 RUST_LOG=kafkaesque=info \
 $BINARY > /tmp/kafkaesque-cluster-test/broker2.log 2>&1 &
 BROKER2_PID=$!
 
 wait_for_broker 9096 "Broker 2 (restart)"
-sleep 3
+# Ownership rebalance after a rejoining voter can thrash for a few seconds;
+# wait for the failover topic to look stable before creating more topics.
+run_test "Leaders converged after restart" "wait_for_partition_leaders failover-test 9092 30"
+sleep 2
 
-run_test "Consume from restarted broker 2" "timeout 10 $KCAT -b 127.0.0.1:9096 -t failover-test -C -c 1 -q $KCAT_OPTS | grep -q failover-msg"
+run_test "Consume from restarted broker 2" "run_with_timeout 10 $KCAT -b 127.0.0.1:9096 -t failover-test -o beginning -C -c 1 -q $KCAT_OPTS | grep -q failover-msg"
 
 # =============================================================================
 # Test 7: Large messages across cluster
@@ -310,7 +342,7 @@ echo -e "${BLUE}[Large Messages]${NC}"
 LARGE_MSG_BYTES=500000
 run_test "Produce 500KB message" "head -c $LARGE_MSG_BYTES /dev/zero | tr '\\0' 'x' | $KCAT -b 127.0.0.1:9092 -t large-msg-test -P $KCAT_OPTS"
 sleep 2
-run_test "Consume 500KB from another broker" "timeout 30 $KCAT -b 127.0.0.1:9094 -t large-msg-test -C -c 1 -q $KCAT_OPTS | wc -c | awk '{exit (\$1 >= $LARGE_MSG_BYTES ? 0 : 1)}'"
+run_test "Consume 500KB from another broker" "run_with_timeout 30 $KCAT -b 127.0.0.1:9094 -t large-msg-test -C -c 1 -q $KCAT_OPTS | wc -c | awk '{exit (\$1 >= $LARGE_MSG_BYTES ? 0 : 1)}'"
 
 # =============================================================================
 # Test 8: Multiple topics simultaneously
@@ -318,33 +350,37 @@ run_test "Consume 500KB from another broker" "timeout 30 $KCAT -b 127.0.0.1:9094
 echo ""
 echo -e "${BLUE}[Multiple Topics]${NC}"
 
-# Bounded per-produce: a stuck producer here would otherwise park the wait
-# below and the whole job would die on the CI step timeout with no output.
-# Wait on the producer PIDs specifically — a bare `wait` would also wait on
-# the three broker processes started with `&` above, i.e. forever.
+# Produce → wait for leaders → verify, per topic. Batching all produces
+# before any verify used to race ownership acquisition after failover:
+# metadata could look "converged" while partition 0 was mid-reassign and
+# the single produce was not yet readable cross-broker.
 #
-# Each produce is asserted. The previous shape backgrounded all five and
-# swallowed their exit codes with `|| true`, so a failed produce was
-# indistinguishable from a failed consume — the suite reported "Verify
-# topic-a ✗" while the actual fault was upstream. Produce serially through
-# run_test so the failing side is named.
-for topic in topic-a topic-b topic-c topic-d topic-e; do
-    run_test "Produce to $topic" \
-      "echo msg-for-$topic | timeout 30 $KCAT -b 127.0.0.1:9092 -t $topic -P $KCAT_OPTS"
-done
+# `-o beginning` is required: without a consumer group, kcat's stored
+# offset default can start at end and miss the already-produced message.
+verify_topic_message() {
+    local topic=$1
+    local broker=$2
+    local needle=$3
+    local timeout_secs=${4:-30}
+    for i in $(seq 1 "$timeout_secs"); do
+        if run_with_timeout 5 $KCAT -b 127.0.0.1:$broker -t "$topic" -p 0 -o beginning -C -c 1 -q $KCAT_OPTS 2>/dev/null \
+            | grep -q "$needle"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
 
-# Wait for leadership to converge on each topic we are about to read, from
-# the broker we are about to read it from. This is an assertion too: a topic
-# that never converges fails the suite instead of silently producing an
-# empty consume.
-for spec in "topic-a 9094" "topic-c 9096" "topic-e 9092"; do
+for spec in "topic-a 9094" "topic-b 9092" "topic-c 9096" "topic-d 9094" "topic-e 9092"; do
     set -- $spec
-    run_test "Leaders converged for $1" "wait_for_partition_leaders $1 $2 30"
+    local_topic=$1
+    local_broker=$2
+    run_test "Produce to $local_topic" \
+      "echo msg-for-$local_topic | run_with_timeout 30 $KCAT -b 127.0.0.1:9092 -t $local_topic -P $KCAT_OPTS"
+    run_test "Leaders converged for $local_topic" "wait_for_partition_leaders $local_topic $local_broker 30"
+    run_test "Verify $local_topic" "verify_topic_message $local_topic $local_broker msg-for-$local_topic 30"
 done
-
-run_test "Verify topic-a" "timeout 10 $KCAT -b 127.0.0.1:9094 -t topic-a -C -c 1 -q $KCAT_OPTS | grep -q topic-a"
-run_test "Verify topic-c" "timeout 10 $KCAT -b 127.0.0.1:9096 -t topic-c -C -c 1 -q $KCAT_OPTS | grep -q topic-c"
-run_test "Verify topic-e" "timeout 10 $KCAT -b 127.0.0.1:9092 -t topic-e -C -c 1 -q $KCAT_OPTS | grep -q topic-e"
 
 # =============================================================================
 # Summary

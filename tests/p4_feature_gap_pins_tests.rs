@@ -45,13 +45,11 @@
 //! and the dispatcher rejects the connection at version negotiation.
 //!
 //! ## P4.4 — ACL administration via Kafka RPC
-//! ACL state DOES exist internally — `RaftCoordinator::create_acls` and
-//! `delete_acls` are reachable via the Raft control plane (see
-//! `src/cluster/raft/coordinator/acl.rs`). What's missing is the wire
-//! exposure: `DescribeAcls` (29), `CreateAcls` (30), `DeleteAcls` (31)
-//! are absent from `ApiKey`. Operators today must use the configured
-//! ACL-bootstrap file or an internal admin path; standard Kafka admin
-//! tooling can't read or write ACLs.
+//! ACL state is managed through the Raft control plane
+//! (`RaftCoordinator::{create,delete,describe}_acls`). The Kafka wire
+//! surface (`DescribeAcls` 29, `CreateAcls` 30, `DeleteAcls` 31) is now
+//! wired at v0..=v1 — see `src/cluster/handler/acls.rs`. The pin below
+//! asserts those keys stay advertised.
 //!
 //! ## P4.5 — KIP-848 next-gen group protocol
 //! The classic group protocol (`JoinGroup` 11, `SyncGroup` 14,
@@ -452,38 +450,28 @@ fn delegation_token_api_keys_are_unknown_today() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn acl_admin_rpc_keys_are_unknown_today() {
-    // ACL state IS reachable internally — `RaftCoordinator::create_acls`
-    // and `delete_acls` exist. What's missing is the wire surface that
-    // standard Kafka admin tooling (`kafka-acls.sh`,
-    // `AdminClient.createAcls`) uses to reach them.
-    //
-    // | Key | Name          |
-    // |-----|---------------|
-    // |  29 | DescribeAcls  |
-    // |  30 | CreateAcls    |
-    // |  31 | DeleteAcls    |
-    //
-    // TODO(ACL RPC): a thin adapter from CreateAcls/DeleteAcls/
-    // DescribeAcls handlers onto the existing AclCommand surface would
-    // close this gap without changing the underlying state machine.
-    for key in [29i16, 30, 31] {
+fn acl_admin_rpc_keys_are_supported() {
+    // Wire adapters for DescribeAcls / CreateAcls / DeleteAcls land on the
+    // existing Raft ACL state machine. Pin: the keys are named ApiKey
+    // variants and advertised in SUPPORTED_VERSIONS at v0..=v1.
+    let expected = [
+        (29i16, "DescribeAcls", ApiKey::DescribeAcls),
+        (30, "CreateAcls", ApiKey::CreateAcls),
+        (31, "DeleteAcls", ApiKey::DeleteAcls),
+    ];
+    for (key, name, variant) in expected {
         let parsed = ApiKey::from(key);
-        assert!(
-            matches!(parsed, ApiKey::Unknown(_)),
-            "ACL admin key {} must remain ApiKey::Unknown(_) until the \
-             RPC adapter lands; got {:?}",
-            key,
-            parsed,
+        assert_eq!(
+            parsed, variant,
+            "ACL admin key {key} ({name}) must resolve to {variant:?}; got {parsed:?}"
         );
-        assert!(
-            !SUPPORTED_VERSIONS
-                .iter()
-                .any(|sv| i16::from(sv.api_key) == key),
-            "ACL admin key {} must not appear in SUPPORTED_VERSIONS \
-             until the handler is wired",
-            key,
-        );
+        let sv = SUPPORTED_VERSIONS
+            .iter()
+            .find(|sv| i16::from(sv.api_key) == key)
+            .unwrap_or_else(|| panic!("{name} missing from SUPPORTED_VERSIONS"));
+        assert_eq!(sv.min_version, 0, "{name} min_version");
+        assert_eq!(sv.max_version, 1, "{name} max_version");
+        assert_eq!(parsed.as_str(), name);
     }
 }
 

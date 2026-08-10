@@ -238,7 +238,10 @@ pub struct AclFilter {
 }
 
 impl AclFilter {
-    fn matches(&self, b: &AclBinding) -> bool {
+    /// True when every set constraint on this filter matches `b`.
+    /// Used by the DeleteAcls handler to attribute removed bindings to
+    /// the filter that selected them.
+    pub fn matches(&self, b: &AclBinding) -> bool {
         if let Some(t) = self.resource_type
             && t != b.resource_type
         {

@@ -33,6 +33,7 @@ use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::topic_partition_list::Offset;
 use tempfile::TempDir;
 
 mod common;
@@ -197,6 +198,82 @@ async fn rdkafka_idempotent_producer_offsets_advance() {
             "idempotent producer offsets must advance: {offsets:?}"
         );
     }
+}
+
+/// Consumer group offset commit: produce, consume with a group, commit,
+/// and verify the committed offset via `committed()`. Exercises
+/// FindCoordinator + Join/Sync/Heartbeat + OffsetCommit/Fetch through
+/// librdkafka's negotiated API versions.
+///
+/// Deliberately avoids a second same-group consumer: librdkafka requires
+/// all borrowed messages to be destroyed before the consumer handle, and
+/// overlapping two group members while a `BorrowedMessage` is live has
+/// SIGSEGV'd in CI (`rd_kafka_message` / rebalance). Verify the commit
+/// with the same consumer after dropping the message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rdkafka_consumer_group_commit_round_trip() {
+    let Some((addr, _server, _tempdir)) = start_in_memory_broker().await else {
+        eprintln!("Skipping: no TCP bind permission");
+        return;
+    };
+
+    let topic = "rdkafka-group-commit";
+    let group = "rdkafka-group-commit-g";
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &addr)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("producer");
+
+    let payload = b"group-commit-payload";
+    producer
+        .send(
+            FutureRecord::to(topic).payload(payload).key(b"gk"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("produce");
+
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &addr)
+        .set("group.id", group)
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .set("session.timeout.ms", "6000")
+        .create()
+        .expect("consumer");
+
+    consumer.subscribe(&[topic]).expect("subscribe");
+
+    let recv = tokio::time::timeout(Duration::from_secs(15), consumer.recv())
+        .await
+        .expect("recv timeout")
+        .expect("recv error");
+    assert_eq!(recv.payload().expect("payload"), payload);
+
+    let partition = recv.partition();
+    // Kafka commits the *next* offset to fetch.
+    let committed_next = recv.offset() + 1;
+
+    consumer
+        .commit_message(&recv, rdkafka::consumer::CommitMode::Sync)
+        .expect("commit_message");
+    // librdkafka: destroy BorrowedMessage before further consumer ops /
+    // close. Holding it across rebalance or drop is undefined (SIGSEGV).
+    drop(recv);
+
+    let committed = consumer
+        .committed(Duration::from_secs(5))
+        .expect("committed()");
+    let entry = committed
+        .find_partition(topic, partition)
+        .expect("committed partition entry");
+    assert_eq!(
+        entry.offset(),
+        Offset::Offset(committed_next),
+        "OffsetCommit must stick; got {:?}",
+        entry.offset()
+    );
 }
 
 /// AdminClient: create a topic, list metadata, and delete it. Catches

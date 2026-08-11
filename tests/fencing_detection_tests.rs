@@ -7,8 +7,9 @@
 //! 4. Safe pattern recognition to prevent false positives
 
 use kafkaesque::cluster::metrics;
-use kafkaesque::cluster::{FencingDetectionMethod, SlateDBError, detect_fencing_from_message};
-use serial_test::serial;
+use kafkaesque::cluster::{
+    FencingDetectionMethod, Metrics, SlateDBError, detect_fencing_from_message,
+};
 
 // ============================================================================
 // FencingDetectionMethod Tests
@@ -191,95 +192,73 @@ fn test_slatedb_error_lease_too_short_is_not_fenced() {
 // ============================================================================
 // Circuit Breaker Tests
 // ============================================================================
-// Circuit breaker tests use global state and must run serially to avoid
-// interference from parallel test execution.
+// Each test installs an isolated Metrics handle so parallel suites do not
+// share circuit-breaker atomics (no `#[serial]` required).
 
 #[test]
-#[serial]
 fn test_circuit_breaker_initial_state() {
-    // Reset circuit breaker to known state
-    metrics::reset_circuit_breaker();
-
-    let (count, tripped) = metrics::get_circuit_breaker_state();
-    assert_eq!(count, 0, "Initial circuit breaker count should be 0");
-    assert!(!tripped, "Initial circuit breaker should not be tripped");
+    Metrics::isolated().scope_sync(|| {
+        metrics::reset_circuit_breaker();
+        let (count, tripped) = metrics::get_circuit_breaker_state();
+        assert_eq!(count, 0, "Initial circuit breaker count should be 0");
+        assert!(!tripped, "Initial circuit breaker should not be tripped");
+    });
 }
 
 #[test]
-#[serial]
 fn test_circuit_breaker_not_tripped_initially() {
-    metrics::reset_circuit_breaker();
-    assert!(
-        !metrics::fail_closed_circuit_breaker_tripped(),
-        "Circuit breaker should not be tripped with zero fail-closed events"
-    );
+    Metrics::isolated().scope_sync(|| {
+        metrics::reset_circuit_breaker();
+        assert!(
+            !metrics::fail_closed_circuit_breaker_tripped(),
+            "Circuit breaker should not be tripped with zero fail-closed events"
+        );
+    });
 }
 
 #[test]
-#[serial]
 fn test_circuit_breaker_increments_on_fail_closed() {
-    metrics::reset_circuit_breaker();
-
-    // Record one fail_closed event
-    let _ = metrics::record_fencing_detection_with_circuit_breaker("fail_closed");
-
-    let (count, _) = metrics::get_circuit_breaker_state();
-    // Count should be 1 or higher (may be higher if other tests ran)
-    assert!(
-        count >= 1,
-        "fail_closed should increment counter, got {}",
-        count
-    );
-
-    // Cleanup
-    metrics::reset_circuit_breaker();
+    Metrics::isolated().scope_sync(|| {
+        metrics::reset_circuit_breaker();
+        let _ = metrics::record_fencing_detection_with_circuit_breaker("fail_closed");
+        let (count, _) = metrics::get_circuit_breaker_state();
+        assert_eq!(
+            count, 1,
+            "fail_closed should increment counter, got {count}"
+        );
+    });
 }
 
 #[test]
-#[serial]
 fn test_circuit_breaker_reset_clears_counter() {
-    // Record some events first
-    let _ = metrics::record_fencing_detection_with_circuit_breaker("fail_closed");
-
-    // Then reset
-    metrics::reset_circuit_breaker();
-
-    let (count, _) = metrics::get_circuit_breaker_state();
-    assert_eq!(count, 0, "Reset should clear counter");
+    Metrics::isolated().scope_sync(|| {
+        let _ = metrics::record_fencing_detection_with_circuit_breaker("fail_closed");
+        metrics::reset_circuit_breaker();
+        let (count, _) = metrics::get_circuit_breaker_state();
+        assert_eq!(count, 0, "Reset should clear counter");
+    });
 }
 
 #[test]
-#[serial]
 fn test_circuit_breaker_confirmed_fencing_resets() {
-    metrics::reset_circuit_breaker();
-
-    // Record a fail_closed event
-    let _ = metrics::record_fencing_detection_with_circuit_breaker("fail_closed");
-
-    // Record a confirmed fencing event (typed)
-    metrics::record_fencing_detection_with_circuit_breaker("typed");
-
-    let (count, _) = metrics::get_circuit_breaker_state();
-    assert_eq!(count, 0, "Counter should reset after confirmed fencing");
-
-    // Cleanup
-    metrics::reset_circuit_breaker();
+    Metrics::isolated().scope_sync(|| {
+        metrics::reset_circuit_breaker();
+        let _ = metrics::record_fencing_detection_with_circuit_breaker("fail_closed");
+        metrics::record_fencing_detection_with_circuit_breaker("typed");
+        let (count, _) = metrics::get_circuit_breaker_state();
+        assert_eq!(count, 0, "Counter should reset after confirmed fencing");
+    });
 }
 
 #[test]
-#[serial]
 fn test_circuit_breaker_not_affected_by_not_fencing() {
-    metrics::reset_circuit_breaker();
-
-    // Record some not_fencing events
-    metrics::record_fencing_detection_with_circuit_breaker("not_fencing");
-    metrics::record_fencing_detection_with_circuit_breaker("not_fencing");
-
-    let (count, _) = metrics::get_circuit_breaker_state();
-    assert_eq!(count, 0, "not_fencing events should not increment counter");
-
-    // Cleanup
-    metrics::reset_circuit_breaker();
+    Metrics::isolated().scope_sync(|| {
+        metrics::reset_circuit_breaker();
+        metrics::record_fencing_detection_with_circuit_breaker("not_fencing");
+        metrics::record_fencing_detection_with_circuit_breaker("not_fencing");
+        let (count, _) = metrics::get_circuit_breaker_state();
+        assert_eq!(count, 0, "not_fencing events should not increment counter");
+    });
 }
 
 // ============================================================================

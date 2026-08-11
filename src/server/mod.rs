@@ -272,6 +272,8 @@ pub struct KafkaServer<H: Handler> {
     auth_rate_limiter: Arc<AuthRateLimiter>,
     /// Runtime handle for spawning data plane tasks.
     data_runtime: Handle,
+    /// Metrics handle installed into connection tasks.
+    metrics: crate::cluster::Metrics,
 }
 
 impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
@@ -349,7 +351,14 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
             max_message_size,
             auth_rate_limiter: Arc::new(AuthRateLimiter::new()),
             data_runtime,
+            metrics: crate::cluster::Metrics::process_global(),
         })
+    }
+
+    /// Replace the metrics handle (tests / embedding). Call before `run`.
+    pub fn with_metrics(mut self, metrics: crate::cluster::Metrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Get the auth rate limiter for external access (e.g., for metrics).
@@ -552,6 +561,7 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                         ip,
                     };
                     let force_rx = self.force_shutdown_tx.subscribe();
+                    let metrics = self.metrics.clone();
 
                     self.data_runtime.spawn(
                         async move {
@@ -570,15 +580,19 @@ impl<H: Handler + Send + Sync + 'static> KafkaServer<H> {
                                 tracing::warn!(client_addr = %addr, error = ?e, "Error handling connection");
                             }
                         };
-                        tokio::select! {
-                            _ = force_cancelled(force_rx) => {
-                                tracing::warn!(
-                                    client_addr = %addr,
-                                    "Connection force-cancelled by server shutdown"
-                                );
-                            }
-                            _ = serve => {}
-                        }
+                        metrics
+                            .scope_async(async move {
+                                tokio::select! {
+                                    _ = force_cancelled(force_rx) => {
+                                        tracing::warn!(
+                                            client_addr = %addr,
+                                            "Connection force-cancelled by server shutdown"
+                                        );
+                                    }
+                                    _ = serve => {}
+                                }
+                            })
+                            .await;
                         // ConnectionGuard's Drop decrements active_connections
                         // and connections_per_ip — on normal completion,
                         // force-cancel, and panic alike.

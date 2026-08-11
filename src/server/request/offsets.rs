@@ -6,7 +6,10 @@ use nom::{
 };
 use nombytes::NomBytes;
 
-use crate::parser::{parse_array, parse_kafka_string, parse_kafka_string_opt};
+use crate::parser::{
+    parse_array, parse_kafka_string, parse_kafka_string_opt, parse_nullable_array,
+    parse_nullable_string,
+};
 
 // ============================================================================
 // ListOffsets
@@ -91,8 +94,12 @@ fn parse_list_offsets_partition(
 ///   `group_id`; each partition gains `commit_timestamp` (INT64, v1 only)
 /// - v2: adds `retention_time_ms` (INT64) after `member_id`; partition
 ///   `commit_timestamp` removed
-/// - v5+: `retention_time_ms` removed (KIP-211) — not advertised here
-///   (`versions.rs` caps OffsetCommit at v2)
+/// - v3–v4: same request as v2 (response throttle at v3)
+/// - v5: drops `retention_time_ms` (KIP-211); request otherwise matches v2
+/// - v6: per-partition `committed_leader_epoch` (INT32) after offset
+///   (parsed and ignored)
+/// - v7: nullable `group_instance_id` after `member_id` (not advertised;
+///   gate kept correct for a future bump)
 #[derive(Debug, Clone)]
 pub struct OffsetCommitRequestData {
     pub group_id: String,
@@ -128,6 +135,15 @@ pub fn parse_offset_commit_request(
         parse_kafka_string(s)?
     } else {
         (s, String::new())
+    };
+    // `group_instance_id` is OffsetCommit v7+ only (Kafka OffsetCommitRequest:
+    // "version 7 adds ... groupInstanceId"). v5 only removes retention_time;
+    // v6 adds per-partition leader epoch. Parsing instance id on v5/v6 ate
+    // into the topics array and made librdkafka OffsetCommit underflow.
+    let (s, _group_instance_id) = if version >= 7 {
+        parse_nullable_string(s)?
+    } else {
+        (s, None)
     };
     // `retention_time_ms` (INT64) exists in v2..=v4 (added v2, removed in
     // v5 by KIP-211). It sits between the group fields and the topics
@@ -175,6 +191,9 @@ fn parse_offset_commit_partition(
     // Parsed and dropped: the broker timestamps commits itself, which is
     // exactly the v0/v2+ behavior.
     let (s, _commit_timestamp) = if version == 1 { be_i64(s)? } else { (s, -1i64) };
+    // v6+: committed_leader_epoch (INT32) before metadata. Ignored until
+    // we persist leader epochs on the offset topic.
+    let (s, _committed_leader_epoch) = if version >= 6 { be_i32(s)? } else { (s, -1i32) };
     let (s, committed_metadata) = parse_kafka_string_opt(s)?;
 
     Ok((
@@ -206,10 +225,22 @@ pub struct OffsetFetchTopicData {
 
 pub fn parse_offset_fetch_request(
     s: NomBytes,
-    _version: i16,
+    version: i16,
 ) -> IResult<NomBytes, OffsetFetchRequestData> {
     let (s, group_id) = parse_kafka_string(s)?;
-    let (s, topics) = parse_array(parse_offset_fetch_topic)(s)?;
+    // Topics is nullable from v2 (null = fetch all committed offsets). We
+    // treat null as an empty list today — "fetch all" is not implemented.
+    let (s, topics) = if version >= 2 {
+        parse_nullable_array(parse_offset_fetch_topic)(s)?
+    } else {
+        parse_array(parse_offset_fetch_topic)(s)?
+    };
+    // `require_stable` is OffsetFetch v7+ only (Kafka OffsetFetchRequest.json:
+    // "Version 3, 4, and 5 are the same as version 2." / "Version 7 is adding
+    // the require stable flag."). Parsing it on v4/v5 consumed a phantom byte
+    // librdkafka never sends, so every OffsetFetch failed and consumers hung.
+    // We do not advertise v7 yet; keep the gate correct for when we do.
+    let (s, _require_stable) = if version >= 7 { be_i8(s)? } else { (s, 0i8) };
 
     Ok((s, OffsetFetchRequestData { group_id, topics }))
 }
@@ -250,6 +281,9 @@ mod tests {
             // commit_timestamp (v1 only)
             buf.extend_from_slice(&1_700_000_000_000i64.to_be_bytes());
         }
+        if version >= 6 {
+            buf.extend_from_slice(&(-1i32).to_be_bytes()); // committed_leader_epoch
+        }
         match metadata {
             Some(m) => build_string(m, buf),
             None => buf.extend_from_slice(&(-1i16).to_be_bytes()),
@@ -259,6 +293,34 @@ mod tests {
     // ========================================================================
     // OffsetCommit
     // ========================================================================
+
+    #[test]
+    fn test_parse_offset_commit_v5_and_v6_have_no_group_instance_id() {
+        // Kafka: v5 drops retention; v6 adds leader epoch; v7 adds
+        // groupInstanceId. A v5/v6 body must not expect an instance id.
+        for version in [5i16, 6] {
+            let mut data = Vec::new();
+            build_string("grp", &mut data);
+            data.extend_from_slice(&1i32.to_be_bytes()); // generation
+            build_string("member-1", &mut data);
+            // NO group_instance_id, NO retention_time
+            data.extend_from_slice(&1i32.to_be_bytes()); // 1 topic
+            build_string("topic-a", &mut data);
+            data.extend_from_slice(&1i32.to_be_bytes()); // 1 partition
+            build_commit_partition(version, 0, 42, Some("m"), &mut data);
+
+            let (rest, req) =
+                parse_offset_commit_request(NomBytes::from(data.as_slice()), version).unwrap();
+            assert!(
+                rest.into_bytes().is_empty(),
+                "v{version}: must consume entire body"
+            );
+            assert_eq!(req.group_id, "grp");
+            assert_eq!(req.generation_id, 1);
+            assert_eq!(req.member_id, "member-1");
+            assert_eq!(req.topics[0].partitions[0].committed_offset, 42);
+        }
+    }
 
     #[test]
     fn test_parse_offset_commit_v0_has_no_generation_or_member() {
@@ -369,6 +431,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================================
+    // OffsetFetch
+    // ========================================================================
+
+    #[test]
+    fn test_parse_offset_fetch_v5_has_no_require_stable() {
+        // Kafka: "Version 3, 4, and 5 are the same as version 2." RequireStable
+        // arrives only at v7. A v5 body must be fully consumed without an
+        // extra BOOLEAN — that bug made librdkafka consumers hang.
+        let mut data = Vec::new();
+        build_string("grp", &mut data);
+        data.extend_from_slice(&1i32.to_be_bytes()); // 1 topic
+        build_string("topic-a", &mut data);
+        data.extend_from_slice(&1i32.to_be_bytes()); // 1 partition index
+        data.extend_from_slice(&0i32.to_be_bytes());
+
+        for version in [2i16, 3, 4, 5] {
+            let (rest, req) =
+                parse_offset_fetch_request(NomBytes::from(data.as_slice()), version).unwrap();
+            assert!(
+                rest.into_bytes().is_empty(),
+                "v{version}: must consume entire body (no phantom require_stable)"
+            );
+            assert_eq!(req.group_id, "grp");
+            assert_eq!(req.topics.len(), 1);
+            assert_eq!(req.topics[0].name, "topic-a");
+            assert_eq!(req.topics[0].partition_indexes, vec![0]);
+        }
+    }
+
+    #[test]
+    fn test_parse_offset_fetch_v5_null_topics_array() {
+        // Java / librdkafka may send topics = null (−1) to mean "all committed
+        // offsets". That is legal from OffsetFetch v2; we collapse to [].
+        let mut data = Vec::new();
+        build_string("grp", &mut data);
+        data.extend_from_slice(&(-1i32).to_be_bytes()); // null topics
+
+        let (rest, req) = parse_offset_fetch_request(NomBytes::from(data.as_slice()), 5).unwrap();
+        assert!(rest.into_bytes().is_empty(), "null topics must fully parse");
+        assert_eq!(req.group_id, "grp");
+        assert!(req.topics.is_empty());
+    }
+
+    #[test]
+    fn test_parse_offset_fetch_v5_rejects_phantom_require_stable_leftover() {
+        // Regression lock: if someone re-introduces reading require_stable on
+        // v5, a correct Java body (no flag) still parses — but a body that
+        // *includes* an extra byte must leave that byte unconsumed (or fail)
+        // rather than silently treat it as require_stable then succeed clean.
+        let mut data = Vec::new();
+        build_string("grp", &mut data);
+        data.extend_from_slice(&0i32.to_be_bytes()); // empty topics
+        data.push(1); // phantom byte a buggy v4+ gate would consume
+
+        let (rest, req) = parse_offset_fetch_request(NomBytes::from(data.as_slice()), 5).unwrap();
+        assert_eq!(req.group_id, "grp");
+        assert!(
+            !rest.into_bytes().is_empty(),
+            "v5 must NOT consume a trailing require_stable byte"
+        );
+    }
+
+    #[test]
+    fn test_parse_offset_fetch_v7_require_stable() {
+        let mut data = Vec::new();
+        build_string("grp", &mut data);
+        data.extend_from_slice(&0i32.to_be_bytes()); // empty topics
+        data.push(1); // require_stable = true
+
+        let (rest, req) = parse_offset_fetch_request(NomBytes::from(data.as_slice()), 7).unwrap();
+        assert!(rest.into_bytes().is_empty());
+        assert_eq!(req.group_id, "grp");
+        assert!(req.topics.is_empty());
     }
 
     // ========================================================================

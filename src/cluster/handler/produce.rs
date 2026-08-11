@@ -48,8 +48,9 @@
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use crate::batch::{ProduceBatchValidation, validate_produce_batch_async};
 use crate::error::KafkaCode;
-use crate::protocol::{CrcValidationResult, parse_producer_info, validate_batch_crc_async};
+use crate::protocol::parse_producer_info;
 use crate::server::RequestContext;
 use crate::server::request::{ApiKey, ProducePartitionData, ProduceRequestData};
 use crate::server::response::{
@@ -391,7 +392,7 @@ async fn fire_and_forget_produce(
     partition: ProducePartitionData,
     validate_crc: bool,
 ) -> Result<(), ()> {
-    use crate::protocol::{CrcValidationResult, validate_batch_crc_async};
+    use crate::batch::{validate_produce_batch_async, validate_produce_batch_attributes_only};
 
     // Skip zombie mode check for fire-and-forget (best effort)
     if partition_manager.is_zombie() {
@@ -399,19 +400,17 @@ async fn fire_and_forget_produce(
         return Err(());
     }
 
-    // CRC-validate at ingress, before any partition lookup or lease check.
-    // A flood of corrupt batches would otherwise force a per-partition
-    // lookup, lease verification, and ownership check on every record before
-    // rejection — multiplying the attacker's CPU draw on the broker by an
-    // order of magnitude.
-    if validate_crc {
-        match validate_batch_crc_async(&partition.records).await {
-            CrcValidationResult::Valid => {}
-            _ => {
-                crate::cluster::metrics::record_produce_dropped("crc_invalid", 1);
-                return Err(());
-            }
-        }
+    // CRC + attribute + compression gate at ingress, before any partition
+    // lookup. Attribute/codec refusal always applies (refuse-don't-lie);
+    // CRC itself remains optional via `validate_crc`.
+    let validation = if validate_crc {
+        validate_produce_batch_async(&partition.records).await
+    } else {
+        validate_produce_batch_attributes_only(&partition.records)
+    };
+    if !validation.is_valid() {
+        crate::cluster::metrics::record_produce_dropped("crc_invalid", 1);
+        return Err(());
     }
 
     // Get partition store - for acks=0, don't try to acquire if we don't own
@@ -497,72 +496,36 @@ impl SlateDBClusterHandler {
         }
 
         if self.validate_record_crc {
-            match validate_batch_crc_async(&partition.records).await {
-                CrcValidationResult::Valid => {}
-                CrcValidationResult::Invalid { expected, actual } => {
+            match validate_produce_batch_async(&partition.records).await {
+                ProduceBatchValidation::Valid => {}
+                rejected => {
+                    let code = rejected.to_kafka_code();
                     warn!(
                         topic = %topic,
                         partition = partition.partition_index,
-                        expected_crc = %format_args!("{:#x}", expected),
-                        actual_crc = %format_args!("{:#x}", actual),
-                        "Rejecting batch with invalid CRC"
+                        error_code = ?code,
+                        validation = ?rejected,
+                        "Rejecting produce batch"
                     );
                     crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse::error(
-                        partition.partition_index,
-                        KafkaCode::CorruptMessage,
-                    );
+                    return ProducePartitionResponse::error(partition.partition_index, code);
                 }
-                CrcValidationResult::TooSmall => {
+            }
+        } else {
+            // CRC optional, but transactional/control/codec refusal is not.
+            match crate::batch::validate_produce_batch_attributes_only(&partition.records) {
+                ProduceBatchValidation::Valid => {}
+                rejected => {
+                    let code = rejected.to_kafka_code();
                     warn!(
                         topic = %topic,
                         partition = partition.partition_index,
-                        batch_size = partition.records.len(),
-                        "Rejecting batch too small to contain valid CRC"
+                        error_code = ?code,
+                        validation = ?rejected,
+                        "Rejecting produce batch (attributes/compression)"
                     );
                     crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse::error(
-                        partition.partition_index,
-                        KafkaCode::CorruptMessage,
-                    );
-                }
-                CrcValidationResult::FrameMismatch {
-                    claimed_size,
-                    actual_size,
-                } => {
-                    warn!(
-                        topic = %topic,
-                        partition = partition.partition_index,
-                        claimed_size,
-                        actual_size,
-                        "Rejecting batch: header batch_length disagrees with payload size"
-                    );
-                    crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse::error(
-                        partition.partition_index,
-                        KafkaCode::CorruptMessage,
-                    );
-                }
-                CrcValidationResult::OffloadFailed => {
-                    warn!(
-                        topic = %topic,
-                        partition = partition.partition_index,
-                        "Rejecting batch: CRC offload failed (blocking-pool saturated or panicked)"
-                    );
-                    crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse::error(
-                        partition.partition_index,
-                        KafkaCode::CorruptMessage,
-                    );
-                }
-                // The CRC enum is non_exhaustive across crate boundaries.
-                // Reject conservatively if a future variant reaches us.
-                _ => {
-                    crate::cluster::metrics::record_coordinator_failure("crc_validation_failed");
-                    return ProducePartitionResponse::error(
-                        partition.partition_index,
-                        KafkaCode::CorruptMessage,
-                    );
+                    return ProducePartitionResponse::error(partition.partition_index, code);
                 }
             }
         }

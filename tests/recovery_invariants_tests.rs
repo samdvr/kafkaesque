@@ -55,16 +55,10 @@ fn build_batch(
     base_sequence: i32,
     record_count: i32,
 ) -> Bytes {
-    let mut batch = vec![0u8; 100];
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes());
-    batch[16] = 2;
-    batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes());
-    batch[27..35].copy_from_slice(&1_000i64.to_be_bytes()); // first_timestamp
-    batch[35..43].copy_from_slice(&1_000i64.to_be_bytes()); // max_timestamp
+    let mut batch = kafkaesque::batch::build_minimal_valid_batch(record_count);
     batch[43..51].copy_from_slice(&producer_id.to_be_bytes());
     batch[51..53].copy_from_slice(&producer_epoch.to_be_bytes());
     batch[53..57].copy_from_slice(&base_sequence.to_be_bytes());
-    batch[57..61].copy_from_slice(&record_count.to_be_bytes());
     let crc = kafkaesque::protocol::crc32c(&batch[21..]);
     batch[17..21].copy_from_slice(&crc.to_be_bytes());
     Bytes::from(batch)

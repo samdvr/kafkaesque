@@ -23,6 +23,7 @@ local-disk reliability requirement.
 - [Deployment](#deployment)
 - [Cargo features](#cargo-features)
 - [Supported APIs](#supported-apis)
+- [Client compatibility](#client-compatibility)
 - [Testing](#testing)
 - [Fuzzing](#fuzzing)
 - [Development](#development)
@@ -409,6 +410,11 @@ Kafkaesque implements the core Kafka protocol used by modern clients:
 - **Auth** — `SaslHandshake`, `SaslAuthenticate` (PLAIN, SCRAM-SHA-256;
   requires `--features sasl`).
 
+Exact version ranges are advertised over `ApiVersions` and locked to the
+CHANGELOG via `tests/changelog_contract_tests.rs`. See
+[Client compatibility](#client-compatibility) for what that means for
+librdkafka, Java, and kcat.
+
 Not yet supported, called out because the wire protocol makes them look
 available:
 
@@ -424,8 +430,57 @@ available:
   "sessionless" signal telling clients to keep sending full fetches; a
   `session_id` the broker never issued is answered with
   `FETCH_SESSION_ID_NOT_FOUND`.
-- **Transactions.** `transactional_id` is rejected at produce time.
+- **Transactions / EOS.** `transactional_id` is rejected at produce and at
+  `InitProducerId`. RecordBatch attribute bit 4 (transactional) and bit 5
+  (control) are refused on the produce path.
+- **Static membership (KIP-345).** `group.instance.id` requires JoinGroup
+  v5+ / Heartbeat v3+ / SyncGroup v3+, which are **not** advertised.
+- **KIP-848 consumer group protocol.** ApiKeys 68/69 are absent; clients
+  that support it fall back to the classic protocol.
 - **Idempotent-producer deduplication** beyond the per-session `producer_id`.
+
+## Client compatibility
+
+Kafkaesque speaks the Kafka wire protocol. That is **not** the same claim
+as “every Kafka client feature works.” Clients that honor `ApiVersions`
+(the default for librdkafka with `api.version.request=true`, and for
+modern Java `kafka-clients`) negotiate `min(client_max, broker_max)` and
+do not fail hard when the broker advertises a lower ceiling. Clients that
+disable version negotiation, or that require APIs we do not advertise
+(static membership, transactions, KIP-848), will get `UnsupportedVersion`
+(35) or a typed produce/admin error — the connection stays open.
+
+### Verified in CI
+
+| Client | How | Notes |
+|---|---|---|
+| **librdkafka** via `rdkafka` 0.38 | `tests/rdkafka_e2e.rs` (dedicated CI job) | Produce, consume with `group.id`, group offset commit, idempotent produce, admin. Uses ApiVersions negotiation against the advertised ceilings. |
+| **kcat** | `scripts/run-e2e.sh`, `scripts/run-cluster-e2e.sh` | Produce/consume smoke and multi-broker failover. |
+| **Java `kafka-clients`** | `java-smoke/` + `scripts/run-java-smoke.sh` (CI `java-client-matrix`) | Produce → consume → OffsetCommit with classic RangeAssignor. Do **not** enable `group.instance.id`, transactions, or KIP-848. |
+
+### Group API ceilings (what clients will negotiate)
+
+| API | Advertised | Why it stops there |
+|---|---|---|
+| OffsetCommit | v0–**v6** | v5 drops retention; v6 leader_epoch ignored. `groupInstanceId` is v7+ (refused). |
+| OffsetFetch | v0–**v5** | v5 response `committed_leader_epoch` (-1). Request body same as v2 (no `require_stable`; that is v7+). Flexible / multi-group v6+ refused. |
+| JoinGroup | v0–**v4** | v4 MemberIdRequired (KIP-394). v5 static membership refused. |
+| SyncGroup | v0–**v3** | v3 `group_instance_id` parsed and ignored. |
+| Heartbeat | v0–**v3** | v3 `group_instance_id` parsed and ignored. |
+| LeaveGroup | v0–**v3** | v3 batch leave supported; instance ids ignored. |
+| FindCoordinator | v0–**v2** | v2 error_message. Flexible / multi-key v3+ refused. |
+
+A client that forces JoinGroup v5 (or any version above the advertised
+max) receives `UnsupportedVersion` without the broker closing the socket.
+The contract is locked by `tests/client_compatibility_matrix_tests.rs`.
+
+### Produce batch contract
+
+Compressed RecordBatches (gzip / snappy / lz4 / zstd) are accepted when
+the payload decompresses and the inner record count matches the header
+`records_count`. Undefined codec ids, undecompressible payloads, and
+header/body count mismatches are rejected. Transactional and control
+attribute bits are rejected even when the CRC is valid.
 
 ## Testing
 

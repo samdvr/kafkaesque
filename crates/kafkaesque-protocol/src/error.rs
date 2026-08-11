@@ -416,6 +416,11 @@ pub enum KafkaCode {
     /// missing. Per KIP-394, brokers return this for JoinGroup v4+ when the
     /// client supplied an empty `member_id`, along with a freshly generated id.
     MemberIdRequired = 79,
+    /// The record is invalid. Used when a client produces a control batch
+    /// (attributes bit 5) — control records are broker-emitted only — or
+    /// when inner record validation rejects a batch that is otherwise
+    /// CRC-valid. Apache Kafka code 87 (`INVALID_RECORD`).
+    InvalidRecord = 87,
 }
 
 impl KafkaCode {
@@ -490,6 +495,7 @@ mod tests {
             KafkaCode::from_i16(58),
             Some(KafkaCode::SaslAuthenticationFailed)
         );
+        assert_eq!(KafkaCode::from_i16(87), Some(KafkaCode::InvalidRecord));
     }
 
     #[test]

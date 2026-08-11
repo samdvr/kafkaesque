@@ -60,14 +60,7 @@ const PARTITION: i32 = 0;
 /// markers — the broker's job here is just "store and return", not
 /// transaction-aware processing.
 fn make_batch(record_count: i32) -> Bytes {
-    let mut batch = vec![0u8; 100];
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes()); // batch_length
-    batch[16] = 2; // magic v2
-    batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes()); // last_offset_delta
-    batch[57..61].copy_from_slice(&record_count.to_be_bytes()); // records_count
-    let crc = kafkaesque::protocol::crc32c(&batch[21..]);
-    batch[17..21].copy_from_slice(&crc.to_be_bytes());
-    Bytes::from(batch)
+    Bytes::from(kafkaesque::batch::build_minimal_valid_batch(record_count))
 }
 
 async fn create_topic_and_produce(broker: &BrokerHandle, batches: i32) {
@@ -90,34 +83,38 @@ async fn create_topic_and_produce(broker: &BrokerHandle, batches: i32) {
         .await;
 
     for _ in 0..batches {
-        let resp = broker
-            .handler
-            .handle_produce(
-                &ctx,
-                ProduceRequestData {
-                    transactional_id: None,
-                    acks: 1,
-                    timeout_ms: 5_000,
-                    topics: vec![ProduceTopicData {
-                        name: TOPIC.into(),
-                        partitions: vec![ProducePartitionData {
-                            partition_index: PARTITION,
-                            records: make_batch(3),
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let resp = broker
+                .handler
+                .handle_produce(
+                    &ctx,
+                    ProduceRequestData {
+                        transactional_id: None,
+                        acks: 1,
+                        timeout_ms: 5_000,
+                        topics: vec![ProduceTopicData {
+                            name: TOPIC.into(),
+                            partitions: vec![ProducePartitionData {
+                                partition_index: PARTITION,
+                                records: make_batch(3),
+                            }],
                         }],
-                    }],
-                },
-            )
-            .await;
-        // Defend against accidental setup regressions: if Produce errors,
-        // every test below would fail with a misleading "no records"
-        // assertion. Surface the produce error explicitly.
-        let p = &resp.responses[0].partitions[0];
-        assert_eq!(
-            p.error_code,
-            KafkaCode::None,
-            "setup produce failed: {:?}",
-            p.error_code
-        );
+                    },
+                )
+                .await;
+            let p = &resp.responses[0].partitions[0];
+            if p.error_code == KafkaCode::None {
+                break;
+            }
+            assert!(
+                p.error_code == KafkaCode::NotLeaderForPartition
+                    && std::time::Instant::now() < deadline,
+                "setup produce failed: {:?}",
+                p.error_code
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 }
 

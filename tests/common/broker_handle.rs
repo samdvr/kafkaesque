@@ -117,6 +117,7 @@ impl BrokerHandle {
             principal: Arc::from("User:ANONYMOUS"),
             client_host: Arc::from("127.0.0.1"),
             transport_tls: false,
+            metrics: kafkaesque::cluster::Metrics::default(),
         }
     }
 

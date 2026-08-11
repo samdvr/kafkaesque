@@ -786,6 +786,7 @@ impl Handler for InMemoryHandler {
         LeaveGroupResponseData {
             throttle_time_ms: 0,
             error_code: KafkaCode::None,
+            members: vec![],
         }
     }
 
@@ -848,6 +849,7 @@ impl Handler for InMemoryHandler {
                 partition_responses.push(OffsetFetchPartitionResponse {
                     partition_index,
                     committed_offset,
+                    committed_leader_epoch: -1,
                     metadata: None,
                     error_code: KafkaCode::None,
                 });

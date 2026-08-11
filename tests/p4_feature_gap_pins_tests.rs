@@ -81,17 +81,7 @@ const COMPACT_TOPIC: &str = "p4-compaction-pins";
 /// or control batch here — the txn pins exercise the request-level
 /// transactional_id field, not record-level attribute bits.
 fn make_batch(record_count: i32) -> Bytes {
-    let mut batch = vec![0u8; 100];
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes()); // batch_length
-    batch[16] = 2; // magic v2
-    batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes()); // last_offset_delta
-    batch[43..51].copy_from_slice(&(-1i64).to_be_bytes()); // producer_id
-    batch[51..53].copy_from_slice(&(-1i16).to_be_bytes()); // producer_epoch
-    batch[53..57].copy_from_slice(&(-1i32).to_be_bytes()); // base_sequence
-    batch[57..61].copy_from_slice(&record_count.to_be_bytes()); // records_count
-    let crc = kafkaesque::protocol::crc32c(&batch[21..]);
-    batch[17..21].copy_from_slice(&crc.to_be_bytes());
-    Bytes::from(batch)
+    Bytes::from(kafkaesque::batch::build_minimal_valid_batch(record_count))
 }
 
 async fn ensure_topic(broker: &BrokerHandle, name: &str, configs: Vec<(String, Option<String>)>) {
@@ -399,11 +389,11 @@ async fn keyed_batches_are_never_collapsed_today() {
         p.high_watermark,
     );
     let returned = p.records.as_ref().expect("fetch must return records");
-    // Each make_batch is exactly 100 bytes — both batches must round-trip
-    // intact, with nothing collapsing them.
+    let one = make_batch(1).len();
+    // Both batches must round-trip intact, with nothing collapsing them.
     assert!(
-        returned.len() >= 200,
-        "both batches must be present (no compaction); got {} bytes",
+        returned.len() >= one * 2,
+        "both batches must be present (no compaction); got {} bytes (one batch is {one})",
         returned.len(),
     );
 }

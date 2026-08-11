@@ -175,22 +175,7 @@ fn crc32c(data: &[u8]) -> u32 {
 /// helper in `tests/durability_contract_props.rs` so we exercise the same
 /// CRC + framing path.
 fn build_batch(record_count: i32) -> Bytes {
-    let mut batch = vec![0u8; 100];
-    batch[0..8].copy_from_slice(&0i64.to_be_bytes());
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes());
-    batch[12..16].copy_from_slice(&0i32.to_be_bytes());
-    batch[16] = 2;
-    batch[21..23].copy_from_slice(&0i16.to_be_bytes());
-    batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes());
-    batch[27..35].copy_from_slice(&0i64.to_be_bytes());
-    batch[35..43].copy_from_slice(&0i64.to_be_bytes());
-    batch[43..51].copy_from_slice(&(-1i64).to_be_bytes());
-    batch[51..53].copy_from_slice(&0i16.to_be_bytes());
-    batch[53..57].copy_from_slice(&0i32.to_be_bytes());
-    batch[57..61].copy_from_slice(&record_count.to_be_bytes());
-    let crc = crc32c(&batch[21..]);
-    batch[17..21].copy_from_slice(&crc.to_be_bytes());
-    Bytes::from(batch)
+    Bytes::from(kafkaesque::batch::build_minimal_valid_batch(record_count))
 }
 
 async fn open_store() -> PartitionStore {
@@ -535,11 +520,8 @@ async fn real_raft_release_acquire_epoch_monotonic() {
 
 // =============================================================================
 // Multi-node Raft chaos. Marked `#[ignore]` so PR CI stays cheap; the
-// nightly real-Raft chaos job picks these up. The body is a real
-// multi-node implementation: two coordinators bootstrap a 2-node cluster,
-// then drive linearizable acquire/release/get_owner traffic against the
-// follower so the call routes through Raft forwarding + apply on the
-// leader.
+// `raft-chaos-nightly` job in `.github/workflows/ci.yml` runs
+// `--ignored` on schedule / workflow_dispatch.
 // =============================================================================
 
 /// Build a multi-node cluster of `n` `RaftCoordinator`s where node 1 is
@@ -764,12 +746,4 @@ async fn real_raft_multi_node_partition_owner_is_linearizable() {
          partial-order violation in acquire/release/get_owner across the \
          leader/follower forwarding boundary"
     );
-
-    // If the harness ever drifts so this test cannot run on a clean
-    // checkout, fall back to a no-op `return` instead of a panic — the
-    // test stays `#[ignore]`'d and a stray un-ignore must not break CI.
-    #[allow(unreachable_code)]
-    {
-        return;
-    }
 }

@@ -27,6 +27,7 @@ fn create_context() -> RequestContext {
         principal: Arc::from("User:ANONYMOUS"),
         client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
+        metrics: kafkaesque::cluster::Metrics::default(),
     }
 }
 
@@ -263,10 +264,8 @@ async fn test_default_leave_group() {
     let handler = DefaultHandler;
     let ctx = create_context();
 
-    let request = LeaveGroupRequestData {
-        group_id: "test-group".to_string(),
-        member_id: "member-1".to_string(),
-    };
+    let request =
+        LeaveGroupRequestData::for_member("test-group".to_string(), "member-1".to_string());
 
     let response = handler.handle_leave_group(&ctx, request).await;
 

@@ -5,12 +5,11 @@
 //! so a future implementation knows what to flip.
 //!
 //! ## P1.4 — Fetch sessions (KIP-227)
-//! `src/cluster/handler/fetch.rs` parses `session_id` and
-//! `session_epoch` from the request but always returns `session_id=0`
-//! in the response — i.e. every Fetch becomes a "full fetch" from the
-//! broker's point of view. Real Java / librdkafka consumers default to
-//! incremental fetch; the broker's no-op behavior is functionally
-//! correct (full fetch every poll) but a 10×+ throughput penalty.
+//! Sessions are not implemented. A sessionless fetch (`session_id=0`)
+//! always gets `session_id=0` back (full fetch). A nonzero `session_id`
+//! is refused with `FetchSessionIdNotFound` so clients discard the
+//! phantom session — see `tests/fetch_session_contract_tests.rs`.
+//! This file pins the sessionless "never assigns a session" half.
 //!
 //! ## P1.18 — Magic-version down-conversion
 //! Kafkaesque advertises Fetch v4..=v11 only (per `versions.rs`).
@@ -43,15 +42,8 @@ use common::BrokerHandle;
 const TOPIC: &str = "feature-gap-pins";
 
 fn build_batch_with_attributes(record_count: i32, attributes: u16) -> Bytes {
-    let mut batch = vec![0u8; 100];
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes());
-    batch[16] = 2; // magic v2
+    let mut batch = kafkaesque::batch::build_minimal_valid_batch(record_count);
     batch[21..23].copy_from_slice(&attributes.to_be_bytes());
-    batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes());
-    batch[43..51].copy_from_slice(&(-1i64).to_be_bytes());
-    batch[51..53].copy_from_slice(&(-1i16).to_be_bytes());
-    batch[53..57].copy_from_slice(&(-1i32).to_be_bytes());
-    batch[57..61].copy_from_slice(&record_count.to_be_bytes());
     let crc = kafkaesque::protocol::crc32c(&batch[21..]);
     batch[17..21].copy_from_slice(&crc.to_be_bytes());
     Bytes::from(batch)
@@ -166,11 +158,10 @@ async fn fetch_response_session_id_is_always_zero_today() {
 }
 
 #[tokio::test]
-async fn fetch_with_explicit_session_id_returns_zero_today() {
-    // A consumer that *thinks* it has a session (session_id=42) and
-    // sends a continuation request also gets session_id=0 back —
-    // signalling the broker has dropped/never had the session. The
-    // consumer falls back to a full fetch on the next poll.
+async fn fetch_with_explicit_session_id_is_rejected() {
+    // Aligned with `fetch_session_contract_tests`: a nonzero session_id we
+    // never issued must return FetchSessionIdNotFound (not a silent full
+    // fetch). session_id in the response stays 0.
     let broker = BrokerHandle::spawn(ClusterProfile::Development).await;
     ensure_topic(&broker).await;
     produce_with_retry(&broker, build_batch_with_attributes(1, 0)).await;
@@ -179,11 +170,9 @@ async fn fetch_with_explicit_session_id_returns_zero_today() {
         .handler
         .handle_fetch(&broker.ctx(), fetch_request(42, 7))
         .await;
-    assert_eq!(
-        resp.session_id, 0,
-        "today's contract: broker doesn't honor existing session ids; got {}",
-        resp.session_id,
-    );
+    assert_eq!(resp.error_code, KafkaCode::FetchSessionIdNotFound);
+    assert_eq!(resp.session_id, 0);
+    assert!(resp.responses.is_empty());
 }
 
 #[tokio::test]
@@ -245,51 +234,52 @@ fn fetch_min_version_advertised_is_v4_today() {
 }
 
 // ---------------------------------------------------------------------------
-// P1.19 — Control records pass through the broker untouched
+// P1.19 — Control / transactional batches are refused at produce
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn control_record_batches_round_trip_byte_for_byte() {
-    // Attributes bit 5 = control batch. The broker doesn't interpret
-    // control records (no transaction support); it just stores and
-    // returns the bytes. Pin: a control batch produced by a misbehaving
-    // client comes back to a fetcher unchanged, including the
-    // attributes byte. A regression where the broker started filtering
-    // control batches would break the contract for clients that
-    // intentionally produce them (test fixtures, debugging tools).
-    //
-    // TODO: when transactions land, the broker must
-    // either generate control batches itself (commit/abort markers) or
-    // strip them from non-transactional fetches. Either way the
-    // assertion below should be revisited.
+async fn control_and_transactional_batches_are_rejected_at_produce() {
+    // Refuse-don't-lie: CRC-valid control/transactional attribute bits are
+    // rejected at produce (`InvalidRecord` / `InvalidRequest`). Fetch never
+    // needs to interpret markers the log cannot contain.
     let broker = BrokerHandle::spawn(ClusterProfile::Development).await;
     ensure_topic(&broker).await;
 
-    // attributes bit 5 = control. We also set transactional bit 4 to
-    // mirror what a real EOS abort marker would carry.
-    let attrs = (1u16 << 4) | (1u16 << 5);
-    let payload = build_batch_with_attributes(1, attrs);
-    let _ = produce_with_retry(&broker, payload.clone()).await;
+    let control = 1u16 << 5;
+    let txn = 1u16 << 4;
+    let both = control | txn;
 
-    let resp = broker
-        .handler
-        .handle_fetch(&broker.ctx(), fetch_request(0, 0))
-        .await;
-    let p = &resp.responses[0].partitions[0];
-    assert_eq!(p.error_code, KafkaCode::None);
-    let returned = p.records.as_ref().expect("fetch must return data");
-
-    // Locate the attributes bytes in the returned batch (offset 21..23
-    // within whatever batch comes back — the broker may patch the
-    // base_offset but does not touch attributes).
-    assert!(
-        returned.len() >= 23,
-        "returned batch must contain at least the v2 header through attributes",
-    );
-    let returned_attrs = u16::from_be_bytes([returned[21], returned[22]]);
-    assert_eq!(
-        returned_attrs, attrs,
-        "control + transactional attribute bits must round-trip; sent {:#06b}, got {:#06b}",
-        attrs, returned_attrs,
-    );
+    for attrs in [control, txn, both] {
+        let payload = build_batch_with_attributes(1, attrs);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let code = loop {
+            let resp = broker
+                .handler
+                .handle_produce(
+                    &broker.ctx(),
+                    ProduceRequestData {
+                        transactional_id: None,
+                        acks: 1,
+                        timeout_ms: 5_000,
+                        topics: vec![ProduceTopicData {
+                            name: TOPIC.into(),
+                            partitions: vec![ProducePartitionData {
+                                partition_index: 0,
+                                records: payload.clone(),
+                            }],
+                        }],
+                    },
+                )
+                .await;
+            let code = resp.responses[0].partitions[0].error_code;
+            if code != KafkaCode::NotLeaderForPartition || std::time::Instant::now() >= deadline {
+                break code;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert!(
+            matches!(code, KafkaCode::InvalidRecord | KafkaCode::InvalidRequest),
+            "attrs={attrs:#x} must be refused at produce, got {code:?}"
+        );
+    }
 }

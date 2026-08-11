@@ -266,8 +266,27 @@ pub(super) async fn handle_join_group(
     // A uuid handed back alongside an error response gets reused as a
     // valid member id on the client's retry, materializing a phantom
     // member in the group on the next successful path.
+    //
+    // JoinGroup v4+ (KIP-394): an empty member_id must receive
+    // MemberIdRequired with a generated id and must NOT join yet. The
+    // client retries with that id. Pre-v4 clients still get the
+    // generate-and-join behavior.
     let member_id = if request.member_id.is_empty() {
-        format!("member-{}", uuid::Uuid::new_v4())
+        let generated = format!(
+            "{}-{}",
+            ctx.client_id.as_deref().unwrap_or("member"),
+            uuid::Uuid::new_v4()
+        );
+        if ctx.api_version >= 4 {
+            debug!(
+                group_id = %request.group_id,
+                member_id = %generated,
+                api_version = ctx.api_version,
+                "JoinGroup v4+: empty member_id → MemberIdRequired"
+            );
+            return JoinGroupResponseData::error(KafkaCode::MemberIdRequired, generated);
+        }
+        generated
     } else {
         request.member_id.clone()
     };
@@ -658,6 +677,7 @@ pub(super) async fn handle_leave_group(
         return LeaveGroupResponseData {
             throttle_time_ms: 0,
             error_code: KafkaCode::InvalidGroupId,
+            members: vec![],
         };
     }
     // LeaveGroup requires Read on the Group resource.
@@ -673,48 +693,66 @@ pub(super) async fn handle_leave_group(
         return LeaveGroupResponseData {
             throttle_time_ms: 0,
             error_code: KafkaCode::GroupAuthorizationFailed,
+            members: vec![],
         };
     }
 
-    match handler
-        .coordinator
-        .leave_group(&request.group_id, &request.member_id)
-        .await
-    {
-        Ok(true) => {
-            debug!(
-                group_id = %request.group_id,
-                member_id = %request.member_id,
-                "Member left group"
-            );
-            crate::cluster::metrics::record_group_operation("leave", "success");
-            LeaveGroupResponseData {
-                throttle_time_ms: 0,
-                error_code: KafkaCode::None,
+    let members_to_leave = if request.members.is_empty() {
+        vec![crate::server::request::LeaveGroupMemberData {
+            member_id: request.member_id.clone(),
+            group_instance_id: None,
+        }]
+    } else {
+        request.members.clone()
+    };
+
+    let mut member_results = Vec::with_capacity(members_to_leave.len());
+    let mut top_error = KafkaCode::None;
+
+    for member in &members_to_leave {
+        let error_code = match handler
+            .coordinator
+            .leave_group(&request.group_id, &member.member_id)
+            .await
+        {
+            Ok(true) => {
+                debug!(
+                    group_id = %request.group_id,
+                    member_id = %member.member_id,
+                    "Member left group"
+                );
+                crate::cluster::metrics::record_group_operation("leave", "success");
+                KafkaCode::None
             }
-        }
-        Ok(false) => {
-            // The member (or the whole group) is unknown; Kafka answers
-            // UNKNOWN_MEMBER_ID rather than pretending the leave succeeded.
-            debug!(
-                group_id = %request.group_id,
-                member_id = %request.member_id,
-                "LeaveGroup for unknown member"
-            );
-            crate::cluster::metrics::record_group_operation("leave", "error");
-            LeaveGroupResponseData {
-                throttle_time_ms: 0,
-                error_code: KafkaCode::UnknownMemberId,
+            Ok(false) => {
+                debug!(
+                    group_id = %request.group_id,
+                    member_id = %member.member_id,
+                    "LeaveGroup for unknown member"
+                );
+                crate::cluster::metrics::record_group_operation("leave", "error");
+                KafkaCode::UnknownMemberId
             }
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to remove group member");
-            crate::cluster::metrics::record_group_operation("leave", "error");
-            LeaveGroupResponseData {
-                throttle_time_ms: 0,
-                error_code: e.to_kafka_code(),
+            Err(e) => {
+                error!(error = %e, "Failed to remove group member");
+                crate::cluster::metrics::record_group_operation("leave", "error");
+                e.to_kafka_code()
             }
+        };
+        if top_error == KafkaCode::None && error_code != KafkaCode::None {
+            top_error = error_code;
         }
+        member_results.push(crate::server::response::LeaveGroupMemberResponse {
+            member_id: member.member_id.clone(),
+            group_instance_id: member.group_instance_id.clone(),
+            error_code,
+        });
+    }
+
+    LeaveGroupResponseData {
+        throttle_time_ms: 0,
+        error_code: top_error,
+        members: member_results,
     }
 }
 
@@ -1142,6 +1180,7 @@ mod tests {
         let response = LeaveGroupResponseData {
             throttle_time_ms: 0,
             error_code: KafkaCode::None,
+            members: vec![],
         };
 
         assert_eq!(response.error_code, KafkaCode::None);
@@ -1283,6 +1322,7 @@ mod tests {
         let leave_group = LeaveGroupResponseData {
             throttle_time_ms: 0,
             error_code: KafkaCode::None,
+            members: vec![],
         };
 
         assert_eq!(find_coord.throttle_time_ms, 0);

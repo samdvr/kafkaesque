@@ -29,17 +29,17 @@
 //!
 //! | API              | Min | Max | Why min isn't 0                                |
 //! |------------------|-----|-----|------------------------------------------------|
-//! | Produce          | 3   | 3   | parser reads `transactional_id` (v3+)          |
+//! | Produce          | 3   | 9   | parser reads `transactional_id` (v3+); flexible at v9 |
 //! | Fetch            | 4   | 11  | parser reads `max_bytes` (v3+) and `isolation` (v4+); v7 sessions, v9 leader_epoch, v11 rack |
 //! | ListOffsets      | 0   | 2   | parser is version-agnostic                     |
-//! | Metadata         | 0   | 1   | parser is version-agnostic                     |
-//! | OffsetCommit     | 0   | 2   |                                                |
-//! | OffsetFetch      | 0   | 1   |                                                |
-//! | FindCoordinator  | 0   | 1   |                                                |
-//! | JoinGroup        | 0   | 2   |                                                |
-//! | Heartbeat        | 0   | 1   |                                                |
-//! | LeaveGroup       | 0   | 1   |                                                |
-//! | SyncGroup        | 0   | 1   |                                                |
+//! | Metadata         | 0   | 9   | flexible at v9                                 |
+//! | OffsetCommit     | 0   | 6   | v3 throttle; v5 drops retention; v6 leader_epoch ignored; v7 groupInstanceId not advertised |
+//! | OffsetFetch      | 0   | 5   | v2 top-level error, v3 throttle; v5 response `committed_leader_epoch` (-1); v7 require_stable not advertised |
+//! | FindCoordinator  | 0   | 2   | v1 throttle; v2 error_message                                                 |
+//! | JoinGroup        | 0   | 4   | v4 MemberIdRequired (KIP-394); v5 static membership (KIP-345) refused         |
+//! | Heartbeat        | 0   | 3   | v3 group_instance_id parsed and ignored                                       |
+//! | LeaveGroup       | 0   | 3   | v3 batch leave; per-member instance ids ignored                               |
+//! | SyncGroup        | 0   | 3   | v3 group_instance_id parsed and ignored                                       |
 //! | DescribeGroups   | 0   | 1   |                                                |
 //! | ListGroups       | 0   | 2   |                                                |
 //! | SaslHandshake    | 0   | 1   |                                                |
@@ -114,13 +114,24 @@ pub const SUPPORTED_VERSIONS: &[SupportedVersion] = &[
     // v8 cluster/topic authorized_operations. v10+ adds topic_id (UUID)
     // and is intentionally deferred.
     SupportedVersion::new(ApiKey::Metadata, 0, 9),
-    SupportedVersion::new(ApiKey::OffsetCommit, 0, 2),
-    SupportedVersion::new(ApiKey::OffsetFetch, 0, 1),
-    SupportedVersion::new(ApiKey::FindCoordinator, 0, 1),
-    SupportedVersion::new(ApiKey::JoinGroup, 0, 2),
-    SupportedVersion::new(ApiKey::Heartbeat, 0, 1),
-    SupportedVersion::new(ApiKey::LeaveGroup, 0, 1),
-    SupportedVersion::new(ApiKey::SyncGroup, 0, 1),
+    // OffsetCommit: v3 response throttle; v2..=v4 retention_time parsed+dropped;
+    // v5 drops retention only; v6 adds per-partition `committed_leader_epoch`
+    // (parsed, ignored). `group_instance_id` is v7+ (not advertised). Flexible
+    // from v8.
+    SupportedVersion::new(ApiKey::OffsetCommit, 0, 6),
+    // OffsetFetch: v2 error_code, v3 throttle, v5 response
+    // `committed_leader_epoch` (always -1 until epochs are stored). Request
+    // body is identical for v2–v5; `require_stable` is v7+ only (not advertised).
+    // v6+ flexible / multi-group not advertised.
+    SupportedVersion::new(ApiKey::OffsetFetch, 0, 5),
+    SupportedVersion::new(ApiKey::FindCoordinator, 0, 2),
+    // JoinGroup through v4: empty member_id on v4+ returns MemberIdRequired
+    // (KIP-394) with a generated id; client retries. v5 `group_instance_id`
+    // (KIP-345 static membership) remains a deliberate non-goal.
+    SupportedVersion::new(ApiKey::JoinGroup, 0, 4),
+    SupportedVersion::new(ApiKey::Heartbeat, 0, 3),
+    SupportedVersion::new(ApiKey::LeaveGroup, 0, 3),
+    SupportedVersion::new(ApiKey::SyncGroup, 0, 3),
     SupportedVersion::new(ApiKey::DescribeGroups, 0, 1),
     SupportedVersion::new(ApiKey::ListGroups, 0, 2),
     SupportedVersion::new(ApiKey::SaslHandshake, 0, 1),
@@ -214,13 +225,13 @@ pub const PARSER_ENCODER_COVERAGE: &[(ApiKey, i16, i16)] = &[
     (ApiKey::Fetch, 4, 11),
     (ApiKey::ListOffsets, 0, 2),
     (ApiKey::Metadata, 0, 9),
-    (ApiKey::OffsetCommit, 0, 2),
-    (ApiKey::OffsetFetch, 0, 1),
-    (ApiKey::FindCoordinator, 0, 1),
-    (ApiKey::JoinGroup, 0, 2),
-    (ApiKey::Heartbeat, 0, 1),
-    (ApiKey::LeaveGroup, 0, 1),
-    (ApiKey::SyncGroup, 0, 1),
+    (ApiKey::OffsetCommit, 0, 6),
+    (ApiKey::OffsetFetch, 0, 5),
+    (ApiKey::FindCoordinator, 0, 2),
+    (ApiKey::JoinGroup, 0, 4),
+    (ApiKey::Heartbeat, 0, 3),
+    (ApiKey::LeaveGroup, 0, 3),
+    (ApiKey::SyncGroup, 0, 3),
     (ApiKey::DescribeGroups, 0, 1),
     (ApiKey::ListGroups, 0, 2),
     (ApiKey::SaslHandshake, 0, 1),

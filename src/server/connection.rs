@@ -165,11 +165,57 @@ fn peek_api_key_raw(data: &Bytes) -> Option<i16> {
     Some(i16::from_be_bytes([data[0], data[1]]))
 }
 
+/// Best-effort api version from a request frame body.
+fn peek_api_version(data: &Bytes) -> Option<i16> {
+    if data.len() < 4 {
+        return None;
+    }
+    Some(i16::from_be_bytes([data[2], data[3]]))
+}
+
 /// Minimal Kafka error response carrying `correlation_id` so clients see a
 /// typed error instead of a connection reset.
 fn encode_wire_error_response(correlation_id: i32, error_code: KafkaCode) -> Result<Vec<u8>> {
     use crate::server::response::ErrorResponseData;
     encode_response(correlation_id, &ErrorResponseData { error_code })
+}
+
+/// When request-body parse fails, prefer an API-shaped error body for keys
+/// whose clients decode a specific schema (not the generic 2-byte
+/// `ErrorResponseData`). A 2-byte body for OffsetFetch v5 surfaces as
+/// `BufferUnderflowException` at `throttleTimeMs` in kafka-clients.
+///
+/// Only APIs with a usable top-level `error_code` are shaped here —
+/// OffsetCommit errors are per-partition, so an empty topics body would
+/// look like success.
+fn encode_parse_failure_response(data: &Bytes, error_code: KafkaCode) -> Result<Vec<u8>> {
+    use crate::server::request::ApiKey;
+    use crate::server::response::OffsetFetchResponseData;
+
+    let correlation_id = match peek_correlation_id(data) {
+        Some(cid) => cid,
+        None => return encode_wire_error_response(0, error_code),
+    };
+    let (Some(api_key_raw), Some(api_version)) = (peek_api_key_raw(data), peek_api_version(data))
+    else {
+        return encode_wire_error_response(correlation_id, error_code);
+    };
+
+    match ApiKey::from(api_key_raw) {
+        ApiKey::OffsetFetch
+            if crate::server::versions::is_version_supported(ApiKey::OffsetFetch, api_version) =>
+        {
+            let resp = OffsetFetchResponseData {
+                throttle_time_ms: 0,
+                topics: vec![],
+                error_code,
+            };
+            let mut body = Vec::new();
+            resp.encode_versioned(&mut body, api_version)?;
+            encode_versioned_raw_response(correlation_id, ApiKey::OffsetFetch, api_version, body)
+        }
+        _ => encode_wire_error_response(correlation_id, error_code),
+    }
 }
 
 /// Encode a version-aware response body with the correct header style.
@@ -911,14 +957,11 @@ pub trait AuthRateLimited {
 /// Track connection metrics (open/close).
 /// Unified metrics handling.
 fn track_connection_open() {
-    crate::cluster::metrics::ACTIVE_CONNECTIONS.inc();
-    crate::cluster::metrics::TOTAL_CONNECTIONS
-        .with_label_values(&["success"])
-        .inc();
+    crate::cluster::Metrics::current().connection_opened("success");
 }
 
 fn track_connection_close() {
-    crate::cluster::metrics::ACTIVE_CONNECTIONS.dec();
+    crate::cluster::Metrics::current().connection_closed();
 }
 
 /// Result of auth-related request processing.
@@ -994,9 +1037,9 @@ async fn dispatch_request_common<H: Handler>(
                 first_bytes = ?&data[..data.len().min(32)],
                 "Failed to parse request"
             );
-            if let Some(correlation_id) = peek_correlation_id(&data) {
+            if peek_correlation_id(&data).is_some() {
                 return (
-                    encode_wire_error_response(correlation_id, KafkaCode::InvalidRequest)
+                    encode_parse_failure_response(&data, KafkaCode::InvalidRequest)
                         .map(DispatchedResponse::from),
                     AuthResult::NotAuth,
                 );
@@ -1057,6 +1100,7 @@ async fn dispatch_request_common<H: Handler>(
         principal,
         client_host,
         transport_tls,
+        metrics: crate::cluster::Metrics::current(),
     };
 
     tracing::debug!(
@@ -1144,10 +1188,14 @@ async fn dispatch_request_common<H: Handler>(
             }
             encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
-        Request::OffsetCommit(_, req) => encode_response(
-            correlation_id,
-            &handler.handle_offset_commit(&ctx, req).await,
-        ),
+        Request::OffsetCommit(header, req) => {
+            let resp = handler.handle_offset_commit(&ctx, req).await;
+            let mut body = Vec::new();
+            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
+                return (Err(e), auth_result);
+            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
+        }
         Request::OffsetFetch(header, req) => {
             let resp = handler.handle_offset_fetch(&ctx, req).await;
             error_code_label = resp.error_code.metric_label();
@@ -1157,10 +1205,14 @@ async fn dispatch_request_common<H: Handler>(
             }
             encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
-        Request::FindCoordinator(_, req) => {
+        Request::FindCoordinator(header, req) => {
             let resp = handler.handle_find_coordinator(&ctx, req).await;
             error_code_label = resp.error_code.metric_label();
-            encode_response(correlation_id, &resp)
+            let mut body = Vec::new();
+            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
+                return (Err(e), auth_result);
+            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::JoinGroup(header, req) => {
             let resp = handler.handle_join_group(&ctx, req).await;

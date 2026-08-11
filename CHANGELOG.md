@@ -197,7 +197,7 @@ Called out because the wire protocol makes them look available:
   RecordBatch attribute bit 4 (transactional) / bit 5 (control) are
   refused on the produce path.
 
-## [0.1.0] - 2026-01-01
+### 2026-01-01
 
 ### Added
 

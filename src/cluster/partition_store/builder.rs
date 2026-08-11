@@ -12,7 +12,7 @@ use moka::sync::Cache as MokaCache;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 use slatedb::Db;
-use slatedb::config::{PutOptions, Settings as SlateDbSettings};
+use slatedb::config::{GarbageCollectorOptions, PutOptions, Settings as SlateDbSettings};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize};
 use std::time::Duration;
@@ -54,6 +54,11 @@ pub struct PartitionStoreBuilder {
     /// compactor task spawns onto the broker-wide bounded runtime
     /// rather than the ambient runtime.
     slatedb_compaction_handle: Option<tokio::runtime::Handle>,
+    /// Whether SlateDB GC may advance manifest/compactions boundary
+    /// files via conditional overwrite (`PutMode::Update`). Must be
+    /// `false` for `LocalFileSystem`, which does not implement that
+    /// mode; leave `true` for S3/GCS/Azure/`InMemory`.
+    slatedb_gc_boundary_files_enabled: bool,
 }
 
 impl Default for PartitionStoreBuilder {
@@ -82,6 +87,9 @@ impl PartitionStoreBuilder {
             slatedb_flush_interval_ms: 100, // 100ms default
             slatedb_block_cache: None,
             slatedb_compaction_handle: None,
+            // Match SlateDB's default. Callers using LocalFileSystem
+            // must flip this off — see `slatedb_gc_boundary_files_enabled`.
+            slatedb_gc_boundary_files_enabled: true,
         }
     }
 
@@ -235,6 +243,23 @@ impl PartitionStoreBuilder {
         self
     }
 
+    /// Enable or disable SlateDB GC boundary-file advancement.
+    ///
+    /// SlateDB 0.15+ advances `gc/*.boundary` with `PutMode::Update`
+    /// (ETag / If-Match). `object_store::local::LocalFileSystem` returns
+    /// `NotImplemented` for that mode, which spams
+    /// `error collecting garbage [resource=Compactions, …]` on every GC
+    /// tick. Pass `false` when the backing store is local disk; keep the
+    /// default (`true`) for cloud object stores and `InMemory`.
+    ///
+    /// When disabled, raise GC `min_age` above the longest expected
+    /// stale-writer lifetime if multiple processes share the same path
+    /// (see SlateDB `GarbageCollectorOptions::boundary_files_enabled`).
+    pub fn slatedb_gc_boundary_files_enabled(mut self, enabled: bool) -> Self {
+        self.slatedb_gc_boundary_files_enabled = enabled;
+        self
+    }
+
     /// Build the PartitionStore.
     pub async fn build(self) -> SlateDBResult<PartitionStore> {
         use super::super::keys::{
@@ -277,11 +302,19 @@ impl PartitionStoreBuilder {
         let block_cache = self.slatedb_block_cache.clone();
         let compaction_handle = self.slatedb_compaction_handle.clone();
 
-        // Prepare SlateDB settings with explicit memory limits for backpressure
+        // Prepare SlateDB settings with explicit memory limits for backpressure.
+        // When boundary files are disabled (LocalFileSystem), keep GC on but
+        // skip conditional boundary advances that the store cannot perform.
+        let garbage_collector_options = {
+            let mut gc = GarbageCollectorOptions::default();
+            gc.boundary_files_enabled = self.slatedb_gc_boundary_files_enabled;
+            Some(gc)
+        };
         let slatedb_settings = SlateDbSettings {
             max_unflushed_bytes: self.slatedb_max_unflushed_bytes,
             l0_sst_size_bytes: self.slatedb_l0_sst_size_bytes,
             flush_interval: Some(Duration::from_millis(self.slatedb_flush_interval_ms)),
+            garbage_collector_options,
             ..SlateDbSettings::default()
         };
         info!(
@@ -290,6 +323,7 @@ impl PartitionStoreBuilder {
             flush_interval_ms = self.slatedb_flush_interval_ms,
             block_cache_shared = block_cache.is_some(),
             compaction_runtime_shared = compaction_handle.is_some(),
+            gc_boundary_files_enabled = self.slatedb_gc_boundary_files_enabled,
             "SlateDB settings configured for backpressure"
         );
 

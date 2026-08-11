@@ -379,6 +379,12 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
             slatedb_max_unflushed_bytes: self.config.slatedb_max_unflushed_bytes,
             slatedb_l0_sst_size_bytes: self.config.slatedb_l0_sst_size_bytes,
             slatedb_flush_interval_ms: self.config.slatedb_flush_interval_ms,
+            // LocalFileSystem cannot CAS-update GC boundary files
+            // (`PutMode::Update` → NotImplemented). Cloud backends can.
+            slatedb_gc_boundary_files_enabled: !matches!(
+                self.config.object_store,
+                crate::cluster::config::ObjectStoreType::Local { .. }
+            ),
             slatedb_resources: self.slatedb_resources.clone(),
             max_owned_partitions_per_broker: self.config.max_owned_partitions_per_broker,
             acquire_locks: self.acquire_locks.clone(),

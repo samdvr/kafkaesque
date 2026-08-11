@@ -115,6 +115,10 @@ pub(super) struct OwnershipContext<C: ClusterCoordinator> {
     pub(super) slatedb_max_unflushed_bytes: usize,
     pub(super) slatedb_l0_sst_size_bytes: usize,
     pub(super) slatedb_flush_interval_ms: u64,
+    /// When false, SlateDB GC skips boundary-file CAS advances. Set for
+    /// `ObjectStoreType::Local` because LocalFileSystem does not implement
+    /// `PutMode::Update`.
+    pub(super) slatedb_gc_boundary_files_enabled: bool,
     /// Broker-wide shared block cache + dedicated compaction runtime
     /// handle. Threaded into every `Db::builder` via `apply_store_tuning`
     /// so all per-partition `Db` instances share one cache and one
@@ -169,6 +173,7 @@ pub(super) fn apply_store_tuning<C: ClusterCoordinator>(
         .slatedb_max_unflushed_bytes(ctx.slatedb_max_unflushed_bytes)
         .slatedb_l0_sst_size_bytes(ctx.slatedb_l0_sst_size_bytes)
         .slatedb_flush_interval_ms(ctx.slatedb_flush_interval_ms)
+        .slatedb_gc_boundary_files_enabled(ctx.slatedb_gc_boundary_files_enabled)
         .slatedb_compaction_handle(ctx.slatedb_resources.compaction_handle.clone());
     // The cache is `Option<Arc<dyn DbCache>>` — `None` when the
     // operator zeroes `slatedb_block_cache_bytes` to A/B against the

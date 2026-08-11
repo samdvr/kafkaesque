@@ -12,7 +12,9 @@
 //!   something to mutate.
 //! - **Topic purging** (`PurgePartition`): when a topic is deleted from
 //!   control, its per-partition entries must be removed from the owning
-//!   shard.
+//!   shard. The purge decision is made against a control view read *after*
+//!   the shard read it is based on — see [`propagate_topic_purge`] for why
+//!   the tick-wide snapshot is not safe here.
 //! - **Broker liveness shadow** (`UpdateBrokerLivenessShadow`): broker
 //!   `status` (Active / Fenced / etc.) is authored on control. Each shard
 //!   keeps a *shadow* of it so the cross-domain fencing gate
@@ -77,7 +79,10 @@ pub const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_millis(200);
 /// Snapshot of a single tick's view of control state, taken once per tick
 /// and reused across the per-shard sub-passes. Avoids re-locking the
 /// control SM 3× per tick (init + purge + shadow).
-struct ControlSnapshot {
+///
+/// `pub(super)` so the end-to-end tests in `super::cluster` can build a
+/// deliberately stale snapshot and drive one sub-pass with it.
+pub(super) struct ControlSnapshot {
     /// `(topic_name → (partition_count, created_at_ms))`. Computed from
     /// `control_state.topic_registry.topics`.
     topics: Vec<(Arc<str>, i32, u64)>,
@@ -159,7 +164,11 @@ pub(super) async fn reconcile_once(cluster: &Arc<RaftCluster>, node_id: RaftNode
 /// `topic_registry.topics` and `broker_domain.brokers` are both
 /// `HashMap<...>`. Cloning into owned `Vec`s here is cheap relative to a
 /// 200ms tick and lets us drop the control read lock before walking shards.
-async fn capture_control_snapshot(cluster: &Arc<RaftCluster>) -> ControlSnapshot {
+///
+/// `pub(super)` so the end-to-end tests in `super::cluster` can capture a
+/// snapshot, mutate control behind its back, and drive one sub-pass with the
+/// now-stale view.
+pub(super) async fn capture_control_snapshot(cluster: &Arc<RaftCluster>) -> ControlSnapshot {
     let sm = cluster.control().state_machine();
     let state = sm.state().await;
 
@@ -252,6 +261,25 @@ async fn propagate_topic_init(
 /// Purge per-partition state on `shard_idx` for any topic that no longer
 /// exists in control's registry.
 ///
+/// # Why the control view is re-read here
+///
+/// `snapshot` was taken at the top of the tick, and the sub-passes before
+/// this one issue Raft proposals, so by the time we run it can be hundreds of
+/// milliseconds old. A topic created in that window is *absent* from
+/// `snapshot.topic_set` while its partition entries are already *present* on
+/// the shard (`CreateTopics` seeds them eagerly, and the metadata handler
+/// acquires partition 0 right after). Purging on the stale view therefore
+/// deleted a live, owned partition: ownership and `leader_epoch` were wiped,
+/// the owner's next produce failed `RenewLease` with `NotOwned`, the
+/// partition manager closed the store, and the partition only came back on
+/// the next ownership sweep (seconds later, with produces failing throughout).
+///
+/// Re-reading control *after* the shard read makes the purge decision safe:
+/// an entry present on the shard at T1 implies control had the topic before
+/// T1, so if control at T2 > T1 still doesn't have it, it was genuinely
+/// deleted. The re-read only happens when there is something to purge, so a
+/// converged tick pays nothing.
+///
 /// **Caveat — same-name re-create race**: if `CreateTopic("X") →
 /// DeleteTopic("X") → CreateTopic("X")` happens within one reconciler tick,
 /// the purge sweep observes the topic in control (the second create) and
@@ -259,12 +287,12 @@ async fn propagate_topic_init(
 /// survive on the shard. Closing this race needs either a `created_at_ms`
 /// fingerprint on `PartitionInfo` or an explicit tombstone TTL on control —
 /// see the module docs.
-async fn propagate_topic_purge(
+pub(super) async fn propagate_topic_purge(
     cluster: &Arc<RaftCluster>,
     shard_idx: ShardId,
     snapshot: &ControlSnapshot,
 ) {
-    let to_purge: Vec<(String, i32)> = {
+    let candidates: Vec<(String, i32)> = {
         let sm = cluster
             .shard(shard_idx)
             .expect("shard exists")
@@ -279,7 +307,25 @@ async fn propagate_topic_purge(
             .collect()
     };
 
-    for (topic, partition) in to_purge {
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Fresh control view, read strictly after the shard read above.
+    let live_topics: HashSet<Arc<str>> = {
+        let sm = cluster.control().state_machine();
+        let state = sm.state().await;
+        state.topic_registry.topics.keys().cloned().collect()
+    };
+
+    for (topic, partition) in candidates {
+        if live_topics.contains(topic.as_str()) {
+            debug!(
+                shard = shard_idx,
+                topic, partition, "reconciler: skipping purge — topic exists on control"
+            );
+            continue;
+        }
         let cmd = ShardCommand::Partition(PartitionStateCommand::PurgePartition {
             topic: topic.clone(),
             partition,

@@ -1633,7 +1633,8 @@ mod tests {
     // and deterministic.
 
     use super::super::domains::{
-        BrokerCommand, BrokerStatus, PartitionStateResponse, TopicRegistryCommand,
+        BrokerCommand, BrokerStatus, PartitionStateCommand, PartitionStateResponse,
+        TopicRegistryCommand,
     };
     use super::super::reconciler;
     use std::collections::HashMap;
@@ -1930,6 +1931,129 @@ mod tests {
             partition: 0,
         };
         let _: ShardCommand = ShardCommand::Noop;
+
+        cluster.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciler_purge_does_not_wipe_a_topic_created_after_the_tick_snapshot() {
+        // Regression: the purge sweep used the control snapshot taken at the
+        // top of the tick, but the sub-passes ahead of it issue Raft
+        // proposals, so that view can be hundreds of ms stale. A topic
+        // created inside that window is absent from the snapshot while its
+        // partitions are already seeded AND acquired on the shard — the
+        // sweep then purged a live partition, wiping owner + leader_epoch.
+        // Observable symptom: the owner's next produce failed RenewLease
+        // with NotOwned, the store was closed, and the partition only
+        // returned on the next ownership sweep (~5s of failing produces).
+        let tmp = tempfile::tempdir().unwrap();
+        let config = smoke_config(next_test_port(), tmp.path(), 2);
+        let cluster = RaftCluster::new(config, Arc::new(InMemory::new()), Handle::current())
+            .await
+            .unwrap();
+        cluster.initialize_cluster().await.unwrap();
+        assert!(wait_for_leader(&cluster.control().clone(), Duration::from_secs(5)).await);
+        for i in 0..cluster.metadata_shards() {
+            let s = cluster.shard(i).unwrap().clone();
+            assert!(wait_for_leader(&s, Duration::from_secs(5)).await);
+        }
+
+        // The stale view: captured BEFORE the topic exists on control. This
+        // is exactly what a tick that started a moment before the create
+        // carries into its purge sub-pass.
+        let stale = reconciler::capture_control_snapshot(&cluster).await;
+
+        let topic = "created-mid-tick".to_string();
+        cluster
+            .write_control(ControlCommand::TopicRegistry(
+                TopicRegistryCommand::CreateTopic {
+                    name: topic.clone(),
+                    partitions: 1,
+                    config: HashMap::new(),
+                    timestamp_ms: 1_000,
+                },
+            ))
+            .await
+            .unwrap();
+
+        // Seed + acquire on the owning shard, as `CreateTopics` and the
+        // metadata handler do for partition 0.
+        let target = cluster.router().shard_for_topic(&topic);
+        cluster
+            .write_shard(
+                target,
+                ShardCommand::Partition(PartitionStateCommand::InitPartition {
+                    topic: topic.clone(),
+                    partition: 0,
+                    created_at_ms: 1_000,
+                }),
+            )
+            .await
+            .unwrap();
+        let acquired = cluster
+            .write_shard(
+                target,
+                ShardCommand::Partition(PartitionStateCommand::AcquirePartition {
+                    topic: topic.clone(),
+                    partition: 0,
+                    broker_id: 0,
+                    lease_duration_ms: 60_000,
+                    timestamp_ms: 2_000,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                acquired,
+                ShardResponse::Partition(PartitionStateResponse::PartitionAcquired { .. })
+            ),
+            "setup: acquire must succeed, got {:?}",
+            acquired
+        );
+
+        // The purge sub-pass, driven with the stale snapshot.
+        reconciler::propagate_topic_purge(&cluster, target, &stale).await;
+
+        // The partition must still be there, still owned, epoch intact.
+        {
+            let sm = cluster.shard(target).unwrap().state_machine();
+            let state = sm.state().await;
+            let info = state
+                .partition_state
+                .partitions
+                .get(&(Arc::from(topic.as_str()), 0))
+                .expect("live partition purged by a stale-snapshot sweep");
+            assert_eq!(
+                info.owner_broker_id,
+                Some(0),
+                "purge sweep wiped ownership of a live partition"
+            );
+            assert_eq!(info.leader_epoch, 1, "purge sweep reset leader_epoch");
+        }
+
+        // The sweep must still purge for real: delete on control, then the
+        // same stale snapshot (which also lacks the topic) purges it.
+        cluster
+            .write_control(ControlCommand::TopicRegistry(
+                TopicRegistryCommand::DeleteTopic {
+                    name: topic.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+        reconciler::propagate_topic_purge(&cluster, target, &stale).await;
+        {
+            let sm = cluster.shard(target).unwrap().state_machine();
+            let state = sm.state().await;
+            assert!(
+                !state
+                    .partition_state
+                    .partitions
+                    .contains_key(&(Arc::from(topic.as_str()), 0)),
+                "purge stopped working for genuinely deleted topics"
+            );
+        }
 
         cluster.shutdown().await.unwrap();
     }

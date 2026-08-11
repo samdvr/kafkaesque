@@ -462,8 +462,8 @@ disable version negotiation, or that require APIs we do not advertise
 
 | API | Advertised | Why it stops there |
 |---|---|---|
-| OffsetCommit | v0–**v6** | v5 drops retention / parses instance id (ignored); v6 leader_epoch ignored. Flexible v7+ refused. |
-| OffsetFetch | v0–**v5** | v5 response `committed_leader_epoch` (-1). Flexible / multi-group v6+ refused. |
+| OffsetCommit | v0–**v6** | v5 drops retention; v6 leader_epoch ignored. `groupInstanceId` is v7+ (refused). |
+| OffsetFetch | v0–**v5** | v5 response `committed_leader_epoch` (-1). Request body same as v2 (no `require_stable`; that is v7+). Flexible / multi-group v6+ refused. |
 | JoinGroup | v0–**v4** | v4 MemberIdRequired (KIP-394). v5 static membership refused. |
 | SyncGroup | v0–**v3** | v3 `group_instance_id` parsed and ignored. |
 | Heartbeat | v0–**v3** | v3 `group_instance_id` parsed and ignored. |

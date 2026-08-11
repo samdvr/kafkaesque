@@ -7,13 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **OffsetFetch v4/v5 request parse.** `require_stable` is Kafka OffsetFetch
+  **v7+** only (v3–v5 request bodies match v2). Parsing it on v4/v5 ate a
+  phantom trailing byte librdkafka / kafka-clients never send, so group
+  consumers hung on OffsetFetch (Java: `BufferUnderflowException` at
+  `throttleTimeMs` from a 2-byte generic error body). Gate corrected to v7+.
+- **OffsetFetch parse-failure response shape.** When OffsetFetch body parse
+  fails, answer with a versioned OffsetFetchResponse (`throttle` + empty
+  topics + top-level `InvalidRequest`) instead of the generic 2-byte
+  `ErrorResponseData`, so kafka-clients can decode the error.
+- **OffsetCommit v5/v6 request parse.** `group_instance_id` is OffsetCommit
+  **v7+** only (v5 only drops retention; v6 adds leader epoch). Parsing the
+  instance id early mis-framed the topics array and made OffsetCommit
+  underflow under librdkafka.
+- **`rdkafka_consumer_group_commit_round_trip` SIGSEGV.** Verify commits via
+  `committed()` on the same consumer after dropping the `BorrowedMessage`;
+  a second same-group member while the message was live crashed librdkafka
+  in CI.
+
 ### Changed
 
 - **Classic group API ceilings raised** (still short of flexible / static
   membership): FindCoordinator→2, Heartbeat/SyncGroup→3 (instance id
   parsed+ignored), LeaveGroup→3 (batch leave), JoinGroup→4 (KIP-394
-  MemberIdRequired), OffsetCommit→6, OffsetFetch→5 (`committed_leader_epoch`
-  always -1). JoinGroup v5+ and flexible group APIs remain refused.
+  MemberIdRequired), OffsetCommit→6 (v5 drops retention; v6 leader
+  epoch), OffsetFetch→5 (`committed_leader_epoch` always -1). JoinGroup
+  v5+ and flexible group APIs remain refused.
 - **Produce inner-record validation.** After decompress (or for
   uncompressed batches), the broker walks the records section and rejects
   batches whose header `records_count` does not match the walk

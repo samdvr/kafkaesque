@@ -532,7 +532,10 @@ async fn test_leave_group_unknown_member_returns_unknown_member_id() {
     let resp = handler
         .handle_leave_group(
             &ctx,
-            LeaveGroupRequestData::for_member("never-existed-group".to_string(), "ghost".to_string()),
+            LeaveGroupRequestData::for_member(
+                "never-existed-group".to_string(),
+                "ghost".to_string(),
+            ),
         )
         .await;
     assert_eq!(resp.error_code, KafkaCode::UnknownMemberId);
@@ -549,7 +552,10 @@ async fn test_leave_group_unknown_member_returns_unknown_member_id() {
     let resp = handler
         .handle_leave_group(
             &ctx,
-            LeaveGroupRequestData::for_member("leave-unknown-group".to_string(), "ghost".to_string()),
+            LeaveGroupRequestData::for_member(
+                "leave-unknown-group".to_string(),
+                "ghost".to_string(),
+            ),
         )
         .await;
     assert_eq!(resp.error_code, KafkaCode::UnknownMemberId);

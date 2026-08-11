@@ -180,4 +180,3 @@ pub(super) fn apply_store_tuning<C: ClusterCoordinator>(
     }
     builder
 }
-

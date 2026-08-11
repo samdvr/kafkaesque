@@ -1240,7 +1240,8 @@ async fn test_leave_group() {
     let handler = create_test_handler().await;
     let ctx = create_test_context();
 
-    let request = LeaveGroupRequestData::for_member("test-group".to_string(), "member-1".to_string());
+    let request =
+        LeaveGroupRequestData::for_member("test-group".to_string(), "member-1".to_string());
 
     let response = handler.handle_leave_group(&ctx, request).await;
 

@@ -1,15 +1,13 @@
 //! Builder for creating [`PartitionStore`] instances.
 
-use super::batch_index::{BatchIndex, DEFAULT_BATCH_INDEX_MAX_SIZE};
-use super::producer_state::{ProducerState, DEFAULT_PRODUCER_STATE_CACHE_SIZE};
-use super::PartitionStore;
-use super::{
-    DEFAULT_MAX_FETCH_RESPONSE_SIZE, DURABLE_WRITE_OPTIONS, FAST_WRITE_OPTIONS,
-};
 use super::super::error::{SlateDBError, SlateDBResult};
 use super::super::keys::HIGH_WATERMARK_KEY;
 use super::super::partition_recovery::{load_producer_states, recover_hwm_from_records};
 use super::super::zombie_mode::ZombieModeState;
+use super::PartitionStore;
+use super::batch_index::{BatchIndex, DEFAULT_BATCH_INDEX_MAX_SIZE};
+use super::producer_state::{DEFAULT_PRODUCER_STATE_CACHE_SIZE, ProducerState};
+use super::{DEFAULT_MAX_FETCH_RESPONSE_SIZE, DURABLE_WRITE_OPTIONS, FAST_WRITE_OPTIONS};
 use moka::sync::Cache as MokaCache;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
@@ -647,4 +645,3 @@ impl PartitionStoreBuilder {
         Ok(store)
     }
 }
-

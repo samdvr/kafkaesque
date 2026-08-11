@@ -50,12 +50,12 @@
 //! detect and reject duplicate or out-of-order messages. This provides
 //! exactly-once semantics for idempotent producers.
 
-mod offset_reservation;
-mod batch_index;
-mod producer_state;
-mod builder;
 mod append;
+mod batch_index;
+mod builder;
 mod fetch;
+mod offset_reservation;
+mod producer_state;
 
 pub use builder::PartitionStoreBuilder;
 pub use producer_state::ProducerState;
@@ -72,9 +72,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::error::{SlateDBError, SlateDBResult};
-use super::keys::{
-    HIGH_WATERMARK_KEY, encode_record_key, parse_record_count_checked,
-};
+use super::keys::{HIGH_WATERMARK_KEY, encode_record_key, parse_record_count_checked};
 use super::load_metrics::LoadMetricsCollector;
 use super::zombie_mode::ZombieModeState;
 
@@ -275,7 +273,6 @@ pub struct PartitionStore {
     /// resets cleanly to `high_watermark`).
     append_failed: AtomicBool,
 }
-
 
 impl PartitionStore {
     /// Open or create a partition store.
@@ -488,7 +485,6 @@ impl PartitionStore {
             collector.record_fetch(&self.topic, self.partition, bytes, messages);
         }
     }
-
 
     /// Add a batch entry to the index.
     fn add_to_batch_index(&self, base_offset: i64, record_count: i32) {
@@ -1192,7 +1188,6 @@ impl PartitionStore {
     }
 }
 
-
 impl Debug for PartitionStore {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("PartitionStore")
@@ -1206,11 +1201,9 @@ impl Debug for PartitionStore {
     }
 }
 
-
 impl PartitionStore {
     /// Create a new builder for PartitionStore.
     pub fn builder() -> PartitionStoreBuilder {
         PartitionStoreBuilder::new()
     }
 }
-

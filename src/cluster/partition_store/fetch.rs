@@ -1,9 +1,9 @@
 //! Fetch and batch-index lookup path for [`PartitionStore`].
 
-use super::PartitionStore;
-use super::INITIAL_BATCH_BACKSCAN_WINDOW;
 use super::super::error::{SlateDBError, SlateDBResult};
 use super::super::keys::{encode_record_key, parse_record_count_checked};
+use super::INITIAL_BATCH_BACKSCAN_WINDOW;
+use super::PartitionStore;
 use bytes::{Bytes, BytesMut};
 use std::sync::atomic::Ordering;
 use tracing::{debug, error};
@@ -320,5 +320,4 @@ impl PartitionStore {
             window = window.saturating_mul(2);
         }
     }
-
 }

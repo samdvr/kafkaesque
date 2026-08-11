@@ -33,8 +33,8 @@
 //! | Fetch            | 4   | 11  | parser reads `max_bytes` (v3+) and `isolation` (v4+); v7 sessions, v9 leader_epoch, v11 rack |
 //! | ListOffsets      | 0   | 2   | parser is version-agnostic                     |
 //! | Metadata         | 0   | 9   | flexible at v9                                 |
-//! | OffsetCommit     | 0   | 6   | v3 throttle; v5 drops retention / parses instance id (ignored); v6 leader_epoch ignored |
-//! | OffsetFetch      | 0   | 5   | v2 top-level error, v3 throttle; v5 response `committed_leader_epoch` (-1); require_stable ignored |
+//! | OffsetCommit     | 0   | 6   | v3 throttle; v5 drops retention; v6 leader_epoch ignored; v7 groupInstanceId not advertised |
+//! | OffsetFetch      | 0   | 5   | v2 top-level error, v3 throttle; v5 response `committed_leader_epoch` (-1); v7 require_stable not advertised |
 //! | FindCoordinator  | 0   | 2   | v1 throttle; v2 error_message                                                 |
 //! | JoinGroup        | 0   | 4   | v4 MemberIdRequired (KIP-394); v5 static membership (KIP-345) refused         |
 //! | Heartbeat        | 0   | 3   | v3 group_instance_id parsed and ignored                                       |
@@ -115,12 +115,13 @@ pub const SUPPORTED_VERSIONS: &[SupportedVersion] = &[
     // and is intentionally deferred.
     SupportedVersion::new(ApiKey::Metadata, 0, 9),
     // OffsetCommit: v3 response throttle; v2..=v4 retention_time parsed+dropped;
-    // v5 drops retention and adds nullable `group_instance_id` (parsed, ignored —
-    // static membership still requires JoinGroup v5 which we refuse); v6 adds
-    // per-partition `committed_leader_epoch` (parsed, ignored). v7+ flexible.
+    // v5 drops retention only; v6 adds per-partition `committed_leader_epoch`
+    // (parsed, ignored). `group_instance_id` is v7+ (not advertised). Flexible
+    // from v8.
     SupportedVersion::new(ApiKey::OffsetCommit, 0, 6),
-    // OffsetFetch: v2 error_code, v3 throttle, v4 `require_stable` (ignored),
-    // v5 response `committed_leader_epoch` (always -1 until epochs are stored).
+    // OffsetFetch: v2 error_code, v3 throttle, v5 response
+    // `committed_leader_epoch` (always -1 until epochs are stored). Request
+    // body is identical for v2–v5; `require_stable` is v7+ only (not advertised).
     // v6+ flexible / multi-group not advertised.
     SupportedVersion::new(ApiKey::OffsetFetch, 0, 5),
     SupportedVersion::new(ApiKey::FindCoordinator, 0, 2),

@@ -33,6 +33,7 @@ use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::topic_partition_list::Offset;
 use tempfile::TempDir;
 
 mod common;
@@ -200,9 +201,15 @@ async fn rdkafka_idempotent_producer_offsets_advance() {
 }
 
 /// Consumer group offset commit: produce, consume with a group, commit,
-/// and verify the committed offset sticks via a fresh consumer in the
-/// same group. Exercises FindCoordinator + Join/Sync/Heartbeat +
-/// OffsetCommit/Fetch through librdkafka's negotiated API versions.
+/// and verify the committed offset via `committed()`. Exercises
+/// FindCoordinator + Join/Sync/Heartbeat + OffsetCommit/Fetch through
+/// librdkafka's negotiated API versions.
+///
+/// Deliberately avoids a second same-group consumer: librdkafka requires
+/// all borrowed messages to be destroyed before the consumer handle, and
+/// overlapping two group members while a `BorrowedMessage` is live has
+/// SIGSEGV'd in CI (`rd_kafka_message` / rebalance). Verify the commit
+/// with the same consumer after dropping the message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rdkafka_consumer_group_commit_round_trip() {
     let Some((addr, _server, _tempdir)) = start_in_memory_broker().await else {
@@ -232,6 +239,7 @@ async fn rdkafka_consumer_group_commit_round_trip() {
         .set("group.id", group)
         .set("auto.offset.reset", "earliest")
         .set("enable.auto.commit", "false")
+        .set("session.timeout.ms", "6000")
         .create()
         .expect("consumer");
 
@@ -243,27 +251,28 @@ async fn rdkafka_consumer_group_commit_round_trip() {
         .expect("recv error");
     assert_eq!(recv.payload().expect("payload"), payload);
 
+    let partition = recv.partition();
+    // Kafka commits the *next* offset to fetch.
+    let committed_next = recv.offset() + 1;
+
     consumer
         .commit_message(&recv, rdkafka::consumer::CommitMode::Sync)
         .expect("commit_message");
+    // librdkafka: destroy BorrowedMessage before further consumer ops /
+    // close. Holding it across rebalance or drop is undefined (SIGSEGV).
+    drop(recv);
 
-    // A second consumer in the same group with auto.offset.reset=latest
-    // must not re-read the committed record if the commit stuck.
-    let consumer2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &addr)
-        .set("group.id", group)
-        .set("auto.offset.reset", "latest")
-        .set("enable.auto.commit", "false")
-        .create()
-        .expect("consumer2");
-    consumer2.subscribe(&[topic]).expect("subscribe2");
-
-    // Leave enough time for a rebalance + empty poll; we expect timeout
-    // (no new records past the committed offset).
-    let second = tokio::time::timeout(Duration::from_secs(3), consumer2.recv()).await;
-    assert!(
-        second.is_err(),
-        "committed offset must prevent re-delivery of the same record"
+    let committed = consumer
+        .committed(Duration::from_secs(5))
+        .expect("committed()");
+    let entry = committed
+        .find_partition(topic, partition)
+        .expect("committed partition entry");
+    assert_eq!(
+        entry.offset(),
+        Offset::Offset(committed_next),
+        "OffsetCommit must stick; got {:?}",
+        entry.offset()
     );
 }
 

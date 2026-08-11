@@ -458,10 +458,7 @@ async fn leave_group_for_already_departed_member_returns_unknown_member_id() {
     assert_eq!(first_leave.error_code, KafkaCode::None);
 
     let second_leave = h
-        .handle_leave_group(
-            &ctx(),
-            LeaveGroupRequestData::for_member(group, member_id),
-        )
+        .handle_leave_group(&ctx(), LeaveGroupRequestData::for_member(group, member_id))
         .await;
     assert!(
         matches!(

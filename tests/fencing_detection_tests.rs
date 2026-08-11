@@ -222,7 +222,10 @@ fn test_circuit_breaker_increments_on_fail_closed() {
         metrics::reset_circuit_breaker();
         let _ = metrics::record_fencing_detection_with_circuit_breaker("fail_closed");
         let (count, _) = metrics::get_circuit_breaker_state();
-        assert_eq!(count, 1, "fail_closed should increment counter, got {count}");
+        assert_eq!(
+            count, 1,
+            "fail_closed should increment counter, got {count}"
+        );
     });
 }
 

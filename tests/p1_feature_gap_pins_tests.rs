@@ -272,18 +272,13 @@ async fn control_and_transactional_batches_are_rejected_at_produce() {
                 )
                 .await;
             let code = resp.responses[0].partitions[0].error_code;
-            if code != KafkaCode::NotLeaderForPartition
-                || std::time::Instant::now() >= deadline
-            {
+            if code != KafkaCode::NotLeaderForPartition || std::time::Instant::now() >= deadline {
                 break code;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         };
         assert!(
-            matches!(
-                code,
-                KafkaCode::InvalidRecord | KafkaCode::InvalidRequest
-            ),
+            matches!(code, KafkaCode::InvalidRecord | KafkaCode::InvalidRequest),
             "attrs={attrs:#x} must be refused at produce, got {code:?}"
         );
     }

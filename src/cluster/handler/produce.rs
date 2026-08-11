@@ -48,8 +48,8 @@
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use crate::error::KafkaCode;
 use crate::batch::{ProduceBatchValidation, validate_produce_batch_async};
+use crate::error::KafkaCode;
 use crate::protocol::parse_producer_info;
 use crate::server::RequestContext;
 use crate::server::request::{ApiKey, ProducePartitionData, ProduceRequestData};
@@ -392,9 +392,7 @@ async fn fire_and_forget_produce(
     partition: ProducePartitionData,
     validate_crc: bool,
 ) -> Result<(), ()> {
-    use crate::batch::{
-        validate_produce_batch_async, validate_produce_batch_attributes_only,
-    };
+    use crate::batch::{validate_produce_batch_async, validate_produce_batch_attributes_only};
 
     // Skip zombie mode check for fire-and-forget (best effort)
     if partition_manager.is_zombie() {

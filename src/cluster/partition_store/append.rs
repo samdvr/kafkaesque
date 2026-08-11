@@ -1,14 +1,14 @@
 //! Append path for [`PartitionStore`].
 
-use super::offset_reservation::OffsetReservation;
-use super::producer_state::ProducerState;
-use super::PartitionStore;
-use super::{DURABLE_WRITE_OPTIONS, FAST_WRITE_OPTIONS, HWM_CHECKPOINT_INTERVAL_BATCHES};
 use super::super::error::{SlateDBError, SlateDBResult};
 use super::super::keys::{
     HIGH_WATERMARK_KEY, encode_producer_state_key, encode_producer_state_value, encode_record_key,
     parse_record_count_checked, patch_base_offset,
 };
+use super::PartitionStore;
+use super::offset_reservation::OffsetReservation;
+use super::producer_state::ProducerState;
+use super::{DURABLE_WRITE_OPTIONS, FAST_WRITE_OPTIONS, HWM_CHECKPOINT_INTERVAL_BATCHES};
 use crate::protocol::parse_producer_info;
 use bytes::Bytes;
 use slatedb::WriteBatch;
@@ -371,7 +371,9 @@ impl PartitionStore {
                             cached_offset = state.last_base_offset,
                             "Returning cached base_offset for duplicate retry"
                         );
-                        super::super::metrics::record_idempotency_rejection("duplicate_idempotent_ok");
+                        super::super::metrics::record_idempotency_rejection(
+                            "duplicate_idempotent_ok",
+                        );
                         idempotent_dup_offset = Some(state.last_base_offset);
                     } else {
                         warn!(
@@ -552,7 +554,11 @@ impl PartitionStore {
             // recovery; with the flag off, consumers see HWM jumps over an
             // empty range. Track the gap as a metric so operators can
             // alarm on persistent gap rates.
-            super::super::metrics::record_partition_offset_gap(&self.topic, self.partition, record_count);
+            super::super::metrics::record_partition_offset_gap(
+                &self.topic,
+                self.partition,
+                record_count,
+            );
 
             // Trip the sticky `append_failed` flag so subsequent appends
             // on this instance are rejected. Without this guard, the next
@@ -736,5 +742,4 @@ impl PartitionStore {
         self.producer_states.insert(producer_id, state);
         Ok(Some(state))
     }
-
 }

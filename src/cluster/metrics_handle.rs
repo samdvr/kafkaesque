@@ -146,8 +146,7 @@ impl CircuitBreakerState {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    let last_confirmed =
-                        self.last_confirmed_fencing_millis.load(Ordering::SeqCst);
+                    let last_confirmed = self.last_confirmed_fencing_millis.load(Ordering::SeqCst);
                     let trips = self.consecutive_trips.load(Ordering::SeqCst);
                     let backoff_multiplier = 1u64 << trips.min(4);
                     let reset_window = (self.base_reset_window_ms.load(Ordering::SeqCst)
@@ -271,10 +270,7 @@ impl Metrics {
             .register(Box::new(active_connections.clone()))
             .expect("register active_connections");
         let total_connections = IntCounterVec::new(
-            Opts::new(
-                "connections_total",
-                "Total client connections accepted.",
-            ),
+            Opts::new("connections_total", "Total client connections accepted."),
             &["status"],
         )
         .expect("static metric");

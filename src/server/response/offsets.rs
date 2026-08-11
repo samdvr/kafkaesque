@@ -593,4 +593,36 @@ mod tests {
         // Should start with throttle_time_ms
         assert_eq!(&buf_v3[0..4], &[0, 0, 0, 100]);
     }
+
+    #[test]
+    fn test_offset_fetch_response_v5_includes_leader_epoch() {
+        let response = OffsetFetchResponseData {
+            throttle_time_ms: 0,
+            topics: vec![OffsetFetchTopicResponse {
+                name: "t".to_string(),
+                partitions: vec![OffsetFetchPartitionResponse {
+                    partition_index: 0,
+                    committed_offset: 7,
+                    committed_leader_epoch: -1,
+                    metadata: None,
+                    error_code: KafkaCode::None,
+                }],
+            }],
+            error_code: KafkaCode::None,
+        };
+
+        let mut v3 = Vec::new();
+        response.encode_versioned(&mut v3, 3).unwrap();
+        let mut v5 = Vec::new();
+        response.encode_versioned(&mut v5, 5).unwrap();
+
+        // v5 adds committed_leader_epoch (i32) per partition
+        assert_eq!(v3.len() + 4, v5.len(), "v3={} v5={}", v3.len(), v5.len());
+
+        // Layout after topic name "t" (i16 len=1 + 't') + partitions len:
+        // Find partition_index at a known offset and ensure epoch bytes follow offset.
+        // throttle(4) + topics_len(4) + name(2+1) + parts_len(4) + part(4) + offset(8) = 27
+        // then epoch(4) for v5
+        assert_eq!(&v5[27..31], &(-1i32).to_be_bytes());
+    }
 }

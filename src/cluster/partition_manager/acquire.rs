@@ -318,4 +318,3 @@ pub(super) async fn release_partition_for_deleted_topic<C: ClusterCoordinator>(
         .with_label_values(&[topic])
         .dec();
 }
-

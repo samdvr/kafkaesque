@@ -326,4 +326,3 @@ pub(super) async fn try_exit_zombie_mode<C: ClusterCoordinator>(
         }
     }
 }
-

@@ -24,10 +24,10 @@ use prometheus::{
 };
 use tracing::warn;
 
-mod registration;
-mod circuit_breaker;
 mod cardinality;
+mod circuit_breaker;
 mod raft;
+mod registration;
 
 pub use registration::REGISTRY;
 pub(crate) use registration::{
@@ -35,15 +35,17 @@ pub(crate) use registration::{
     register_int_gauge_safe, register_int_gauge_vec_safe,
 };
 
-pub use circuit_breaker::*;
+use cardinality::bounded_topic_label;
 pub use cardinality::{
     PartitionCounters, configure_metrics, partition_counters, record_fetch, record_fetch_async,
     record_produce, record_produce_async,
 };
-pub(crate) use cardinality::{bounded_group_label, bounded_partition_label, bounded_principal_label};
+pub(crate) use cardinality::{
+    bounded_group_label, bounded_partition_label, bounded_principal_label,
+};
 #[cfg(test)]
 pub(crate) use cardinality::{get_partition_label, get_partition_label_sync};
-use cardinality::bounded_topic_label;
+pub use circuit_breaker::*;
 
 pub use raft::*;
 

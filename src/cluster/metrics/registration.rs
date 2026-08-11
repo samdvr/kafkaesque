@@ -101,4 +101,3 @@ pub(crate) fn register_histogram_vec_safe(
         }
     }
 }
-

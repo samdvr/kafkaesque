@@ -11,6 +11,7 @@ use super::*;
 use crate::error::KafkaCode;
 use crate::server::request::ApiKey;
 use crate::server::response::{ApiVersionData, ApiVersionsResponseData};
+use bytes::{BufMut, BytesMut};
 
 #[test]
 fn test_encode_api_versions_standard_v0() {
@@ -540,6 +541,33 @@ fn test_encode_wire_error_response_carries_correlation_id() {
     assert_eq!(result.len(), 10);
     assert_eq!(&result[4..8], &9001i32.to_be_bytes());
     assert_eq!(&result[8..10], &42i16.to_be_bytes()); // InvalidRequest
+}
+
+#[test]
+fn test_encode_parse_failure_response_shapes_offset_fetch_v5() {
+    // OffsetFetch=9, version=5, correlation=77 — body intentionally absent /
+    // malformed so this path is what Request::parse Err would hit.
+    let mut data = BytesMut::new();
+    data.put_i16(9);
+    data.put_i16(5);
+    data.put_i32(77);
+    data.put_i16(-1); // null client_id
+    let data = data.freeze();
+
+    let frame = encode_parse_failure_response(&data, KafkaCode::InvalidRequest).unwrap();
+    // size(4) + correlation(4) + throttle(4) + topics_len(4) + error(2)
+    assert_eq!(
+        frame.len(),
+        18,
+        "must not be the generic 10-byte ErrorResponse"
+    );
+    assert_eq!(&frame[4..8], &77i32.to_be_bytes());
+    assert_eq!(&frame[8..12], &0i32.to_be_bytes()); // throttle
+    assert_eq!(&frame[12..16], &0i32.to_be_bytes()); // empty topics
+    assert_eq!(
+        &frame[16..18],
+        &(KafkaCode::InvalidRequest as i16).to_be_bytes()
+    );
 }
 
 #[test]

@@ -36,7 +36,6 @@ use super::zombie_mode::ZombieModeState;
 /// Each partition can be accessed independently without blocking other partitions.
 pub(super) type PartitionStateMap = Arc<DashMap<PartitionKey, PartitionState>>;
 
-
 mod acquire;
 mod jitter;
 mod ownership;
@@ -1880,7 +1879,6 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
     }
 }
 
-
 // ============================================================================
 // Partition Manager Tests
 // ============================================================================
@@ -1888,4 +1886,3 @@ impl<C: ClusterCoordinator + 'static> PartitionManager<C> {
 #[cfg(test)]
 #[path = "../partition_manager_tests.rs"]
 mod tests;
-

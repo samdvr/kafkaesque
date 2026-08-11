@@ -329,7 +329,9 @@ fn snappy_xerial_bytes(data: &[u8]) -> Option<Vec<u8>> {
         if compressed_len == 0 || offset + compressed_len > data.len() {
             return None;
         }
-        let block = dec.decompress_vec(&data[offset..offset + compressed_len]).ok()?;
+        let block = dec
+            .decompress_vec(&data[offset..offset + compressed_len])
+            .ok()?;
         out.extend_from_slice(&block);
         offset += compressed_len;
         saw_block = true;

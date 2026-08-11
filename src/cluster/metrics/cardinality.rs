@@ -13,7 +13,6 @@ use super::{
 // Cardinality-aware metric recording
 // ============================================================================
 
-
 /// Pre-formatted partition labels for the common range. Most clusters keep
 /// partition counts under 1024; pre-formatting amortizes the per-record
 /// `itoa::Buffer` work and keeps a stable `&'static str` so the metric

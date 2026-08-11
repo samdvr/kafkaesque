@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [Unreleased]
+
+### Fixed
+
+- **Reconciler purged freshly created partitions.** The purge sweep decided
+  what to delete from a control snapshot taken at the top of the reconciler
+  tick, but the sub-passes ahead of it issue Raft proposals, so that view
+  could be hundreds of milliseconds stale. A topic created inside that window
+  was absent from the snapshot while its partitions were already seeded *and*
+  acquired on the shard, so the sweep deleted a live partition — wiping owner
+  and `leader_epoch`. The owner's next produce failed `RenewLease` with
+  `NotOwned`, the partition store was closed, and the partition only returned
+  on the next ownership sweep, so "create topic, produce immediately" stalled
+  for seconds (`MessageTimedOut` in `tests/rdkafka_e2e.rs` when several
+  brokers boot concurrently). The purge decision is now made against a
+  control view read *after* the shard read it is based on.
+
+
 ## [v0.2.0] - 2026-08-10
 
 ### Fixed

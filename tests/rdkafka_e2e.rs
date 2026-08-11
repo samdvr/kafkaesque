@@ -199,6 +199,74 @@ async fn rdkafka_idempotent_producer_offsets_advance() {
     }
 }
 
+/// Consumer group offset commit: produce, consume with a group, commit,
+/// and verify the committed offset sticks via a fresh consumer in the
+/// same group. Exercises FindCoordinator + Join/Sync/Heartbeat +
+/// OffsetCommit/Fetch through librdkafka's negotiated API versions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rdkafka_consumer_group_commit_round_trip() {
+    let Some((addr, _server, _tempdir)) = start_in_memory_broker().await else {
+        eprintln!("Skipping: no TCP bind permission");
+        return;
+    };
+
+    let topic = "rdkafka-group-commit";
+    let group = "rdkafka-group-commit-g";
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &addr)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("producer");
+
+    let payload = b"group-commit-payload";
+    producer
+        .send(
+            FutureRecord::to(topic).payload(payload).key(b"gk"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("produce");
+
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &addr)
+        .set("group.id", group)
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("consumer");
+
+    consumer.subscribe(&[topic]).expect("subscribe");
+
+    let recv = tokio::time::timeout(Duration::from_secs(15), consumer.recv())
+        .await
+        .expect("recv timeout")
+        .expect("recv error");
+    assert_eq!(recv.payload().expect("payload"), payload);
+
+    consumer
+        .commit_message(&recv, rdkafka::consumer::CommitMode::Sync)
+        .expect("commit_message");
+
+    // A second consumer in the same group with auto.offset.reset=latest
+    // must not re-read the committed record if the commit stuck.
+    let consumer2: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &addr)
+        .set("group.id", group)
+        .set("auto.offset.reset", "latest")
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("consumer2");
+    consumer2.subscribe(&[topic]).expect("subscribe2");
+
+    // Leave enough time for a rebalance + empty poll; we expect timeout
+    // (no new records past the committed offset).
+    let second = tokio::time::timeout(Duration::from_secs(3), consumer2.recv()).await;
+    assert!(
+        second.is_err(),
+        "committed offset must prevent re-delivery of the same record"
+    );
+}
+
 /// AdminClient: create a topic, list metadata, and delete it. Catches
 /// regressions in `CreateTopics` / `DeleteTopics` request shape and the
 /// metadata-refresh flow that `auto.create.topics.enable=true` would

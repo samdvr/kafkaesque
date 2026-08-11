@@ -20,12 +20,13 @@ fn create_test_context() -> RequestContext {
     RequestContext {
         client_addr: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
         conn_id: 1,
-        api_version: 8,
+        api_version: 2,
         client_id: Some("debug-test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),
         principal: Arc::from("User:ANONYMOUS"),
         client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
+        metrics: kafkaesque::cluster::Metrics::default(),
     }
 }
 
@@ -72,36 +73,16 @@ fn create_record_batch_with_messages(messages: &[&str]) -> Bytes {
 
     // Add records
     for (offset_delta, msg) in messages.iter().enumerate() {
-        let record_start = batch.len();
-
-        // Encode record length (varint placeholder)
-        let record_length_pos = batch.len();
-        batch.put_u8(0); // placeholder for length varint
-
-        // attributes (1 byte varint)
-        batch.put_u8(0);
-
-        // timestamp_delta (varint)
-        batch.put_u8(0);
-
-        // offset_delta (varint)
-        put_varint(&mut batch, offset_delta as i64);
-
-        // key length (varint) - null key
-        put_varint(&mut batch, -1);
-
-        // value length (varint)
-        put_varint(&mut batch, msg.len() as i64);
-
-        // value
-        batch.put_slice(msg.as_bytes());
-
-        // headers count (varint)
-        batch.put_u8(0);
-
-        // Calculate and update record length
-        let record_len = batch.len() - record_start - 1;
-        batch[record_length_pos] = record_len as u8;
+        let mut body = BytesMut::new();
+        body.put_u8(0); // attributes
+        put_varint(&mut body, 0); // timestamp_delta
+        put_varint(&mut body, offset_delta as i64);
+        put_varint(&mut body, -1); // null key
+        put_varint(&mut body, msg.len() as i64);
+        body.put_slice(msg.as_bytes());
+        put_varint(&mut body, 0); // headers count
+        put_varint(&mut batch, body.len() as i64);
+        batch.extend_from_slice(&body);
     }
 
     // Update batch length
@@ -303,8 +284,7 @@ async fn test_consumer_group_protocol_debug() {
     // Step 2: Produce messages
     // =========================================================================
     println!("\n=== STEP 2: Produce messages ===");
-    let messages = vec!["msg-1", "msg-2", "msg-3", "msg-4", "msg-5"];
-    let records = create_record_batch_with_messages(&messages);
+    let records = Bytes::from(kafkaesque::batch::build_minimal_valid_batch(5));
 
     let produce_req = ProduceRequestData {
         transactional_id: None,

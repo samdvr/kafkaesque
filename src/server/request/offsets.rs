@@ -6,7 +6,10 @@ use nom::{
 };
 use nombytes::NomBytes;
 
-use crate::parser::{parse_array, parse_kafka_string, parse_kafka_string_opt};
+use crate::parser::{
+    parse_array, parse_kafka_string, parse_kafka_string_opt, parse_nullable_array,
+    parse_nullable_string,
+};
 
 // ============================================================================
 // ListOffsets
@@ -91,8 +94,12 @@ fn parse_list_offsets_partition(
 ///   `group_id`; each partition gains `commit_timestamp` (INT64, v1 only)
 /// - v2: adds `retention_time_ms` (INT64) after `member_id`; partition
 ///   `commit_timestamp` removed
-/// - v5+: `retention_time_ms` removed (KIP-211) — not advertised here
-///   (`versions.rs` caps OffsetCommit at v2)
+/// - v3–v4: same request as v2 (response throttle at v3)
+/// - v5: drops `retention_time_ms`; adds nullable `group_instance_id`
+///   after `member_id` (parsed and ignored — static membership needs
+///   JoinGroup v5 which we refuse)
+/// - v6: per-partition `committed_leader_epoch` (INT32) after offset
+///   (parsed and ignored)
 #[derive(Debug, Clone)]
 pub struct OffsetCommitRequestData {
     pub group_id: String,
@@ -128,6 +135,13 @@ pub fn parse_offset_commit_request(
         parse_kafka_string(s)?
     } else {
         (s, String::new())
+    };
+    // v5+: nullable group_instance_id (KIP-345). Parsed and dropped — we do
+    // not honor static membership without JoinGroup v5.
+    let (s, _group_instance_id) = if version >= 5 {
+        parse_nullable_string(s)?
+    } else {
+        (s, None)
     };
     // `retention_time_ms` (INT64) exists in v2..=v4 (added v2, removed in
     // v5 by KIP-211). It sits between the group fields and the topics
@@ -175,6 +189,13 @@ fn parse_offset_commit_partition(
     // Parsed and dropped: the broker timestamps commits itself, which is
     // exactly the v0/v2+ behavior.
     let (s, _commit_timestamp) = if version == 1 { be_i64(s)? } else { (s, -1i64) };
+    // v6+: committed_leader_epoch (INT32) before metadata. Ignored until
+    // we persist leader epochs on the offset topic.
+    let (s, _committed_leader_epoch) = if version >= 6 {
+        be_i32(s)?
+    } else {
+        (s, -1i32)
+    };
     let (s, committed_metadata) = parse_kafka_string_opt(s)?;
 
     Ok((
@@ -206,10 +227,18 @@ pub struct OffsetFetchTopicData {
 
 pub fn parse_offset_fetch_request(
     s: NomBytes,
-    _version: i16,
+    version: i16,
 ) -> IResult<NomBytes, OffsetFetchRequestData> {
     let (s, group_id) = parse_kafka_string(s)?;
-    let (s, topics) = parse_array(parse_offset_fetch_topic)(s)?;
+    // Topics is nullable from v2 (null = fetch all committed offsets). We
+    // treat null as an empty list today — "fetch all" is not implemented.
+    let (s, topics) = if version >= 2 {
+        parse_nullable_array(parse_offset_fetch_topic)(s)?
+    } else {
+        parse_array(parse_offset_fetch_topic)(s)?
+    };
+    // v4+: require_stable BOOLEAN — ignored (no transactions / LSO gating).
+    let (s, _require_stable) = if version >= 4 { be_i8(s)? } else { (s, 0i8) };
 
     Ok((s, OffsetFetchRequestData { group_id, topics }))
 }
@@ -249,6 +278,9 @@ mod tests {
         if version == 1 {
             // commit_timestamp (v1 only)
             buf.extend_from_slice(&1_700_000_000_000i64.to_be_bytes());
+        }
+        if version >= 6 {
+            buf.extend_from_slice(&(-1i32).to_be_bytes()); // committed_leader_epoch
         }
         match metadata {
             Some(m) => build_string(m, buf),

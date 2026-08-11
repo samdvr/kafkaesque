@@ -44,16 +44,9 @@ const PARTITION: i32 = 0;
 /// `(ts, ts)`. Producer_id = -1 so back-to-back identical batches don't
 /// dedup. Payload is 100 bytes; CRC is computed over [21..end].
 fn build_batch_at(record_count: i32, ts_ms: i64) -> Bytes {
-    let mut batch = vec![0u8; 100];
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes()); // batch_length
-    batch[16] = 2; // magic v2
-    batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes()); // last_offset_delta
-    batch[27..35].copy_from_slice(&ts_ms.to_be_bytes()); // first_timestamp
-    batch[35..43].copy_from_slice(&ts_ms.to_be_bytes()); // max_timestamp
-    batch[43..51].copy_from_slice(&(-1i64).to_be_bytes()); // producer_id
-    batch[51..53].copy_from_slice(&(-1i16).to_be_bytes()); // producer_epoch
-    batch[53..57].copy_from_slice(&(-1i32).to_be_bytes()); // base_sequence
-    batch[57..61].copy_from_slice(&record_count.to_be_bytes()); // records_count
+    let mut batch = kafkaesque::batch::build_minimal_valid_batch(record_count);
+    batch[27..35].copy_from_slice(&ts_ms.to_be_bytes());
+    batch[35..43].copy_from_slice(&ts_ms.to_be_bytes());
     let crc = kafkaesque::protocol::crc32c(&batch[21..]);
     batch[17..21].copy_from_slice(&crc.to_be_bytes());
     Bytes::from(batch)

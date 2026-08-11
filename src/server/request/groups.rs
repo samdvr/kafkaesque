@@ -8,7 +8,7 @@ use nom::{
 use nombytes::NomBytes;
 
 use crate::constants::MAX_MEMBER_METADATA_SIZE;
-use crate::parser::{parse_array, parse_kafka_string};
+use crate::parser::{parse_array, parse_kafka_string, parse_nullable_string};
 
 // ============================================================================
 // FindCoordinator
@@ -60,11 +60,10 @@ pub struct JoinGroupProtocolData {
 /// - v1: adds `rebalance_timeout_ms` (INT32) between `session_timeout_ms`
 ///   and `member_id` (KIP-62). For v0 clients Kafka uses the session
 ///   timeout as the rebalance timeout, mirrored here.
-/// - v2: identical request layout to v1 (v2 only added `throttle_time_ms`
-///   to the *response*).
-/// - v5: adds `group_instance_id` (KIP-345) — NOT parsed here because
-///   `versions.rs` advertises JoinGroup 0..=2 only; v3+ requests are
-///   rejected with UnsupportedVersion before body parsing.
+/// - v2–v4: identical request layout to v1 (v2/v3 only changed the
+///   *response*; v4 is MemberIdRequired behavior in the handler).
+/// - v5: adds `group_instance_id` (KIP-345) — NOT advertised; rejected
+///   with UnsupportedVersion before body parsing.
 pub fn parse_join_group_request(
     s: NomBytes,
     version: i16,
@@ -129,11 +128,18 @@ pub struct HeartbeatRequestData {
 
 pub fn parse_heartbeat_request(
     s: NomBytes,
-    _version: i16,
+    version: i16,
 ) -> IResult<NomBytes, HeartbeatRequestData> {
     let (s, group_id) = parse_kafka_string(s)?;
     let (s, generation_id) = be_i32(s)?;
     let (s, member_id) = parse_kafka_string(s)?;
+    // v3+ group_instance_id (KIP-345): parse and ignore — static membership
+    // requires JoinGroup v5 which we refuse, so an instance id here is inert.
+    let (s, _group_instance_id) = if version >= 3 {
+        parse_nullable_string(s)?
+    } else {
+        (s, None)
+    };
 
     Ok((
         s,
@@ -149,25 +155,83 @@ pub fn parse_heartbeat_request(
 // LeaveGroup
 // ============================================================================
 
+/// One member entry in a LeaveGroup v3+ batch leave.
+#[derive(Debug, Clone)]
+pub struct LeaveGroupMemberData {
+    pub member_id: String,
+    /// Present on the wire for v3+; ignored (static membership not supported).
+    pub group_instance_id: Option<String>,
+}
+
 /// LeaveGroup request data.
 #[derive(Debug, Clone)]
 pub struct LeaveGroupRequestData {
     pub group_id: String,
+    /// Single-member id for v0–v2; empty when `members` carries the roster.
     pub member_id: String,
+    /// Populated for every version: one entry for v0–v2, the batch for v3+.
+    pub members: Vec<LeaveGroupMemberData>,
+}
+
+impl LeaveGroupRequestData {
+    /// Classic single-member leave (v0–v2 wire shape).
+    pub fn for_member(group_id: impl Into<String>, member_id: impl Into<String>) -> Self {
+        let member_id = member_id.into();
+        Self {
+            group_id: group_id.into(),
+            members: vec![LeaveGroupMemberData {
+                member_id: member_id.clone(),
+                group_instance_id: None,
+            }],
+            member_id,
+        }
+    }
 }
 
 pub fn parse_leave_group_request(
     s: NomBytes,
-    _version: i16,
+    version: i16,
 ) -> IResult<NomBytes, LeaveGroupRequestData> {
     let (s, group_id) = parse_kafka_string(s)?;
-    let (s, member_id) = parse_kafka_string(s)?;
+    if version >= 3 {
+        let (s, members) = parse_array(parse_leave_group_member)(s)?;
+        let member_id = members
+            .first()
+            .map(|m| m.member_id.clone())
+            .unwrap_or_default();
+        Ok((
+            s,
+            LeaveGroupRequestData {
+                group_id,
+                member_id,
+                members,
+            },
+        ))
+    } else {
+        let (s, member_id) = parse_kafka_string(s)?;
+        let members = vec![LeaveGroupMemberData {
+            member_id: member_id.clone(),
+            group_instance_id: None,
+        }];
+        Ok((
+            s,
+            LeaveGroupRequestData {
+                group_id,
+                member_id,
+                members,
+            },
+        ))
+    }
+}
 
+fn parse_leave_group_member(s: NomBytes) -> IResult<NomBytes, LeaveGroupMemberData> {
+    let (s, member_id) = parse_kafka_string(s)?;
+    let (s, group_instance_id) = parse_nullable_string(s)?;
     Ok((
         s,
-        LeaveGroupRequestData {
-            group_id,
+        LeaveGroupMemberData {
             member_id,
+            group_instance_id: group_instance_id.map(|b| String::from_utf8_lossy(&b).into_owned()),
         },
     ))
 }
@@ -193,11 +257,17 @@ pub struct SyncGroupAssignmentData {
 
 pub fn parse_sync_group_request(
     s: NomBytes,
-    _version: i16,
+    version: i16,
 ) -> IResult<NomBytes, SyncGroupRequestData> {
     let (s, group_id) = parse_kafka_string(s)?;
     let (s, generation_id) = be_i32(s)?;
     let (s, member_id) = parse_kafka_string(s)?;
+    // v3+ group_instance_id: parse and ignore (see Heartbeat).
+    let (s, _group_instance_id) = if version >= 3 {
+        parse_nullable_string(s)?
+    } else {
+        (s, None)
+    };
     let (s, assignments) = parse_array(parse_sync_group_assignment)(s)?;
 
     Ok((
@@ -620,10 +690,7 @@ mod tests {
         };
         assert!(format!("{:?}", heartbeat).contains("HeartbeatRequestData"));
 
-        let leave = LeaveGroupRequestData {
-            group_id: "g".to_string(),
-            member_id: "m".to_string(),
-        };
+        let leave = LeaveGroupRequestData::for_member("g".to_string(), "m".to_string());
         assert!(format!("{:?}", leave).contains("LeaveGroupRequestData"));
 
         let describe = DescribeGroupsRequestData {

@@ -97,11 +97,13 @@
 //! exposing the fields: broker-to-broker replication (partitions are stored
 //! once in the object store, `replication_factor > 1` is refused, and
 //! `acks=all` equals `acks=1`), log compaction, incremental fetch sessions,
-//! and transactions. Multi-node Raft adversarial coverage lives in
+//! and transactions (`transactional_id` and RecordBatch transactional /
+//! control attribute bits are refused on produce). Multi-node Raft
+//! adversarial coverage lives in
 //! `tests/p2_multinode_gap_pins_tests.rs` (in-process harness:
 //! `tests/common/raft_multinode.rs`); process-level failover is exercised
-//! by `scripts/run-cluster-e2e.sh`. Read the "Durability contract" section
-//! of `README.md` before relying on it for durability.
+//! by `scripts/run-cluster-e2e.sh`. Read the "Durability contract" and
+//! "Client compatibility" sections of `README.md` before relying on it.
 //!
 //! ## Resources
 //! - [Kafka Protocol Spec](https://kafka.apache.org/protocol.html)
@@ -115,7 +117,16 @@
 // `kafkaesque-protocol`.
 pub use kafkaesque_protocol::{bytes_chain, constants, encode, error, parser, types};
 
+mod batch_validation;
 mod protocol_async;
+
+/// Produce-path RecordBatch validation (CRC + attribute + compression).
+pub mod batch {
+    pub use crate::batch_validation::{
+        ProduceBatchValidation, build_minimal_valid_batch, validate_produce_batch,
+        validate_produce_batch_async, validate_produce_batch_attributes_only,
+    };
+}
 
 /// Re-export of [`kafkaesque_protocol::protocol`] augmented with the
 /// tokio-flavored [`validate_batch_crc_async`] helper used on the

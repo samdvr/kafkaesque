@@ -58,9 +58,24 @@ impl FindCoordinatorResponseData {
 
 impl ToByte for FindCoordinatorResponseData {
     fn encode<W: BufMut>(&self, buffer: &mut W) -> Result<()> {
-        self.throttle_time_ms.encode(buffer)?;
+        // Default to v2 framing (throttle + error_message).
+        self.encode_versioned(buffer, 2)
+    }
+}
+
+impl FindCoordinatorResponseData {
+    /// Encode for a specific API version.
+    /// - v0: error_code, node_id, host, port
+    /// - v1: throttle_time_ms + v0 fields
+    /// - v2+: throttle_time_ms, error_code, error_message, node_id, host, port
+    pub fn encode_versioned<W: BufMut>(&self, buffer: &mut W, version: i16) -> Result<()> {
+        if version >= 1 {
+            self.throttle_time_ms.encode(buffer)?;
+        }
         (self.error_code as i16).encode(buffer)?;
-        encode_nullable_string(self.error_message.as_deref(), buffer)?;
+        if version >= 2 {
+            encode_nullable_string(self.error_message.as_deref(), buffer)?;
+        }
         self.node_id.encode(buffer)?;
         self.host.encode(buffer)?;
         self.port.encode(buffer)?;
@@ -245,17 +260,36 @@ impl ToByte for HeartbeatResponseData {
 pub struct LeaveGroupResponseData {
     pub throttle_time_ms: i32,
     pub error_code: KafkaCode,
+    /// Per-member results for v3+ batch leave; empty for v0–v2.
+    pub members: Vec<LeaveGroupMemberResponse>,
+}
+
+/// One member entry in a LeaveGroup v3+ response.
+#[derive(Debug, Clone)]
+pub struct LeaveGroupMemberResponse {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub error_code: KafkaCode,
 }
 
 impl LeaveGroupResponseData {
     /// Encode for a specific API version.
     /// - v0: NO throttle_time_ms
-    /// - v1+: HAS throttle_time_ms
+    /// - v1–v2: HAS throttle_time_ms
+    /// - v3+: throttle_time_ms, top-level error_code, members array
     pub fn encode_versioned<W: BufMut>(&self, buffer: &mut W, version: i16) -> Result<()> {
         if version >= 1 {
             self.throttle_time_ms.encode(buffer)?;
         }
         (self.error_code as i16).encode(buffer)?;
+        if version >= 3 {
+            (self.members.len() as i32).encode(buffer)?;
+            for member in &self.members {
+                member.member_id.encode(buffer)?;
+                encode_nullable_string(member.group_instance_id.as_deref(), buffer)?;
+                (member.error_code as i16).encode(buffer)?;
+            }
+        }
         Ok(())
     }
 }
@@ -730,6 +764,7 @@ mod tests {
         let response = LeaveGroupResponseData {
             throttle_time_ms: 100,
             error_code: KafkaCode::None,
+            members: vec![],
         };
 
         let mut buf_v0 = Vec::new();

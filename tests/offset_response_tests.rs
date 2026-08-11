@@ -404,6 +404,7 @@ fn test_offset_fetch_partition_response_clone() {
     let partition = OffsetFetchPartitionResponse {
         partition_index: 1,
         committed_offset: 999,
+        committed_leader_epoch: -1,
         metadata: Some("meta".to_string()),
         error_code: KafkaCode::None,
     };

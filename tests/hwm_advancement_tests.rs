@@ -42,22 +42,7 @@ use common::BrokerHandle;
 const TOPIC: &str = "hwm-tests";
 
 fn build_batch(record_count: i32) -> Bytes {
-    let mut batch = vec![0u8; 100];
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes());
-    batch[16] = 2;
-    batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes());
-    // producer_id = -1 marks the batch non-idempotent. Without this, the
-    // broker treats producer_id=0 as a real idempotent producer and
-    // exact-replays of identical batches get dedup'd to the original
-    // base_offset — which silently breaks every test that produces the
-    // same fixture twice and expects HWM to advance.
-    batch[43..51].copy_from_slice(&(-1i64).to_be_bytes());
-    batch[51..53].copy_from_slice(&(-1i16).to_be_bytes()); // producer_epoch
-    batch[53..57].copy_from_slice(&(-1i32).to_be_bytes()); // base_sequence
-    batch[57..61].copy_from_slice(&record_count.to_be_bytes());
-    let crc = kafkaesque::protocol::crc32c(&batch[21..]);
-    batch[17..21].copy_from_slice(&crc.to_be_bytes());
-    Bytes::from(batch)
+    Bytes::from(kafkaesque::batch::build_minimal_valid_batch(record_count))
 }
 
 async fn ensure_topic(broker: &BrokerHandle, name: &str) {

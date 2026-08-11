@@ -135,11 +135,29 @@ impl OffsetCommitPartitionResponse {
     }
 }
 
-impl ToByte for OffsetCommitResponseData {
-    fn encode<W: BufMut>(&self, buffer: &mut W) -> Result<()> {
-        self.throttle_time_ms.encode(buffer)?;
+impl OffsetCommitResponseData {
+    /// Encode for a specific API version.
+    ///
+    /// - v0–v2: topics array only (no top-level throttle)
+    /// - v3+: `throttle_time_ms` + topics array
+    ///
+    /// Prior to this versioned encoder, `ToByte` always emitted throttle,
+    /// so a client that negotiated OffsetCommit v2 would mis-read the
+    /// topics array (the leading `0` throttle looked like an empty
+    /// topics list). Advertise at most what this encoder can frame.
+    pub fn encode_versioned<W: BufMut>(&self, buffer: &mut W, version: i16) -> Result<()> {
+        if version >= 3 {
+            self.throttle_time_ms.encode(buffer)?;
+        }
         encode_array(buffer, &self.topics)?;
         Ok(())
+    }
+}
+
+impl ToByte for OffsetCommitResponseData {
+    fn encode<W: BufMut>(&self, buffer: &mut W) -> Result<()> {
+        // Default to the highest non-flexible layout we advertise.
+        self.encode_versioned(buffer, 3)
     }
 }
 
@@ -181,6 +199,9 @@ pub struct OffsetFetchTopicResponse {
 pub struct OffsetFetchPartitionResponse {
     pub partition_index: i32,
     pub committed_offset: i64,
+    /// Leader epoch of the committed offset. Always `-1` until we persist
+    /// epochs on the offset topic; required on the wire for OffsetFetch v5+.
+    pub committed_leader_epoch: i32,
     pub metadata: Option<String>,
     pub error_code: KafkaCode,
 }
@@ -191,6 +212,7 @@ impl OffsetFetchPartitionResponse {
         Self {
             partition_index,
             committed_offset,
+            committed_leader_epoch: -1,
             metadata,
             error_code: KafkaCode::None,
         }
@@ -201,6 +223,7 @@ impl OffsetFetchPartitionResponse {
         Self {
             partition_index,
             committed_offset: -1,
+            committed_leader_epoch: -1,
             metadata: None,
             error_code: KafkaCode::None,
         }
@@ -212,11 +235,25 @@ impl OffsetFetchResponseData {
     /// - v0-v1: topics array only
     /// - v2: topics array + error_code
     /// - v3+: throttle_time_ms + topics array + error_code
+    /// - v5+: each partition includes `committed_leader_epoch` before metadata
     pub fn encode_versioned<W: BufMut>(&self, buffer: &mut W, version: i16) -> Result<()> {
         if version >= 3 {
             self.throttle_time_ms.encode(buffer)?;
         }
-        encode_array(buffer, &self.topics)?;
+        (self.topics.len() as i32).encode(buffer)?;
+        for topic in &self.topics {
+            topic.name.encode(buffer)?;
+            (topic.partitions.len() as i32).encode(buffer)?;
+            for p in &topic.partitions {
+                p.partition_index.encode(buffer)?;
+                p.committed_offset.encode(buffer)?;
+                if version >= 5 {
+                    p.committed_leader_epoch.encode(buffer)?;
+                }
+                encode_nullable_string(p.metadata.as_deref(), buffer)?;
+                (p.error_code as i16).encode(buffer)?;
+            }
+        }
         if version >= 2 {
             (self.error_code as i16).encode(buffer)?;
         }
@@ -234,6 +271,8 @@ impl ToByte for OffsetFetchResponseData {
 impl ToByte for OffsetFetchTopicResponse {
     fn encode<W: BufMut>(&self, buffer: &mut W) -> Result<()> {
         self.name.encode(buffer)?;
+        // Pre-v5 partition layout (no leader_epoch). Prefer
+        // `OffsetFetchResponseData::encode_versioned` for versioned framing.
         encode_array(buffer, &self.partitions)?;
         Ok(())
     }
@@ -321,6 +360,25 @@ mod tests {
     // ========================================================================
     // OffsetCommit Tests
     // ========================================================================
+
+    #[test]
+    fn test_offset_commit_response_encode_versioned_throttle_gate() {
+        let response = OffsetCommitResponseData {
+            throttle_time_ms: 50,
+            topics: vec![],
+        };
+
+        let mut v2 = Vec::new();
+        response.encode_versioned(&mut v2, 2).unwrap();
+        // v2: topics array only → INT32 length 0
+        assert_eq!(v2, 0i32.to_be_bytes());
+
+        let mut v3 = Vec::new();
+        response.encode_versioned(&mut v3, 3).unwrap();
+        // v3: throttle (4) + topics length (4)
+        assert_eq!(v3.len(), 8);
+        assert_eq!(&v3[..4], &50i32.to_be_bytes());
+    }
 
     #[test]
     fn test_offset_commit_response_encode() {
@@ -417,6 +475,7 @@ mod tests {
         let partition = OffsetFetchPartitionResponse {
             partition_index: 0,
             committed_offset: 12345,
+            committed_leader_epoch: -1,
             metadata: Some("test-metadata".to_string()),
             error_code: KafkaCode::None,
         };

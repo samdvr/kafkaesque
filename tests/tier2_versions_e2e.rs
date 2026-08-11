@@ -474,6 +474,7 @@ async fn default_metadata_handler_serializes_at_v9() {
         principal: Arc::from("User:ANONYMOUS"),
         client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
+        metrics: kafkaesque::cluster::Metrics::default(),
     };
 
     let resp = DefaultHandler
@@ -522,6 +523,7 @@ async fn default_fetch_handler_serializes_at_v11() {
         principal: Arc::from("User:ANONYMOUS"),
         client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
+        metrics: kafkaesque::cluster::Metrics::default(),
     };
 
     let req = FetchRequestData {
@@ -576,6 +578,7 @@ async fn default_produce_handler_serializes_at_v9() {
         principal: Arc::from("User:ANONYMOUS"),
         client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
+        metrics: kafkaesque::cluster::Metrics::default(),
     };
 
     let req = ProduceRequestData {

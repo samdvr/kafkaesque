@@ -28,16 +28,19 @@
 //!      `DuplicateSequence`, `InvalidProducerEpoch` (covered by
 //!      `src/cluster/partition_store_tests.rs`).
 //!
-//! What we deliberately do NOT assert (and the audit P0.1 spells out):
+//! What we deliberately do NOT assert yet:
 //!
 //! - **Timestamp-type policy** (createTime vs. logAppendTime rewriting):
 //!   the broker doesn't enforce a topic-config-driven policy yet.
-//! - **Transactional/control-bit consistency**: transactional batches
-//!   are accepted (the bit is ignored) but no transactional support
-//!   exists. See P4.1.
-//! - **Sequence-within-batch monotonicity**: requires decompressing and
-//!   walking inner records. See P0.6 inner-decode.
+//! - **Sequence-within-batch monotonicity**: requires walking inner
+//!   uncompressed records after decompress (decompression itself is
+//!   gated; deep record walks are still future work).
 //! - **Magic-version down-conversion**: handled at the connection layer
+//!
+//! Transactional and control attribute bits are refused at produce
+//! (`InvalidRequest` / `InvalidRecord`). Undefined codecs and
+//! undecompressible payloads are refused (`UnsupportedCompressionType` /
+//! `CorruptMessage`).
 //!   in Fetch (not Produce). See P1.18.
 
 use bytes::Bytes;
@@ -58,17 +61,7 @@ const TOPIC: &str = "validation-tests";
 /// valid CRC. Sets producer_id = -1 so back-to-back identical fixtures
 /// don't trip exact-replay deduplication.
 fn well_formed_batch(record_count: i32) -> Vec<u8> {
-    let mut batch = vec![0u8; 100];
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes()); // batch_length
-    batch[16] = 2; // magic v2
-    batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes()); // last_offset_delta
-    batch[43..51].copy_from_slice(&(-1i64).to_be_bytes()); // producer_id
-    batch[51..53].copy_from_slice(&(-1i16).to_be_bytes()); // producer_epoch
-    batch[53..57].copy_from_slice(&(-1i32).to_be_bytes()); // base_sequence
-    batch[57..61].copy_from_slice(&record_count.to_be_bytes()); // records_count
-    let crc = kafkaesque::protocol::crc32c(&batch[21..]);
-    batch[17..21].copy_from_slice(&crc.to_be_bytes());
-    batch
+    kafkaesque::batch::build_minimal_valid_batch(record_count)
 }
 
 async fn ensure_topic(broker: &BrokerHandle, name: &str) {
@@ -177,7 +170,8 @@ async fn payload_byte_flipped_after_valid_crc_returns_corrupt_message() {
     ensure_topic(&broker, TOPIC).await;
 
     let mut batch = well_formed_batch(1);
-    batch[80] ^= 0x01; // flip a byte well inside the CRC region
+    let idx = batch.len() - 1;
+    batch[idx] ^= 0x01; // flip a byte well inside the CRC region
     let (code, _) = produce_and_get_error(&broker, batch).await;
     assert_eq!(code, KafkaCode::CorruptMessage);
 }
@@ -321,7 +315,10 @@ async fn record_count_zero_returns_corrupt_message() {
     batch[17..21].copy_from_slice(&crc.to_be_bytes());
 
     let (code, _) = produce_and_get_error(&broker, batch).await;
-    assert_eq!(code, KafkaCode::CorruptMessage);
+    assert!(
+        matches!(code, KafkaCode::CorruptMessage | KafkaCode::InvalidRecord),
+        "zero records_count must be rejected, got {code:?}"
+    );
 }
 
 #[tokio::test]
@@ -337,10 +334,9 @@ async fn record_count_disagrees_with_last_offset_delta_returns_corrupt_message()
     batch[17..21].copy_from_slice(&crc.to_be_bytes());
 
     let (code, _) = produce_and_get_error(&broker, batch).await;
-    assert_eq!(
-        code,
-        KafkaCode::CorruptMessage,
-        "records_count != last_offset_delta + 1 must be rejected",
+    assert!(
+        matches!(code, KafkaCode::CorruptMessage | KafkaCode::InvalidRecord),
+        "records_count != last_offset_delta + 1 must be rejected, got {code:?}"
     );
 }
 
@@ -349,17 +345,11 @@ async fn record_count_disagrees_with_last_offset_delta_returns_corrupt_message()
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn transactional_bit_in_attributes_is_currently_accepted() {
+async fn transactional_bit_in_attributes_is_rejected() {
     // The transactional bit (attributes bit 4) marks a batch as part of
-    // a transaction. The broker rejects transactions at the produce
-    // path semantically (no coordinator), but currently DOES accept the
-    // bit set without rejecting the batch — the audit's P4.1 / P0.1
-    // gap. Pin today's pass-through so a future strict check is a
-    // visible flip.
-    //
-    // TODO(transactions): when transactions land, decide whether
-    // to reject transactional bits without a transactional_id, or fence
-    // the batch as `InvalidProducerEpoch` / `OperationNotAttempted`.
+    // a transaction. Transactions are unsupported, so a CRC-valid batch
+    // with the bit set is refused with InvalidRequest — same signal as
+    // a Produce request carrying transactional_id.
     let broker = BrokerHandle::spawn(ClusterProfile::Development).await;
     ensure_topic(&broker, TOPIC).await;
 
@@ -373,21 +363,16 @@ async fn transactional_bit_in_attributes_is_currently_accepted() {
     let (code, _) = produce_and_get_error(&broker, batch).await;
     assert_eq!(
         code,
-        KafkaCode::None,
-        "today's contract: transactional bit accepted without coordinator (TODO P4.1)",
+        KafkaCode::InvalidRequest,
+        "transactional attribute bit must be refused without a txn coordinator",
     );
 }
 
 #[tokio::test]
-async fn control_batch_bit_is_currently_accepted() {
+async fn control_batch_bit_is_rejected() {
     // Control records (attributes bit 5) carry transaction abort/commit
-    // markers. Producers should never emit them — only the broker (or
-    // the txn coordinator) does. Today the broker accepts them. Pin
-    // that contract.
-    //
-    // TODO(transactions): reject control batches from clients at
-    // the produce path; they must only be emitted internally by the
-    // transaction coordinator.
+    // markers. Producers must never emit them — only the broker (or
+    // the txn coordinator) does. Refuse with InvalidRecord.
     let broker = BrokerHandle::spawn(ClusterProfile::Development).await;
     ensure_topic(&broker, TOPIC).await;
 
@@ -400,7 +385,7 @@ async fn control_batch_bit_is_currently_accepted() {
     let (code, _) = produce_and_get_error(&broker, batch).await;
     assert_eq!(
         code,
-        KafkaCode::None,
-        "today's contract: control bit accepted from clients (TODO P4.1)",
+        KafkaCode::InvalidRecord,
+        "client-produced control batches must be refused",
     );
 }

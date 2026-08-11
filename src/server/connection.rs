@@ -911,14 +911,11 @@ pub trait AuthRateLimited {
 /// Track connection metrics (open/close).
 /// Unified metrics handling.
 fn track_connection_open() {
-    crate::cluster::metrics::ACTIVE_CONNECTIONS.inc();
-    crate::cluster::metrics::TOTAL_CONNECTIONS
-        .with_label_values(&["success"])
-        .inc();
+    crate::cluster::Metrics::current().connection_opened("success");
 }
 
 fn track_connection_close() {
-    crate::cluster::metrics::ACTIVE_CONNECTIONS.dec();
+    crate::cluster::Metrics::current().connection_closed();
 }
 
 /// Result of auth-related request processing.
@@ -1057,6 +1054,7 @@ async fn dispatch_request_common<H: Handler>(
         principal,
         client_host,
         transport_tls,
+        metrics: crate::cluster::Metrics::current(),
     };
 
     tracing::debug!(
@@ -1144,10 +1142,14 @@ async fn dispatch_request_common<H: Handler>(
             }
             encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
-        Request::OffsetCommit(_, req) => encode_response(
-            correlation_id,
-            &handler.handle_offset_commit(&ctx, req).await,
-        ),
+        Request::OffsetCommit(header, req) => {
+            let resp = handler.handle_offset_commit(&ctx, req).await;
+            let mut body = Vec::new();
+            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
+                return (Err(e), auth_result);
+            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
+        }
         Request::OffsetFetch(header, req) => {
             let resp = handler.handle_offset_fetch(&ctx, req).await;
             error_code_label = resp.error_code.metric_label();
@@ -1157,10 +1159,14 @@ async fn dispatch_request_common<H: Handler>(
             }
             encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
-        Request::FindCoordinator(_, req) => {
+        Request::FindCoordinator(header, req) => {
             let resp = handler.handle_find_coordinator(&ctx, req).await;
             error_code_label = resp.error_code.metric_label();
-            encode_response(correlation_id, &resp)
+            let mut body = Vec::new();
+            if let Err(e) = resp.encode_versioned(&mut body, header.api_version) {
+                return (Err(e), auth_result);
+            }
+            encode_versioned_raw_response(correlation_id, header.api_key, header.api_version, body)
         }
         Request::JoinGroup(header, req) => {
             let resp = handler.handle_join_group(&ctx, req).await;

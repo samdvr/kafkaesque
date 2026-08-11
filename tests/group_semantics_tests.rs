@@ -60,12 +60,15 @@ fn create_test_context() -> RequestContext {
     RequestContext {
         client_addr: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
         conn_id: 1,
-        api_version: 8,
+        // Classic JoinGroup (generate-and-join). v4 MemberIdRequired is
+        // covered by `join_group_v4_empty_member_id_requires_retry`.
+        api_version: 2,
         client_id: Some("test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),
         principal: Arc::from("User:ANONYMOUS"),
         client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
+        metrics: kafkaesque::cluster::Metrics::default(),
     }
 }
 
@@ -529,10 +532,7 @@ async fn test_leave_group_unknown_member_returns_unknown_member_id() {
     let resp = handler
         .handle_leave_group(
             &ctx,
-            LeaveGroupRequestData {
-                group_id: "never-existed-group".to_string(),
-                member_id: "ghost".to_string(),
-            },
+            LeaveGroupRequestData::for_member("never-existed-group".to_string(), "ghost".to_string()),
         )
         .await;
     assert_eq!(resp.error_code, KafkaCode::UnknownMemberId);
@@ -549,10 +549,7 @@ async fn test_leave_group_unknown_member_returns_unknown_member_id() {
     let resp = handler
         .handle_leave_group(
             &ctx,
-            LeaveGroupRequestData {
-                group_id: "leave-unknown-group".to_string(),
-                member_id: "ghost".to_string(),
-            },
+            LeaveGroupRequestData::for_member("leave-unknown-group".to_string(), "ghost".to_string()),
         )
         .await;
     assert_eq!(resp.error_code, KafkaCode::UnknownMemberId);
@@ -572,10 +569,7 @@ async fn test_leave_group_known_member_succeeds() {
     let resp = handler
         .handle_leave_group(
             &ctx,
-            LeaveGroupRequestData {
-                group_id: group.to_string(),
-                member_id: join.member_id.clone(),
-            },
+            LeaveGroupRequestData::for_member(group.to_string(), join.member_id.clone()),
         )
         .await;
     assert_eq!(resp.error_code, KafkaCode::None);
@@ -584,10 +578,7 @@ async fn test_leave_group_known_member_succeeds() {
     let resp = handler
         .handle_leave_group(
             &ctx,
-            LeaveGroupRequestData {
-                group_id: group.to_string(),
-                member_id: join.member_id,
-            },
+            LeaveGroupRequestData::for_member(group.to_string(), join.member_id),
         )
         .await;
     assert_eq!(resp.error_code, KafkaCode::UnknownMemberId);
@@ -697,4 +688,32 @@ async fn test_metadata_reports_raft_leader_as_controller() {
     // controller must be broker 1 (not -1, and derived from Raft state
     // rather than blindly echoing self).
     assert_eq!(metadata.controller_id, 1);
+}
+
+#[tokio::test]
+async fn join_group_v4_empty_member_id_requires_retry() {
+    let handler = create_test_handler().await;
+    let mut ctx = create_test_context();
+    ctx.api_version = 4;
+
+    let first = handler
+        .handle_join_group(
+            &ctx,
+            join_request("kip394-group", "", vec![("range", b"sub")]),
+        )
+        .await;
+    assert_eq!(first.error_code, KafkaCode::MemberIdRequired);
+    assert!(
+        !first.member_id.is_empty(),
+        "MemberIdRequired must return a generated member id"
+    );
+
+    let second = handler
+        .handle_join_group(
+            &ctx,
+            join_request("kip394-group", &first.member_id, vec![("range", b"sub")]),
+        )
+        .await;
+    assert_eq!(second.error_code, KafkaCode::None);
+    assert_eq!(second.member_id, first.member_id);
 }

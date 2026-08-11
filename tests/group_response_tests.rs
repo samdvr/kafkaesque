@@ -284,7 +284,8 @@ fn test_leave_group_with_no_error() {
     let response = LeaveGroupResponseData {
         throttle_time_ms: 0,
         error_code: KafkaCode::None,
-    };
+            members: vec![],
+        };
 
     assert_eq!(response.error_code, KafkaCode::None);
     assert_eq!(response.throttle_time_ms, 0);
@@ -295,7 +296,8 @@ fn test_leave_group_with_error() {
     let response = LeaveGroupResponseData {
         throttle_time_ms: 0,
         error_code: KafkaCode::UnknownMemberId,
-    };
+            members: vec![],
+        };
 
     assert_eq!(response.error_code, KafkaCode::UnknownMemberId);
 }
@@ -320,7 +322,8 @@ fn test_leave_group_clone() {
     let response = LeaveGroupResponseData {
         throttle_time_ms: 0,
         error_code: KafkaCode::None,
-    };
+            members: vec![],
+        };
     let cloned = response.clone();
     assert_eq!(response.error_code, cloned.error_code);
 }

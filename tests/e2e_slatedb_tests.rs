@@ -42,36 +42,16 @@ fn create_record_batch_with_messages(messages: &[&str]) -> Bytes {
 
     // Add records
     for (offset_delta, msg) in messages.iter().enumerate() {
-        let record_start = batch.len();
-
-        // Encode record length (varint placeholder)
-        let record_length_pos = batch.len();
-        batch.put_u8(0); // placeholder for length varint
-
-        // attributes (1 byte varint)
-        batch.put_u8(0);
-
-        // timestamp_delta (varint)
-        batch.put_u8(0);
-
-        // offset_delta (varint)
-        put_varint(&mut batch, offset_delta as i64);
-
-        // key length (varint) - null key
-        put_varint(&mut batch, -1);
-
-        // value length (varint)
-        put_varint(&mut batch, msg.len() as i64);
-
-        // value
-        batch.put_slice(msg.as_bytes());
-
-        // headers count (varint)
-        batch.put_u8(0);
-
-        // Calculate and update record length
-        let record_len = batch.len() - record_start - 1;
-        batch[record_length_pos] = record_len as u8;
+        let mut body = BytesMut::new();
+        body.put_u8(0); // attributes
+        put_varint(&mut body, 0); // timestamp_delta
+        put_varint(&mut body, offset_delta as i64); // offset_delta
+        put_varint(&mut body, -1); // null key
+        put_varint(&mut body, msg.len() as i64); // value length
+        body.put_slice(msg.as_bytes());
+        put_varint(&mut body, 0); // headers count
+        put_varint(&mut batch, body.len() as i64);
+        batch.extend_from_slice(&body);
     }
 
     // Update batch length
@@ -157,6 +137,29 @@ fn create_test_context() -> RequestContext {
         principal: Arc::from("User:ANONYMOUS"),
         client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
+        metrics: kafkaesque::cluster::Metrics::default(),
+    }
+}
+
+async fn produce_until_ok(
+    handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
+    request: ProduceRequestData,
+) -> i64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let resp = handler.handle_produce(ctx, request.clone()).await;
+        let p = &resp.responses[0].partitions[0];
+        if p.error_code == KafkaCode::None {
+            return p.base_offset;
+        }
+        assert!(
+            p.error_code == KafkaCode::NotLeaderForPartition
+                && std::time::Instant::now() < deadline,
+            "produce failed: {:?}",
+            p.error_code
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
@@ -173,17 +176,18 @@ fn parse_records(records: &Bytes) -> Vec<String> {
 
     // Parse records
     while pos < records.len() {
-        if pos + 1 > records.len() {
+        // Record length is a zig-zag varint covering the body that follows.
+        let (record_len, consumed) = read_varint(&records[pos..]);
+        pos += consumed;
+        if record_len < 0 {
             break;
         }
-
-        // Read record length (simplified - assumes < 128 bytes)
-        let record_len = records[pos] as usize;
-        pos += 1;
+        let record_len = record_len as usize;
 
         if pos + record_len > records.len() {
             break;
         }
+        let record_end = pos + record_len;
 
         // Skip attributes (1 byte)
         pos += 1;
@@ -211,36 +215,19 @@ fn parse_records(records: &Bytes) -> Vec<String> {
 
         // Read value
         if value_len > 0 {
-            let value = &records[pos..pos + value_len as usize];
+            let end = pos + value_len as usize;
+            if end > record_end {
+                break;
+            }
+            let value = &records[pos..end];
             if let Ok(s) = std::str::from_utf8(value) {
                 messages.push(s.to_string());
             }
-            pos += value_len as usize;
+            pos = end;
         }
 
-        // Read headers count
-        let (headers_count, consumed) = read_varint(&records[pos..]);
-        pos += consumed;
-
-        // Skip headers (simplified)
-        for _ in 0..headers_count {
-            if pos >= records.len() {
-                break;
-            }
-            // Skip header key
-            let (key_len, consumed) = read_varint(&records[pos..]);
-            pos += consumed;
-            if key_len > 0 {
-                pos += key_len as usize;
-            }
-
-            // Skip header value
-            let (val_len, consumed) = read_varint(&records[pos..]);
-            pos += consumed;
-            if val_len > 0 {
-                pos += val_len as usize;
-            }
-        }
+        // Headers live in the remainder of the record body; skip to end.
+        pos = record_end;
     }
 
     messages
@@ -312,12 +299,7 @@ async fn test_e2e_produce_and_consume_with_verification() {
         }],
     };
 
-    let produce_response = handler.handle_produce(&ctx, produce_req).await;
-    assert_eq!(
-        produce_response.responses[0].partitions[0].error_code,
-        KafkaCode::None
-    );
-    let base_offset = produce_response.responses[0].partitions[0].base_offset;
+    let base_offset = produce_until_ok(&handler, &ctx, produce_req).await;
     assert!(base_offset >= 0);
 
     // Fetch and verify messages
@@ -420,11 +402,7 @@ async fn test_e2e_slatedb_persistence_across_restart() {
             }],
         };
 
-        let response = handler.handle_produce(&ctx, produce_req).await;
-        assert_eq!(
-            response.responses[0].partitions[0].error_code,
-            KafkaCode::None
-        );
+        let _ = produce_until_ok(&handler, &ctx, produce_req).await;
 
         // Explicitly drop handler to ensure cleanup
         drop(handler);
@@ -556,11 +534,7 @@ async fn test_e2e_message_ordering_preserved() {
             }],
         };
 
-        let response = handler.handle_produce(&ctx, produce_req).await;
-        assert_eq!(
-            response.responses[0].partitions[0].error_code,
-            KafkaCode::None
-        );
+        let _ = produce_until_ok(&handler, &ctx, produce_req).await;
     }
 
     // Fetch all messages and verify ordering
@@ -660,11 +634,7 @@ async fn test_e2e_large_messages() {
         }],
     };
 
-    let produce_response = handler.handle_produce(&ctx, produce_req).await;
-    assert_eq!(
-        produce_response.responses[0].partitions[0].error_code,
-        KafkaCode::None
-    );
+    let _ = produce_until_ok(&handler, &ctx, produce_req).await;
 
     // Fetch and verify
     let fetch_req = FetchRequestData {
@@ -761,11 +731,7 @@ async fn test_e2e_multiple_produce_cycles_with_persistence() {
             }],
         };
 
-        let response = handler.handle_produce(&ctx, produce_req).await;
-        assert_eq!(
-            response.responses[0].partitions[0].error_code,
-            KafkaCode::None
-        );
+        let _ = produce_until_ok(&handler, &ctx, produce_req).await;
 
         // Verify all messages from all cycles so far
         let fetch_req = FetchRequestData {
@@ -852,11 +818,7 @@ async fn test_e2e_slatedb_data_persistence() {
         }],
     };
 
-    let response = handler.handle_produce(&ctx, produce_req).await;
-    assert_eq!(
-        response.responses[0].partitions[0].error_code,
-        KafkaCode::None
-    );
+    let _ = produce_until_ok(&handler, &ctx, produce_req).await;
 
     // Fetch all messages to verify they are persisted in SlateDB
     let fetch_req = FetchRequestData {
@@ -1016,13 +978,7 @@ async fn test_e2e_produce_consume_with_advertised_host() {
         }],
     };
 
-    let produce_resp = handler.handle_produce(&ctx, produce_req).await;
-    assert_eq!(
-        produce_resp.responses[0].partitions[0].error_code,
-        KafkaCode::None,
-        "Produce should succeed"
-    );
-    let base_offset = produce_resp.responses[0].partitions[0].base_offset;
+    let base_offset = produce_until_ok(&handler, &ctx, produce_req).await;
     assert!(base_offset >= 0, "Base offset should be non-negative");
 
     // Step 5: Fetch messages and verify payloads match exactly

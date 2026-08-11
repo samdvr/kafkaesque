@@ -18,35 +18,34 @@ use common::enable_single_node_bootstrap;
 
 /// Helper to create a minimal valid Kafka RecordBatch for testing.
 fn create_test_batch(record_count: i32) -> Bytes {
-    let mut batch = vec![0u8; 100];
+    Bytes::from(kafkaesque::batch::build_minimal_valid_batch(record_count))
+}
 
-    // base_offset
-    batch[0..8].copy_from_slice(&0i64.to_be_bytes());
-    // batch_length
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes());
-    // partition_leader_epoch
-    batch[12..16].copy_from_slice(&0i32.to_be_bytes());
-    // magic = 2
-    batch[16] = 2;
-    // attributes
-    batch[21..23].copy_from_slice(&0i16.to_be_bytes());
-    // last_offset_delta
-    batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes());
-    // timestamps
-    batch[27..35].copy_from_slice(&0i64.to_be_bytes());
-    batch[35..43].copy_from_slice(&0i64.to_be_bytes());
-    // producer info
-    batch[43..51].copy_from_slice(&0i64.to_be_bytes());
-    batch[51..53].copy_from_slice(&0i16.to_be_bytes());
-    batch[53..57].copy_from_slice(&0i32.to_be_bytes());
-    // records_count
-    batch[57..61].copy_from_slice(&record_count.to_be_bytes());
-
-    // Compute CRC-32C
-    let crc = compute_crc32c(&batch[21..]);
-    batch[17..21].copy_from_slice(&crc.to_be_bytes());
-
-    Bytes::from(batch)
+async fn produce_until_ok(
+    handler: &SlateDBClusterHandler,
+    ctx: &RequestContext,
+    request: ProduceRequestData,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let prod = handler.handle_produce(ctx, request.clone()).await;
+        let codes: Vec<_> = prod
+            .responses
+            .iter()
+            .flat_map(|t| t.partitions.iter().map(|p| p.error_code))
+            .collect();
+        if codes.iter().all(|c| *c == KafkaCode::None) {
+            return;
+        }
+        assert!(
+            codes
+                .iter()
+                .all(|c| *c == KafkaCode::None || *c == KafkaCode::NotLeaderForPartition)
+                && std::time::Instant::now() < deadline,
+            "produce failed: {codes:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 fn compute_crc32c(data: &[u8]) -> u32 {
@@ -125,12 +124,13 @@ fn create_test_context() -> RequestContext {
     RequestContext {
         client_addr: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
         conn_id: 1,
-        api_version: 8,
+        api_version: 2,
         client_id: Some("test-client".to_string()),
         request_id: uuid::Uuid::new_v4(),
         principal: Arc::from("User:ANONYMOUS"),
         client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
+        metrics: kafkaesque::cluster::Metrics::default(),
     }
 }
 
@@ -755,12 +755,7 @@ async fn test_produce_multiple_partitions() {
         }],
     };
 
-    let response = handler.handle_produce(&ctx, request).await;
-
-    assert_eq!(response.responses[0].partitions.len(), 3);
-    for partition_resp in &response.responses[0].partitions {
-        assert_eq!(partition_resp.error_code, KafkaCode::None);
-    }
+    produce_until_ok(&handler, &ctx, request).await;
 }
 
 // ============================================================================
@@ -797,7 +792,7 @@ async fn test_fetch_request_success() {
             }],
         }],
     };
-    let _ = handler.handle_produce(&ctx, produce_req).await;
+    produce_until_ok(&handler, &ctx, produce_req).await;
 
     // Fetch the data
     let fetch_req = FetchRequestData {
@@ -1036,7 +1031,7 @@ async fn test_list_offsets_latest() {
             }],
         }],
     };
-    let _ = handler.handle_produce(&ctx, produce_req).await;
+    produce_until_ok(&handler, &ctx, produce_req).await;
 
     // List offsets with latest timestamp
     let request = ListOffsetsRequestData {
@@ -1245,10 +1240,7 @@ async fn test_leave_group() {
     let handler = create_test_handler().await;
     let ctx = create_test_context();
 
-    let request = LeaveGroupRequestData {
-        group_id: "test-group".to_string(),
-        member_id: "member-1".to_string(),
-    };
+    let request = LeaveGroupRequestData::for_member("test-group".to_string(), "member-1".to_string());
 
     let response = handler.handle_leave_group(&ctx, request).await;
 

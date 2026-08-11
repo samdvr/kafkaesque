@@ -388,14 +388,7 @@ async fn end_offset_reflects_live_hwm_after_produce() {
     let before_offset = before.topics[0].partitions[0].end_offset;
 
     // Produce a 5-record batch.
-    let mut bytes = vec![0u8; 100];
-    bytes[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes());
-    bytes[16] = 2;
-    bytes[23..27].copy_from_slice(&4i32.to_be_bytes()); // last_offset_delta
-    bytes[57..61].copy_from_slice(&5i32.to_be_bytes()); // record_count
-    let crc = kafkaesque::protocol::crc32c(&bytes[21..]);
-    bytes[17..21].copy_from_slice(&crc.to_be_bytes());
-    let payload = Bytes::from(bytes);
+    let payload = Bytes::from(kafkaesque::batch::build_minimal_valid_batch(5));
 
     // ensure_topic waits until the read path returns ownership, but the
     // partition manager may still be opening the SlateDB store for

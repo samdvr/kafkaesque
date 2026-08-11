@@ -61,22 +61,7 @@ fn crc32c(data: &[u8]) -> u32 {
 /// Build a non-idempotent record batch (`producer_id = -1`). The framing
 /// matches what the produce handler hands to `PartitionStore::append_batch_durable`.
 fn build_batch(record_count: i32) -> Bytes {
-    let mut batch = vec![0u8; 100];
-    batch[0..8].copy_from_slice(&0i64.to_be_bytes()); // base_offset
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes()); // batch_length
-    batch[12..16].copy_from_slice(&0i32.to_be_bytes()); // partition_leader_epoch
-    batch[16] = 2; // magic
-    batch[21..23].copy_from_slice(&0i16.to_be_bytes()); // attributes
-    batch[23..27].copy_from_slice(&(record_count - 1).to_be_bytes()); // last_offset_delta
-    batch[27..35].copy_from_slice(&0i64.to_be_bytes()); // base_timestamp
-    batch[35..43].copy_from_slice(&0i64.to_be_bytes()); // max_timestamp
-    batch[43..51].copy_from_slice(&(-1i64).to_be_bytes()); // producer_id (non-idempotent)
-    batch[51..53].copy_from_slice(&0i16.to_be_bytes()); // producer_epoch
-    batch[53..57].copy_from_slice(&0i32.to_be_bytes()); // base_sequence
-    batch[57..61].copy_from_slice(&record_count.to_be_bytes()); // records_count
-    let crc = crc32c(&batch[21..]);
-    batch[17..21].copy_from_slice(&crc.to_be_bytes());
-    Bytes::from(batch)
+    Bytes::from(kafkaesque::batch::build_minimal_valid_batch(record_count))
 }
 
 /// Bootstrap a two-broker mock cluster sharing coordination state.

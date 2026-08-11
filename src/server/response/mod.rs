@@ -207,6 +207,7 @@ mod tests {
         let response = LeaveGroupResponseData {
             throttle_time_ms: 0,
             error_code: KafkaCode::UnknownMemberId,
+            members: vec![],
         };
         let mut buf = Vec::new();
         response.encode(&mut buf).unwrap();
@@ -387,6 +388,7 @@ mod tests {
         let response = OffsetFetchPartitionResponse {
             partition_index: 0,
             committed_offset: 42,
+            committed_leader_epoch: -1,
             metadata: Some("meta".to_string()),
             error_code: KafkaCode::None,
         };

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Classic group API ceilings raised** (still short of flexible / static
+  membership): FindCoordinator→2, Heartbeat/SyncGroup→3 (instance id
+  parsed+ignored), LeaveGroup→3 (batch leave), JoinGroup→4 (KIP-394
+  MemberIdRequired), OffsetCommit→6, OffsetFetch→5 (`committed_leader_epoch`
+  always -1). JoinGroup v5+ and flexible group APIs remain refused.
+- **Produce inner-record validation.** After decompress (or for
+  uncompressed batches), the broker walks the records section and rejects
+  batches whose header `records_count` does not match the walk
+  (`InvalidRecord`).
+- **Fetch session refuse path aligned** in P1 pins with
+  `fetch_session_contract_tests` (`session_id≠0` → FetchSessionIdNotFound).
+- **OffsetCommit advertised through v3** with a versioned response encoder.
+  Throttle is emitted only for v3+; v0–v2 responses no longer prepend a
+  spurious throttle that made negotiating clients mis-read the topics array.
+- **OffsetFetch advertised through v3** (top-level `error_code` at v2,
+  `throttle_time_ms` at v3). The encoder already handled these layouts; the
+  broker now advertises them so Java/librdkafka negotiate matching framing.
+- **Produce refuse-don't-lie at the RecordBatch layer.** CRC-valid batches
+  with the transactional attribute bit, the control-batch bit, an undefined
+  compression codec, or an undecompressible records section are rejected
+  (`InvalidRequest` / `InvalidRecord` / `UnsupportedCompressionType` /
+  `CorruptMessage`). `InvalidRecord` (87) added to `KafkaCode`.
+- **Metrics isolation.** `Metrics::current()` / `scope_sync` / `scope_async`
+  carry circuit-breaker state and connection counters. `RequestContext` and
+  `KafkaServer` thread the handle; fencing circuit-breaker tests no longer
+  need `#[serial]`.
+- **Module carve.** `metrics`, `partition_store`, and `partition_manager`
+  are directories modules (registration / circuit_breaker / raft / cardinality;
+  append / fetch / builder; acquire / ownership / zombie / jitter).
+
+### Added
+
+- **Java `kafka-clients` smoke** (`java-smoke/` + `scripts/run-java-smoke.sh`)
+  and required CI job `java-client-matrix` (Temurin 17 + Maven).
+- librdkafka e2e: consumer-group OffsetCommit round-trip.
+- Client compatibility matrix (README) + table lock tests + TCP wire tests
+  (`client_compat_wire_tests`) asserting ApiVersions ceilings and JoinGroup
+  v5 → UnsupportedVersion without closing the socket.
+- `raft-chaos-nightly` CI job (schedule / workflow_dispatch): runs the
+  ignored multi-node Raft linearizability test, scaled failover stress, and
+  a longer loom preemption smoke.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added
@@ -88,13 +132,13 @@ the code again.
 - Fetch (v4–v11)
 - ListOffsets (v0–v2)
 - Metadata (v0–v9)
-- OffsetCommit (v0–v2)
-- OffsetFetch (v0–v1)
-- FindCoordinator (v0–v1)
-- JoinGroup (v0–v2)
-- Heartbeat (v0–v1)
-- LeaveGroup (v0–v1)
-- SyncGroup (v0–v1)
+- OffsetCommit (v0–v6)
+- OffsetFetch (v0–v5)
+- FindCoordinator (v0–v2)
+- JoinGroup (v0–v4)
+- Heartbeat (v0–v3)
+- LeaveGroup (v0–v3)
+- SyncGroup (v0–v3)
 - DescribeGroups (v0–v1)
 - ListGroups (v0–v2)
 - SaslHandshake (v0–v1)
@@ -129,7 +173,9 @@ Called out because the wire protocol makes them look available:
   other fields; responses always carry `session_id = 0`, the spec's
   sessionless path, and a `session_id` the broker never issued is answered
   with `FETCH_SESSION_ID_NOT_FOUND`.
-- **Transactions.** `transactional_id` is rejected at produce time.
+- **Transactions.** `transactional_id` is rejected at produce time, and
+  RecordBatch attribute bit 4 (transactional) / bit 5 (control) are
+  refused on the produce path.
 
 ## [0.1.0] - 2026-01-01
 

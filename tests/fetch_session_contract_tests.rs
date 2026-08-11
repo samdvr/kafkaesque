@@ -57,17 +57,7 @@ const TOPIC: &str = "fetch-session-contract";
 /// the other fetch/produce tests use (the CRC must be real — the broker
 /// validates it).
 fn make_batch() -> Bytes {
-    let mut batch = vec![0u8; 100];
-    batch[8..12].copy_from_slice(&(100i32 - 12).to_be_bytes()); // batch_length
-    batch[16] = 2; // magic v2
-    batch[23..27].copy_from_slice(&0i32.to_be_bytes()); // last_offset_delta
-    batch[43..51].copy_from_slice(&(-1i64).to_be_bytes()); // producer_id
-    batch[51..53].copy_from_slice(&(-1i16).to_be_bytes()); // producer_epoch
-    batch[53..57].copy_from_slice(&(-1i32).to_be_bytes()); // base_sequence
-    batch[57..61].copy_from_slice(&1i32.to_be_bytes()); // records_count
-    let crc = kafkaesque::protocol::crc32c(&batch[21..]);
-    batch[17..21].copy_from_slice(&crc.to_be_bytes());
-    Bytes::from(batch)
+    Bytes::from(kafkaesque::batch::build_minimal_valid_batch(1))
 }
 
 async fn setup() -> BrokerHandle {

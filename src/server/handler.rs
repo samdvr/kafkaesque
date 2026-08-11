@@ -74,6 +74,11 @@ pub struct RequestContext {
     pub client_host: Arc<str>,
     /// True when the request arrived over a TLS-wrapped transport.
     pub transport_tls: bool,
+    /// Per-request metrics handle. Defaults to the process-global registry;
+    /// tests and embeds can install an isolated handle via
+    /// [`crate::cluster::Metrics::scope_async`] so parallel suites do not
+    /// share circuit-breaker / connection state.
+    pub metrics: crate::cluster::Metrics,
 }
 
 impl RequestContext {
@@ -401,6 +406,7 @@ pub trait Handler: Send + Sync {
                         .map(|idx| OffsetFetchPartitionResponse {
                             partition_index: idx,
                             committed_offset: -1,
+                            committed_leader_epoch: -1,
                             metadata: None,
                             error_code: KafkaCode::None,
                         })
@@ -465,6 +471,7 @@ pub trait Handler: Send + Sync {
         LeaveGroupResponseData {
             throttle_time_ms: 0,
             error_code: KafkaCode::None,
+            members: vec![],
         }
     }
 

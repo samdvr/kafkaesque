@@ -11,19 +11,12 @@
 //!   bits 6+    reserved
 //! ```
 //!
-//! Kafkaesque today treats compressed payloads as opaque bytes: the produce
-//! path validates the v2 header (magic, batch_length, CRC, record_count) and
-//! persists the payload unchanged; the fetch path returns it unchanged. The
-//! CRC at bytes 17–20 covers bytes 21+ — i.e. the compressed payload is
-//! covered by the CRC even though the broker never decodes it. Real Kafka
-//! clients (librdkafka, Java) compress on the producer side and decompress
-//! on the consumer side, so this pass-through model is functionally
-//! correct. What it does NOT do is validate the *inner* record stream — a
-//! batch whose compressed payload decodes to garbage but whose CRC matches
-//! is silently accepted today. That is a real gap, but adding inner decode
-//! is feature work (see P0.6 in `tests_from_kafka.md`) — the tests in this
-//! file lock in the observable contract as it stands so a future inner-decode
-//! implementation is a tightening, not a behavior change.
+//! Kafkaesque today validates compressed payloads on produce: CRC, then
+//! codec id, then an attempted decompress. Fetch still returns stored
+//! bytes as opaque — clients decompress on the consumer side. Real Kafka
+//! clients (librdkafka, Java) compress on the producer and decompress on
+//! the consumer, so this model stays interoperable while refusing
+//! undecompressible / undefined-codec batches (refuse-don't-lie).
 //!
 //! What this file asserts:
 //!
@@ -34,7 +27,8 @@
 //!    of codec — i.e. the broker DOES detect transport corruption of
 //!    compressed batches, even without decoding them.
 //! 3. The `attributes` bits encode codec + flag bits independently — setting
-//!    `transactional` or `log-append-time` alongside a codec preserves both.
+//!    `log-append-time` alongside a codec preserves both (transactional /
+//!    control bits are refused on the produce path; see batch_validation).
 //! 4. `parse_record_count` reads the explicit header field correctly
 //!    irrespective of how (or whether) the records section is compressed.
 //! 5. `patch_base_offset` does not disturb the CRC envelope on a compressed
@@ -44,20 +38,8 @@
 //!    magic byte, not silently mis-CRCed.
 //! 7. The async CRC offload path (≥ 64 KiB) returns the same verdict as the
 //!    sync path for compressed payloads.
-//!
-//! What this file deliberately does NOT assert (and shouldn't, until
-//! inner-decode lands):
-//!
-//! - That the compressed payload's record_count agrees with the header's
-//!   `last_offset_delta + 1` *after decompression*.
-//! - That an unrecognised codec value (e.g. attributes bits 0..2 = 7) is
-//!   rejected at append time. Today the broker accepts it and stores it.
-//! - That zstd is gated on min batch version (Kafka rejects zstd in v0/v1).
-//!   Kafkaesque only supports v2, so this is automatically satisfied via
-//!   the `UnsupportedMagic` check.
-//!
-//! Each of those is its own future test — pinned here as TODOs so the
-//! contract gap is visible.
+//! 8. Produce-path validation refuses undefined codecs and undecompressible
+//!    payloads while still accepting well-formed compressed batches.
 
 use bytes::Bytes;
 use kafkaesque::constants::{
@@ -348,7 +330,9 @@ fn codec_bits_occupy_low_three_bits_of_attributes() {
 #[test]
 fn codec_coexists_with_transactional_and_log_append_time_bits() {
     // Bit 4 = transactional, bit 3 = log-append timestamp type.
-    // These must be readable alongside the codec bits without interference.
+    // These must be readable alongside the codec bits without interference
+    // at the CRC layer. Produce-path validation still refuses the
+    // transactional bit (refuse-don't-lie).
     let extra = (1u16 << 3) | (1u16 << 4); // log-append-time + transactional
     for codec in Codec::all() {
         let payload = encode(codec, b"with-flags");
@@ -361,6 +345,12 @@ fn codec_coexists_with_transactional_and_log_append_time_bits() {
             validate_batch_crc(&batch),
             CrcValidationResult::Valid,
             "{}: CRC must still validate with extra flags",
+            codec.name(),
+        );
+        assert_eq!(
+            kafkaesque::batch::validate_produce_batch(&batch),
+            kafkaesque::batch::ProduceBatchValidation::TransactionalBatch,
+            "{}: produce path must refuse transactional bit",
             codec.name(),
         );
     }
@@ -485,48 +475,32 @@ async fn async_crc_path_agrees_for_large_compressed_batches() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Documented gap — accept malformed compressed payload (TODO when
-//    inner-decode lands).
+// 7. Compression refuse-don't-lie — codec + inner decompress at produce.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn malformed_compressed_payload_with_valid_crc_is_currently_accepted() {
-    // The broker today does not decompress payloads, so a batch whose
-    // attributes claim `gzip` but whose payload is NOT a valid gzip stream
-    // sails through CRC validation. This test pins that observable
-    // behavior so a future inner-decode implementation has a clear
-    // counter-test to flip: when decompression lands, this should become
-    // `CrcValidationResult::Invalid` (or a new variant), and the assertion
-    // below should be inverted.
-    //
-    // TODO(P0.6 inner-decode): when the produce path begins decompressing,
-    // change the expectation here to assert rejection on malformed
-    // payload. See `tests_from_kafka.md` § P0.6.
+fn malformed_compressed_payload_with_valid_crc_is_rejected_on_produce_path() {
+    // CRC can still validate an opaque gzip-looking blob; the produce
+    // validator must still refuse it once it tries to decompress.
     let bogus_gzip = b"\x1f\x8b\x08not-actually-a-gzip-stream-just-the-magic";
     let batch = build_batch(Codec::Gzip, 0, 1, bogus_gzip);
     assert_eq!(
         validate_batch_crc(&batch),
         CrcValidationResult::Valid,
-        "today's contract: opaque payload + valid CRC = accepted; flip when inner decode lands",
+        "CRC remains a transport check and passes for this fixture",
+    );
+    assert_eq!(
+        kafkaesque::batch::validate_produce_batch(&batch),
+        kafkaesque::batch::ProduceBatchValidation::Undecompressible { codec: 1 },
+        "produce path must refuse undecompressible gzip payloads",
     );
 }
 
 #[test]
-fn unrecognised_codec_value_is_currently_accepted() {
-    // Attributes bits 0..2 = 7 is not a defined codec. Today the validator
-    // ignores codec semantics entirely (it only checks magic, length, CRC),
-    // so this batch is accepted. Pin that fact so a future codec-validator
-    // implementation knows what to flip.
-    //
-    // TODO(P0.6 inner-decode): reject undefined codec values at append.
-    //
-    // We bypass `build_batch` here because `Codec` has no variant for 7;
-    // we want to stamp it directly into the attributes byte without
-    // construing it as a valid codec value.
+fn unrecognised_codec_value_is_rejected_on_produce_path() {
+    // Attributes bits 0..2 = 7 is not a defined codec.
     let payload = b"opaque";
     let mut batch = build_batch(Codec::None, 0, 1, payload);
-    // Stamp codec id 7 into the low 3 bits of attributes (bytes 21..23),
-    // preserving the upper bits, then re-CRC.
     let mut attrs = u16::from_be_bytes([batch[21], batch[22]]);
     attrs = (attrs & !0b111) | 7;
     batch[21..23].copy_from_slice(&attrs.to_be_bytes());
@@ -541,6 +515,29 @@ fn unrecognised_codec_value_is_currently_accepted() {
     assert_eq!(
         validate_batch_crc(&batch),
         CrcValidationResult::Valid,
-        "today's contract: undefined codec is accepted; flip when codec validation lands",
+        "CRC does not interpret codec bits",
     );
+    assert_eq!(
+        kafkaesque::batch::validate_produce_batch(&batch),
+        kafkaesque::batch::ProduceBatchValidation::UnsupportedCompression { codec: 7 },
+        "produce path must refuse undefined compression codecs",
+    );
+}
+
+#[test]
+fn well_formed_compressed_codecs_pass_produce_validation() {
+    // Compress a real v2 records section (not arbitrary bytes) so the
+    // post-decompress inner-record walk matches `records_count`.
+    let valid = kafkaesque::batch::build_minimal_valid_batch(1);
+    let records = &valid[61..];
+    for codec in Codec::all() {
+        let payload = encode(codec, records);
+        let batch = build_batch(codec, 0, 1, &payload);
+        assert_eq!(
+            kafkaesque::batch::validate_produce_batch(&batch),
+            kafkaesque::batch::ProduceBatchValidation::Valid,
+            "{}: well-formed compressed batch must be accepted",
+            codec.name(),
+        );
+    }
 }

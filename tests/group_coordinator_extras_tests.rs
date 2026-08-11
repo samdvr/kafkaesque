@@ -85,12 +85,13 @@ fn ctx() -> RequestContext {
     RequestContext {
         client_addr: "127.0.0.1:0".parse().unwrap(),
         conn_id: 1,
-        api_version: 8,
+        api_version: 2,
         client_id: Some("group-extras".into()),
         request_id: uuid::Uuid::new_v4(),
         principal: Arc::from("User:ANONYMOUS"),
         client_host: Arc::from("127.0.0.1"),
         transport_tls: false,
+        metrics: kafkaesque::cluster::Metrics::default(),
     }
 }
 
@@ -451,10 +452,7 @@ async fn leave_group_for_already_departed_member_returns_unknown_member_id() {
     let first_leave = h
         .handle_leave_group(
             &ctx(),
-            LeaveGroupRequestData {
-                group_id: group.into(),
-                member_id: member_id.clone(),
-            },
+            LeaveGroupRequestData::for_member(group, member_id.clone()),
         )
         .await;
     assert_eq!(first_leave.error_code, KafkaCode::None);
@@ -462,10 +460,7 @@ async fn leave_group_for_already_departed_member_returns_unknown_member_id() {
     let second_leave = h
         .handle_leave_group(
             &ctx(),
-            LeaveGroupRequestData {
-                group_id: group.into(),
-                member_id,
-            },
+            LeaveGroupRequestData::for_member(group, member_id),
         )
         .await;
     assert!(

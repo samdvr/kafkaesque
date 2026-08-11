@@ -682,6 +682,7 @@ pub(super) async fn handle_offset_fetch(
                     .map(|&partition_index| OffsetFetchPartitionResponse {
                         partition_index,
                         committed_offset: -1,
+                        committed_leader_epoch: -1,
                         metadata: None,
                         error_code: KafkaCode::GroupAuthorizationFailed,
                     })
@@ -707,6 +708,7 @@ pub(super) async fn handle_offset_fetch(
                 .map(|&partition_index| OffsetFetchPartitionResponse {
                     partition_index,
                     committed_offset: -1,
+                    committed_leader_epoch: -1,
                     metadata: None,
                     error_code: KafkaCode::InvalidTopic,
                 })
@@ -746,6 +748,7 @@ pub(super) async fn handle_offset_fetch(
                 .map(|&partition_index| OffsetFetchPartitionResponse {
                     partition_index,
                     committed_offset: -1,
+                    committed_leader_epoch: -1,
                     metadata: None,
                     error_code: KafkaCode::TopicAuthorizationFailed,
                 })
@@ -787,6 +790,7 @@ pub(super) async fn handle_offset_fetch(
             partition_responses.push(OffsetFetchPartitionResponse {
                 partition_index,
                 committed_offset,
+                committed_leader_epoch: -1,
                 metadata,
                 error_code,
             });
@@ -892,6 +896,7 @@ mod tests {
         let response = OffsetFetchPartitionResponse {
             partition_index: 0,
             committed_offset: 100,
+            committed_leader_epoch: -1,
             metadata: Some("consumer-metadata".to_string()),
             error_code: KafkaCode::None,
         };
@@ -908,6 +913,7 @@ mod tests {
         let response = OffsetFetchPartitionResponse {
             partition_index: 0,
             committed_offset: -1,
+            committed_leader_epoch: -1,
             metadata: None,
             error_code: KafkaCode::None,
         };
@@ -922,6 +928,7 @@ mod tests {
         let response = OffsetFetchPartitionResponse {
             partition_index: 0,
             committed_offset: -1,
+            committed_leader_epoch: -1,
             metadata: None,
             error_code: KafkaCode::GroupCoordinatorNotAvailable,
         };
@@ -936,12 +943,14 @@ mod tests {
             OffsetFetchPartitionResponse {
                 partition_index: 0,
                 committed_offset: 100,
+                committed_leader_epoch: -1,
                 metadata: None,
                 error_code: KafkaCode::None,
             },
             OffsetFetchPartitionResponse {
                 partition_index: 1,
                 committed_offset: 200,
+                committed_leader_epoch: -1,
                 metadata: None,
                 error_code: KafkaCode::None,
             },
@@ -1097,6 +1106,7 @@ mod tests {
                 partitions: vec![OffsetFetchPartitionResponse {
                     partition_index: 0,
                     committed_offset: 100,
+                    committed_leader_epoch: -1,
                     metadata: None,
                     error_code: KafkaCode::None,
                 }],
@@ -1106,6 +1116,7 @@ mod tests {
                 partitions: vec![OffsetFetchPartitionResponse {
                     partition_index: 0,
                     committed_offset: 200,
+                    committed_leader_epoch: -1,
                     metadata: None,
                     error_code: KafkaCode::None,
                 }],
@@ -1132,6 +1143,7 @@ mod tests {
         let response = OffsetFetchPartitionResponse {
             partition_index: 0,
             committed_offset: 100,
+            committed_leader_epoch: -1,
             metadata: None,
             error_code: KafkaCode::None,
         };
@@ -1144,6 +1156,7 @@ mod tests {
         let response = OffsetFetchPartitionResponse {
             partition_index: 0,
             committed_offset: 100,
+            committed_leader_epoch: -1,
             metadata: Some("client-metadata".to_string()),
             error_code: KafkaCode::None,
         };

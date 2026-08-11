@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+
+
+## [0.2.0] - 2026-08-10
 
 ### Fixed
 
@@ -72,9 +74,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored multi-node Raft linearizability test, scaled failover stress, and
   a longer loom preemption smoke.
 
-## [0.2.0] - 2026-08-10
-
-### Added
 
 - **Sharded Raft metadata plane.** The single combined Raft group is replaced
   by a control group plus N metadata shard groups, all reachable on one

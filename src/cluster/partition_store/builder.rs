@@ -305,11 +305,10 @@ impl PartitionStoreBuilder {
         // Prepare SlateDB settings with explicit memory limits for backpressure.
         // When boundary files are disabled (LocalFileSystem), keep GC on but
         // skip conditional boundary advances that the store cannot perform.
-        let garbage_collector_options = {
-            let mut gc = GarbageCollectorOptions::default();
-            gc.boundary_files_enabled = self.slatedb_gc_boundary_files_enabled;
-            Some(gc)
-        };
+        let garbage_collector_options = Some(GarbageCollectorOptions {
+            boundary_files_enabled: self.slatedb_gc_boundary_files_enabled,
+            ..GarbageCollectorOptions::default()
+        });
         let slatedb_settings = SlateDbSettings {
             max_unflushed_bytes: self.slatedb_max_unflushed_bytes,
             l0_sst_size_bytes: self.slatedb_l0_sst_size_bytes,

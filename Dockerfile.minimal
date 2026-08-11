@@ -40,7 +40,18 @@ WORKDIR /app
 # passed explicitly, so every cargo invocation below passes it. The triple is
 # resolved from rustc rather than hardcoded, because this image is also built
 # for linux/arm64.
-ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static -C opt-level=z -C lto=fat -C codegen-units=1"
+ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
+
+# Size/optimization knobs go through the profile, NOT RUSTFLAGS. Cargo passes
+# `-C embed-bitcode=no` to dependency crates whenever the *profile* has LTO
+# disabled (the release default), and rustc rejects `-C embed-bitcode=no`
+# together with a `-C lto` flag: "options `-C embed-bitcode=no` and `-C lto` are
+# incompatible". Setting the profile via CARGO_PROFILE_* lets cargo emit bitcode
+# for the dependency crates so fat LTO actually works, and keeps the override
+# scoped to this image instead of slowing down every other release build.
+ENV CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
+    CARGO_PROFILE_RELEASE_LTO=fat \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 
 RUN rustc -vV | sed -n 's/^host: //p' > /rust-target && cat /rust-target
 

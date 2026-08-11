@@ -562,30 +562,8 @@ impl PartitionCoordinator for RaftCoordinator {
     }
 
     async fn register_topic(&self, topic: &str, partitions: i32) -> SlateDBResult<()> {
-        let command = ControlCommand::TopicRegistry(TopicRegistryCommand::CreateTopic {
-            name: topic.to_string(),
-            partitions,
-            config: HashMap::new(),
-            timestamp_ms: current_time_ms(),
-        });
-
-        // Topic existence is cluster-wide; the per-partition state seeds
-        // (InitPartition) are propagated by the reconciler in the next
-        // step of the sharding plan. Until the reconciler ships, partition
-        // entries appear lazily as brokers AcquirePartition them — same
-        // legacy behaviour for the steady-state hot path, only `CreateTopic`
-        // itself is no longer the seeding point.
-        let response = self.cluster().write_control(command).await?;
-        match response {
-            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicCreated { .. }) => Ok(()),
-            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicAlreadyExists {
-                ..
-            }) => Ok(()),
-            other => Err(SlateDBError::Storage(format!(
-                "Unexpected response: {:?}",
-                other
-            ))),
-        }
+        self.register_topic_with_config(topic, partitions, HashMap::new())
+            .await
     }
 
     async fn register_topic_with_config(
@@ -594,19 +572,38 @@ impl PartitionCoordinator for RaftCoordinator {
         partitions: i32,
         config: HashMap<String, String>,
     ) -> SlateDBResult<()> {
+        let created_at_ms = current_time_ms();
         let command = ControlCommand::TopicRegistry(TopicRegistryCommand::CreateTopic {
             name: topic.to_string(),
             partitions,
             config,
-            timestamp_ms: current_time_ms(),
+            timestamp_ms: created_at_ms,
         });
 
         let response = self.cluster().write_control(command).await?;
         match response {
-            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicCreated { .. }) => Ok(()),
+            // Topic existence is cluster-wide (control group); per-partition
+            // lease state lives in a shard group and must be seeded
+            // separately. Do it eagerly so a produce that follows
+            // `CreateTopics` doesn't race the reconciler — see
+            // `seed_partition_states`.
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicCreated { .. }) => {
+                self.seed_partition_states(topic, partitions, created_at_ms)
+                    .await;
+                Ok(())
+            }
+            // Also seed on AlreadyExists: a concurrent creator may have
+            // committed the control entry but not yet finished seeding, and
+            // `InitPartition` is idempotent. This is what makes a retried
+            // `CreateTopics` self-healing instead of inheriting the first
+            // attempt's partial seed.
             ControlResponse::TopicRegistry(TopicRegistryResponse::TopicAlreadyExists {
                 ..
-            }) => Ok(()),
+            }) => {
+                self.seed_partition_states(topic, partitions, created_at_ms)
+                    .await;
+                Ok(())
+            }
             other => Err(SlateDBError::Storage(format!(
                 "Unexpected response: {:?}",
                 other
@@ -848,7 +845,17 @@ impl PartitionCoordinator for RaftCoordinator {
         });
         let response = self.cluster().write_control(command).await?;
         match response {
-            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicGrown { .. }) => Ok(true),
+            ControlResponse::TopicRegistry(TopicRegistryResponse::TopicGrown { .. }) => {
+                // Same control→shard gap as the create path: the added
+                // partitions need shard-side entries before a produce can
+                // acquire them. Seeding 0..new_count rather than just the
+                // added range costs only idempotent no-ops for the
+                // pre-existing partitions and repairs any earlier partial
+                // seed.
+                self.seed_partition_states(topic, new_count, current_time_ms())
+                    .await;
+                Ok(true)
+            }
             ControlResponse::TopicRegistry(TopicRegistryResponse::TopicNotFound { .. }) => {
                 Ok(false)
             }
@@ -866,6 +873,105 @@ impl PartitionCoordinator for RaftCoordinator {
 }
 
 impl RaftCoordinator {
+    /// Eagerly seed per-partition state for `partitions` of `topic` on the
+    /// shard that owns it.
+    ///
+    /// `CreateTopic` commits to the **control** group, but partition leases
+    /// live in a shard group. Without this call the shard only learns about
+    /// the partitions when the reconciler's next tick propagates
+    /// `InitPartition` — and until then `RenewLease` / `AcquirePartition`
+    /// on a partition the shard SM has never seen falls through to
+    /// `PartitionNotOwned`, which surfaces to clients as
+    /// `NotLeaderForPartition`. A producer that writes immediately after
+    /// `CreateTopics` loses that race.
+    ///
+    /// Seeding here closes the window on the create path; the reconciler
+    /// remains the backstop for topics created before it started, for
+    /// shards that were mid-election during the create, and for any
+    /// proposal that fails below.
+    ///
+    /// Proposals are issued concurrently rather than in sequence: they all
+    /// target one shard, so arriving together lets Raft batch them into few
+    /// log entries and bounds latency at roughly one round-trip instead of
+    /// one per partition (topics may have up to
+    /// `max_partitions_per_topic` = 1000).
+    ///
+    /// Failures are logged, not returned. The control write has already
+    /// committed by this point, so the topic *does* exist; failing
+    /// `CreateTopics` afterwards would tell the client the create did not
+    /// happen. A failed seed degrades to exactly the old lazy behaviour.
+    async fn seed_partition_states(&self, topic: &str, partitions: i32, created_at_ms: u64) {
+        if partitions <= 0 {
+            return;
+        }
+        let start = Instant::now();
+        let seeds = (0..partitions).map(|partition| async move {
+            let cmd = ShardCommand::Partition(PartitionStateCommand::InitPartition {
+                topic: topic.to_string(),
+                partition,
+                created_at_ms,
+            });
+            (
+                partition,
+                self.cluster().write_shard_for_topic(topic, cmd).await,
+            )
+        });
+        let results = futures::future::join_all(seeds).await;
+
+        let mut failed = 0usize;
+        for (partition, result) in results {
+            match result {
+                // Both arms are success: `InitPartition` is idempotent, so a
+                // concurrent creator or a reconciler tick that got there
+                // first is not an error.
+                Ok(ShardResponse::Partition(PartitionStateResponse::PartitionInitialized {
+                    ..
+                }))
+                | Ok(ShardResponse::Partition(PartitionStateResponse::PartitionAlreadyExists {
+                    ..
+                })) => {}
+                Ok(other) => {
+                    failed += 1;
+                    debug!(
+                        topic = %topic,
+                        partition,
+                        response = ?other,
+                        "unexpected response seeding partition state (reconciler will retry)"
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    debug!(
+                        topic = %topic,
+                        partition,
+                        error = %e,
+                        "failed to seed partition state (reconciler will retry)"
+                    );
+                }
+            }
+        }
+
+        if failed > 0 {
+            // Worth a level above debug: until the reconciler catches up,
+            // produces to the un-seeded partitions answer
+            // NotLeaderForPartition.
+            info!(
+                topic = %topic,
+                partitions,
+                failed,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "partition state seeding partially failed; reconciler will converge"
+            );
+        } else {
+            debug!(
+                topic = %topic,
+                partitions,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "seeded partition state for new topic"
+            );
+        }
+    }
+
     /// Confirm a cached owner entry still matches local state-machine data.
     ///
     /// The owner entry lives in the shard owning this topic. We use that

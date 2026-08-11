@@ -54,6 +54,26 @@ use common::BrokerHandle;
 
 const TOPIC: &str = "ofle-tests";
 
+/// How long the setup helpers wait for a freshly created topic to become
+/// usable.
+///
+/// This is a convergence poll, not a latency assertion: the loops below
+/// return the instant the broker is ready, so a generous ceiling costs
+/// nothing in the happy path and only changes how much load the test
+/// tolerates before declaring failure.
+///
+/// It needs to be this generous because every test in this file spawns its
+/// own broker (Raft + SlateDB) and `cargo test` runs them concurrently —
+/// 9 brokers booting at once on a loaded machine. Partition acquisition
+/// runs on the partition manager's ownership sweep, so under that load the
+/// first successful acquire can land well after the previous 5s ceiling.
+/// Measured on an 18-core laptop: 5s failed 2 of 20 full-target runs with a
+/// sustained `NotLeaderForPartition`, while 30s failed 0 of 20. The old
+/// ceiling was timing the machine, not the broker.
+///
+/// If a wait here actually expires, treat it as a real ownership bug.
+const TOPIC_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Create the topic and poll OffsetForLeaderEpoch until the broker
 /// reports ownership (i.e. response error_code == None for the
 /// `current_leader_epoch=-1` probe). `handle_create_topics` only writes
@@ -79,7 +99,7 @@ async fn ensure_topic(broker: &BrokerHandle, name: &str) {
         )
         .await;
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + TOPIC_READY_TIMEOUT;
     loop {
         let resp = broker
             .handler
@@ -393,9 +413,9 @@ async fn end_offset_reflects_live_hwm_after_produce() {
     // ensure_topic waits until the read path returns ownership, but the
     // partition manager may still be opening the SlateDB store for
     // writes when the first produce arrives. Retry briefly until the
-    // write side catches up. After ~5s give up — that's a real bug, not
-    // a setup race.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // write side catches up. If this expires, that's a real bug, not a
+    // setup race — see `TOPIC_READY_TIMEOUT`.
+    let deadline = std::time::Instant::now() + TOPIC_READY_TIMEOUT;
     let mut last_err = KafkaCode::None;
     let prod_ok = loop {
         let prod = broker
